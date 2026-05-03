@@ -53,6 +53,11 @@
 // Used in feature flags only (`asm-keccak`, `keccak-cache-global`)
 use alloy_primitives as _;
 
+// Used by the chain-id dispatch in `bin/reth/src/main.rs`; the
+// `unused_crate_dependencies` lint is scoped per compilation target so this
+// extern declaration is needed to suppress the warning here in lib.rs.
+use eyre as _;
+
 pub mod cli;
 
 /// Re-exported utils.
@@ -219,6 +224,11 @@ use aquamarine as _;
 // used in main
 use clap as _;
 use reth_cli_util as _;
+use reth_msgboard as _;
+use reth_msgboard_types as _;
+use reth_pulsechain_forks as _;
+use reth_pulsechain_node as _;
+use tokio as _;
 use tracing as _;
 
 // Firehose

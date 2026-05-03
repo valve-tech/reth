@@ -153,6 +153,10 @@ members = [
     "testing/testing-utils",
     "testing/runner",
     "crates/tracing-otlp",
+    "crates/pulsechain/hardforks",
+    "crates/pulsechain/node",
+    "crates/net/msgboard-types",
+    "crates/net/msgboard",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]
@@ -317,6 +321,12 @@ codegen-units = 1
 incremental = false
 
 [workspace.dependencies]
+# pulsechain
+reth-pulsechain-forks = { path = "crates/pulsechain/hardforks", default-features = false }
+reth-pulsechain-node = { path = "crates/pulsechain/node" }
+reth-msgboard-types = { path = "crates/net/msgboard-types", default-features = false }
+reth-msgboard = { path = "crates/net/msgboard" }
+
 # reth
 reth = { path = "bin/reth" }
 reth-storage-rpc-provider = { path = "crates/storage/rpc-provider" }

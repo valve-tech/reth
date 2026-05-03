@@ -1,0 +1,28 @@
+[Unit]
+Description=Lighthouse Consensus Client (PulseChain Testnet V4)
+After=network-online.target reth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/lighthouse-pulse
+ExecStart=/root/lighthouse-pulse/target/release/lighthouse beacon_node \
+  --network pulsechain_testnet_v4 \
+  --datadir /mnt/reth/lighthouse \
+  --execution-jwt /mnt/reth/jwt.hex \
+  --execution-endpoint http://127.0.0.1:8551 \
+  --port 9300 \
+  --discovery-port 9300 \
+  --disable-upnp \
+  --enr-address 116.202.173.179 \
+  --enr-udp-port 9300 \
+  --enr-tcp-port 9300 \
+  --http --http-address 127.0.0.1 --http-port 5052 \
+  --checkpoint-sync-url https://checkpoint.v4.testnet.pulsechain.com
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
