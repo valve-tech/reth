@@ -4513,6 +4513,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hex-literal"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
+
+[[package]]
 name = "hickory-net"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7469,6 +7475,7 @@ dependencies = [
  "aquamarine",
  "backon",
  "clap",
+ "eyre",
  "reth-chainspec",
  "reth-cli-runner",
  "reth-cli-util",
@@ -7478,6 +7485,8 @@ dependencies = [
  "reth-ethereum-cli",
  "reth-ethereum-payload-builder",
  "reth-ethereum-primitives",
+ "reth-msgboard",
+ "reth-msgboard-types",
  "reth-network",
  "reth-network-api",
  "reth-node-api",
@@ -7489,6 +7498,8 @@ dependencies = [
  "reth-payload-primitives",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-pulsechain-forks",
+ "reth-pulsechain-node",
  "reth-revm",
  "reth-rpc",
  "reth-rpc-api",
@@ -8969,6 +8980,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-msgboard"
+version = "2.2.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-serde 2.0.4",
+ "async-trait",
+ "bytes",
+ "clap",
+ "eyre",
+ "futures",
+ "humantime",
+ "jsonrpsee",
+ "metrics",
+ "parking_lot",
+ "reth-eth-wire",
+ "reth-fs-util",
+ "reth-libmdbx",
+ "reth-metrics",
+ "reth-msgboard-types",
+ "reth-network",
+ "reth-network-api",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-rpc-builder",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "reth-msgboard-types"
+version = "2.2.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "hex-literal",
+ "secp256k1 0.30.0",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "reth-net-banlist"
 version = "2.2.0"
 dependencies = [
@@ -9659,6 +9717,56 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "reth-pulsechain-forks"
+version = "2.2.0"
+dependencies = [
+ "alloy-eips 2.0.4",
+ "alloy-primitives",
+ "reth-chainspec",
+ "reth-ethereum-forks",
+ "reth-network-peers",
+]
+
+[[package]]
+name = "reth-pulsechain-node"
+version = "2.2.0"
+dependencies = [
+ "alloy-chains",
+ "alloy-consensus",
+ "alloy-eips 2.0.4",
+ "alloy-evm",
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
+ "eyre",
+ "jsonrpsee",
+ "reth-chainspec",
+ "reth-cli",
+ "reth-consensus",
+ "reth-ethereum-cli",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-execution-types",
+ "reth-network",
+ "reth-network-peers",
+ "reth-node-api",
+ "reth-node-builder",
+ "reth-node-ethereum",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-pulsechain-forks",
+ "reth-rpc-builder",
+ "reth-rpc-eth-api",
+ "reth-storage-errors",
+ "reth-tracing",
+ "reth-transaction-pool",
+ "revm",
 ]
 
 [[package]]

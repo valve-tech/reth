@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tracing::trace;
+use tracing::{trace, warn};
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// Contains the connectivity related state of the network.
@@ -258,27 +258,21 @@ impl<N: NetworkPrimitives> Swarm<N> {
                     return None
                 }
 
-                // When `enforce_enr_fork_id` is enabled, peers discovered without a confirmed
-                // fork ID (via EIP-868 ENR) are deferred — they'll only be added once a
-                // `DiscoveredEnrForkId` event arrives with a validated fork ID.
-                //
-                // When disabled (default), peers without a fork ID are admitted immediately.
-                // Peers that *do* carry a fork ID are always validated against ours.
-                let enforce = self.peers().enforce_enr_fork_id();
-                let allow = match fork_id {
-                    Some(f) => self.sessions.is_valid_fork_id(f),
-                    None => !enforce,
-                };
-                if allow {
-                    self.peers_mut().add_peer(peer_id, addr, fork_id);
-                }
+                // PulseChain: Skip ENR fork ID filtering entirely. go-pulse/erigon-pulse
+                // compute fork IDs differently from our Ethereum-inherited schedule, so
+                // fork ID comparison is unreliable. The ETH handshake still validates
+                // protocol compatibility.
+                self.peers_mut().add_peer(peer_id, addr, fork_id);
             }
             StateAction::DiscoveredEnrForkId { peer_id, addr, fork_id } => {
                 if self.sessions.is_valid_fork_id(fork_id) {
                     self.peers_mut().add_peer(peer_id, addr, Some(fork_id));
                 } else {
-                    trace!(target: "net", ?peer_id, remote_fork_id=?fork_id, our_fork_id=?self.sessions.fork_id(), "fork id mismatch, removing peer");
-                    self.peers_mut().remove_peer(peer_id);
+                    // PulseChain: ENR fork IDs may not match because go-pulse/erigon-pulse
+                    // compute fork IDs with a different fork schedule than our Ethereum-inherited
+                    // one. Don't remove already-connected peers — the ETH handshake already
+                    // validated protocol compatibility. Just skip adding them again.
+                    trace!(target: "net", ?peer_id, remote_fork_id=?fork_id, our_fork_id=?self.sessions.fork_id(), "ENR fork id mismatch, skipping peer add (not disconnecting)");
                 }
             }
         }

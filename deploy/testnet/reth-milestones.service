@@ -1,0 +1,6 @@
+[Unit]
+Description=Log reth sync milestones
+
+[Service]
+Type=oneshot
+ExecStart=/root/deploy/monitor-milestones.sh

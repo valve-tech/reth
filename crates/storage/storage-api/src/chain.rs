@@ -3,7 +3,7 @@ use alloc::{vec, vec::Vec};
 use alloy_consensus::Header;
 use alloy_primitives::BlockNumber;
 use core::marker::PhantomData;
-use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_db_api::{
     cursor::{DbCursorRO, DbCursorRW},
     models::StoredBlockOmmers,
@@ -162,8 +162,32 @@ where
 
         for (header, transactions) in inputs {
             // If we are past shanghai, then all blocks should have a withdrawal list,
-            // even if empty
-            let withdrawals = if chain_spec.is_shanghai_active_at_timestamp(header.timestamp()) {
+            // even if empty.
+            //
+            // PulseChain: blocks before PrimordialPulse are canonical Ethereum blocks.
+            // Ethereum's Shanghai activated at timestamp 1,681,338,455, but PulseChain's
+            // chain spec has Shanghai later. Use Ethereum's timestamp for pre-fork blocks
+            // so that withdrawals are correctly included in reconstructed block bodies.
+            let shanghai_active = {
+                const ETHEREUM_SHANGHAI_TIMESTAMP: u64 = 1_681_338_455;
+                let chain_id = EthChainSpec::chain_id(chain_spec.as_ref());
+                let primordial_pulse_block: Option<u64> = match chain_id {
+                    369 => Some(17_233_000),
+                    943 => Some(16_492_700),
+                    32382 => Some(10),
+                    _ => None,
+                };
+                if let Some(pp_block) = primordial_pulse_block {
+                    if header.number() < pp_block {
+                        header.timestamp() >= ETHEREUM_SHANGHAI_TIMESTAMP
+                    } else {
+                        chain_spec.is_shanghai_active_at_timestamp(header.timestamp())
+                    }
+                } else {
+                    chain_spec.is_shanghai_active_at_timestamp(header.timestamp())
+                }
+            };
+            let withdrawals = if shanghai_active {
                 withdrawals_cursor
                     .seek_exact(header.number())?
                     .map(|(_, w)| w.withdrawals)

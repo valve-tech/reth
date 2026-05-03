@@ -1,0 +1,30 @@
+[Unit]
+Description=Reth Execution Client (PulseChain Testnet V4, extension-model)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/reth
+ExecStart=/root/reth/target/release/reth node \
+  --chain pulsechain-testnet-v4 \
+  --datadir /mnt/reth \
+  --port 30303 \
+  --discovery.port 30303 \
+  --http --http.addr 0.0.0.0 --http.port 8545 \
+  --http.api eth,net,web3,debug,trace,txpool,rpc,reth,ots \
+  --http.corsdomain "*" \
+  --ws --ws.addr 0.0.0.0 --ws.port 8546 \
+  --ws.api eth,net,web3,debug,trace,txpool,rpc,reth,ots \
+  --ws.origins "*" \
+  --rpc.max-connections 500 \
+  --authrpc.addr 127.0.0.1 --authrpc.port 8551 \
+  --authrpc.jwtsecret /mnt/reth/jwt.hex \
+  --metrics 0.0.0.0:9001
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

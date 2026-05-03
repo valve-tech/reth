@@ -1,0 +1,45 @@
+[package]
+name = "reth-msgboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "PulseChain msgboard P2P sub-protocol manager and in-memory board"
+
+[lints]
+workspace = true
+
+[dependencies]
+reth-msgboard-types = { workspace = true, features = ["std"] }
+reth-network = { workspace = true }
+reth-network-api = { workspace = true }
+reth-eth-wire = { workspace = true }
+reth-fs-util = { workspace = true }
+reth-libmdbx = { workspace = true }
+reth-metrics = { workspace = true }
+reth-primitives-traits = { workspace = true }
+reth-provider = { workspace = true }
+reth-rpc-builder = { workspace = true }
+
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+alloy-serde = { workspace = true, features = ["std"] }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+eyre = { workspace = true }
+futures = { workspace = true }
+humantime = { workspace = true }
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+metrics = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+tempfile = { workspace = true }
