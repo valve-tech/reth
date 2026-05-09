@@ -177,15 +177,8 @@ const DEPOSIT_CONTRACT_INITIAL_STORAGE: [(B256, B256); 31] = [
 
 /// Abstracts state writes needed by the `PrimordialPulse` transition.
 ///
-/// Implemented by [`tests::MockState`] for unit testing. Phase 4 adds an impl
-/// for `revm::State<DB>` in `crates/pulsechain/evm/`.
-//
-// TODO(Phase 4): implement for revm::State<DB> in reth-pulsechain-evm:
-//   fn increment_balance — load or default account, add balance delta
-//   fn set_code          — replace account bytecode
-//   fn set_nonce         — set account nonce
-//   fn set_storage       — write storage slot
-//   fn selfdestruct      — mark account destructed; transfer ETH balance per EVM semantics
+/// Implemented by [`tests::MockState`] for unit testing and blanket-impl'd for
+/// any `T: StateDB` in `evm.rs` for the live revm path.
 pub trait PrimordialPulseStateWriter {
     /// Add `amount` to the balance of `address`.
     fn increment_balance(&mut self, address: Address, amount: U256);
@@ -211,12 +204,10 @@ pub trait PrimordialPulseStateWriter {
 /// Apply the `PrimordialPulse` state transition.
 ///
 /// Must be called exactly once when `block_number == primordial_pulse_block`, after all
-/// transactions have executed but before state root commitment.
+/// transactions have executed but before state root commitment. Wired in
+/// `PulsechainBlockExecutor::finish` (`evm.rs`).
 ///
 /// `chain_id` must be `369` (mainnet) or `943` (testnet v4).
-//
-// TODO(Phase 4): wire into PulsechainBlockExecutorFactory in reth-pulsechain-evm
-// TODO(Phase 4): integration-test against known post-fork state root
 pub fn apply_primordial_pulse<S: PrimordialPulseStateWriter>(state: &mut S, chain_id: u64) {
     debug_assert!(
         chain_id == 369 || chain_id == 943,
