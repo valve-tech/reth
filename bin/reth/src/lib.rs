@@ -233,5 +233,5 @@ use tracing as _;
 
 // Firehose
 mod firehose;
-pub use firehose::FirehoseExecutorBuilder;
+pub use firehose::{FirehoseExecutorBuilder, PulsechainFirehoseExecutorBuilder};
 use firehose_tracer as _;

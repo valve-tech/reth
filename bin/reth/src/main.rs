@@ -14,7 +14,7 @@ static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 use std::sync::Arc;
 
 use clap::Parser;
-use reth::{cli::Cli, FirehoseExecutorBuilder};
+use reth::{cli::Cli, FirehoseExecutorBuilder, PulsechainFirehoseExecutorBuilder};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_msgboard::{args::MsgboardArgs, MsgboardLauncher};
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
@@ -116,14 +116,21 @@ fn run_ethereum_node() -> eyre::Result<()> {
 /// Launch path for PulseChain chains (pulsechain mainnet/testnet) and any
 /// other chain not handled by [`run_ethereum_node`].
 ///
-/// Uses [`PulsechainNode`] with custom components (EVM with CHAINID override,
-/// consensus with Shanghai gap fix). Adds the PulseChain-specific
-/// `eth_estimateGas` margin and bootnode injection.
+/// Uses [`PulsechainNode`] with [`PulsechainFirehoseExecutorBuilder`] swapped in
+/// for the default executor — the executor wraps [`PulsechainEvmConfig`] in
+/// `FirehoseEvmConfig` so PulseChain block execution fires the firehose tracer
+/// hooks (CHAINID override, Shanghai-gap consensus, PrimordialPulse transition
+/// all preserved). The "firehose" ExEx drives downstream block streaming.
+///
+/// PrimordialPulse fork-block tracing is wired separately in
+/// `crates/pulsechain/node/src/evm.rs` (see NOTES-firehose.md).
 fn run_pulsechain_node() -> eyre::Result<()> {
     // We use `run_with_components` (instead of the convenience `run`) because our chain
     // spec is `PulsechainChainSpec` (a wrapper that overrides Shanghai detection for the
     // pre-PrimordialPulse Ethereum-replay range). `Cli::run` is hard-bound to upstream
-    // `ChainSpec`, so we pass the components closure ourselves.
+    // `ChainSpec`, so we pass the components closure ourselves. The closure provides
+    // (EvmConfig, Consensus) for non-launch CLI commands; the actual launch path below
+    // uses the components-builder API to swap in firehose-instrumented components.
     let components = |spec: Arc<PulsechainChainSpec>| {
         (PulsechainEvmConfig::new(spec.clone()), Arc::new(PulsechainConsensus::new(spec)))
     };
@@ -142,18 +149,33 @@ fn run_pulsechain_node() -> eyre::Result<()> {
             let launcher = MsgboardLauncher::new(msgboard_args);
             let launcher_for_rpc = launcher.clone();
 
-            let node = builder.node(PulsechainNode::default()).extend_rpc_modules(move |ctx| {
-                let datadir = ctx.config().datadir().data_dir().to_path_buf();
-                launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
+            // Build via the components fluent API so we can swap in
+            // PulsechainFirehoseExecutorBuilder + install the firehose ExEx.
+            // Mirrors the run_ethereum_node path but with PulseChain's
+            // pool/network/consensus/payload builders.
+            let handle = builder
+                .with_types::<PulsechainNode>()
+                .with_components(
+                    PulsechainNode::components()
+                        .executor(PulsechainFirehoseExecutorBuilder::default()),
+                )
+                .with_add_ons(EthereumAddOns::default())
+                .extend_rpc_modules(move |ctx| {
+                    let datadir = ctx.config().datadir().data_dir().to_path_buf();
+                    launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
 
-                // Replace eth_estimateGas with a version that adds a 20% margin.
-                let eth_api = ctx.registry.eth_api().clone();
-                install_gas_estimation_margin(ctx.modules, eth_api)?;
+                    // Replace eth_estimateGas with a version that adds a 20% margin.
+                    let eth_api = ctx.registry.eth_api().clone();
+                    install_gas_estimation_margin(ctx.modules, eth_api)?;
 
-                Ok(())
-            });
+                    Ok(())
+                })
+                .install_exex("firehose", |ctx| async move {
+                    Ok(async move { reth_firehose::run_exex(ctx).await })
+                })
+                .launch()
+                .await?;
 
-            let handle = node.launch().await?;
             launcher.install_post_launch_tasks(
                 handle.node.network.clone(),
                 handle.node.provider.clone(),

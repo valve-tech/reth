@@ -66,6 +66,7 @@ reth-msgboard.workspace = true
 reth-msgboard-types.workspace = true
 
 # alloy
+alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types = { workspace = true, features = ["engine"] }
 
