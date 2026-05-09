@@ -158,6 +158,112 @@ impl<T: StateDB> PrimordialPulseStateWriter for T {
     }
 }
 
+// ── Firehose tracing for the PrimordialPulse system call ────────────────────
+
+/// Wraps a [`PrimordialPulseStateWriter`] to additionally emit firehose tracer
+/// events for each balance / code / nonce / storage change. Used at the
+/// `PrimordialPulse` call site so the firehose stream sees the fork-block
+/// transition (the writes go through `evm.db_mut()` directly, bypassing
+/// revm's opcode dispatch and therefore the inspector hooks).
+///
+/// Each method:
+///   1. Reads the prior value via [`StateDB::basic`] / [`StateDB::storage`].
+///   2. Forwards the call to the inner writer (the existing `T: StateDB` impl
+///      handles the actual revm cache + commit dance).
+///   3. Emits the corresponding tracer event.
+///
+/// Mirrors the `BalanceIncreaseGenesisBalance` / `BalanceDecreaseSelfdestruct`
+/// reasons used by erigon-pulse / firehose-go-pulse.
+struct TracingPrimordialPulseStateWriter<'a, T: StateDB> {
+    inner: &'a mut T,
+    tracer: &'a mut firehose_tracer::Tracer,
+}
+
+impl<'a, T: StateDB> PrimordialPulseStateWriter for TracingPrimordialPulseStateWriter<'a, T> {
+    fn increment_balance(&mut self, address: alloy_primitives::Address, amount: U256) {
+        let old_balance = self
+            .inner
+            .basic(address)
+            .ok()
+            .flatten()
+            .map(|info| info.balance)
+            .unwrap_or(U256::ZERO);
+        <T as PrimordialPulseStateWriter>::increment_balance(self.inner, address, amount);
+        let new_balance = old_balance.saturating_add(amount);
+        self.tracer.on_balance_change(
+            address,
+            old_balance,
+            new_balance,
+            firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason::GenesisBalance,
+        );
+    }
+
+    fn selfdestruct(&mut self, address: alloy_primitives::Address) {
+        // Snapshot prior account state for event emission.
+        let info = self.inner.basic(address).ok().flatten().unwrap_or_default();
+        let old_balance = info.balance;
+        let old_code_hash = info.code_hash;
+        <T as PrimordialPulseStateWriter>::selfdestruct(self.inner, address);
+        if !old_balance.is_zero() {
+            self.tracer.on_balance_change(
+                address,
+                old_balance,
+                U256::ZERO,
+                firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason::SuicideWithdraw,
+            );
+        }
+        // Code goes to empty after selfdestruct; old_code/new_code byte slices
+        // are best-effort empty (consumers can fetch by hash if needed). The
+        // KECCAK_EMPTY hash for new_code_hash is what revm sets after destruct.
+        self.tracer.on_code_change(
+            address,
+            old_code_hash,
+            alloy_primitives::KECCAK256_EMPTY,
+            &[],
+            &[],
+        );
+    }
+
+    fn set_code(&mut self, address: alloy_primitives::Address, code: &[u8]) {
+        let old_code_hash = self
+            .inner
+            .basic(address)
+            .ok()
+            .flatten()
+            .map(|info| info.code_hash)
+            .unwrap_or(alloy_primitives::KECCAK256_EMPTY);
+        let new_code_hash = Bytecode::new_raw(Bytes::copy_from_slice(code)).hash_slow();
+        <T as PrimordialPulseStateWriter>::set_code(self.inner, address, code);
+        // For PrimordialPulse, set_code follows selfdestruct on the same address,
+        // so old_code is empty in practice. Emit empty old_code rather than
+        // chasing it via code_by_hash — the hash itself is the canonical signal.
+        self.tracer.on_code_change(address, old_code_hash, new_code_hash, &[], code);
+    }
+
+    fn set_nonce(&mut self, address: alloy_primitives::Address, nonce: u64) {
+        let old_nonce = self
+            .inner
+            .basic(address)
+            .ok()
+            .flatten()
+            .map(|info| info.nonce)
+            .unwrap_or(0);
+        <T as PrimordialPulseStateWriter>::set_nonce(self.inner, address, nonce);
+        self.tracer.on_nonce_change(address, old_nonce, nonce);
+    }
+
+    fn set_storage(&mut self, address: alloy_primitives::Address, slot: B256, value: B256) {
+        let old_value = self
+            .inner
+            .storage(address, U256::from_be_bytes(slot.0))
+            .ok()
+            .map(|v| B256::from(v.to_be_bytes()))
+            .unwrap_or(B256::ZERO);
+        <T as PrimordialPulseStateWriter>::set_storage(self.inner, address, slot, value);
+        self.tracer.on_storage_change(address, slot, old_value, value);
+    }
+}
+
 // ── PulsechainBlockExecutor ───────────────────────────────────────────────────
 
 /// Block executor for `PulseChain`.
@@ -283,8 +389,30 @@ where
 
             // PrimordialPulse fires exactly once at the fork block.
             // Uses == (not >=) so the transition never re-applies.
+            //
+            // When the firehose tracer is initialized, wrap the transition with
+            // system-call hooks and route per-write events through a tracing
+            // adapter. The transition mutates state via `evm.db_mut()` (revm
+            // State<DB>) without going through opcode dispatch, so the firehose
+            // inspector never sees those writes — same problem as EIP-4895
+            // withdrawals, same shape of solution. The tracer locks are short
+            // (acquired three times: start, run, end) and there's no contention
+            // because block executor `finish` is single-threaded.
             if self.block_number == self.primordial_pulse_block {
-                apply_primordial_pulse(evm.db_mut(), self.chain_id);
+                if reth_firehose::is_tracer_initialized() {
+                    reth_firehose::tracer().on_system_call_start();
+                    {
+                        let mut tracer = reth_firehose::tracer();
+                        let mut tracing_writer = TracingPrimordialPulseStateWriter {
+                            inner: evm.db_mut(),
+                            tracer: &mut *tracer,
+                        };
+                        apply_primordial_pulse(&mut tracing_writer, self.chain_id);
+                    }
+                    reth_firehose::tracer().on_system_call_end();
+                } else {
+                    apply_primordial_pulse(evm.db_mut(), self.chain_id);
+                }
             }
 
             Ok((evm, result))
