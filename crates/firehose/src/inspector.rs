@@ -184,6 +184,26 @@ impl<'a> FirehoseInspector<'a> {
             return Some((alloy_primitives::utils::KECCAK256_EMPTY, Vec::new()));
         }
 
+        // Sanity cap on the preimage size.
+        //
+        // `size` is read off the EVM stack as a U256 — `saturating_to::<usize>()` returns
+        // `usize::MAX` for values that don't fit, and `vec![0u8; usize::MAX]` triggers
+        // RawVec's capacity-overflow panic. This actually happens in the wild: at pulsechain
+        // testnet v4 block ~4,219,263 (Bug 4), some tx pushes a huge `size` and we land in
+        // the zero-pad branch below because `step` fires before memory resize.
+        //
+        // Two reasons it's safe to bail with None here:
+        //   1. Real EVM keccak is bounded by gas — practical max is ~512 KiB at a 30M-gas
+        //      block limit (quadratic memory cost). 32 MiB is well past anything legitimate.
+        //   2. Per the comment block above the call site (line 1061+), preimage is only
+        //      *emitted* from `step_end` when the opcode actually executes. A tx hashing
+        //      32 MiB+ would OOG on memory expansion anyway, so the emission path is dead.
+        //      Returning None just skips the doomed allocation.
+        const MAX_KECCAK_PREIMAGE_LEN: usize = 32 * 1024 * 1024;
+        if len > MAX_KECCAK_PREIMAGE_LEN {
+            return None;
+        }
+
         let offset = offset.saturating_to::<usize>();
         let mem_len = interp.memory.len();
 
