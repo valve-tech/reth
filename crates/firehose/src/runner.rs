@@ -7,7 +7,8 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_forks::EthereumHardforks;
 use reth_evm::execute::BlockExecutor;
 use reth_exex::{ExExContext, ExExEvent};
-use reth_provider::{BlockIdReader, BlockReader, StateProviderBox, StateProviderFactory};
+use reth_primitives_traits::SealedBlock;
+use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, StateProviderBox, StateProviderFactory};
 use reth_revm::{
     database::StateProviderDatabase,
     revm::{context::Block as _, Database as _},
@@ -34,17 +35,13 @@ where
 
     let tracer = &mut *crate::tracer();
 
-    if block.number() == 1 {
-        tracer.on_genesis_block(
-            firehose_tracer::types::BlockEvent {
-                block: mapper::to_block_data(block.sealed_block()),
-                finalized: None,
-                flash_block: None,
-            },
-            mapper::to_genesis_alloc(ctx.config.chain.genesis()),
-        );
-        return Ok(());
-    }
+    // Block 1 used to short-circuit here and emit `on_genesis_block` with block 1's
+    // data + chain-spec alloc, which was wrong on two counts: (a) the genesis-block
+    // event represents block 0 not block 1, and (b) firing it during block-execution
+    // means it never fires for nodes where reth's pipeline has already advanced past
+    // block 1. The proper genesis emit now happens in `run_exex` at chain-init time
+    // (see below) when `last_block_number() == 0`. Block 1 flows through the normal
+    // `on_block_start` → execute → `on_block_end` path like any other block.
 
     tracer.on_block_start(firehose_tracer::types::BlockEvent {
         block: mapper::to_block_data(block.sealed_block()),
@@ -230,7 +227,7 @@ where
 pub async fn run_exex<Node>(mut ctx: ExExContext<Node>) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
-    Node::Provider: BlockReader + StateProviderFactory,
+    Node::Provider: BlockReader + BlockNumReader + StateProviderFactory,
     ChainSpec<Node>: EthereumHardforks + EthChainSpec,
     SignedTx<Node>: mapper::SignatureFields,
 {
@@ -240,6 +237,53 @@ where
         env!("CARGO_PKG_VERSION"),
         firehose_tracer::config::ChainConfig::new(chain_id),
     );
+
+    // Emit FIRE BLOCK 0 ONCE when reth boots on a fresh chain (canonical head == 0,
+    // i.e. only the chain-spec-installed genesis block is in the DB, nothing synced
+    // past it). This synthesizes the genesis block event with the chain's pre-allocated
+    // state (balances, code, nonces, storage) carried inside as `REASON_GENESIS_BALANCE`
+    // / OnCodeChange / OnNonceChange / OnStorageChange events — mirroring geth's
+    // `OnGenesisBlock` hook fired from `core/blockchain.go:500-514`.
+    //
+    // Without this, no `0000000000-*.dbin.zst` one-block file is ever produced, and the
+    // downstream fireeth merger sits in a "too many unlinkable blocks at base 401" loop
+    // forever because block 1's parent_hash (the genesis hash) has no anchor in the stream.
+    //
+    // On restarts where reth's head is already past 0 (i.e. the firehose pipeline already
+    // received the genesis event in an earlier run), this is a no-op. Reading the head via
+    // `last_block_number` rather than checking for the absence of a one-block file in the
+    // downstream MinIO bucket keeps the ExEx ignorant of downstream storage state.
+    let head = ctx.provider().last_block_number().wrap_err(
+        "failed to read last_block_number — provider not initialized?",
+    )?;
+    if head == 0 {
+        // Pull the genesis block from the provider (reth initializes it from the chain spec
+        // at first boot) and seal it into a SealedBlock. `SealedBlock::seal_slow` computes the
+        // hash from the header — fine here since this fires once per chain lifetime.
+        let genesis_block = ctx
+            .provider()
+            .block_by_number(0)
+            .wrap_err("failed to read genesis block from provider")?
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "reth has no block 0 in DB at run_exex start — chain spec init didn't run?"
+                )
+            })?;
+        let genesis = SealedBlock::seal_slow(genesis_block);
+        info!(
+            number = 0,
+            hash = %genesis.hash(),
+            "Emitting FIRE BLOCK 0 with chain-spec genesis allocations (fresh chain detected)"
+        );
+        crate::tracer().on_genesis_block(
+            firehose_tracer::types::BlockEvent {
+                block: mapper::to_block_data(&genesis),
+                finalized: None,
+                flash_block: None,
+            },
+            mapper::to_genesis_alloc(ctx.config.chain.genesis()),
+        );
+    }
 
     while let Some(notification) = ctx.notifications.next().await {
         let notification = notification?;

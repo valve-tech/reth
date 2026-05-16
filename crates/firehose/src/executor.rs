@@ -588,11 +588,21 @@ where
         let mut tracer =
             FirehoseBlockTracer::start::<F::Primitives>(block.sealed_block(), finalized);
 
-        // Genesis (block 1): on_genesis_block has already been flushed by start and
-        // there are no mid-block events to emit. Execute the block normally (for state mutations)
-        // without going through the wrapper; the tracer guard has `is_genesis() == true` and
-        // mark_verified is a no-op.
-        if tracer.is_genesis() {
+        // Bug 3 mitigation: route block 1 through the upstream executor directly rather than
+        // through the firehose-traced wrapper. The wrapper's pre-execute / post-execute hook
+        // sequence drops block 1's miner reward when there are no transactions to wrap around
+        // (block 1 historically has 0 txs on Ethereum/PulseChain replay), which surfaces as a
+        // `LackOfFundForMaxFee` panic hundreds of thousands of blocks later. The upstream
+        // executor's post-execution-changes path applies the reward correctly.
+        //
+        // Trade-off: the firehose tracer does NOT see block 1's miner reward as a
+        // `BalanceChange` event — block 1's one-block file carries headers + (empty) tx list +
+        // on_block_end, but no synthetic reward. Acceptable for now; the canonical fix is to
+        // make the trace wrapper handle no-tx blocks correctly (separate task).
+        //
+        // NOT to be confused with the FIRE BLOCK 0 emit, which fires standalone at chain-init
+        // in `run_exex` and is wholly unrelated to this bypass.
+        if block.number() == 1 {
             let result = (|| -> Result<_, BlockExecutionError> {
                 let r = self
                     .strategy_factory

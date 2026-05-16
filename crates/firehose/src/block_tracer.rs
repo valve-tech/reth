@@ -1,11 +1,16 @@
 //! Block-level drop guard that owns the Firehose tracer lifecycle for a single block.
 //!
-//! A [`FirehoseBlockTracer`] acquires the global tracer lock and emits `on_block_start`
-//! (or `on_genesis_block`) on construction. The caller must later consume the guard via
+//! A [`FirehoseBlockTracer`] acquires the global tracer lock and emits `on_block_start` on
+//! construction. The caller must later consume the guard via
 //! [`FirehoseBlockTracer::mark_verified`] (flushes the block to stdout) or
 //! [`FirehoseBlockTracer::mark_failed`] (discards it). If the guard is dropped without
 //! being consumed, it emits `on_block_end(Some(err))` as a safety net so incomplete
 //! blocks are never flushed as valid.
+//!
+//! Block 0 (genesis) is NOT routed through this guard — it's emitted standalone at
+//! chain-init time by `runner::run_exex` via `tracer.on_genesis_block(...)` so the chain's
+//! pre-allocated state surfaces as a single FIRE BLOCK 0 event before any normal block
+//! execution begins. The downstream merger relies on that event as its chain anchor.
 //!
 //! This type exists so that the `on_block_end` call can be deferred until **after** all
 //! post-execution validation (receipt root, state root, consensus) has completed. Without
@@ -38,8 +43,6 @@ where
 {
     guard: G,
     status: Status,
-    /// `true` if this guard was created for block 1 (the genesis marker).
-    is_genesis: bool,
 }
 
 impl<G> Debug for FirehoseBlockTracer<G>
@@ -47,19 +50,16 @@ where
     G: DerefMut<Target = firehose_tracer::Tracer>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FirehoseBlockTracer")
-            .field("status", &self.status)
-            .field("is_genesis", &self.is_genesis)
-            .finish()
+        f.debug_struct("FirehoseBlockTracer").field("status", &self.status).finish()
     }
 }
 
 impl FirehoseBlockTracer<GlobalTracerGuard> {
     /// Acquires the global tracer and emits the start-of-block event.
     ///
-    /// For block 1 this emits `on_genesis_block` (with an empty genesis alloc — the caller is
-    /// expected not to rely on it for historical sync). For all other blocks it emits
-    /// `on_block_start`.
+    /// Always emits `on_block_start`. The genesis block (block 0) is NOT routed through this
+    /// guard — it's emitted standalone at chain-init time by `runner::run_exex` via
+    /// `tracer.on_genesis_block(...)`. See that function's comments for the rationale.
     ///
     /// Takes a [`SealedBlock`] rather than a `RecoveredBlock` so the guard can be started before
     /// transaction senders have been recovered. Block-level data read by the mapper is signer-free.
@@ -80,24 +80,12 @@ impl FirehoseBlockTracer<GlobalTracerGuard> {
         <<N::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: BlockHeader + Sealable,
     {
         let mut guard = crate::tracer();
-        let is_genesis = block.header().number() == 1;
-        if is_genesis {
-            guard.on_genesis_block(
-                firehose_tracer::types::BlockEvent {
-                    block: mapper::to_block_data(block),
-                    finalized,
-                    flash_block: None,
-                },
-                Default::default(),
-            );
-        } else {
-            guard.on_block_start(firehose_tracer::types::BlockEvent {
-                block: mapper::to_block_data(block),
-                finalized,
-                flash_block: None,
-            });
-        }
-        Self { guard, status: Status::Started, is_genesis }
+        guard.on_block_start(firehose_tracer::types::BlockEvent {
+            block: mapper::to_block_data(block),
+            finalized,
+            flash_block: None,
+        });
+        Self { guard, status: Status::Started }
     }
 }
 
@@ -120,24 +108,12 @@ impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
         <N::Block as BlockTrait>::Body: BlockBody,
         <<N::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: BlockHeader + Sealable,
     {
-        let is_genesis = block.header().number() == 1;
-        if is_genesis {
-            tracer.on_genesis_block(
-                firehose_tracer::types::BlockEvent {
-                    block: mapper::to_block_data(block),
-                    finalized,
-                    flash_block: None,
-                },
-                Default::default(),
-            );
-        } else {
-            tracer.on_block_start(firehose_tracer::types::BlockEvent {
-                block: mapper::to_block_data(block),
-                finalized,
-                flash_block: None,
-            });
-        }
-        Self { guard: tracer, status: Status::Started, is_genesis }
+        tracer.on_block_start(firehose_tracer::types::BlockEvent {
+            block: mapper::to_block_data(block),
+            finalized,
+            flash_block: None,
+        });
+        Self { guard: tracer, status: Status::Started }
     }
 }
 
@@ -145,11 +121,6 @@ impl<G> FirehoseBlockTracer<G>
 where
     G: DerefMut<Target = firehose_tracer::Tracer>,
 {
-    /// Returns `true` if this guard was created for the genesis marker (block 1).
-    pub const fn is_genesis(&self) -> bool {
-        self.is_genesis
-    }
-
     /// Returns a mutable reference to the held tracer, for in-block event emission.
     pub fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer {
         &mut self.guard
@@ -170,25 +141,14 @@ where
     /// Call this only after **all** post-execution validations (receipt root, state root,
     /// consensus checks) have succeeded. Calling it earlier risks flushing a block that later
     /// turns out to be invalid.
-    ///
-    /// For the genesis marker (block 1), this is a no-op: `on_genesis_block` already flushed the
-    /// block during [`Self::start`] and the Firehose protocol does not expect a
-    /// matching `on_block_end`.
     pub fn mark_verified(mut self) {
-        if !self.is_genesis {
-            self.guard.on_block_end(None);
-        }
+        self.guard.on_block_end(None);
         self.status = Status::Consumed;
     }
 
     /// Consumes the guard and emits `on_block_end(Some(err))`, discarding the block.
-    ///
-    /// For the genesis marker (block 1), this is a no-op: the `on_genesis_block` event has already
-    /// been flushed and cannot be retracted.
     pub fn mark_failed(mut self, err: &dyn std::error::Error) {
-        if !self.is_genesis {
-            self.guard.on_block_end(Some(err));
-        }
+        self.guard.on_block_end(Some(err));
         self.status = Status::Consumed;
     }
 }
@@ -198,10 +158,9 @@ where
     G: DerefMut<Target = firehose_tracer::Tracer>,
 {
     fn drop(&mut self) {
-        // Safety net: any early-return path that fails to call mark_verified/mark_failed ends here.
-        // Treat it as failure so the block is discarded rather than flushed. Genesis is exempt:
-        // `on_genesis_block` was emitted standalone and has no matching end event.
-        if matches!(self.status, Status::Started) && !self.is_genesis {
+        // Safety net: any early-return path that fails to call mark_verified/mark_failed ends
+        // here. Treat it as failure so the block is discarded rather than flushed.
+        if matches!(self.status, Status::Started) {
             let err = std::io::Error::other(
                 "FirehoseBlockTracer dropped without mark_verified/mark_failed",
             );
