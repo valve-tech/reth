@@ -177,6 +177,11 @@ where
 pub struct FirehoseWrappedExecutor<Inner, Extras = NoPostTxExtras, Adjust = NoPreTxAdjust> {
     inner: Inner,
     withdrawals: Option<Withdrawals>,
+    /// Beneficiary addresses for any ommer (uncle) headers in this block. Pre-merge only —
+    /// empty on post-merge / post-Shanghai blocks. Used by [`Self::finish`] to emit
+    /// `RewardMineUncle` balance-change events that `db.increment_balances()` otherwise
+    /// applies invisibly to the inspector.
+    ommer_beneficiaries: Vec<Address>,
     /// Running count of logs emitted so far in this block, used to derive each receipt's
     /// block-wide `log_index_start` when building `on_tx_end` receipt data.
     log_index: u32,
@@ -193,8 +198,20 @@ impl Debug for FirehoseWrappedExecutor<()> {
 impl<Inner> FirehoseWrappedExecutor<Inner, NoPostTxExtras, NoPreTxAdjust> {
     /// Wraps `inner` with Firehose tracer hooks. `withdrawals` is consumed inside
     /// [`Self::finish`] to emit per-address balance changes for EIP-4895 validator withdrawals.
-    pub const fn new(inner: Inner, withdrawals: Option<Withdrawals>) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras: NoPostTxExtras, adjust: NoPreTxAdjust }
+    /// `ommer_beneficiaries` is consumed in the same place to emit `RewardMineUncle` events.
+    pub const fn new(
+        inner: Inner,
+        withdrawals: Option<Withdrawals>,
+        ommer_beneficiaries: Vec<Address>,
+    ) -> Self {
+        Self {
+            inner,
+            withdrawals,
+            ommer_beneficiaries,
+            log_index: 0,
+            extras: NoPostTxExtras,
+            adjust: NoPreTxAdjust,
+        }
     }
 }
 
@@ -207,9 +224,17 @@ impl<Inner, Extras> FirehoseWrappedExecutor<Inner, Extras, NoPreTxAdjust> {
     pub const fn with_extras(
         inner: Inner,
         withdrawals: Option<Withdrawals>,
+        ommer_beneficiaries: Vec<Address>,
         extras: Extras,
     ) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras, adjust: NoPreTxAdjust }
+        Self {
+            inner,
+            withdrawals,
+            ommer_beneficiaries,
+            log_index: 0,
+            extras,
+            adjust: NoPreTxAdjust,
+        }
     }
 }
 
@@ -220,10 +245,11 @@ impl<Inner, Extras, Adjust> FirehoseWrappedExecutor<Inner, Extras, Adjust> {
     pub const fn with_hooks(
         inner: Inner,
         withdrawals: Option<Withdrawals>,
+        ommer_beneficiaries: Vec<Address>,
         adjust: Adjust,
         extras: Extras,
     ) -> Self {
-        Self { inner, withdrawals, log_index: 0, extras, adjust }
+        Self { inner, withdrawals, ommer_beneficiaries, log_index: 0, extras, adjust }
     }
 }
 
@@ -382,6 +408,25 @@ where
     fn finish(
         mut self,
     ) -> Result<(Self::Evm, BlockExecutionResult<Self::Receipt>), BlockExecutionError> {
+        // Capture pre-`inner.finish()` balances for any address that the upstream
+        // `post_block_balance_increments` path will touch via `db.increment_balances()` —
+        // namely the coinbase (block reward) and each ommer beneficiary (uncle reward).
+        // These increments bypass the EVM journal so the inspector never sees them; we
+        // sample here and emit explicit `BalanceChange` events after the inner finishes.
+        // Pre-merge only: when `withdrawals.is_some()` (post-Shanghai) the static block
+        // reward is zero and we skip the sampling entirely.
+        let prereward_state = if self.withdrawals.is_none() {
+            let coinbase = self.inner.evm().block().beneficiary();
+            let (db, _, _) = self.inner.evm_mut().components_mut();
+            Some(BlockRewardPreState::capture(
+                db,
+                coinbase,
+                &self.ommer_beneficiaries,
+            ))
+        } else {
+            None
+        };
+
         // Open the post-execution system-call window (EIP-4895 withdrawals, EIP-7251 consolidation
         // requests, etc.). Close it AFTER the inner finish so inner post-execution work lands
         // inside the window.
@@ -397,6 +442,13 @@ where
         // EIP-4895 validator withdrawals are applied via db.increment_balances() inside the
         // inner finish(), bypassing the EVM journal — the inspector never sees them.
         emit_withdrawal_balance_changes(&mut evm, self.withdrawals.as_ref());
+
+        // Pre-merge static block reward + per-ommer uncle reward — same db.increment_balances()
+        // invisibility as withdrawals. Geth-firehose emits these as `REASON_REWARD_MINE_BLOCK`
+        // (coinbase) and `REASON_REWARD_MINE_UNCLE` (per ommer beneficiary); we mirror that.
+        if let Some(pre) = prereward_state {
+            emit_block_reward_balance_changes(&mut evm, &pre);
+        }
 
         Ok((evm, exec_result))
     }
@@ -588,42 +640,6 @@ where
         let mut tracer =
             FirehoseBlockTracer::start::<F::Primitives>(block.sealed_block(), finalized);
 
-        // Bug 3 mitigation: route block 1 through the upstream executor directly rather than
-        // through the firehose-traced wrapper. The wrapper's pre-execute / post-execute hook
-        // sequence drops block 1's miner reward when there are no transactions to wrap around
-        // (block 1 historically has 0 txs on Ethereum/PulseChain replay), which surfaces as a
-        // `LackOfFundForMaxFee` panic hundreds of thousands of blocks later. The upstream
-        // executor's post-execution-changes path applies the reward correctly.
-        //
-        // Trade-off: the firehose tracer does NOT see block 1's miner reward as a
-        // `BalanceChange` event — block 1's one-block file carries headers + (empty) tx list +
-        // on_block_end, but no synthetic reward. Acceptable for now; the canonical fix is to
-        // make the trace wrapper handle no-tx blocks correctly (separate task).
-        //
-        // NOT to be confused with the FIRE BLOCK 0 emit, which fires standalone at chain-init
-        // in `run_exex` and is wholly unrelated to this bypass.
-        if block.number() == 1 {
-            let result = (|| -> Result<_, BlockExecutionError> {
-                let r = self
-                    .strategy_factory
-                    .executor_for_block(&mut self.db, block)
-                    .map_err(BlockExecutionError::other)?
-                    .execute_block(block.transactions_recovered())?;
-                self.db.merge_transitions(BundleRetention::Reverts);
-                Ok(r)
-            })();
-            return match result {
-                Ok(r) => {
-                    self.pending_tracer = Some(tracer);
-                    Ok(r)
-                }
-                Err(e) => {
-                    tracer.mark_failed(&e);
-                    Err(e)
-                }
-            };
-        }
-
         let block_result =
             self.hooks.execute_one_traced(&self.strategy_factory, &mut self.db, block, &mut tracer);
 
@@ -731,7 +747,13 @@ where
     let inner = evm_config.create_executor(evm, exec_ctx);
 
     let withdrawals = block.body().withdrawals().cloned();
-    let wrapped = FirehoseWrappedExecutor::with_hooks(inner, withdrawals, adjust, extras);
+    let ommer_beneficiaries: Vec<Address> = block
+        .body()
+        .ommers()
+        .map(|o| o.iter().map(|h| h.beneficiary()).collect())
+        .unwrap_or_default();
+    let wrapped =
+        FirehoseWrappedExecutor::with_hooks(inner, withdrawals, ommer_beneficiaries, adjust, extras);
 
     wrapped.execute_block(block.transactions_recovered())
 }
@@ -772,6 +794,92 @@ where
 
     for (addr, pre, post) in events {
         inspector.tracer_mut().on_balance_change(addr, pre, post, Reason::Withdrawal);
+    }
+}
+
+/// Pre-`inner.finish()` balance snapshot for addresses that the upstream Ethereum executor's
+/// `post_block_balance_increments` path will mutate via `db.increment_balances()` — namely the
+/// block coinbase and each ommer beneficiary.
+///
+/// Sampled BEFORE `inner.finish()` runs so we can compute the static block reward + uncle reward
+/// deltas after the inner has applied them, and emit the corresponding `RewardMineBlock` /
+/// `RewardMineUncle` balance-change events that would otherwise be invisible to the inspector.
+///
+/// Ommers are stored as a `Vec<(Address, U256)>` rather than a map so the emission order matches
+/// the canonical block-body ordering — geth-firehose emits one `RewardMineUncle` event per uncle
+/// in the order they appear in the block, and consumers may depend on that ordering.
+#[derive(Debug)]
+struct BlockRewardPreState {
+    coinbase: Address,
+    coinbase_pre: U256,
+    /// `(beneficiary, pre_balance)` pairs in the order of the block's ommer list.
+    ommer_pre: Vec<(Address, U256)>,
+}
+
+impl BlockRewardPreState {
+    fn capture<DB: reth_revm::Database>(
+        db: &mut DB,
+        coinbase: Address,
+        ommer_beneficiaries: &[Address],
+    ) -> Self {
+        let read = |db: &mut DB, addr: Address| -> U256 {
+            db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or_default()
+        };
+        let coinbase_pre = read(db, coinbase);
+        let ommer_pre =
+            ommer_beneficiaries.iter().map(|&addr| (addr, read(db, addr))).collect();
+        Self { coinbase, coinbase_pre, ommer_pre }
+    }
+}
+
+/// Emits the pre-merge static block reward and per-uncle balance changes that
+/// `db.increment_balances()` applied invisibly inside `inner.finish()`.
+///
+/// Must be called with `tracer.transaction == None` (i.e. outside any system-call window) so
+/// that `on_balance_change` routes the events to `block.balance_changes` directly — same
+/// constraint as [`emit_withdrawal_balance_changes`].
+///
+/// Emission shape mirrors geth-firehose for the common case:
+///  - coinbase: one `RewardMineBlock` event with `pre = coinbase_pre`, `post = coinbase_post`
+///  - each ommer beneficiary: one `RewardMineUncle` event with the per-uncle pre/post, in
+///    canonical block-body order
+///
+/// **Known edge case**: if `coinbase` also appears as an ommer beneficiary (self-mined uncle)
+/// the two events would share identical `pre`/`post` values rather than the sequential deltas
+/// geth emits, since this helper observes only the final post-`inner.finish()` balance for
+/// each address rather than reconstructing per-reward amounts. The trace's net balance is still
+/// consistent (post-finish() balance), but a consumer that sums the deltas per reason would
+/// see double-counting. No Ethereum mainnet or PulseChain block currently hits this — block 1
+/// (the bug-3 trigger) has no ommers — and it would require splitting `post_block_balance_increments`
+/// into per-reason chunks to fix. Revisit if a downstream consumer surfaces the divergence.
+fn emit_block_reward_balance_changes<E>(evm: &mut E, pre: &BlockRewardPreState)
+where
+    E: reth_evm::Evm,
+    E::Inspector: FirehoseInspectorApi,
+    E::DB: reth_revm::Database,
+{
+    use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
+
+    let (db, inspector, _) = evm.components_mut();
+    let read =
+        |db: &mut <E as reth_evm::Evm>::DB, addr: Address| -> U256 {
+            db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or_default()
+        };
+
+    // Tracer::on_balance_change drops no-op (pre == post) emissions internally, so we don't
+    // pre-filter here — saves a branch per address and keeps the call shape parallel to
+    // emit_withdrawal_balance_changes.
+    let coinbase_post = read(db, pre.coinbase);
+    inspector.tracer_mut().on_balance_change(
+        pre.coinbase,
+        pre.coinbase_pre,
+        coinbase_post,
+        Reason::RewardMineBlock,
+    );
+
+    for &(addr, pre_bal) in &pre.ommer_pre {
+        let post_bal = read(db, addr);
+        inspector.tracer_mut().on_balance_change(addr, pre_bal, post_bal, Reason::RewardMineUncle);
     }
 }
 
