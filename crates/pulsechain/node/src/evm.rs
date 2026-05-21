@@ -390,27 +390,53 @@ where
             // PrimordialPulse fires exactly once at the fork block.
             // Uses == (not >=) so the transition never re-applies.
             //
-            // When the firehose tracer is initialized, wrap the transition with
-            // system-call hooks and route per-write events through a tracing
-            // adapter. The transition mutates state via `evm.db_mut()` (revm
-            // State<DB>) without going through opcode dispatch, so the firehose
-            // inspector never sees those writes — same problem as EIP-4895
-            // withdrawals, same shape of solution. The tracer locks are short
-            // (acquired three times: start, run, end) and there's no contention
-            // because block executor `finish` is single-threaded.
+            // The transition mutates state via `evm.db_mut()` (revm State<DB>)
+            // without going through opcode dispatch, so the firehose inspector
+            // never sees those writes — same problem as EIP-4895 withdrawals
+            // and the pre-merge block reward, same shape of solution: wrap the
+            // mutations with a tracing adapter that emits explicit balance/
+            // storage change events.
+            //
+            // We MUST use `try_lock_tracer` here, NOT `tracer`. When this
+            // executor runs under the pipeline path, the outer
+            // `FirehoseWrappedExecutor::finish` in
+            // `crates/firehose/src/executor.rs` already holds the global
+            // tracer's `MutexGuard` (via `run_wrapped_block`'s `tracer_guard`
+            // parameter). `std::sync::Mutex` is non-reentrant, so a plain
+            // `tracer()` here would `lock()` the same mutex from the same
+            // thread and futex-sleep forever. That deadlock is exactly what
+            // wedged the testnet v4 firehose pipeline at PrimordialPulse
+            // block 16,492,700 on 2026-05-19 (executor sat in `Mutex::lock`
+            // for >32h with no error log, no panic, no DB writes in flight).
+            //
+            // `try_lock_tracer` returns `None` in that nested case; we fall
+            // back to a non-tracing apply so state still commits correctly
+            // and the chain syncs.
+            //
+            // FIXME(firehose-primordialpulse): In the nested fallback the
+            // per-write events do NOT make it into the firehose stream. State
+            // is correct, but downstream firehose consumers will see the
+            // PrimordialPulse allocation as implicit (no `BalanceChange` /
+            // `StorageChange` events). Proper fix: move the emission to the
+            // wrapper layer — capture a `PrimordialPulsePreState` before
+            // `inner.finish()` and emit deltas after, mirroring
+            // `emit_block_reward_balance_changes` in
+            // `crates/firehose/src/executor.rs`.
             if self.block_number == self.primordial_pulse_block {
-                if reth_firehose::is_tracer_initialized() {
-                    reth_firehose::tracer().on_system_call_start();
+                if let Some(mut tracer) = reth_firehose::try_lock_tracer() {
+                    tracer.on_system_call_start();
                     {
-                        let mut tracer = reth_firehose::tracer();
                         let mut tracing_writer = TracingPrimordialPulseStateWriter {
                             inner: evm.db_mut(),
                             tracer: &mut *tracer,
                         };
                         apply_primordial_pulse(&mut tracing_writer, self.chain_id);
                     }
-                    reth_firehose::tracer().on_system_call_end();
+                    tracer.on_system_call_end();
                 } else {
+                    // Either the tracer is uninitialized (tests / non-firehose
+                    // builds) or we are nested under FirehoseWrappedExecutor.
+                    // Either way, fall back to the bare apply.
                     apply_primordial_pulse(evm.db_mut(), self.chain_id);
                 }
             }

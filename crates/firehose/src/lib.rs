@@ -51,3 +51,17 @@ pub fn tracer() -> MutexGuard<'static, firehose_tracer::Tracer> {
         .lock()
         .expect("firehose tracer mutex poisoned")
 }
+
+/// Non-blocking variant of [`tracer`]. Returns `None` if the tracer mutex is
+/// already held (typically by `FirehoseWrappedExecutor::finish` further up
+/// the call stack — see `crates/firehose/src/executor.rs`) or if the tracer
+/// has not yet been initialized.
+///
+/// Use this from code paths that may be reached re-entrantly under the
+/// wrapper — `std::sync::Mutex` is non-reentrant, so a plain [`tracer`]
+/// call from such a path would deadlock on the same thread. The
+/// PulseChain `PrimordialPulse` handler in
+/// `crates/pulsechain/node/src/evm.rs` is the canonical example.
+pub fn try_lock_tracer() -> Option<MutexGuard<'static, firehose_tracer::Tracer>> {
+    GLOBAL_TRACER.get().and_then(|m| m.try_lock().ok())
+}
