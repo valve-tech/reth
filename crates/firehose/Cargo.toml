@@ -26,6 +26,14 @@ reth-provider.workspace = true
 reth-revm.workspace = true
 reth-tracing.workspace = true
 
+# PulseChain-specific (intentional cross-crate dep): the firehose wrapper layer
+# emits FIRE BLOCK events for the PrimordialPulse state transition by walking
+# the spec data (sacrifice credits binary, deposit-contract bytecode + initial
+# storage, treasury allocation). That data lives in `reth-pulsechain-forks`,
+# the lowest-level PulseChain crate, which has no dependency on firehose so
+# this edge is acyclic. See `FIXME(firehose-primordialpulse)` history.
+reth-pulsechain-forks.workspace = true
+
 # alloy
 alloy-consensus.workspace = true
 alloy-eips.workspace = true

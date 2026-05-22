@@ -427,6 +427,32 @@ where
             None
         };
 
+        // PulseChain PrimordialPulse: capture pre-state for every address the
+        // `apply_primordial_pulse` call inside `inner.finish()` will mutate
+        // (~thousands of sacrifice-credit recipients + treasury + ETH and PULSE
+        // deposit contracts). Chain ID is read directly from the inner EVM:
+        // `primordial_pulse::fork_block_for` returns `None` for non-PulseChain
+        // chains, and the block-number check below filters non-fork blocks on
+        // PulseChain itself, so a single unconditional probe is correct here
+        // and lets us avoid a `Some(chain_id)` parameter that every wrapper
+        // construction site would otherwise have to set.
+        let pp_pre_state = {
+            let chain_id = self.inner.evm().chain_id();
+            crate::primordial_pulse::fork_block_for(chain_id).and_then(|fork_block| {
+                let block_number =
+                    self.inner.evm().block().number().saturating_to::<u64>();
+                if block_number != fork_block {
+                    return None;
+                }
+                let (db, _, _) = self.inner.evm_mut().components_mut();
+                crate::primordial_pulse::PrimordialPulsePreState::capture(
+                    db,
+                    chain_id,
+                    block_number,
+                )
+            })
+        };
+
         // Open the post-execution system-call window (EIP-4895 withdrawals, EIP-7251 consolidation
         // requests, etc.). Close it AFTER the inner finish so inner post-execution work lands
         // inside the window.
@@ -448,6 +474,17 @@ where
         // (coinbase) and `REASON_REWARD_MINE_UNCLE` (per ommer beneficiary); we mirror that.
         if let Some(pre) = prereward_state {
             emit_block_reward_balance_changes(&mut evm, &pre);
+        }
+
+        // PulseChain PrimordialPulse: emit the captured diffs as FIRE BLOCK events
+        // (balance changes for sacrifice credits + treasury, plus account-level
+        // diffs for the two deposit contracts). Same invisibility problem as
+        // withdrawals — `apply_primordial_pulse` writes the new state directly
+        // into the journal via plain `db` calls that the inspector never sees.
+        // Emits its own system-call window internally so the events attach to a
+        // dedicated PrimordialPulse system call rather than the block reward.
+        if let Some(pre) = pp_pre_state {
+            crate::primordial_pulse::emit_primordial_pulse_changes(&mut evm, &pre);
         }
 
         Ok((evm, exec_result))

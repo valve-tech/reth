@@ -12,6 +12,8 @@ pub mod inspector;
 pub mod mapper;
 /// Prelude module with common imports and utilities.
 pub mod prelude;
+/// PrimordialPulse state-transition emission (PulseChain-specific).
+pub mod primordial_pulse;
 /// Runner module for executing processing tasks.
 pub mod runner;
 

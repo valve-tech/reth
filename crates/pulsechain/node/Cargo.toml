@@ -43,11 +43,6 @@ reth-tracing.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 
-# Firehose — emits PrimordialPulse system-call events when the global tracer
-# is initialized at runtime. No-op otherwise; tracer init is gated by main.rs.
-reth-firehose.workspace = true
-firehose-tracer.workspace = true
-
 # reth — CLI chain spec parser
 reth-cli.workspace = true
 reth-ethereum-cli = { workspace = true, default-features = false }

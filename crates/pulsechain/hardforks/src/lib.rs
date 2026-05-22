@@ -9,3 +9,4 @@
 
 pub mod chainspec;
 pub mod hardfork;
+pub mod primordial_pulse;
