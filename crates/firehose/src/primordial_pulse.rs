@@ -156,106 +156,140 @@ impl PrimordialPulsePreState {
 /// Diff `pre` against the post-`inner.finish()` state and emit firehose events.
 ///
 /// Must be called with the tracer in block-context (i.e., between
-/// `on_block_start` and `on_block_end`), but OUTSIDE any open transaction
-/// frame. We open a system-call window internally so storage changes can
-/// emit cleanly — same pattern as withdrawal balance-changes do.
+/// `on_block_start` and `on_block_end`) and OUTSIDE any open transaction frame.
+///
+/// ## Routing model (load-bearing)
+///
+/// The firehose tracer routes per-field events differently:
+///   - `on_balance_change` outside a transaction → `block.balance_changes`. ✓
+///   - `on_code_change` outside a transaction → `block.code_changes`. ✓
+///   - `on_nonce_change` and `on_storage_change` REQUIRE `ensure_in_block_and_in_trx`
+///     AND a peekable `active_call` on the call stack. Otherwise they either panic
+///     (no trx) or land in `deferred_call_state` which is DISCARDED when the
+///     system-call frame closes without ever populating a `Call`.
+///
+/// So this function emits in two passes:
+///   1. **Block-level pass** (no system-call wrap): all balance + code changes go
+///      straight to `block.balance_changes` / `block.code_changes`.
+///   2. **Synthetic system-call pass**: `on_system_call_start` → `on_call_enter`
+///      creates a [`Call`] frame; nonce + storage changes are emitted into that
+///      frame; `on_call_exit` + `on_system_call_end` move the frame into
+///      `block.system_calls`. This is the only routing path that gets those two
+///      field types into the wire output.
+///
+/// An earlier draft of this function wrapped EVERYTHING in a system-call window
+/// but never created a `Call` frame. That sent every event into
+/// `deferred_call_state` which got dropped on `on_system_call_end` — verified
+/// empirically against block 16,492,700 chunk on 2026-05-23 (only 1
+/// `balance_change` made it through: the block reward, emitted later by the
+/// existing `emit_block_reward_balance_changes` flow). The two-pass split fixes
+/// that.
 pub fn emit_primordial_pulse_changes<E>(evm: &mut E, pre: &PrimordialPulsePreState)
 where
     E: reth_evm::Evm,
     E::Inspector: FirehoseInspectorApi,
     E::DB: reth_revm::Database,
 {
-    let (db, inspector, _) = evm.components_mut();
-    let tracer = inspector.tracer_mut();
-
-    // Open a system-call window so on_storage_change calls have the in-block-and-in-trx
-    // context they require. Mirrors the previous (deadlock-prone) approach in
-    // `crates/pulsechain/node/src/evm.rs` and the parallel `withdrawals` emit flow.
-    tracer.on_system_call_start();
-
-    // (1) Balance changes — sacrifice credits + (testnet) treasury.
-    // Reason::GenesisBalance is the closest semantic fit: a hardfork-time
-    // allocation outside any EVM transaction. Verified that
-    // `on_balance_change` drops Unknown-reason events — must NOT use Unknown.
-    for &(addr, pre_bal, credit) in &pre.balance_credits {
-        let post_bal = read_balance(db, addr);
-        // Sanity: post should equal pre + credit if no other reason touched this
-        // address during this block. We don't enforce — `on_balance_change` is
-        // already a no-op for equal old/new, so a spurious read still wouldn't
-        // corrupt the stream.
-        let _ = credit; // mainly for debugger visibility / future logging
-        tracer.on_balance_change(addr, pre_bal, post_bal, Reason::GenesisBalance);
-    }
-
-    // (2) ETH_DEPOSIT_CONTRACT selfdestruct: balance → 0, nonce → 0, code → empty.
-    // Storage clearing is NOT emitted — see module-level docs.
+    // ── Pass 1: block-level balance + code changes ────────────────────────────
     {
-        let addr = spec::ETH_DEPOSIT_CONTRACT;
-        let post = read_account(db, addr, &[]);
-        if pre.eth_deposit_pre.balance != post.balance {
-            // Treat the destroyed balance as a withdraw-style refund event. Geth-pulse
-            // emits this with reason REASON_SUICIDE_WITHDRAW (zeros the contract); use
-            // the same here.
+        let (db, inspector, _) = evm.components_mut();
+        let tracer = inspector.tracer_mut();
+
+        // Sacrifice credits + (testnet) treasury. Reason::GenesisBalance is the
+        // closest semantic fit — a hardfork-time allocation outside any EVM tx.
+        // `on_balance_change` drops events with reason=Unknown so this matters.
+        for &(addr, pre_bal, _credit) in &pre.balance_credits {
+            let post_bal = read_balance(db, addr);
+            tracer.on_balance_change(addr, pre_bal, post_bal, Reason::GenesisBalance);
+        }
+
+        // ETH_DEPOSIT_CONTRACT: balance → 0 (selfdestruct), code → empty.
+        // Storage clearing is NOT emitted — see module-level docs.
+        let eth_addr = spec::ETH_DEPOSIT_CONTRACT;
+        let eth_post = read_account(db, eth_addr, &[]);
+        if pre.eth_deposit_pre.balance != eth_post.balance {
+            // Geth-pulse uses REASON_SUICIDE_WITHDRAW for this; we mirror.
             tracer.on_balance_change(
-                addr,
+                eth_addr,
                 pre.eth_deposit_pre.balance,
-                post.balance,
+                eth_post.balance,
                 Reason::SuicideWithdraw,
             );
         }
-        if pre.eth_deposit_pre.nonce != post.nonce {
-            tracer.on_nonce_change(addr, pre.eth_deposit_pre.nonce, post.nonce);
-        }
-        if pre.eth_deposit_pre.code_hash != post.code_hash {
+        if pre.eth_deposit_pre.code_hash != eth_post.code_hash {
             tracer.on_code_change(
-                addr,
+                eth_addr,
                 pre.eth_deposit_pre.code_hash,
-                post.code_hash,
+                eth_post.code_hash,
                 &pre.eth_deposit_pre.code,
-                &post.code,
+                &eth_post.code,
             );
         }
-    }
 
-    // (3) PULSE_DEPOSIT_CONTRACT deploy: code installed + 31 storage slots set.
-    // Nonce stays at 0 (set_nonce(.., 0) explicitly, presumably no-op vs default).
-    {
-        let addr = spec::PULSE_DEPOSIT_CONTRACT;
-        let post = read_account(db, addr, &spec::DEPOSIT_CONTRACT_INITIAL_STORAGE
-            .iter().map(|(s, _)| *s).collect::<Vec<_>>());
-
-        if pre.pulse_deposit_pre.balance != post.balance {
+        // PULSE_DEPOSIT_CONTRACT: balance change (if any) + code installation.
+        let pulse_addr = spec::PULSE_DEPOSIT_CONTRACT;
+        let pulse_post_basic = read_account(db, pulse_addr, &[]);
+        if pre.pulse_deposit_pre.balance != pulse_post_basic.balance {
             tracer.on_balance_change(
-                addr,
+                pulse_addr,
                 pre.pulse_deposit_pre.balance,
-                post.balance,
+                pulse_post_basic.balance,
                 Reason::GenesisBalance,
             );
         }
-        if pre.pulse_deposit_pre.nonce != post.nonce {
-            tracer.on_nonce_change(addr, pre.pulse_deposit_pre.nonce, post.nonce);
-        }
-        if pre.pulse_deposit_pre.code_hash != post.code_hash {
+        if pre.pulse_deposit_pre.code_hash != pulse_post_basic.code_hash {
             tracer.on_code_change(
-                addr,
+                pulse_addr,
                 pre.pulse_deposit_pre.code_hash,
-                post.code_hash,
+                pulse_post_basic.code_hash,
                 &pre.pulse_deposit_pre.code,
-                &post.code,
+                &pulse_post_basic.code,
             );
-        }
-
-        // 31 storage slots. Walk pre+post in lockstep — the spec defines the
-        // (slot, expected_value) pairs, so pre is whatever was there before and
-        // post should equal `expected_value`.
-        for (i, (slot, _expected)) in spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.iter().enumerate() {
-            let pre_value = pre.pulse_deposit_pre.storage_slots_pre.get(i).map(|(_, v)| *v)
-                .unwrap_or(B256::ZERO);
-            let post_value = post.storage_slots_pre.get(i).map(|(_, v)| *v).unwrap_or(B256::ZERO);
-            tracer.on_storage_change(addr, *slot, pre_value, post_value);
         }
     }
 
+    // ── Pass 2: synthetic system-call wrapping nonce + storage ────────────────
+    // call_enter requires a `typ: u8` corresponding to a revm `Opcode` value;
+    // `0xf1` is Opcode::Call, which `opcode_to_call_type` maps to CallType::Call.
+    // We use zero address + empty input + 0 gas because there's no actual EVM
+    // execution here — this is purely a container for state-diff events.
+    const CALL_OPCODE: u8 = 0xf1;
+    let zero_addr = Address::ZERO;
+
+    let (db, inspector, _) = evm.components_mut();
+    let tracer = inspector.tracer_mut();
+
+    tracer.on_system_call_start();
+    tracer.on_call_enter(0, CALL_OPCODE, zero_addr, zero_addr, &[], 0, U256::ZERO);
+
+    // ETH_DEPOSIT_CONTRACT: nonce change (storage skipped, see module-level docs).
+    let eth_addr = spec::ETH_DEPOSIT_CONTRACT;
+    let eth_post = read_account(db, eth_addr, &[]);
+    if pre.eth_deposit_pre.nonce != eth_post.nonce {
+        tracer.on_nonce_change(eth_addr, pre.eth_deposit_pre.nonce, eth_post.nonce);
+    }
+
+    // PULSE_DEPOSIT_CONTRACT: nonce + 31 storage-slot writes.
+    let pulse_addr = spec::PULSE_DEPOSIT_CONTRACT;
+    let pulse_slots: Vec<B256> =
+        spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.iter().map(|(s, _)| *s).collect();
+    let pulse_post = read_account(db, pulse_addr, &pulse_slots);
+    if pre.pulse_deposit_pre.nonce != pulse_post.nonce {
+        tracer.on_nonce_change(pulse_addr, pre.pulse_deposit_pre.nonce, pulse_post.nonce);
+    }
+    for (i, (slot, _expected)) in spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.iter().enumerate() {
+        let pre_value = pre
+            .pulse_deposit_pre
+            .storage_slots_pre
+            .get(i)
+            .map(|(_, v)| *v)
+            .unwrap_or(B256::ZERO);
+        let post_value =
+            pulse_post.storage_slots_pre.get(i).map(|(_, v)| *v).unwrap_or(B256::ZERO);
+        tracer.on_storage_change(pulse_addr, *slot, pre_value, post_value);
+    }
+
+    tracer.on_call_exit(0, &[], 0, None, false);
     tracer.on_system_call_end();
 }
 
