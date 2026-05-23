@@ -453,7 +453,7 @@ revm-database-interface = { version = "11.0.0", default-features = false }
 revm-inspectors = "0.39.0"
 
 # eth
-alloy-dyn-abi = "1.5.6"
+alloy-dyn-abi = "1.6.0"
 alloy-primitives = { version = "1.5.6", default-features = false, features = ["map-foldhash"] }
 alloy-sol-types = { version = "1.5.6", default-features = false }
 
@@ -559,18 +559,18 @@ miniz_oxide = { version = "0.9.0", default-features = false }
 chrono = "0.4.41"
 
 # metrics
-metrics = "0.24.0"
+metrics = "0.24.6"
 metrics-derive = "0.1.1"
-metrics-exporter-prometheus = { version = "0.18.0", default-features = false }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 metrics-process = "2.1.0"
-metrics-util = { default-features = false, version = "0.20.0" }
+metrics-util = { default-features = false, version = "0.20.4" }
 
 # proc-macros
 proc-macro2 = "1.0"
 quote = "1.0"
 
 # tokio
-tokio = { version = "1.51.1", default-features = false }
+tokio = { version = "1.52.3", default-features = false }
 tokio-stream = "0.1.11"
 tokio-tungstenite = "0.28.0"
 tokio-util = { version = "0.7.4", features = ["codec"] }
@@ -584,7 +584,7 @@ futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 hyper = "1.9"
 hyper-util = "0.1.5"
-pin-project = "1.0.12"
+pin-project = "1.1.13"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 tracing-futures = "0.2"
 tower = "0.5"
@@ -661,7 +661,7 @@ ahash = "0.8"
 anyhow = "1.0"
 bindgen = { version = "0.72", default-features = false }
 block-padding = "0.3"
-cc = "1.2.15"
+cc = "1.2.62"
 cipher = "0.4.3"
 comfy-table = "7.0"
 concat-kdf = "0.1.0"
@@ -680,7 +680,7 @@ hickory-resolver = "0.26.1"
 hmac = "0.12.1"
 human_bytes = "0.4.1"
 indexmap = "2"
-interprocess = "2.2.0"
+interprocess = "2.4.2"
 lz4_flex = { version = "0.12", default-features = false }
 memmap2 = "0.9.4"
 num-traits = "0.2.15"
