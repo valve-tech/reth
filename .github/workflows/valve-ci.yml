@@ -12,7 +12,7 @@ name: valve-ci
 
 on:
   push:
-    branches: [firehose, master]
+    branches: [main]
   pull_request:
 
 env:
