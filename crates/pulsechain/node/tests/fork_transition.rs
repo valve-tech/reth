@@ -86,8 +86,10 @@ fn test_sacrifice_credits_binary_format() {
 /// the erigon-pulse `applySacrificeCredits` function.
 #[test]
 fn test_sacrifice_credits_known_first_mainnet_record() {
-    let bin_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("res/sacrifice_credits_mainnet.bin");
+    // Spec binaries were relocated node/res → hardforks/res (firehose Bug-5 fix,
+    // so reth-firehose can read them without a cycle on reth-pulsechain-node).
+    let bin_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../hardforks/res/sacrifice_credits_mainnet.bin");
     let data = std::fs::read(&bin_path).expect("sacrifice_credits_mainnet.bin must exist");
 
     // First record: total_length=30, so we read 1 header + 30 payload = 31 bytes
