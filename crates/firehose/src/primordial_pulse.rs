@@ -360,4 +360,71 @@ mod tests {
         assert_eq!(fork_block_for(1), None);
         assert_eq!(fork_block_for(0), None);
     }
+
+    // ── PrimordialPulse emission regression (consensus-critical) ──────────────
+    //
+    // These lock the on-wire-validated event decomposition for the firehose
+    // PrimordialPulse emit path (validated against PulseChain testnet v4 chain
+    // 943 block 16,492,700 on 2026-05-23):
+    //
+    //   286,833 balance_changes + 2 code_changes + 31 storage_changes + 1 nonce_change
+    //
+    // The pure decode/spec assertions (exact credit counts, treasury constants,
+    // 31-slot storage table, bytecode length) live in `reth-pulsechain-forks`'s
+    // `primordial_pulse::tests`. The tests here cross-check the spec data that
+    // the EMIT PATH in this module consumes, so a change to the spec that would
+    // alter the wire output fails loudly here too.
+    //
+    // OUT OF HERMETIC SCOPE: asserting that `emit_primordial_pulse_changes`
+    // actually drives the inspector to produce those exact wire counts requires
+    // a live revm `Evm` + populated `Database` (pre/post account+storage state at
+    // the fork block) and a real `FirehoseInspector`. That path is validated
+    // on-wire and is not faked here — a mock DB returning post==pre would emit
+    // zero changes and prove nothing.
+
+    /// Block-level pass emits exactly 2 code changes: ETH deposit cleared +
+    /// PULSE deposit installed. Both contract addresses must be the spec values.
+    #[test]
+    fn emit_path_targets_two_distinct_deposit_contracts_for_code_changes() {
+        assert_ne!(
+            spec::ETH_DEPOSIT_CONTRACT,
+            spec::PULSE_DEPOSIT_CONTRACT,
+            "the 2 code_changes must target two distinct contracts",
+        );
+        // Installed code is the 4898-byte PULSE deposit bytecode; ETH side clears.
+        assert_eq!(spec::DEPOSIT_CONTRACT_BYTECODE.len(), 4898);
+    }
+
+    /// System-call pass iterates the 31-slot table for storage changes and emits
+    /// the PULSE deposit nonce change (set to 0). The emit path reads exactly
+    /// `DEPOSIT_CONTRACT_INITIAL_STORAGE` so its length pins the 31 storage_changes.
+    #[test]
+    fn emit_path_iterates_31_storage_slots_and_one_nonce() {
+        assert_eq!(
+            spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.len(),
+            31,
+            "emit path emits one StorageChange per initial-storage slot",
+        );
+    }
+
+    /// The emit path walks `decode_chain_credits` for balance changes; lock the
+    /// per-chain counts the firehose side consumes (matches the on-wire total
+    /// once treasury + reward + suicide-withdraw are added — see forks-crate
+    /// test `testnet_v4_balance_change_decomposition_totals_286_833`).
+    #[test]
+    fn emit_path_credit_counts_match_on_wire() {
+        assert_eq!(decode_chain_credits(943).len(), 286_830, "testnet v4 credits");
+        assert_eq!(decode_chain_credits(369).len(), 292_217, "mainnet credits");
+        assert!(decode_chain_credits(1).is_empty(), "non-pulse chain: no credits");
+
+        // Testnet adds a treasury entry ahead of the credits; mainnet does not.
+        // (capture() pushes treasury first for chain 943 only.)
+        let testnet_balance_credit_entries =
+            decode_chain_credits(943).len() + /* treasury */ 1;
+        assert_eq!(
+            testnet_balance_credit_entries + /* reward */ 1 + /* suicide_withdraw */ 1,
+            286_833,
+            "testnet v4 on-wire balance_change total",
+        );
+    }
 }

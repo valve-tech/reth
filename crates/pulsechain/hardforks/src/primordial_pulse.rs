@@ -242,3 +242,144 @@ pub fn decode_sacrifice_credits(data: &[u8]) -> Vec<(Address, U256)> {
 
     credits
 }
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+//
+// PrimordialPulse regression tests. These lock the on-wire-validated
+// PrimordialPulse balance/code/storage/nonce decomposition into the test suite.
+//
+// On-wire validation reference (PulseChain testnet v4, chain 943, block
+// 16,492,700, verified 2026-05-23): the firehose stream emitted exactly
+//   286,833 balance_changes + 2 code_changes + 31 storage_changes + 1 nonce_change.
+//
+// The 286,833 balance_changes decompose (verified by the asserts below) as:
+//   286,830  sacrifice-credit allocations  (Reason::GenesisBalance)
+//   +     1  testnet treasury allocation   (Reason::GenesisBalance)
+//   +     1  block reward (coinbase)        (Reason::RewardMineBlock)
+//   +     1  ETH deposit contract selfdestruct withdraw (Reason::SuicideWithdraw)
+//   = 286,833
+//
+// Note: the original hand-written breakdown described "286,831 GenesisBalance"
+// — that figure is the sacrifice credits (286,830) PLUS the treasury (1). The
+// decomposition is split out explicitly here so a future change to either the
+// credits blob or the treasury handling fails loudly.
+//
+// These assertions are hermetic: they decode the embedded `.bin` resources and
+// inspect the const tables directly — no datadir, no network, no EVM/DB state.
+// The actual *emission* (that finish() drives the inspector to produce those
+// exact wire events) requires a live EVM+DB and is out of hermetic scope; it is
+// covered on-wire and partially in `reth-pulsechain-node`'s `apply_primordial_pulse`
+// MockState tests.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Number of block-reward (coinbase) BalanceChange events PrimordialPulse
+    /// contributes — emitted by the existing `emit_block_reward_balance_changes`
+    /// flow, not the PrimordialPulse emit path, but part of the on-wire total.
+    const REWARD_MINE_BLOCK_COUNT: usize = 1;
+    /// Number of SuicideWithdraw BalanceChange events — the ETH deposit
+    /// contract balance going to zero on selfdestruct.
+    const SUICIDE_WITHDRAW_COUNT: usize = 1;
+
+    #[test]
+    fn testnet_v4_balance_change_decomposition_totals_286_833() {
+        let blob = sacrifice_credits_for(943).expect("chain 943 has a credits blob");
+        let credits = decode_sacrifice_credits(blob);
+
+        // Locked: exact sacrifice-credit count for testnet v4.
+        assert_eq!(credits.len(), 286_830, "testnet v4 sacrifice-credit count");
+
+        // Testnet has exactly one treasury allocation (mainnet has none).
+        let treasury_count = 1usize;
+
+        let total = credits.len()
+            + treasury_count
+            + REWARD_MINE_BLOCK_COUNT
+            + SUICIDE_WITHDRAW_COUNT;
+
+        assert_eq!(
+            total, 286_833,
+            "testnet v4 total BalanceChange events must match on-wire block 16,492,700"
+        );
+    }
+
+    #[test]
+    fn testnet_v4_treasury_constants_are_locked() {
+        // Treasury is a SEPARATE allocation, NOT part of the sacrifice-credits blob.
+        // Source: pulsechain-testnet-v4.json `pulseChain.treasury`.
+        assert_eq!(
+            TESTNET_V4_TREASURY,
+            address!("A592ED65885bcbCeb30442F4902a0D1Cf3AcB8fC"),
+        );
+        assert_eq!(
+            TESTNET_V4_TREASURY_BALANCE,
+            uint!(0x314DC6448D9338C15B0A00000000_U256),
+        );
+        assert!(!TESTNET_V4_TREASURY_BALANCE.is_zero(), "treasury balance must be nonzero");
+    }
+
+    #[test]
+    fn mainnet_sacrifice_credit_count_is_locked() {
+        let blob = sacrifice_credits_for(369).expect("chain 369 has a credits blob");
+        let credits = decode_sacrifice_credits(blob);
+
+        // Locked: exact sacrifice-credit count for mainnet. Mainnet has NO treasury,
+        // so its PrimordialPulse balance-change total (sans the universal reward +
+        // suicide-withdraw) is exactly this count.
+        assert_eq!(credits.len(), 292_217, "mainnet sacrifice-credit count");
+        assert!(!credits.is_empty(), "mainnet credits must be nonzero");
+    }
+
+    #[test]
+    fn deposit_contract_initial_storage_has_exactly_31_slots() {
+        assert_eq!(
+            DEPOSIT_CONTRACT_INITIAL_STORAGE.len(),
+            31,
+            "PULSE deposit contract initial-storage table must have 31 slots",
+        );
+        // Slots are the contiguous range 0x22..=0x40 (Merkle-tree zero hashes).
+        for (i, (slot, value)) in DEPOSIT_CONTRACT_INITIAL_STORAGE.iter().enumerate() {
+            let expected_slot = 0x22u64 + i as u64;
+            assert_eq!(
+                U256::from_be_bytes(slot.0),
+                U256::from(expected_slot),
+                "slot {i} should be 0x{expected_slot:x}",
+            );
+            assert!(!value.is_zero(), "slot {i} value must be a nonzero zero-hash entry");
+        }
+        // First and last slot values pinned (Merkle zero-hash sequence).
+        assert_eq!(
+            DEPOSIT_CONTRACT_INITIAL_STORAGE[0].1,
+            b256!("f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"),
+        );
+        assert_eq!(
+            DEPOSIT_CONTRACT_INITIAL_STORAGE[30].1,
+            b256!("985e929f70af28d0bdd1a90a808f977f597c7c778c489e98d3bd8910d31ac0f7"),
+        );
+    }
+
+    #[test]
+    fn deposit_contract_addresses_and_bytecode_are_locked() {
+        // 2 code_changes on-wire: ETH deposit cleared + PULSE deposit installed.
+        assert_eq!(
+            ETH_DEPOSIT_CONTRACT,
+            address!("00000000219ab540356cBB839Cbe05303d7705Fa"),
+        );
+        assert_eq!(
+            PULSE_DEPOSIT_CONTRACT,
+            address!("3693693693693693693693693693693693693693"),
+        );
+        // PULSE deposit contract bytecode is 4898 bytes (the only nonzero code
+        // installed — the ETH deposit's code goes to empty on selfdestruct).
+        assert_eq!(DEPOSIT_CONTRACT_BYTECODE.len(), 4898, "deposit bytecode length");
+        assert!(!DEPOSIT_CONTRACT_BYTECODE.is_empty());
+    }
+
+    #[test]
+    fn no_credits_blob_for_non_pulse_chains() {
+        assert!(sacrifice_credits_for(1).is_none(), "ethereum mainnet");
+        assert!(sacrifice_credits_for(0).is_none());
+        assert!(sacrifice_credits_for(942).is_none(), "testnet v3 (no blob)");
+    }
+}
