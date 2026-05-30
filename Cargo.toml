@@ -455,7 +455,7 @@ revm-database-interface = { version = "11.0.0", default-features = false }
 revm-inspectors = "0.39.0"
 
 # eth
-alloy-dyn-abi = "1.5.6"
+alloy-dyn-abi = "1.6.0"
 alloy-primitives = { version = "1.5.6", default-features = false, features = [
     "map-foldhash",
 ] }
@@ -472,34 +472,34 @@ alloy-trie = { version = "0.9.4", default-features = false }
 
 alloy-hardforks = "0.4.7"
 
-alloy-consensus = { version = "2.0.4", default-features = false }
+alloy-consensus = { version = "2.0.5", default-features = false }
 alloy-contract = { version = "2.0.4", default-features = false }
 alloy-eips = { version = "2.0.4", default-features = false }
-alloy-genesis = { version = "2.0.4", default-features = false }
-alloy-json-rpc = { version = "2.0.4", default-features = false }
+alloy-genesis = { version = "2.0.5", default-features = false }
+alloy-json-rpc = { version = "2.0.5", default-features = false }
 alloy-network = { version = "2.0.4", default-features = false }
-alloy-network-primitives = { version = "2.0.4", default-features = false }
+alloy-network-primitives = { version = "2.0.5", default-features = false }
 alloy-provider = { version = "2.0.4", features = [
     "reqwest",
     "debug-api",
 ], default-features = false }
 alloy-pubsub = { version = "2.0.4", default-features = false }
-alloy-rpc-client = { version = "2.0.4", default-features = false }
-alloy-rpc-types = { version = "2.0.4", features = [
+alloy-rpc-client = { version = "2.0.5", default-features = false }
+alloy-rpc-types = { version = "2.0.5", features = [
     "eth",
 ], default-features = false }
-alloy-rpc-types-admin = { version = "2.0.4", default-features = false }
-alloy-rpc-types-anvil = { version = "2.0.4", default-features = false }
-alloy-rpc-types-beacon = { version = "2.0.4", default-features = false }
-alloy-rpc-types-debug = { version = "2.0.4", default-features = false }
+alloy-rpc-types-admin = { version = "2.0.5", default-features = false }
+alloy-rpc-types-anvil = { version = "2.0.5", default-features = false }
+alloy-rpc-types-beacon = { version = "2.0.5", default-features = false }
+alloy-rpc-types-debug = { version = "2.0.5", default-features = false }
 alloy-rpc-types-engine = { version = "2.0.4", default-features = false }
 alloy-rpc-types-eth = { version = "2.0.4", default-features = false }
-alloy-rpc-types-mev = { version = "2.0.4", default-features = false }
-alloy-rpc-types-trace = { version = "2.0.4", default-features = false }
-alloy-rpc-types-txpool = { version = "2.0.4", default-features = false }
+alloy-rpc-types-mev = { version = "2.0.5", default-features = false }
+alloy-rpc-types-trace = { version = "2.0.5", default-features = false }
+alloy-rpc-types-txpool = { version = "2.0.5", default-features = false }
 alloy-serde = { version = "2.0.4", default-features = false }
-alloy-signer = { version = "2.0.4", default-features = false }
-alloy-signer-local = { version = "2.0.4", default-features = false }
+alloy-signer = { version = "2.0.5", default-features = false }
+alloy-signer-local = { version = "2.0.5", default-features = false }
 alloy-transport = { version = "2.0.4" }
 alloy-transport-http = { version = "2.0.4", features = [
     "reqwest-rustls-tls",
@@ -508,7 +508,7 @@ alloy-transport-ipc = { version = "2.0.4", default-features = false }
 alloy-transport-ws = { version = "2.0.4", default-features = false }
 
 # misc
-either = { version = "1.15.0", default-features = false }
+either = { version = "1.16.0", default-features = false }
 arrayvec = { version = "0.7.6", default-features = false }
 aquamarine = "0.6"
 auto_impl = "1"
@@ -525,7 +525,7 @@ brotli = "8"
 cfg-if = "1.0"
 clap = "4"
 color-eyre = "0.6"
-dashmap = "6.0"
+dashmap = "6.2"
 derive_more = { version = "2", default-features = false, features = ["full"] }
 dirs-next = "2.0.0"
 dyn-clone = "1.0.17"
@@ -566,7 +566,7 @@ strum = { version = "0.27", default-features = false }
 strum_macros = "0.27"
 syn = "2.0"
 thiserror = { version = "2.0.0", default-features = false }
-tar = "0.4.44"
+tar = "0.4.46"
 tracing = { version = "0.1.0", default-features = false, features = [
     "attributes",
 ] }
@@ -581,18 +581,18 @@ miniz_oxide = { version = "0.9.0", default-features = false }
 chrono = "0.4.41"
 
 # metrics
-metrics = "0.24.0"
+metrics = "0.24.6"
 metrics-derive = "0.1.1"
-metrics-exporter-prometheus = { version = "0.18.0", default-features = false }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 metrics-process = "2.1.0"
-metrics-util = { default-features = false, version = "0.20.0" }
+metrics-util = { default-features = false, version = "0.20.4" }
 
 # proc-macros
 proc-macro2 = "1.0"
 quote = "1.0"
 
 # tokio
-tokio = { version = "1.51.1", default-features = false }
+tokio = { version = "1.52.3", default-features = false }
 tokio-stream = "0.1.11"
 tokio-tungstenite = "0.28.0"
 tokio-util = { version = "0.7.4", features = ["codec"] }
@@ -606,7 +606,7 @@ futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 hyper = "1.9"
 hyper-util = "0.1.5"
-pin-project = "1.0.12"
+pin-project = "1.1.13"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "stream",
@@ -673,8 +673,8 @@ rstest = "0.26.1"
 test-case = "3"
 
 # ssz encoding
-ethereum_ssz = "0.10.1"
-ethereum_ssz_derive = "0.10.1"
+ethereum_ssz = "0.10.4"
+ethereum_ssz_derive = "0.10.4"
 
 # allocators
 jemalloc_pprof = { version = "0.8", default-features = false }
@@ -689,7 +689,7 @@ ahash = "0.8"
 anyhow = "1.0"
 bindgen = { version = "0.72", default-features = false }
 block-padding = "0.3"
-cc = "1.2.15"
+cc = "1.2.62"
 cipher = "0.4.3"
 comfy-table = "7.0"
 concat-kdf = "0.1.0"
@@ -708,7 +708,7 @@ hickory-resolver = "0.25.0"
 hmac = "0.12.1"
 human_bytes = "0.4.1"
 indexmap = "2"
-interprocess = "2.2.0"
+interprocess = "2.4.2"
 lz4_flex = { version = "0.12", default-features = false }
 memmap2 = "0.9.4"
 num-traits = "0.2.15"
@@ -740,7 +740,7 @@ vergen-git2 = "9.1.0"
 ipnet = "2.11"
 
 ## Firehose Additions
-firehose-tracer = "=5.0.0"
+firehose-tracer = "=5.1.1"
 reth-firehose = { path = "crates/firehose" }
 reth-firehose-tests = { path = "crates/firehose-tests" }
 
