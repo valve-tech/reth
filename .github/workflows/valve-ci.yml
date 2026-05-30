@@ -48,7 +48,7 @@ jobs:
           cache-on-failure: true
 
       # nextest, installed the same way the upstream unit.yml does.
-      - uses: taiki-e/install-action@1f2425cdb59f8fffb99ee16a5968edf6f57a2b93 # v2.75.24
+      - uses: taiki-e/install-action@f48d2f8ba2b452934c948b7be1a768079c3632ff # v2.79.6
         with:
           tool: nextest
 
