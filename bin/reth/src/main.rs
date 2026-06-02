@@ -14,7 +14,7 @@ static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 use std::sync::Arc;
 
 use clap::Parser;
-use reth::{cli::Cli, FirehoseExecutorBuilder, PulsechainFirehoseExecutorBuilder};
+use reth::{cli::Cli, PulsechainFirehoseExecutorBuilder};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_msgboard::{args::MsgboardArgs, MsgboardLauncher};
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
@@ -44,15 +44,9 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    // Initialize the firehose tracer ABOVE chain dispatch — tracer state is
-    // global, not chain-scoped, so both run_ethereum_node() and
-    // run_pulsechain_node() share the same tracer once it's set. The tracer
-    // is a no-op until something fires it; safe to install unconditionally.
-    reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer::config::Config {
-        chain_client: firehose_tracer::config::ChainClient::Reth,
-        ..Default::default()
-    }));
-
+    // Firehose tracer init is gated inside `run_pulsechain_node` only — see
+    // the comment there for the lifecycle-contract reason this can't run
+    // unconditionally before chain dispatch.
     let result =
         if requested_ethereum_chain() { run_ethereum_node() } else { run_pulsechain_node() };
 
@@ -125,6 +119,26 @@ fn run_ethereum_node() -> eyre::Result<()> {
 /// PrimordialPulse fork-block tracing is wired separately in
 /// `crates/pulsechain/node/src/evm.rs` (see NOTES-firehose.md).
 fn run_pulsechain_node() -> eyre::Result<()> {
+    // Initialise the firehose tracer ONLY on the PulseChain dispatch path.
+    //
+    // The tracer's `on_block_execution_start` hook asserts that
+    // `on_blockchain_init` was fired earlier in the node lifecycle. The
+    // PulseChain path satisfies that contract via the firehose ExEx wired
+    // into `PulsechainFirehoseExecutorBuilder` below — it fires
+    // `on_blockchain_init` during the executor's chain-init pass.
+    //
+    // Upstream `EthereumNode` (used by `run_ethereum_node`) has no
+    // equivalent ExEx and never fires that hook. Installing the tracer
+    // before chain dispatch therefore panicked on `--chain mainnet` at the
+    // first block-execution call with:
+    //   "the OnBlockchainInit hook should have been called at this point"
+    // (firehose-tracer-5.0.0/src/tracer.rs:1739). Gating the init here so
+    // the tracer never enters the Ethereum lifecycle in the first place.
+    reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer::config::Config {
+        chain_client: firehose_tracer::config::ChainClient::Reth,
+        ..Default::default()
+    }));
+
     // We use `run_with_components` (instead of the convenience `run`) because our chain
     // spec is `PulsechainChainSpec` (a wrapper that overrides Shanghai detection for the
     // pre-PrimordialPulse Ethereum-replay range). `Cli::run` is hard-bound to upstream
