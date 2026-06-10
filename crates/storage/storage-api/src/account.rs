@@ -46,6 +46,36 @@ pub trait AccountExtReader {
     ) -> ProviderResult<BTreeMap<Address, Vec<BlockNumber>>>;
 }
 
+/// Read access to the account-history index (`tables::AccountsHistory`): for a given address,
+/// the block numbers at which the account's state changed.
+///
+/// The index is populated from account changesets, i.e. it contains the blocks where the
+/// account's info (balance / nonce / code) changed. Note that blocks where only the account's
+/// *storage* changed are tracked in the separate storage-history index and are NOT guaranteed to
+/// appear here.
+#[auto_impl(&, Arc, Box)]
+pub trait AccountHistoryReader: Send + Sync {
+    /// Returns up to `limit` block numbers strictly BELOW `before`, in descending order,
+    /// at which `address` changed. An empty result means there are no recorded changes
+    /// below `before`.
+    fn account_changed_blocks_before(
+        &self,
+        address: Address,
+        before: BlockNumber,
+        limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>>;
+
+    /// Returns up to `limit` block numbers strictly ABOVE `after`, in ascending order,
+    /// at which `address` changed. An empty result means there are no recorded changes
+    /// above `after`.
+    fn account_changed_blocks_after(
+        &self,
+        address: Address,
+        after: BlockNumber,
+        limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>>;
+}
+
 /// `AccountChange` reader
 #[auto_impl(&, Arc, Box)]
 pub trait ChangeSetReader {

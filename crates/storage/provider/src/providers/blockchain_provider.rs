@@ -27,7 +27,9 @@ use reth_primitives_traits::{Account, RecoveredBlock, SealedHeader, StorageEntry
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
-use reth_storage_api::{BlockBodyIndicesProvider, NodePrimitivesProvider, StorageChangeSetReader};
+use reth_storage_api::{
+    AccountHistoryReader, BlockBodyIndicesProvider, NodePrimitivesProvider, StorageChangeSetReader,
+};
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
 use revm_database::BundleState;
@@ -759,6 +761,26 @@ impl<N: ProviderNodeTypes> AccountReader for BlockchainProvider<N> {
     /// Get basic account information.
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         self.consistent_provider()?.basic_account(address)
+    }
+}
+
+impl<N: ProviderNodeTypes> AccountHistoryReader for BlockchainProvider<N> {
+    fn account_changed_blocks_before(
+        &self,
+        address: Address,
+        before: BlockNumber,
+        limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        self.consistent_provider()?.account_changed_blocks_before(address, before, limit)
+    }
+
+    fn account_changed_blocks_after(
+        &self,
+        address: Address,
+        after: BlockNumber,
+        limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        self.consistent_provider()?.account_changed_blocks_after(address, after, limit)
     }
 }
 

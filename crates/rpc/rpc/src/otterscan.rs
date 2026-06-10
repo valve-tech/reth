@@ -1,10 +1,10 @@
-use alloy_consensus::{BlockHeader, Typed2718};
+use alloy_consensus::{constants::KECCAK_EMPTY, BlockHeader, Typed2718};
 use alloy_eips::{eip1898::LenientBlockNumberOrTag, BlockId, BlockNumberOrTag};
 use alloy_network::{ReceiptResponse, TransactionResponse};
 use alloy_primitives::{Address, Bloom, Bytes, TxHash, B256, U256};
 use alloy_rpc_types_eth::{BlockTransactions, TransactionReceipt};
 use alloy_rpc_types_trace::{
-    filter::{TraceFilter, TraceFilterMode},
+    filter::{TraceFilter, TraceFilterMatcher, TraceFilterMode},
     otterscan::{
         BlockDetails, ContractCreator, InternalOperation, OperationType, OtsBlockTransactions,
         OtsReceipt, OtsTransactionReceipt, TraceEntry, TransactionsWithReceipts,
@@ -12,9 +12,9 @@ use alloy_rpc_types_trace::{
     parity::{Action, CreateAction, CreateOutput, TraceOutput},
 };
 use async_trait::async_trait;
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{stream, StreamExt};
 use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned};
-use reth_primitives_traits::TxTy;
+use reth_primitives_traits::{RecoveredBlock, TxTy};
 use reth_rpc_api::{EthApiServer, OtterscanServer};
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
@@ -23,7 +23,7 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{utils::binary_search, EthApiError};
 use reth_rpc_server_types::result::internal_rpc_err;
-use reth_storage_api::BlockReader;
+use reth_storage_api::{AccountHistoryReader, BlockReader, ProviderBlock};
 use revm::context_interface::result::ExecutionResult;
 use revm_inspectors::{
     tracing::{types::CallTraceNode, TracingInspectorConfig},
@@ -33,6 +33,13 @@ use revm_primitives::FixedBytes;
 use std::{cmp::Reverse, sync::Arc};
 
 const API_LEVEL: u64 = 8;
+
+/// Number of candidate blocks fetched from the account-history index per batch during
+/// `ots_searchTransactions{Before,After}`.
+const CANDIDATE_BATCH_SIZE: usize = 64;
+
+/// Maximum number of blocks traced concurrently during `ots_searchTransactions{Before,After}`.
+const MAX_CONCURRENT_BLOCK_TRACES: usize = 8;
 
 /// Otterscan API.
 #[derive(Debug)]
@@ -66,6 +73,225 @@ where
             .sum::<u128>();
 
         Ok(BlockDetails::new(block, Default::default(), U256::from(total_fees)))
+    }
+}
+
+impl<Eth> OtterscanApi<Eth>
+where
+    Eth: EthApiServer<
+            RpcTxReq<Eth::NetworkTypes>,
+            RpcTransaction<Eth::NetworkTypes>,
+            RpcBlock<Eth::NetworkTypes>,
+            RpcReceipt<Eth::NetworkTypes>,
+            RpcHeader<Eth::NetworkTypes>,
+            TxTy<Eth::Primitives>,
+        > + EthTransactions
+        + TraceExt
+        + 'static,
+{
+    /// Fetches the recovered blocks for the given block numbers.
+    fn recovered_blocks(
+        &self,
+        numbers: &[u64],
+    ) -> RpcResult<Vec<Arc<RecoveredBlock<ProviderBlock<Eth::Provider>>>>> {
+        let mut blocks = Vec::with_capacity(numbers.len());
+        for &number in numbers {
+            blocks.extend(
+                self.eth
+                    .provider()
+                    .recovered_block_range(number..=number)
+                    .map_err(|_| EthApiError::HeaderRangeNotFound(number.into(), number.into()))?
+                    .into_iter()
+                    .map(Arc::new),
+            );
+        }
+        Ok(blocks)
+    }
+
+    /// Traces the given blocks with a parity tracing inspector and appends the transactions
+    /// (and their receipts) whose traces match `matcher` to `out`.
+    ///
+    /// At most [`MAX_CONCURRENT_BLOCK_TRACES`] blocks are traced concurrently.
+    async fn collect_matching_transactions(
+        &self,
+        blocks: Vec<Arc<RecoveredBlock<ProviderBlock<Eth::Provider>>>>,
+        matcher: &Arc<TraceFilterMatcher>,
+        out: &mut TransactionsWithReceipts<RpcTransaction<Eth::NetworkTypes>>,
+    ) -> RpcResult<()> {
+        let mut block_timestamps = std::collections::HashMap::new();
+        let mut futures = Vec::with_capacity(blocks.len());
+
+        for block in &blocks {
+            let matcher = matcher.clone();
+            block_timestamps.insert(block.hash(), block.header().timestamp());
+
+            futures.push(self.eth.trace_block_until(
+                block.hash().into(),
+                Some(block.clone()),
+                None,
+                TracingInspectorConfig::default_parity(),
+                move |tx_info, mut ctx| {
+                    let mut traces = ctx
+                        .take_inspector()
+                        .into_parity_builder()
+                        .into_localized_transaction_traces(tx_info);
+                    traces.retain(|trace| matcher.matches(&trace.trace));
+
+                    Ok(Some(traces))
+                },
+            ));
+        }
+
+        // execute the traces with bounded concurrency
+        let mut results = stream::iter(futures).buffer_unordered(MAX_CONCURRENT_BLOCK_TRACES);
+
+        while let Some(result) = results.next().await {
+            let traces = result
+                .map_err(Into::into)?
+                .into_iter()
+                .flatten()
+                .flat_map(|traces| traces.into_iter().flatten())
+                .collect::<Vec<_>>();
+
+            let mut prev_tx_hash = FixedBytes::default();
+
+            // iterate over the traces and fetch the corresponding transactions and receipts
+            for trace in &traces {
+                let tx_hash = trace.transaction_hash.ok_or(EthApiError::TransactionNotFound)?;
+
+                // If intermediate traces of the same transaction are matched, skip them
+                if tx_hash == prev_tx_hash {
+                    continue;
+                }
+                prev_tx_hash = tx_hash;
+
+                let tx = EthApiServer::transaction_by_hash(&self.eth, tx_hash);
+                let receipt = EthApiServer::transaction_receipt(&self.eth, tx_hash);
+                let (tx, receipt) = futures::try_join!(tx, receipt)?;
+                let tx = tx.ok_or(EthApiError::TransactionNotFound)?;
+                let receipt = receipt.ok_or(EthApiError::ReceiptNotFound)?;
+
+                let inner = OtsReceipt {
+                    status: receipt.status(),
+                    cumulative_gas_used: receipt.cumulative_gas_used(),
+                    logs: Some(vec![]),
+                    logs_bloom: Some(Bloom::default()),
+                    r#type: tx.ty(),
+                };
+
+                let receipt = TransactionReceipt {
+                    inner,
+                    transaction_hash: receipt.transaction_hash(),
+                    transaction_index: receipt.transaction_index(),
+                    block_hash: receipt.block_hash(),
+                    block_number: receipt.block_number(),
+                    gas_used: receipt.gas_used(),
+                    effective_gas_price: receipt.effective_gas_price(),
+                    blob_gas_used: receipt.blob_gas_used(),
+                    blob_gas_price: receipt.blob_gas_price(),
+                    from: receipt.from(),
+                    to: receipt.to(),
+                    contract_address: receipt.contract_address(),
+                };
+
+                let receipt = OtsTransactionReceipt {
+                    receipt,
+                    timestamp: trace
+                        .block_hash
+                        .and_then(|hash| block_timestamps.get(&hash).copied()),
+                };
+
+                out.txs.push(tx);
+                out.receipts.push(receipt);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Exhaustive fallback for `ots_searchTransactionsBefore`, used when the account-history
+    /// index is unusable (e.g. account history is pruned): linearly walks all blocks from
+    /// `cur_block` down to genesis, tracing every block. This is the pre-index implementation
+    /// and can be extremely slow on long chains.
+    async fn search_transactions_before_linear(
+        &self,
+        matcher: &Arc<TraceFilterMatcher>,
+        out: &mut TransactionsWithReceipts<RpcTransaction<Eth::NetworkTypes>>,
+        mut cur_block: u64,
+        page_size: usize,
+    ) -> RpcResult<()> {
+        const BATCH_SIZE: u64 = 1000;
+
+        // iterate over the blocks until `page_size` transactions are found or the genesis block
+        // is reached
+        while out.txs.len() < page_size {
+            let start = cur_block.saturating_sub(BATCH_SIZE);
+            let end = cur_block;
+
+            let blocks = self
+                .eth
+                .provider()
+                .recovered_block_range(start..=end)
+                .map_err(|_| EthApiError::HeaderRangeNotFound(start.into(), end.into()))?
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>();
+
+            self.collect_matching_transactions(blocks, matcher, out).await?;
+
+            if start == 0 {
+                // Genesis block is reached meaning this is the last page of the transactions
+                out.last_page = true;
+                break;
+            }
+
+            cur_block = start - 1;
+        }
+
+        Ok(())
+    }
+
+    /// Exhaustive fallback for `ots_searchTransactionsAfter`, used when the account-history
+    /// index is unusable (e.g. account history is pruned): linearly walks all blocks from
+    /// `cur_block` up to the tip, tracing every block. This is the pre-index implementation and
+    /// can be extremely slow on long chains.
+    async fn search_transactions_after_linear(
+        &self,
+        matcher: &Arc<TraceFilterMatcher>,
+        out: &mut TransactionsWithReceipts<RpcTransaction<Eth::NetworkTypes>>,
+        mut cur_block: u64,
+        tip: u64,
+        page_size: usize,
+    ) -> RpcResult<()> {
+        const BATCH_SIZE: u64 = 1000;
+
+        // iterate over the blocks until `page_size` transactions are found or the tip is reached
+        while out.txs.len() < page_size {
+            let start = cur_block;
+            let end = std::cmp::min(tip, cur_block + BATCH_SIZE);
+
+            let blocks = self
+                .eth
+                .provider()
+                .recovered_block_range(start..=end)
+                .map_err(|_| EthApiError::HeaderRangeNotFound(start.into(), end.into()))?
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>();
+
+            self.collect_matching_transactions(blocks, matcher, out).await?;
+
+            if end == tip {
+                // most current block is reached meaning this is the first page of the
+                // transactions
+                out.first_page = true;
+                break;
+            }
+
+            cur_block = end + 1;
+        }
+
+        Ok(())
     }
 }
 
@@ -287,24 +513,39 @@ where
     }
 
     /// Handler for `ots_searchTransactionsBefore`
+    ///
+    /// For EOAs, candidate blocks are selected via the account-history index (see
+    /// [`AccountHistoryReader`]) instead of linearly re-executing every block of the chain. An
+    /// EOA's state-change history is effectively complete: any value transfer or outgoing
+    /// transaction changes its balance and/or nonce. The only misses are zero-value incoming
+    /// `CALL`s and reverted incoming calls (which Erigon's call index would list) — a deliberate
+    /// trade for bounded query cost. If the account-history index is unusable (e.g. account
+    /// history is pruned), the EOA path falls back to the exhaustive linear scan.
+    ///
+    /// Contracts intentionally keep the exhaustive trace-based linear scan
+    /// ([`Self::search_transactions_before_linear`]): `AccountsHistory` skips storage-only
+    /// changes (revm's `to_plain_state_reverts` drops `AccountInfoRevert::DoNothing` accounts),
+    /// so the index would hide most incoming calls to e.g. an ERC-20.
     async fn search_transactions_before(
         &self,
         address: Address,
         block_number: LenientBlockNumberOrTag,
         page_size: usize,
     ) -> RpcResult<TransactionsWithReceipts<RpcTransaction<Eth::NetworkTypes>>> {
-        {
+        let is_contract = {
             let state = self.eth.latest_state().map_err(|e| internal_rpc_err(e.to_string()))?;
             let account =
                 state.basic_account(&address).map_err(|e| internal_rpc_err(e.to_string()))?;
 
-            if account.is_none() {
+            let Some(account) = account else {
                 return Err(EthApiError::InvalidParams(
                     "invalid parameter: address does not exist".to_string(),
                 )
                 .into());
-            }
-        }
+            };
+
+            account.bytecode_hash.is_some_and(|hash| hash != KECCAK_EMPTY)
+        };
 
         let tip: u64 = self.eth.block_number()?.saturating_to();
 
@@ -320,8 +561,6 @@ where
             )
             .into());
         }
-
-        const BATCH_SIZE: u64 = 1000;
 
         // Since the results are in reverse chronological order, if the search starts from the tip
         // of the chain (block_number == 0) then it is the first page. If the search reaches
@@ -344,118 +583,59 @@ where
         };
 
         let matcher = Arc::new(filter.matcher());
-        let mut cur_block = if block_number == 0 { tip } else { block_number - 1 };
+        let cur_block = if block_number == 0 { tip } else { block_number - 1 };
 
-        // iterate over the blocks until `page_size` transactions are found or the genesis block is
-        // reached
-        while txs_with_receipts.txs.len() < page_size {
-            let start = cur_block.saturating_sub(BATCH_SIZE);
-            let end = cur_block;
+        // Contracts go straight to the exhaustive linear scan: the account-history index skips
+        // storage-only changes and would hide most incoming calls (see the handler docs).
+        let mut linear_fallback = is_contract;
 
-            let blocks = self
-                .eth
-                .provider()
-                .recovered_block_range(start..=end)
-                .map_err(|_| EthApiError::HeaderRangeNotFound(start.into(), end.into()))?
-                .into_iter()
-                .map(Arc::new)
-                .collect::<Vec<_>>();
+        if !linear_fallback {
+            // Exclusive upper bound for the candidate query: inspect blocks <= `cur_block`.
+            let mut before = cur_block + 1;
 
-            let mut block_timestamps = std::collections::HashMap::new();
-            let mut futures = FuturesUnordered::new();
-
-            // trace a batch of blocks
-            for block in &blocks {
-                let matcher = matcher.clone();
-                block_timestamps.insert(block.hash(), block.header().timestamp());
-
-                let future = self.eth.trace_block_until(
-                    block.hash().into(),
-                    Some(block.clone()),
-                    None,
-                    TracingInspectorConfig::default_parity(),
-                    move |tx_info, mut ctx| {
-                        let mut traces = ctx
-                            .take_inspector()
-                            .into_parity_builder()
-                            .into_localized_transaction_traces(tx_info);
-                        traces.retain(|trace| matcher.matches(&trace.trace));
-
-                        Ok(Some(traces))
-                    },
-                );
-
-                futures.push(future);
-            }
-
-            while let Some(result) = futures.next().await {
-                let traces = result
-                    .map_err(Into::into)?
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|traces| traces.into_iter().flatten())
-                    .collect::<Vec<_>>();
-
-                let mut prev_tx_hash = FixedBytes::default();
-
-                // iterate over the traces and fetch the corresponding transactions and receipts
-                for trace in &traces {
-                    let tx_hash = trace.transaction_hash.ok_or(EthApiError::TransactionNotFound)?;
-
-                    // If intermediate traces of the same transaction are matched, skip them
-                    if tx_hash == prev_tx_hash {
-                        continue;
+            // iterate over the candidate blocks (blocks in which the account's state changed,
+            // newest first) until `page_size` transactions are found or the index is exhausted
+            while txs_with_receipts.txs.len() < page_size {
+                let candidates = match self.eth.provider().account_changed_blocks_before(
+                    address,
+                    before,
+                    CANDIDATE_BATCH_SIZE,
+                ) {
+                    Ok(candidates) => candidates,
+                    Err(_) if before == cur_block + 1 => {
+                        // The first index probe failed: the index is unusable (e.g. account
+                        // history is pruned), fall back to the exhaustive linear scan.
+                        linear_fallback = true;
+                        break;
                     }
-                    prev_tx_hash = tx_hash;
+                    Err(err) => return Err(internal_rpc_err(err.to_string())),
+                };
 
-                    let tx = EthApiServer::transaction_by_hash(&self.eth, tx_hash);
-                    let receipt = EthApiServer::transaction_receipt(&self.eth, tx_hash);
-                    let (tx, receipt) = futures::try_join!(tx, receipt)?;
-                    let tx = tx.ok_or(EthApiError::TransactionNotFound)?;
-                    let receipt = receipt.ok_or(EthApiError::ReceiptNotFound)?;
-
-                    let inner = OtsReceipt {
-                        status: receipt.status(),
-                        cumulative_gas_used: receipt.cumulative_gas_used(),
-                        logs: Some(vec![]),
-                        logs_bloom: Some(Bloom::default()),
-                        r#type: tx.ty(),
-                    };
-
-                    let receipt = TransactionReceipt {
-                        inner,
-                        transaction_hash: receipt.transaction_hash(),
-                        transaction_index: receipt.transaction_index(),
-                        block_hash: receipt.block_hash(),
-                        block_number: receipt.block_number(),
-                        gas_used: receipt.gas_used(),
-                        effective_gas_price: receipt.effective_gas_price(),
-                        blob_gas_used: receipt.blob_gas_used(),
-                        blob_gas_price: receipt.blob_gas_price(),
-                        from: receipt.from(),
-                        to: receipt.to(),
-                        contract_address: receipt.contract_address(),
-                    };
-
-                    let receipt = OtsTransactionReceipt {
-                        receipt,
-                        timestamp: trace
-                            .block_hash
-                            .and_then(|hash| block_timestamps.get(&hash).copied()),
-                    };
-
-                    txs_with_receipts.txs.push(tx);
-                    txs_with_receipts.receipts.push(receipt);
+                if candidates.is_empty() {
+                    // No more changes below the cursor: equivalent to having reached genesis.
+                    txs_with_receipts.last_page = true;
+                    break;
                 }
-            }
 
-            if start == 0 {
-                // Genesis block is reached meaning this is the last page of the transactions
-                txs_with_receipts.last_page = true;
-                break;
-            }
+                // candidates are descending: continue strictly below the smallest one next round
+                before = *candidates.last().expect("candidates is not empty");
 
-            cur_block = start - 1;
+                // trace only the candidate blocks; false positives (state changes not caused by
+                // a matching transaction) are filtered out by the matcher
+                let blocks = self.recovered_blocks(&candidates)?;
+                self.collect_matching_transactions(blocks, &matcher, &mut txs_with_receipts)
+                    .await?;
+            }
+        }
+
+        if linear_fallback {
+            self.search_transactions_before_linear(
+                &matcher,
+                &mut txs_with_receipts,
+                cur_block,
+                page_size,
+            )
+            .await?;
         }
 
         // Zip and sort transactions and receipts together by block number
@@ -491,24 +671,39 @@ where
     }
 
     /// Handler for `ots_searchTransactionsAfter`
+    ///
+    /// For EOAs, candidate blocks are selected via the account-history index (see
+    /// [`AccountHistoryReader`]) instead of linearly re-executing every block of the chain. An
+    /// EOA's state-change history is effectively complete: any value transfer or outgoing
+    /// transaction changes its balance and/or nonce. The only misses are zero-value incoming
+    /// `CALL`s and reverted incoming calls (which Erigon's call index would list) — a deliberate
+    /// trade for bounded query cost. If the account-history index is unusable (e.g. account
+    /// history is pruned), the EOA path falls back to the exhaustive linear scan.
+    ///
+    /// Contracts intentionally keep the exhaustive trace-based linear scan
+    /// ([`Self::search_transactions_after_linear`]): `AccountsHistory` skips storage-only
+    /// changes (revm's `to_plain_state_reverts` drops `AccountInfoRevert::DoNothing` accounts),
+    /// so the index would hide most incoming calls to e.g. an ERC-20.
     async fn search_transactions_after(
         &self,
         address: Address,
         block_number: LenientBlockNumberOrTag,
         page_size: usize,
     ) -> RpcResult<TransactionsWithReceipts<RpcTransaction<Eth::NetworkTypes>>> {
-        {
+        let is_contract = {
             let state = self.eth.latest_state().map_err(|e| internal_rpc_err(e.to_string()))?;
             let account =
                 state.basic_account(&address).map_err(|e| internal_rpc_err(e.to_string()))?;
 
-            if account.is_none() {
+            let Some(account) = account else {
                 return Err(EthApiError::InvalidParams(
                     "invalid parameter: address does not exist".to_string(),
                 )
                 .into());
-            }
-        }
+            };
+
+            account.bytecode_hash.is_some_and(|hash| hash != KECCAK_EMPTY)
+        };
 
         let tip: u64 = self.eth.block_number()?.saturating_to();
 
@@ -524,8 +719,6 @@ where
             )
             .into());
         }
-
-        const BATCH_SIZE: u64 = 1000;
 
         // Since the results are in reverse chronological order, if the search reaches the tip of
         // the chain then it is the first page. If the search starts from the genesis block,
@@ -548,116 +741,73 @@ where
         };
 
         let matcher = Arc::new(filter.matcher());
-        let mut cur_block = if block_number == 0 { 0 } else { block_number + 1 };
 
-        // iterate over the blocks until `page_size` transactions are found or the tip is reached
-        while txs_with_receipts.txs.len() < page_size {
-            let start = cur_block;
-            let end = std::cmp::min(tip, cur_block + BATCH_SIZE);
+        // Contracts go straight to the exhaustive linear scan: the account-history index skips
+        // storage-only changes and would hide most incoming calls (see the handler docs).
+        let mut linear_fallback = is_contract;
 
-            let blocks = self
-                .eth
-                .provider()
-                .recovered_block_range(start..=end)
-                .map_err(|_| EthApiError::HeaderRangeNotFound(start.into(), end.into()))?
-                .into_iter()
-                .map(Arc::new)
-                .collect::<Vec<_>>();
+        if !linear_fallback {
+            // Strictly-above cursor for the candidate query. The linear implementation starts
+            // the scan at `block_number + 1` (or at block 0 for a genesis search); the genesis
+            // block holds no transactions, so starting strictly above 0 is equivalent.
+            let mut after = block_number;
 
-            let mut block_timestamps = std::collections::HashMap::new();
-            let mut futures = FuturesUnordered::new();
-
-            // trace a batch of blocks
-            for block in &blocks {
-                let matcher = matcher.clone();
-                block_timestamps.insert(block.hash(), block.header().timestamp());
-
-                let future = self.eth.trace_block_until(
-                    block.hash().into(),
-                    Some(block.clone()),
-                    None,
-                    TracingInspectorConfig::default_parity(),
-                    move |tx_info, mut ctx| {
-                        let mut traces = ctx
-                            .take_inspector()
-                            .into_parity_builder()
-                            .into_localized_transaction_traces(tx_info);
-                        traces.retain(|trace| matcher.matches(&trace.trace));
-                        Ok(Some(traces))
-                    },
-                );
-
-                futures.push(future);
-            }
-
-            while let Some(result) = futures.next().await {
-                let traces = result
-                    .map_err(Into::into)?
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|traces| traces.into_iter().flatten())
-                    .collect::<Vec<_>>();
-
-                let mut prev_tx_hash = FixedBytes::default();
-
-                // iterate over the traces and fetch the corresponding transactions and receipts
-                for trace in &traces {
-                    let tx_hash = trace.transaction_hash.ok_or(EthApiError::TransactionNotFound)?;
-
-                    // If intermediate traces of the same transaction are matched, skip them
-                    if tx_hash == prev_tx_hash {
-                        continue;
+            // iterate over the candidate blocks (blocks in which the account's state changed,
+            // oldest first) until `page_size` transactions are found or the index is exhausted
+            while txs_with_receipts.txs.len() < page_size {
+                let candidates = match self.eth.provider().account_changed_blocks_after(
+                    address,
+                    after,
+                    CANDIDATE_BATCH_SIZE,
+                ) {
+                    Ok(candidates) => candidates,
+                    Err(_) if after == block_number => {
+                        // The first index probe failed: the index is unusable (e.g. account
+                        // history is pruned), fall back to the exhaustive linear scan.
+                        linear_fallback = true;
+                        break;
                     }
-                    prev_tx_hash = tx_hash;
+                    Err(err) => return Err(internal_rpc_err(err.to_string())),
+                };
 
-                    let tx = EthApiServer::transaction_by_hash(&self.eth, tx_hash);
-                    let receipt = EthApiServer::transaction_receipt(&self.eth, tx_hash);
-                    let (tx, receipt) = futures::try_join!(tx, receipt)?;
-                    let tx = tx.ok_or(EthApiError::TransactionNotFound)?;
-                    let receipt = receipt.ok_or(EthApiError::ReceiptNotFound)?;
+                // candidates are ascending: continue strictly above the largest one next round.
+                // Advance the cursor before filtering against the tip to guarantee progress.
+                let Some(&last_candidate) = candidates.last() else {
+                    // No more changes above the cursor: the search has reached the tip of the
+                    // chain meaning this is the first page of the transactions.
+                    txs_with_receipts.first_page = true;
+                    break;
+                };
+                after = last_candidate;
 
-                    let inner = OtsReceipt {
-                        status: receipt.status(),
-                        cumulative_gas_used: receipt.cumulative_gas_used(),
-                        logs: Some(vec![]),
-                        logs_bloom: Some(Bloom::default()),
-                        r#type: tx.ty(),
-                    };
-
-                    let receipt = TransactionReceipt {
-                        inner,
-                        transaction_hash: receipt.transaction_hash(),
-                        transaction_index: receipt.transaction_index(),
-                        block_hash: receipt.block_hash(),
-                        block_number: receipt.block_number(),
-                        gas_used: receipt.gas_used(),
-                        effective_gas_price: receipt.effective_gas_price(),
-                        blob_gas_used: receipt.blob_gas_used(),
-                        blob_gas_price: receipt.blob_gas_price(),
-                        from: receipt.from(),
-                        to: receipt.to(),
-                        contract_address: receipt.contract_address(),
-                    };
-
-                    let receipt = OtsTransactionReceipt {
-                        receipt,
-                        timestamp: trace
-                            .block_hash
-                            .and_then(|hash| block_timestamps.get(&hash).copied()),
-                    };
-
-                    txs_with_receipts.txs.push(tx);
-                    txs_with_receipts.receipts.push(receipt);
+                // Defensively ignore candidates beyond the tip observed above (the index
+                // snapshot may be slightly ahead of it). Since candidates are ascending, an
+                // empty result here means everything left is above the tip.
+                let candidates =
+                    candidates.into_iter().filter(|block| *block <= tip).collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    txs_with_receipts.first_page = true;
+                    break;
                 }
-            }
 
-            if end == tip {
-                // most current block is reached meaning this is the first page of the transactions
-                txs_with_receipts.first_page = true;
-                break;
+                // trace only the candidate blocks; false positives (state changes not caused by
+                // a matching transaction) are filtered out by the matcher
+                let blocks = self.recovered_blocks(&candidates)?;
+                self.collect_matching_transactions(blocks, &matcher, &mut txs_with_receipts)
+                    .await?;
             }
+        }
 
-            cur_block = end + 1;
+        if linear_fallback {
+            let cur_block = if block_number == 0 { 0 } else { block_number + 1 };
+            self.search_transactions_after_linear(
+                &matcher,
+                &mut txs_with_receipts,
+                cur_block,
+                tip,
+                page_size,
+            )
+            .await?;
         }
 
         // Zip and sort transactions and receipts together by block number

@@ -60,9 +60,10 @@ use reth_prune_types::{
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BlockBodyIndicesProvider, BlockBodyReader, MetadataProvider, MetadataWriter,
-    NodePrimitivesProvider, StateProvider, StateReader, StateWriteConfig, StorageChangeSetReader,
-    StoragePath, StorageSettingsCache, TryIntoHistoricalStateProvider, WriteStateInput,
+    AccountHistoryReader, BlockBodyIndicesProvider, BlockBodyReader, MetadataProvider,
+    MetadataWriter, NodePrimitivesProvider, StateProvider, StateReader, StateWriteConfig,
+    StorageChangeSetReader, StoragePath, StorageSettingsCache, TryIntoHistoricalStateProvider,
+    WriteStateInput,
 };
 use reth_storage_errors::provider::{ProviderResult, StaticFileWriterError};
 use reth_trie::{
@@ -1647,6 +1648,145 @@ impl<TX: DbTx, N: NodeTypes> ChangeSetReader for DatabaseProvider<TX, N> {
                 .map(|r| r.map_err(Into::into))
                 .collect()
         }
+    }
+}
+
+impl<TX: DbTx + Sync + 'static, N: NodeTypes> AccountHistoryReader for DatabaseProvider<TX, N> {
+    fn account_changed_blocks_before(
+        &self,
+        address: Address,
+        before: BlockNumber,
+        limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        self.ensure_account_history_complete()?;
+
+        if before == 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        if self.cached_storage_settings().storage_v2 {
+            // In v2 storage the account-history index lives in RocksDB.
+            return self.with_rocksdb_snapshot(|rocksdb| {
+                rocksdb
+                    .ok_or(ProviderError::UnsupportedProvider)?
+                    .account_changed_blocks_before(address, before, limit)
+            });
+        }
+
+        let mut cursor = self.tx.cursor_read::<tables::AccountsHistory>()?;
+        let mut out = Vec::with_capacity(limit);
+
+        // Seek the first shard that may contain `before` (i.e. highest block in shard >=
+        // `before`). The last shard for an address is keyed with the `u64::MAX` sentinel, so if
+        // the address has any history at all this lands inside the address's shard range.
+        let Some((key, mut chunk)) =
+            cursor.seek(ShardedKey::new(address, before))?.filter(|(k, _)| k.key == address)
+        else {
+            return Ok(Vec::new());
+        };
+        debug_assert_eq!(key.key, address);
+
+        // Number of blocks in the current shard strictly below `before`. `rank(x)` returns the
+        // count of entries <= x; entries are unique block numbers, ascending within a shard.
+        let mut idx = chunk.rank(before - 1);
+        loop {
+            // Drain the current shard from the back (descending order).
+            while idx > 0 && out.len() < limit {
+                idx -= 1;
+                let block = chunk.select(idx).expect("index is within the shard's length; qed");
+                out.push(block);
+            }
+
+            if out.len() >= limit {
+                break;
+            }
+
+            // Move to the previous (older) shard of the same address. All of its blocks are
+            // below `before` because shard keys are the highest block number in the shard.
+            match cursor.prev()? {
+                Some((k, prev_chunk)) if k.key == address => {
+                    chunk = prev_chunk;
+                    idx = chunk.len();
+                }
+                _ => break,
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn account_changed_blocks_after(
+        &self,
+        address: Address,
+        after: BlockNumber,
+        limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        self.ensure_account_history_complete()?;
+
+        if limit == 0 || after == u64::MAX {
+            return Ok(Vec::new());
+        }
+
+        if self.cached_storage_settings().storage_v2 {
+            // In v2 storage the account-history index lives in RocksDB. RocksDB may contain
+            // history entries ahead of what is visible through this provider's MDBX snapshot,
+            // so cap results at the currently visible tip.
+            let visible_tip = self.best_block_number()?;
+            return self.with_rocksdb_snapshot(|rocksdb| {
+                rocksdb.ok_or(ProviderError::UnsupportedProvider)?.account_changed_blocks_after(
+                    address,
+                    after,
+                    limit,
+                    visible_tip,
+                )
+            });
+        }
+
+        let mut cursor = self.tx.cursor_read::<tables::AccountsHistory>()?;
+        let mut out = Vec::with_capacity(limit);
+
+        // Seek the first shard that may contain blocks > `after`.
+        let mut entry = cursor.seek(ShardedKey::new(address, after + 1))?;
+        while let Some((key, chunk)) = entry {
+            if key.key != address {
+                break;
+            }
+
+            // Skip entries <= `after`; `rank` returns the count of entries <= `after`, which is
+            // exactly the index of the first entry strictly above it.
+            let mut idx = chunk.rank(after);
+            let len = chunk.len();
+            while idx < len && out.len() < limit {
+                let block = chunk.select(idx).expect("index is within the shard's length; qed");
+                out.push(block);
+                idx += 1;
+            }
+
+            if out.len() >= limit {
+                break;
+            }
+
+            entry = cursor.next()?;
+        }
+
+        Ok(out)
+    }
+}
+
+impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
+    /// Returns an error if the account-history index is incomplete because account history has
+    /// been pruned.
+    ///
+    /// The [`AccountHistoryReader`] index walk would silently miss changes below the prune
+    /// checkpoint, so callers (e.g. the Otterscan transaction search) rely on this error to fall
+    /// back to an exhaustive scan.
+    fn ensure_account_history_complete(&self) -> ProviderResult<()> {
+        if let Some(checkpoint) = self.get_prune_checkpoint(PruneSegment::AccountHistory)? &&
+            let Some(pruned_block) = checkpoint.block_number
+        {
+            return Err(ProviderError::StateAtBlockPruned(pruned_block));
+        }
+        Ok(())
     }
 }
 
@@ -3953,6 +4093,179 @@ mod tests {
     use revm_database::BundleState;
     use revm_state::AccountInfo;
     use std::{sync::mpsc, time::Duration};
+
+    /// Address used by the `account_changed_blocks_*` tests.
+    const HISTORY_ADDRESS: Address =
+        alloy_primitives::address!("0x00000000000000000000000000000000000000aa");
+    /// A neighboring (higher) address whose history must not leak into the results.
+    const HISTORY_HIGHER_ADDRESS: Address =
+        alloy_primitives::address!("0x00000000000000000000000000000000000000ff");
+
+    /// Sets up an `AccountsHistory` index where [`HISTORY_ADDRESS`] changed at blocks
+    /// `[1, 5, 10, 50, 100]` (first shard, keyed at 100) and `[200, 300, 1000]` (last shard,
+    /// keyed at `u64::MAX`), plus noise entries for [`HISTORY_HIGHER_ADDRESS`].
+    fn setup_account_history() -> crate::ProviderFactory<crate::test_utils::MockNodeTypesWithDB> {
+        let factory = create_test_provider_factory();
+        let tx = factory.provider_rw().unwrap().into_tx();
+
+        tx.put::<tables::AccountsHistory>(
+            ShardedKey { key: HISTORY_ADDRESS, highest_block_number: 100 },
+            BlockNumberList::new([1, 5, 10, 50, 100]).unwrap(),
+        )
+        .unwrap();
+        tx.put::<tables::AccountsHistory>(
+            ShardedKey { key: HISTORY_ADDRESS, highest_block_number: u64::MAX },
+            BlockNumberList::new([200, 300, 1000]).unwrap(),
+        )
+        .unwrap();
+        tx.put::<tables::AccountsHistory>(
+            ShardedKey { key: HISTORY_HIGHER_ADDRESS, highest_block_number: u64::MAX },
+            BlockNumberList::new([2, 7, 400]).unwrap(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        factory
+    }
+
+    #[test]
+    fn account_changed_blocks_before_across_shards() {
+        let factory = setup_account_history();
+        let provider = factory.provider().unwrap();
+
+        // mid-shard within the first shard: strictly below 50
+        assert_eq!(
+            provider.account_changed_blocks_before(HISTORY_ADDRESS, 50, 10).unwrap(),
+            vec![10, 5, 1]
+        );
+
+        // crossing the shard boundary: strictly below 300
+        assert_eq!(
+            provider.account_changed_blocks_before(HISTORY_ADDRESS, 300, 10).unwrap(),
+            vec![200, 100, 50, 10, 5, 1]
+        );
+
+        // exactly at the first shard's key: 100 itself is excluded
+        assert_eq!(
+            provider.account_changed_blocks_before(HISTORY_ADDRESS, 100, 10).unwrap(),
+            vec![50, 10, 5, 1]
+        );
+
+        // above everything: all blocks, descending
+        assert_eq!(
+            provider.account_changed_blocks_before(HISTORY_ADDRESS, u64::MAX, 10).unwrap(),
+            vec![1000, 300, 200, 100, 50, 10, 5, 1]
+        );
+    }
+
+    #[test]
+    fn account_changed_blocks_after_across_shards() {
+        let factory = setup_account_history();
+        let provider = factory.provider().unwrap();
+
+        // mid-shard within the first shard: strictly above 10
+        assert_eq!(
+            provider.account_changed_blocks_after(HISTORY_ADDRESS, 10, 10).unwrap(),
+            vec![50, 100, 200, 300, 1000]
+        );
+
+        // exactly at the first shard's key: 100 itself is excluded
+        assert_eq!(
+            provider.account_changed_blocks_after(HISTORY_ADDRESS, 100, 10).unwrap(),
+            vec![200, 300, 1000]
+        );
+
+        // from genesis: everything, ascending
+        assert_eq!(
+            provider.account_changed_blocks_after(HISTORY_ADDRESS, 0, 10).unwrap(),
+            vec![1, 5, 10, 50, 100, 200, 300, 1000]
+        );
+    }
+
+    #[test]
+    fn account_changed_blocks_limit_truncation() {
+        let factory = setup_account_history();
+        let provider = factory.provider().unwrap();
+
+        // before: the LAST `limit` blocks below the cursor, descending
+        assert_eq!(
+            provider.account_changed_blocks_before(HISTORY_ADDRESS, 1001, 4).unwrap(),
+            vec![1000, 300, 200, 100]
+        );
+
+        // after: the FIRST `limit` blocks above the cursor, ascending, across the shard boundary
+        assert_eq!(
+            provider.account_changed_blocks_after(HISTORY_ADDRESS, 5, 4).unwrap(),
+            vec![10, 50, 100, 200]
+        );
+
+        // zero limit
+        assert!(provider
+            .account_changed_blocks_before(HISTORY_ADDRESS, 1001, 0)
+            .unwrap()
+            .is_empty());
+        assert!(provider.account_changed_blocks_after(HISTORY_ADDRESS, 0, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn account_changed_blocks_missing_address() {
+        let factory = setup_account_history();
+        let provider = factory.provider().unwrap();
+
+        let missing = alloy_primitives::address!("0x0000000000000000000000000000000000000042");
+        assert!(provider.account_changed_blocks_before(missing, 1000, 10).unwrap().is_empty());
+        assert!(provider.account_changed_blocks_after(missing, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn account_changed_blocks_edges() {
+        let factory = setup_account_history();
+        let provider = factory.provider().unwrap();
+
+        // before = 0: nothing is strictly below block 0
+        assert!(provider.account_changed_blocks_before(HISTORY_ADDRESS, 0, 10).unwrap().is_empty());
+        // before = 1: block 1 itself is excluded
+        assert!(provider.account_changed_blocks_before(HISTORY_ADDRESS, 1, 10).unwrap().is_empty());
+
+        // after = last change (the tip as far as the index is concerned): nothing above
+        assert!(provider
+            .account_changed_blocks_after(HISTORY_ADDRESS, 1000, 10)
+            .unwrap()
+            .is_empty());
+        assert!(provider
+            .account_changed_blocks_after(HISTORY_ADDRESS, u64::MAX, 10)
+            .unwrap()
+            .is_empty());
+
+        // the higher address' noise entries are never returned for it either way
+        assert_eq!(
+            provider.account_changed_blocks_after(HISTORY_HIGHER_ADDRESS, 0, 10).unwrap(),
+            vec![2, 7, 400]
+        );
+    }
+
+    #[test]
+    fn account_changed_blocks_errors_when_history_pruned() {
+        let factory = setup_account_history();
+
+        // Record an account-history prune checkpoint: the index is now incomplete and the
+        // reader must refuse to use it (callers fall back to an exhaustive scan).
+        let tx = factory.provider_rw().unwrap().into_tx();
+        tx.put::<tables::PruneCheckpoints>(
+            PruneSegment::AccountHistory,
+            PruneCheckpoint {
+                block_number: Some(100),
+                tx_number: None,
+                prune_mode: PruneMode::Distance(1000),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        assert!(provider.account_changed_blocks_before(HISTORY_ADDRESS, 1000, 10).is_err());
+        assert!(provider.account_changed_blocks_after(HISTORY_ADDRESS, 0, 10).is_err());
+    }
 
     #[test]
     fn test_receipts_by_block_range_empty_range() {
