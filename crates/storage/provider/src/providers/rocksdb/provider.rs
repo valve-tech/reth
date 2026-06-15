@@ -1721,6 +1721,143 @@ impl<'db> RocksReadSnapshot<'db> {
             lowest_available_block_number,
         ))
     }
+
+    /// Returns up to `limit` block numbers strictly below `before`, descending, at which
+    /// `address` changed according to the account-history index.
+    ///
+    /// See `AccountHistoryReader::account_changed_blocks_before`.
+    pub fn account_changed_blocks_before(
+        &self,
+        address: Address,
+        before: BlockNumber,
+        limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        if before == 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let cf = self.cf_handle::<tables::AccountsHistory>()?;
+        let mut iter = self.inner.raw_iterator_cf(cf);
+
+        // Seek the first shard that may contain `before`. The last shard for an address is keyed
+        // with the `u64::MAX` sentinel, so if the address has any history this lands inside the
+        // address's shard range.
+        iter.seek(ShardedKey::new(address, before).encode());
+        check_iter_status(&iter)?;
+
+        let mut out = Vec::with_capacity(limit);
+
+        let Some(mut chunk) = read_account_shard(&iter, address)? else { return Ok(Vec::new()) };
+
+        // Number of blocks in the current shard strictly below `before`.
+        let mut idx = chunk.rank(before - 1);
+        loop {
+            // Drain the current shard from the back (descending order).
+            while idx > 0 && out.len() < limit {
+                idx -= 1;
+                let block = chunk.select(idx).expect("index is within the shard's length; qed");
+                out.push(block);
+            }
+
+            if out.len() >= limit {
+                break;
+            }
+
+            // Move to the previous (older) shard of the same address. All of its blocks are
+            // below `before` because shard keys are the highest block number in the shard.
+            iter.prev();
+            check_iter_status(&iter)?;
+            match read_account_shard(&iter, address)? {
+                Some(prev_chunk) => {
+                    chunk = prev_chunk;
+                    idx = chunk.len();
+                }
+                None => break,
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Returns up to `limit` block numbers strictly above `after` (and at most `visible_tip`),
+    /// ascending, at which `address` changed according to the account-history index.
+    ///
+    /// `visible_tip` is the highest block considered visible from the companion MDBX snapshot.
+    /// History entries above it are ignored even if they already exist in `RocksDB`.
+    ///
+    /// See `AccountHistoryReader::account_changed_blocks_after`.
+    pub fn account_changed_blocks_after(
+        &self,
+        address: Address,
+        after: BlockNumber,
+        limit: usize,
+        visible_tip: BlockNumber,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        if limit == 0 || after == u64::MAX {
+            return Ok(Vec::new());
+        }
+
+        let cf = self.cf_handle::<tables::AccountsHistory>()?;
+        let mut iter = self.inner.raw_iterator_cf(cf);
+
+        // Seek the first shard that may contain blocks > `after`.
+        iter.seek(ShardedKey::new(address, after + 1).encode());
+        check_iter_status(&iter)?;
+
+        let mut out = Vec::with_capacity(limit);
+
+        while let Some(chunk) = read_account_shard(&iter, address)? {
+            // Skip entries <= `after`; `rank` returns the count of entries <= `after`, which is
+            // exactly the index of the first entry strictly above it.
+            let mut idx = chunk.rank(after);
+            let len = chunk.len();
+            while idx < len && out.len() < limit {
+                let block = chunk.select(idx).expect("index is within the shard's length; qed");
+                if block > visible_tip {
+                    // Anything above the visible tip is not yet part of the canonical view.
+                    return Ok(out);
+                }
+                out.push(block);
+                idx += 1;
+            }
+
+            if out.len() >= limit {
+                break;
+            }
+
+            iter.next();
+            check_iter_status(&iter)?;
+        }
+
+        Ok(out)
+    }
+}
+
+/// Returns an error if the iterator is in an error state.
+fn check_iter_status(iter: &RocksDBRawIterEnum<'_>) -> ProviderResult<()> {
+    iter.status().map_err(|e| {
+        ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+            message: e.to_string().into(),
+            code: -1,
+        }))
+    })
+}
+
+/// Decodes the account-history shard at the iterator's current position, if the iterator is
+/// valid and the shard belongs to `address`.
+fn read_account_shard(
+    iter: &RocksDBRawIterEnum<'_>,
+    address: Address,
+) -> ProviderResult<Option<BlockNumberList>> {
+    if !iter.valid() {
+        return Ok(None);
+    }
+    let Some(key_bytes) = iter.key() else { return Ok(None) };
+    if <ShardedKey<Address> as Decode>::decode(key_bytes)?.key != address {
+        return Ok(None);
+    }
+    let Some(value_bytes) = iter.value() else { return Ok(None) };
+    Ok(Some(BlockNumberList::decompress(value_bytes)?))
 }
 
 /// Outcome of pruning a history shard in `RocksDB`.

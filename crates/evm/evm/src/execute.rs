@@ -41,6 +41,18 @@ pub trait Executor<DB: Database>: Sized {
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>;
 
+    /// Executes a single block like [`Self::execute_one`], optionally with tracing.
+    ///
+    /// The default implementation delegates to [`Self::execute_one`]. Implementors can override
+    /// this to inject an inspector without changing call sites.
+    fn execute_and_trace_one(
+        &mut self,
+        block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
+    ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
+    {
+        self.execute_one(block)
+    }
+
     /// Executes the EVM with the given input and accepts a state hook closure that is invoked with
     /// the EVM state after execution.
     fn execute_one_with_state_hook<F>(

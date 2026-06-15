@@ -61,8 +61,8 @@ pub const DEFAULT_MAX_STORAGE_VALUES_SLOTS: usize = 1024;
 /// The default eth historical proof window.
 pub const DEFAULT_ETH_PROOF_WINDOW: u64 = 0;
 
-/// The default eth tx fee cap is 1 ETH
-pub const DEFAULT_TX_FEE_CAP_WEI: u128 = 1_000_000_000_000_000_000u128;
+/// The default eth tx fee cap is 1,000,000 ETH/PLS (raised from 1 for PulseChain parity)
+pub const DEFAULT_TX_FEE_CAP_WEI: u128 = 1_000_000_000_000_000_000_000_000u128;
 
 /// Maximum eth historical proof window. Equivalent to roughly 6 months of data on a 12
 /// second block time, and a month on a 2 second block time.

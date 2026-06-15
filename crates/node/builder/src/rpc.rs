@@ -1454,6 +1454,10 @@ where
             <Node::Types as NodeTypes>::Payload,
             Block = BlockTy<Node::Types>,
         > + Clone,
+    // Bug 6 fix (2026-05-22): propagated for the firehose live-path. `SignedTx` on Ethereum
+    // and PulseChain primitives satisfies this via blanket impls in `reth_firehose::mapper`.
+    <<Node::Types as reth_node_api::NodeTypes>::Primitives as reth_node_api::NodePrimitives>::SignedTx:
+        reth_firehose::mapper::SignatureFields,
 {
     type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;
 

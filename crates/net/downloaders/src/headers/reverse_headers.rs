@@ -31,7 +31,7 @@ use std::{
     task::{ready, Context, Poll},
 };
 use thiserror::Error;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 /// A heuristic that is used to determine the number of requests that should be prepared for a peer.
 /// This should ensure that there are always requests lined up for peers to handle while the
@@ -539,7 +539,7 @@ where
     fn penalize_peer(&self, peer_id: Option<PeerId>, error: &DownloadError) {
         // Penalize the peer for bad response
         if let Some(peer_id) = peer_id {
-            trace!(target: "downloaders::headers", ?peer_id, %error, "Penalizing peer");
+            warn!(target: "downloaders::headers", ?peer_id, %error, "PENALIZE-DEBUG: penalizing peer for bad headers response");
             self.client.report_bad_message(peer_id);
         }
     }
@@ -550,6 +550,7 @@ where
     fn on_headers_error(&self, err: Box<HeadersResponseError>) {
         let HeadersResponseError { request, peer_id, error } = *err;
 
+        warn!(target: "downloaders::headers", ?request, ?peer_id, %error, "HEADERS-ERROR-DEBUG: header response error");
         self.penalize_peer(peer_id, &error);
 
         // Update error metric
