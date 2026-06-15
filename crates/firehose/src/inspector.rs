@@ -193,12 +193,12 @@ impl<'a> FirehoseInspector<'a> {
         // the zero-pad branch below because `step` fires before memory resize.
         //
         // Two reasons it's safe to bail with None here:
-        //   1. Real EVM keccak is bounded by gas — practical max is ~512 KiB at a 30M-gas
-        //      block limit (quadratic memory cost). 32 MiB is well past anything legitimate.
-        //   2. Per the comment block above the call site (line 1061+), preimage is only
-        //      *emitted* from `step_end` when the opcode actually executes. A tx hashing
-        //      32 MiB+ would OOG on memory expansion anyway, so the emission path is dead.
-        //      Returning None just skips the doomed allocation.
+        //   1. Real EVM keccak is bounded by gas — practical max is ~512 KiB at a 30M-gas block
+        //      limit (quadratic memory cost). 32 MiB is well past anything legitimate.
+        //   2. Per the comment block above the call site (line 1061+), preimage is only *emitted*
+        //      from `step_end` when the opcode actually executes. A tx hashing 32 MiB+ would OOG on
+        //      memory expansion anyway, so the emission path is dead. Returning None just skips the
+        //      doomed allocation.
         const MAX_KECCAK_PREIMAGE_LEN: usize = 32 * 1024 * 1024;
         if len > MAX_KECCAK_PREIMAGE_LEN {
             return None;
@@ -657,14 +657,14 @@ impl<'a> FirehoseInspector<'a> {
             // Initialize tracker for this authority from original_info on first encounter.
             if !auth_tracker.contains_key(&authority) {
                 // First, read nonce and code_hash from evm_state (immutable borrow on journal).
-                let (mut nonce, code_hash, code_loaded) = if let Some(acc) =
-                    context.journal().evm_state().get(&authority)
-                {
-                    let code = acc.original_info().code.as_ref().map(|b| b.original_bytes().to_vec());
-                    (acc.original_info().nonce, acc.original_info().code_hash, code)
-                } else {
-                    (0, KECCAK_EMPTY, Some(Vec::new()))
-                };
+                let (mut nonce, code_hash, code_loaded) =
+                    if let Some(acc) = context.journal().evm_state().get(&authority) {
+                        let code =
+                            acc.original_info().code.as_ref().map(|b| b.original_bytes().to_vec());
+                        (acc.original_info().nonce, acc.original_info().code_hash, code)
+                    } else {
+                        (0, KECCAK_EMPTY, Some(Vec::new()))
+                    };
 
                 // Sender's nonce was already incremented by deduct_caller.
                 if authority == tx_sender {
@@ -1179,7 +1179,9 @@ where
         // in-block delegation set by any prior transaction.
         {
             if let Some(account) = context.journal().evm_state().get(&to) {
-                if let Some(eip7702) = account.info.code.as_ref().and_then(|code| code.eip7702_address()) {
+                if let Some(eip7702) =
+                    account.info.code.as_ref().and_then(|code| code.eip7702_address())
+                {
                     self.tracer.set_current_call_address_delegates_to(eip7702);
                 }
             }

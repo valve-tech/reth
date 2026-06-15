@@ -604,7 +604,9 @@ where
         // payloads always carry block 1+, so unconditional guard creation is safe (no
         // is_genesis() check needed, unlike the 1.x reference impl).
         //
-        // Ported from `streamingfast/release/reth-1.x:crates/engine/tree/src/tree/payload_validator.rs:476-510`.
+        // Ported from
+        // `streamingfast/release/reth-1.x:crates/engine/tree/src/tree/payload_validator.rs:
+        // 476-510`.
         let (mut fh_tracer, input): (Option<reth_firehose::FirehoseBlockTracer>, _) =
             if reth_firehose::is_tracer_initialized() {
                 let sealed = self.convert_to_block(input)?;
@@ -1314,7 +1316,8 @@ where
     /// against upstream minimal and localized: upstream's `execute_block` stays pristine, and the
     /// Firehose-specific wiring lives here.
     ///
-    /// Ported from `streamingfast/release/reth-1.x:crates/engine/tree/src/tree/payload_validator.rs:837-939`
+    /// Ported from
+    /// `streamingfast/release/reth-1.x:crates/engine/tree/src/tree/payload_validator.rs:837-939`
     /// as part of Bug 6 fix (2026-05-22).
     #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
     #[expect(clippy::type_complexity)]
@@ -1380,8 +1383,7 @@ where
             // Firehose-specific: install the inspector on the EVM so per-tx events route
             // through the tracer.
             let inspector = tracer.inspector();
-            let evm =
-                self.evm_config.evm_with_env_and_inspector(&mut db, env.evm_env, inspector);
+            let evm = self.evm_config.evm_with_env_and_inspector(&mut db, env.evm_env, inspector);
             let ctx = self
                 .execution_ctx_for(input)
                 .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;

@@ -419,11 +419,7 @@ where
         let prereward_state = if self.withdrawals.is_none() {
             let coinbase = self.inner.evm().block().beneficiary();
             let (db, _, _) = self.inner.evm_mut().components_mut();
-            Some(BlockRewardPreState::capture(
-                db,
-                coinbase,
-                &self.ommer_beneficiaries,
-            ))
+            Some(BlockRewardPreState::capture(db, coinbase, &self.ommer_beneficiaries))
         } else {
             None
         };
@@ -440,8 +436,7 @@ where
         let pp_pre_state = {
             let chain_id = self.inner.evm().chain_id();
             crate::primordial_pulse::fork_block_for(chain_id).and_then(|fork_block| {
-                let block_number =
-                    self.inner.evm().block().number().saturating_to::<u64>();
+                let block_number = self.inner.evm().block().number().saturating_to::<u64>();
                 if block_number != fork_block {
                     return None;
                 }
@@ -794,8 +789,13 @@ where
         .ommers()
         .map(|o| o.iter().map(|h| h.beneficiary()).collect())
         .unwrap_or_default();
-    let wrapped =
-        FirehoseWrappedExecutor::with_hooks(inner, withdrawals, ommer_beneficiaries, adjust, extras);
+    let wrapped = FirehoseWrappedExecutor::with_hooks(
+        inner,
+        withdrawals,
+        ommer_beneficiaries,
+        adjust,
+        extras,
+    );
 
     wrapped.execute_block(block.transactions_recovered())
 }
@@ -868,8 +868,7 @@ impl BlockRewardPreState {
             db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or_default()
         };
         let coinbase_pre = read(db, coinbase);
-        let ommer_pre =
-            ommer_beneficiaries.iter().map(|&addr| (addr, read(db, addr))).collect();
+        let ommer_pre = ommer_beneficiaries.iter().map(|&addr| (addr, read(db, addr))).collect();
         Self { coinbase, coinbase_pre, ommer_pre }
     }
 }
@@ -883,8 +882,8 @@ impl BlockRewardPreState {
 ///
 /// Emission shape mirrors geth-firehose for the common case:
 ///  - coinbase: one `RewardMineBlock` event with `pre = coinbase_pre`, `post = coinbase_post`
-///  - each ommer beneficiary: one `RewardMineUncle` event with the per-uncle pre/post, in
-///    canonical block-body order
+///  - each ommer beneficiary: one `RewardMineUncle` event with the per-uncle pre/post, in canonical
+///    block-body order
 ///
 /// **Known edge case**: if `coinbase` also appears as an ommer beneficiary (self-mined uncle)
 /// the two events would share identical `pre`/`post` values rather than the sequential deltas
@@ -892,8 +891,9 @@ impl BlockRewardPreState {
 /// each address rather than reconstructing per-reward amounts. The trace's net balance is still
 /// consistent (post-finish() balance), but a consumer that sums the deltas per reason would
 /// see double-counting. No Ethereum mainnet or PulseChain block currently hits this — block 1
-/// (the bug-3 trigger) has no ommers — and it would require splitting `post_block_balance_increments`
-/// into per-reason chunks to fix. Revisit if a downstream consumer surfaces the divergence.
+/// (the bug-3 trigger) has no ommers — and it would require splitting
+/// `post_block_balance_increments` into per-reason chunks to fix. Revisit if a downstream consumer
+/// surfaces the divergence.
 fn emit_block_reward_balance_changes<E>(evm: &mut E, pre: &BlockRewardPreState)
 where
     E: reth_evm::Evm,
@@ -903,10 +903,9 @@ where
     use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
 
     let (db, inspector, _) = evm.components_mut();
-    let read =
-        |db: &mut <E as reth_evm::Evm>::DB, addr: Address| -> U256 {
-            db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or_default()
-        };
+    let read = |db: &mut <E as reth_evm::Evm>::DB, addr: Address| -> U256 {
+        db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or_default()
+    };
 
     // Tracer::on_balance_change drops no-op (pre == post) emissions internally, so we don't
     // pre-filter here — saves a branch per address and keeps the call shape parallel to
