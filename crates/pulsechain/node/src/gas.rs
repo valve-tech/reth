@@ -57,14 +57,9 @@ where
         let state_override: Option<StateOverride> = seq.optional_next()?;
         let block_overrides: Option<Box<BlockOverrides>> = seq.optional_next()?;
 
-        let estimate: RpcResult<U256> = EthApiServer::estimate_gas(
-            &**ctx,
-            request,
-            block_id,
-            state_override,
-            block_overrides,
-        )
-        .await;
+        let estimate: RpcResult<U256> =
+            EthApiServer::estimate_gas(&**ctx, request, block_id, state_override, block_overrides)
+                .await;
 
         estimate.map(|gas| {
             gas.saturating_mul(U256::from(GAS_MARGIN_NUMERATOR)) /

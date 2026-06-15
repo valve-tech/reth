@@ -13,12 +13,12 @@
 //!
 //! This module bridges the gap. The wrapper layer
 //! ([`FirehoseWrappedExecutor::finish`](crate::executor::FirehoseWrappedExecutor)):
-//!   1. Captures pre-state for every affected address BEFORE `inner.finish()`
-//!      runs (via [`PrimordialPulsePreState::capture`]).
+//!   1. Captures pre-state for every affected address BEFORE `inner.finish()` runs (via
+//!      [`PrimordialPulsePreState::capture`]).
 //!   2. Calls `inner.finish()`, which applies the transition silently.
-//!   3. Reads post-state from the same DB, diffs against pre, and emits
-//!      `BalanceChange` / `NonceChange` / `CodeChange` / `StorageChange`
-//!      events via the inspector's tracer (via [`emit_primordial_pulse_changes`]).
+//!   3. Reads post-state from the same DB, diffs against pre, and emits `BalanceChange` /
+//!      `NonceChange` / `CodeChange` / `StorageChange` events via the inspector's tracer (via
+//!      [`emit_primordial_pulse_changes`]).
 //!
 //! The spec data — sacrifice-credit binaries, deposit-contract bytecode,
 //! initial-storage table, treasury constants — lives in the lowest-level
@@ -137,19 +137,11 @@ impl PrimordialPulsePreState {
         let eth_deposit_pre = read_account(db, spec::ETH_DEPOSIT_CONTRACT, &[]);
         // For the PulseChain deposit contract, capture pre-values of the 31 slots
         // that will be set so we can emit accurate (old → new) StorageChange events.
-        let pulse_slots: Vec<B256> = spec::DEPOSIT_CONTRACT_INITIAL_STORAGE
-            .iter()
-            .map(|(slot, _)| *slot)
-            .collect();
+        let pulse_slots: Vec<B256> =
+            spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.iter().map(|(slot, _)| *slot).collect();
         let pulse_deposit_pre = read_account(db, spec::PULSE_DEPOSIT_CONTRACT, &pulse_slots);
 
-        Some(Self {
-            chain_id,
-            block_number,
-            balance_credits,
-            eth_deposit_pre,
-            pulse_deposit_pre,
-        })
+        Some(Self { chain_id, block_number, balance_credits, eth_deposit_pre, pulse_deposit_pre })
     }
 }
 
@@ -163,19 +155,18 @@ impl PrimordialPulsePreState {
 /// The firehose tracer routes per-field events differently:
 ///   - `on_balance_change` outside a transaction → `block.balance_changes`. ✓
 ///   - `on_code_change` outside a transaction → `block.code_changes`. ✓
-///   - `on_nonce_change` and `on_storage_change` REQUIRE `ensure_in_block_and_in_trx`
-///     AND a peekable `active_call` on the call stack. Otherwise they either panic
-///     (no trx) or land in `deferred_call_state` which is DISCARDED when the
-///     system-call frame closes without ever populating a `Call`.
+///   - `on_nonce_change` and `on_storage_change` REQUIRE `ensure_in_block_and_in_trx` AND a
+///     peekable `active_call` on the call stack. Otherwise they either panic (no trx) or land in
+///     `deferred_call_state` which is DISCARDED when the system-call frame closes without ever
+///     populating a `Call`.
 ///
 /// So this function emits in two passes:
-///   1. **Block-level pass** (no system-call wrap): all balance + code changes go
-///      straight to `block.balance_changes` / `block.code_changes`.
-///   2. **Synthetic system-call pass**: `on_system_call_start` → `on_call_enter`
-///      creates a [`Call`] frame; nonce + storage changes are emitted into that
-///      frame; `on_call_exit` + `on_system_call_end` move the frame into
-///      `block.system_calls`. This is the only routing path that gets those two
-///      field types into the wire output.
+///   1. **Block-level pass** (no system-call wrap): all balance + code changes go straight to
+///      `block.balance_changes` / `block.code_changes`.
+///   2. **Synthetic system-call pass**: `on_system_call_start` → `on_call_enter` creates a [`Call`]
+///      frame; nonce + storage changes are emitted into that frame; `on_call_exit` +
+///      `on_system_call_end` move the frame into `block.system_calls`. This is the only routing
+///      path that gets those two field types into the wire output.
 ///
 /// An earlier draft of this function wrapped EVERYTHING in a system-call window
 /// but never created a `Call` frame. That sent every event into
@@ -278,14 +269,9 @@ where
         tracer.on_nonce_change(pulse_addr, pre.pulse_deposit_pre.nonce, pulse_post.nonce);
     }
     for (i, (slot, _expected)) in spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.iter().enumerate() {
-        let pre_value = pre
-            .pulse_deposit_pre
-            .storage_slots_pre
-            .get(i)
-            .map(|(_, v)| *v)
-            .unwrap_or(B256::ZERO);
-        let post_value =
-            pulse_post.storage_slots_pre.get(i).map(|(_, v)| *v).unwrap_or(B256::ZERO);
+        let pre_value =
+            pre.pulse_deposit_pre.storage_slots_pre.get(i).map(|(_, v)| *v).unwrap_or(B256::ZERO);
+        let post_value = pulse_post.storage_slots_pre.get(i).map(|(_, v)| *v).unwrap_or(B256::ZERO);
         tracer.on_storage_change(pulse_addr, *slot, pre_value, post_value);
     }
 
@@ -419,8 +405,7 @@ mod tests {
 
         // Testnet adds a treasury entry ahead of the credits; mainnet does not.
         // (capture() pushes treasury first for chain 943 only.)
-        let testnet_balance_credit_entries =
-            decode_chain_credits(943).len() + /* treasury */ 1;
+        let testnet_balance_credit_entries = decode_chain_credits(943).len() + /* treasury */ 1;
         assert_eq!(
             testnet_balance_credit_entries + /* reward */ 1 + /* suicide_withdraw */ 1,
             286_833,

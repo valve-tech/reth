@@ -601,25 +601,24 @@ where
     .err()
     .unwrap();
 
-
-        OtterscanClient::<Transaction, Header>::search_transactions_before(
-            client,
-            address,
-            LenientBlockNumberOrTag::new(BlockNumberOrTag::Number(block_number)),
-            page_size,
-        )
-        .await
-        .err()
-        .unwrap();
-        OtterscanClient::<Transaction, Header>::search_transactions_after(
-            client,
-            address,
-            LenientBlockNumberOrTag::new(BlockNumberOrTag::Number(block_number)),
-            page_size,
-        )
-        .await
-        .err()
-        .unwrap();
+    OtterscanClient::<Transaction, Header>::search_transactions_before(
+        client,
+        address,
+        LenientBlockNumberOrTag::new(BlockNumberOrTag::Number(block_number)),
+        page_size,
+    )
+    .await
+    .err()
+    .unwrap();
+    OtterscanClient::<Transaction, Header>::search_transactions_after(
+        client,
+        address,
+        LenientBlockNumberOrTag::new(BlockNumberOrTag::Number(block_number)),
+        page_size,
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(OtterscanClient::<Transaction, Header>::get_transaction_by_sender_and_nonce(
         client, sender, nonce
     )

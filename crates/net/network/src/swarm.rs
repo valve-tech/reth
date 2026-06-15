@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tracing::{trace, warn};
+use tracing::trace;
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// Contains the connectivity related state of the network.

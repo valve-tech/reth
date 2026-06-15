@@ -207,8 +207,9 @@ where
         tx: impl ExecutableTx<Self>,
     ) -> std::result::Result<Self::Result, BlockExecutionError> {
         // ExecutableTx<PulsechainBlockExecutor> ≡ ExecutableTxParts<E::Tx, R::Transaction>
-        //                                       ≡ ExecutableTx<EthBlockExecutor<'a, E, &'a Spec, &'a R>>
-        // because both executors declare the same Evm and Transaction associated types.
+        //                                       ≡ ExecutableTx<EthBlockExecutor<'a, E, &'a Spec,
+        // &'a R>> because both executors declare the same Evm and Transaction associated
+        // types.
         self.inner.execute_transaction_without_commit(tx)
     }
 

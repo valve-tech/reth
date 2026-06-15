@@ -8,7 +8,9 @@ use reth_ethereum_forks::EthereumHardforks;
 use reth_evm::execute::BlockExecutor;
 use reth_exex::{ExExContext, ExExEvent};
 use reth_primitives_traits::SealedBlock;
-use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, StateProviderBox, StateProviderFactory};
+use reth_provider::{
+    BlockIdReader, BlockNumReader, BlockReader, StateProviderBox, StateProviderFactory,
+};
 use reth_revm::{
     database::StateProviderDatabase,
     revm::{context::Block as _, Database as _},
@@ -253,9 +255,10 @@ where
     // received the genesis event in an earlier run), this is a no-op. Reading the head via
     // `last_block_number` rather than checking for the absence of a one-block file in the
     // downstream MinIO bucket keeps the ExEx ignorant of downstream storage state.
-    let head = ctx.provider().last_block_number().wrap_err(
-        "failed to read last_block_number — provider not initialized?",
-    )?;
+    let head = ctx
+        .provider()
+        .last_block_number()
+        .wrap_err("failed to read last_block_number — provider not initialized?")?;
     if head == 0 {
         // Pull the genesis block from the provider (reth initializes it from the chain spec
         // at first boot) and seal it into a SealedBlock. `SealedBlock::seal_slow` computes the
