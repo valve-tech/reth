@@ -49,6 +49,8 @@ members = [
     "crates/exex/exex/",
     "crates/exex/test-utils/",
     "crates/exex/types/",
+    "crates/firehose",
+    "crates/firehose-tests",
     "crates/metrics/",
     "crates/net/banlist/",
     "crates/net/discv4/",
@@ -151,6 +153,10 @@ members = [
     "testing/testing-utils",
     "testing/runner",
     "crates/tracing-otlp",
+    "crates/pulsechain/hardforks",
+    "crates/pulsechain/node",
+    "crates/net/msgboard-types",
+    "crates/net/msgboard",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]
@@ -314,6 +320,12 @@ codegen-units = 1
 incremental = false
 
 [workspace.dependencies]
+# pulsechain
+reth-pulsechain-forks = { path = "crates/pulsechain/hardforks", default-features = false }
+reth-pulsechain-node = { path = "crates/pulsechain/node" }
+reth-msgboard-types = { path = "crates/net/msgboard-types", default-features = false }
+reth-msgboard = { path = "crates/net/msgboard" }
+
 # reth
 reth = { path = "bin/reth" }
 reth-storage-rpc-provider = { path = "crates/storage/rpc-provider" }
@@ -482,7 +494,10 @@ either = { version = "1.16.0", default-features = false }
 arrayvec = { version = "0.7.6", default-features = false }
 aquamarine = "0.6"
 auto_impl = "1"
-backon = { version = "1.2", default-features = false, features = ["std-blocking-sleep", "tokio-sleep"] }
+backon = { version = "1.2", default-features = false, features = [
+    "std-blocking-sleep",
+    "tokio-sleep",
+] }
 bincode = "1.3"
 bitflags = "2.4"
 boyer-moore-magiclen = "0.2.16"
@@ -507,9 +522,13 @@ linked_hash_set = "0.1"
 libc = "0.2"
 lz4 = "1.28.1"
 modular-bitfield = "0.13.1"
-notify = { version = "8.0.0", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "8.0.0", default-features = false, features = [
+    "macos_fsevent",
+] }
 nybbles = { version = "0.4.8", default-features = false }
-once_cell = { version = "1.19", default-features = false, features = ["critical-section"] }
+once_cell = { version = "1.19", default-features = false, features = [
+    "critical-section",
+] }
 parking_lot = "0.12"
 quanta = "0.12"
 paste = "1.0"
@@ -593,7 +612,10 @@ proptest-arbitrary-interop = "0.1.0"
 # crypto
 enr = { version = "0.13", default-features = false }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
-secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "recovery"] }
+secp256k1 = { version = "0.30", default-features = false, features = [
+    "global-context",
+    "recovery",
+] }
 # rand 8 for secp256k1
 rand_08 = { package = "rand", version = "0.8" }
 
@@ -693,3 +715,21 @@ vergen-git2 = "10.0.1"
 
 # networking
 ipnet = "2.11"
+
+## Firehose Additions
+firehose-tracer = "=5.0.0"
+reth-firehose = { path = "crates/firehose" }
+reth-firehose-tests = { path = "crates/firehose-tests" }
+
+[patch.crates-io]
+## Firehose additions
+# SF fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the Inspector.
+# See https://github.com/alloy-rs/evm/pull/323 for the upstream PR.
+alloy-evm = { git = "https://github.com/streamingfast/evm.git", branch = "sf/v0.34.0" }
+
+## Firehose additions
+# This is needed otherwise we get flooding of debug logs around a problem that seems to happen in Reth directly.
+# This is about wrong execution pool and could be related to ExEx in general (not just our version). We will
+# need to investigate to ensure we are not doing wrong thing that could hinder threading in production.
+[profile.dev.package.reth-chain-state]
+debug-assertions = false

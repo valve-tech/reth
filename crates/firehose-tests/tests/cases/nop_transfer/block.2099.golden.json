@@ -1,0 +1,152 @@
+{
+  "hash": "ipznHkwkGtMB22SRnMWZlBwdGBvUGsTduk+xWNMxh4k=",
+  "header": {
+    "baseFeePerGas": {
+      "bytes": "Bw=="
+    },
+    "blobGasUsed": "0",
+    "coinbase": "+X4YDAUOWrByIRrSwhPrWu5N8TQ=",
+    "difficulty": {
+      "bytes": "AA=="
+    },
+    "excessBlobGas": "0",
+    "gasLimit": "30000000",
+    "hash": "ipznHkwkGtMB22SRnMWZlBwdGBvUGsTduk+xWNMxh4k=",
+    "logsBloom": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    "mixHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "number": "2099",
+    "parentBeaconRoot": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "parentHash": "arc6pm2ZbENkuwXPeB9z8cbjsJ96P5m5lZhC6wERuWY=",
+    "receiptRoot": "VugfFxvMVab/g0XmksD4bltI4BuZbK3AAWIvteNjtCE=",
+    "stateRoot": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "timestamp": "2025-03-17T19:47:24Z",
+    "transactionsRoot": "kJut/dbjX2bGqOutj3UyDeTjMJO0LbmJfuiBepRMxCI=",
+    "uncleHash": "HcxN6N7HXXqrhbVntszUGtMSRRuUinQT8KFC/UDUk0c=",
+    "withdrawalsRoot": "VugfFxvMVab/g0XmksD4bltI4BuZbK3AAWIvteNjtCE="
+  },
+  "number": "2099",
+  "size": "705",
+  "systemCalls": [
+    {
+      "address": "AA899tcygH7xMZ+3uLuFItC+rAI=",
+      "beginOrdinal": "1",
+      "callType": "CALL",
+      "caller": "//////////////////////////4=",
+      "endOrdinal": "2",
+      "gasLimit": "30000000",
+      "index": 1,
+      "input": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    }
+  ],
+  "transactionTraces": [
+    {
+      "beginOrdinal": "3",
+      "calls": [
+        {
+          "address": "pxSsl/NBh5hiC0SG+T+ElpP5kmQ=",
+          "balanceChanges": [
+            {
+              "address": "pxSsl/NBh5hiC0SG+T+ElpP5kmQ=",
+              "newValue": {
+                "bytes": "NjXJkOZtkClM"
+              },
+              "oldValue": {
+                "bytes": "NjXJrcXeoAAA"
+              },
+              "ordinal": "4",
+              "reason": "REASON_GAS_BUY"
+            },
+            {
+              "address": "pxSsl/NBh5hiC0SG+T+ElpP5kmQ=",
+              "newValue": {
+                "bytes": "MMoCMrkKgClM"
+              },
+              "oldValue": {
+                "bytes": "NjXJkOZtkClM"
+              },
+              "ordinal": "7",
+              "reason": "REASON_TRANSFER"
+            },
+            {
+              "address": "pxSsl/NBh5hiC0SG+T+ElpP5kmQ=",
+              "newValue": {
+                "bytes": "NjXJkOZtkClM"
+              },
+              "oldValue": {
+                "bytes": "MMoCMrkKgClM"
+              },
+              "ordinal": "8",
+              "reason": "REASON_TRANSFER"
+            },
+            {
+              "address": "pxSsl/NBh5hiC0SG+T+ElpP5kmQ=",
+              "newValue": {
+                "bytes": "NjXJkR+0TknI"
+              },
+              "oldValue": {
+                "bytes": "NjXJkOZtkClM"
+              },
+              "ordinal": "10",
+              "reason": "REASON_GAS_REFUND"
+            },
+            {
+              "address": "+X4YDAUOWrByIRrSwhPrWu5N8TQ=",
+              "newValue": {
+                "bytes": "OnvN/eZbDZFW"
+              },
+              "oldValue": {
+                "bytes": "OnvN4UAwvhlW"
+              },
+              "ordinal": "11",
+              "reason": "REASON_REWARD_TRANSACTION_FEE"
+            }
+          ],
+          "beginOrdinal": "6",
+          "callType": "CALL",
+          "caller": "pxSsl/NBh5hiC0SG+T+ElpP5kmQ=",
+          "endOrdinal": "9",
+          "gasLimit": "164",
+          "index": 1,
+          "nonceChanges": [
+            {
+              "address": "pxSsl/NBh5hiC0SG+T+ElpP5kmQ=",
+              "newValue": "1",
+              "ordinal": "5"
+            }
+          ],
+          "value": {
+            "bytes": "BWvHXi1jEAAA"
+          }
+        }
+      ],
+      "endOrdinal": "12",
+      "from": "pxSsl/NBh5hiC0SG+T+ElpP5kmQ=",
+      "gasLimit": "21164",
+      "gasPrice": {
+        "bytes": "WWgvBw=="
+      },
+      "gasUsed": "21000",
+      "hash": "9RnN9kEbP292AblZCFassHUQtFTpSQ0hoXz9xDaa+kA=",
+      "maxFeePerGas": {
+        "bytes": "A889Z9g="
+      },
+      "maxPriorityFeePerGas": {
+        "bytes": "WWgvAA=="
+      },
+      "r": "ACj2shJA6nAoaJcTQUxnA1eBeaJMgOvkkmiIBoDA2fM=",
+      "receipt": {
+        "cumulativeGasUsed": "21000",
+        "logsBloom": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+      },
+      "s": "RQPZW7fJS+dRUEog3vzy6Nu8kgNiGSy+VJn3EexoGdI=",
+      "status": "SUCCEEDED",
+      "to": "pxSsl/NBh5hiC0SG+T+ElpP5kmQ=",
+      "type": "TRX_TYPE_DYNAMIC_FEE",
+      "v": "AQ==",
+      "value": {
+        "bytes": "BWvHXi1jEAAA"
+      }
+    }
+  ],
+  "ver": 5
+}
