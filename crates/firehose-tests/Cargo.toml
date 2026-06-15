@@ -1,0 +1,46 @@
+[package]
+name = "reth-firehose-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+firehose-tracer.workspace = true
+reth-firehose.workspace = true
+
+# reth
+reth-chainspec.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-evm-ethereum.workspace = true
+reth-primitives-traits.workspace = true
+reth-revm.workspace = true
+
+# alloy
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+
+# revm
+revm.workspace = true
+
+# encoding & errors
+base64 = "0.22"
+eyre.workspace = true
+hex = "0.4"
+prost = "0.14"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[[test]]
+name = "prestate"
+path = "tests/prestate.rs"

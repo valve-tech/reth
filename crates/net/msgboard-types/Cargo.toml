@@ -1,0 +1,42 @@
+[package]
+name = "reth-msgboard-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "PulseChain msgboard P2P protocol types, PoW verification, and RLP codec"
+
+[lints]
+workspace = true
+
+[dependencies]
+# encoding
+alloy-primitives = { workspace = true, features = ["rlp"] }
+alloy-rlp = { workspace = true, features = ["derive"] }
+
+# crypto — SHA-256 for PoW hash; secp256k1 for scalar base multiplication in challenge
+sha2 = { workspace = true }
+secp256k1 = { workspace = true }
+
+# error handling
+thiserror = { workspace = true }
+
+# optional serde for RPC types
+serde = { workspace = true, features = ["derive"], optional = true }
+
+[dev-dependencies]
+hex-literal = "0.4"
+
+[features]
+default = ["std"]
+std = [
+    "alloy-primitives/std",
+    "alloy-rlp/std",
+    "secp256k1/std",
+    "sha2/std",
+    "thiserror/std",
+    "serde?/std",
+]
+serde = ["dep:serde", "alloy-primitives/serde"]

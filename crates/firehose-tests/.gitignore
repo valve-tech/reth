@@ -1,0 +1,4 @@
+# Diagnostic dumps written by `assert_block_equals_golden` on test failure.
+tests/cases/**/*.actual.txt
+tests/cases/**/*.expected.txt
+tests/cases/**/*.actual.binpb

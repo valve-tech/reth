@@ -1,0 +1,96 @@
+[package]
+name = "reth-pulsechain-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "PulseChain node type for reth (chain IDs 369 / 943)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth — pulsechain primitives / hardforks / chainspec
+reth-pulsechain-forks.workspace = true
+
+# reth — consensus
+reth-consensus.workspace = true
+reth-ethereum-consensus.workspace = true
+reth-execution-types.workspace = true
+
+# reth — chain primitives
+reth-chainspec.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+
+# reth — node builder machinery
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-node-ethereum.workspace = true
+
+# reth — networking
+reth-network.workspace = true
+reth-network-peers.workspace = true
+
+# reth — transaction pool
+reth-transaction-pool.workspace = true
+reth-tracing.workspace = true
+
+# reth — EVM configuration and execution
+reth-evm.workspace = true
+reth-evm-ethereum.workspace = true
+
+# reth — CLI chain spec parser
+reth-cli.workspace = true
+reth-ethereum-cli = { workspace = true, default-features = false }
+
+# alloy — EVM abstraction
+alloy-evm.workspace = true
+
+# alloy — engine types (ExecutionData for ConfigureEngineEvm)
+alloy-rpc-types-engine.workspace = true
+
+# alloy
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+
+# error handling (AnyError for tx_iterator_for_payload)
+reth-storage-errors = { workspace = true, default-features = false }
+
+# revm — state types (Account, AccountInfo, Bytecode, EvmStorageSlot)
+revm.workspace = true
+
+# reth — RPC types (for gas estimation margin wrapper)
+reth-rpc-eth-api.workspace = true
+reth-rpc-builder.workspace = true
+
+# jsonrpsee — needed for RPC method wrapping
+jsonrpsee = { workspace = true, features = ["server"] }
+
+# alloy — RPC types (TransactionRequest, BlockId, StateOverride)
+alloy-rpc-types-eth.workspace = true
+
+# error handling (ChainSpecParser::parse returns eyre::Result)
+eyre.workspace = true
+
+[dev-dependencies]
+alloy-chains.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "reth-chainspec/std",
+    "reth-pulsechain-forks/std",
+    "reth-primitives-traits/std",
+    "alloy-consensus/std",
+    "reth-evm/std",
+    "reth-evm-ethereum/std",
+    "alloy-evm/std",
+    "alloy-primitives/std",
+    "revm/std",
+]
