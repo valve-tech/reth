@@ -2,6 +2,59 @@ VALVE FORK — PROGRESS / FOLLOW-UP TASKS
 =======================================
 
 ------------------------------------------------------------------------------
+TASK: Firehose test coverage — remaining gaps after the v2.3 upgrade
+STATUS: PARTIALLY DONE (added the feasible high-value guards; two items deferred)
+OPENED: 2026-06-15
+OWNER: valve
+------------------------------------------------------------------------------
+
+ADDED (2026-06-15, crates/firehose-tests/tests/):
+  - setup_guards.rs::cancun_block_emits_beacon_root_system_call  (gap #2)
+      Functional guard: a Cancun block with parentBeaconBlockRoot must produce a
+      non-empty firehose `system_calls`. Fails loudly if the alloy-evm inspector
+      patch is ever silently dropped (the exact regression we hit on this upgrade).
+  - setup_guards.rs::alloy_evm_resolves_to_valve_fork           (gap #10)
+      Structural guard: parses workspace Cargo.lock and asserts alloy-evm resolves
+      to the valve-tech/evm fork, not unpatched crates.io.
+  - pipeline_trace.rs::pipeline_executor_matches_golden          (gap #1, pipeline)
+      Drives a block through FirehoseBlockExecutor::execute_and_trace_one (staged-sync
+      path, process-wide tracer) and asserts byte-identical output to the golden.
+      Covers the global-tracer lifecycle, the Executor<DB> impl (execute_and_trace_one
+      / into_state / take_bal), and the deferred mark_verified flush — none of which
+      the local-tracer prestate harness exercised.
+
+DEFERRED (tracked here — not worth shipping brittle tests for):
+  1. LIVE engine-API path: TreePayloadValidator::execute_and_trace_block
+     (crates/engine/tree/src/tree/payload_validator.rs). This is the orchestration
+     most heavily reworked on the v2.3 rebase (parallel-BAL dispatch, convert_to_block
+     re-fit, 3-tuple->4-tuple adaptation, mark_verified). NOT covered.
+     Why deferred: needs a fully-constructed TreePayloadValidator (heavy generics) and
+     the engine-tree TestHarness is a private #[cfg(test)] type (not reusable from an
+     integration-test crate). Worse, the firehose tracer is a process-wide singleton
+     (init_tracer is once-per-process, no reset), so initializing it inside engine-tree's
+     shared test binary would force EVERY block-validation test in that process onto the
+     traced path and break them.
+     Mitigation today: execute_and_trace_block shares the FirehoseWrappedExecutor core
+     with run_wrapped_block (golden-tested) and FirehoseBlockExecutor (pipeline test),
+     and otherwise mirrors the upstream execute_block (covered by the engine-tree suite).
+     To do it properly: a dedicated engine-tree integration-test binary that (a) exposes
+     a minimal block-validation entry point and (b) inits a buffer-backed global tracer,
+     run in isolation (its own process / nextest).
+  2. BAL (EIP-7928) x firehose dispatch. Firehose forces the sequential, non-BAL path
+     (execute_and_trace_block always passes has_bal=false and the dispatch takes the
+     tracer branch before parallel_bal_execution). No test confirms a BAL-eligible block
+     still traces, nor that the non-firehose BAL path is unaffected.
+     Why deferred: BAL requires the Amsterdam fork, which is not active on any chain we
+     run (incl. PulseChain), so there is no realistic block to exercise it; and the
+     dispatch lives in the validator (same scaffolding problem as #1). Revisit when
+     Amsterdam/EIP-7928 is on the roadmap.
+  Also worth adding later (lower priority): end-to-end golden cases for a block WITH
+  withdrawals, contract creation, selfdestruct, logs, multi-tx ordinal ordering,
+  EIP-7702 set-code, and a PrimordialPulse fork block; plus otterscan
+  ots_searchTransactions index-vs-full-scan equivalence and the PulseChain estimate_gas
+  margin + block_overrides forwarding.
+
+------------------------------------------------------------------------------
 TASK: Re-review whether the alloy-evm fork can be folded back to upstream
 STATUS: IN PROGRESS (parked — keeping the minimal fork for now)
 OPENED: 2026-06-15 (during the reth v2.2 -> v2.3 upgrade)
