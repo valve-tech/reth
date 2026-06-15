@@ -148,6 +148,11 @@ impl DeferredTrieData {
     /// Returns trie data, waiting for the async publishing task if it has not completed.
     #[instrument(level = "debug", target = "engine::tree::deferred_trie", skip_all)]
     pub fn wait_cloned(&self) -> ComputedTrieData {
+        #[cfg(feature = "rayon")]
+        debug_assert!(
+            rayon::current_thread_index().is_none(),
+            "wait_cloned must not be called from a rayon worker thread"
+        );
         let bundle = match self.value.get() {
             Some(bundle) => {
                 DEFERRED_TRIE_METRICS.deferred_trie_async_ready.increment(1);

@@ -209,13 +209,35 @@ where
         validate_header_base_fee(header, &self.chain_spec)?;
 
         // EIP-4895: Beacon chain push withdrawals as operations
-        if self.chain_spec.is_shanghai_active_at_timestamp(header.timestamp()) &&
-            header.withdrawals_root().is_none()
-        {
+        //
+        // PulseChain: blocks before PrimordialPulse are canonical Ethereum mainnet blocks.
+        // Ethereum's Shanghai activated at timestamp 1,681,338,455 (~block 17,034,870),
+        // but PulseChain's Shanghai timestamp is later (after PrimordialPulse). For
+        // pre-PrimordialPulse blocks we must use Ethereum's Shanghai timestamp to correctly
+        // validate the withdrawals_root field that Ethereum blocks carry.
+        let shanghai_active = {
+            const ETHEREUM_SHANGHAI_TIMESTAMP: u64 = 1_681_338_455;
+            let chain_id = self.chain_spec.chain_id();
+            // PulseChain mainnet (369): PrimordialPulse at 17,233,000
+            // PulseChain testnet v4 (943): PrimordialPulse at 16,492,700
+            let primordial_pulse_block = match chain_id {
+                369 => Some(17_233_000u64),
+                943 => Some(16_492_700u64),
+                _ => None,
+            };
+            if let Some(pp_block) = primordial_pulse_block {
+                if header.number() < pp_block {
+                    header.timestamp() >= ETHEREUM_SHANGHAI_TIMESTAMP
+                } else {
+                    self.chain_spec.is_shanghai_active_at_timestamp(header.timestamp())
+                }
+            } else {
+                self.chain_spec.is_shanghai_active_at_timestamp(header.timestamp())
+            }
+        };
+        if shanghai_active && header.withdrawals_root().is_none() {
             return Err(ConsensusError::WithdrawalsRootMissing)
-        } else if !self.chain_spec.is_shanghai_active_at_timestamp(header.timestamp()) &&
-            header.withdrawals_root().is_some()
-        {
+        } else if !shanghai_active && header.withdrawals_root().is_some() {
             return Err(ConsensusError::WithdrawalsRootUnexpected)
         }
 

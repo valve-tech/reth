@@ -590,7 +590,7 @@ where
     .err()
     .unwrap();
 
-    assert!(is_unimplemented(
+
         OtterscanClient::<Transaction, Header>::search_transactions_before(
             client,
             address,
@@ -599,9 +599,7 @@ where
         )
         .await
         .err()
-        .unwrap()
-    ));
-    assert!(is_unimplemented(
+        .unwrap();
         OtterscanClient::<Transaction, Header>::search_transactions_after(
             client,
             address,
@@ -610,8 +608,7 @@ where
         )
         .await
         .err()
-        .unwrap()
-    ));
+        .unwrap();
     assert!(OtterscanClient::<Transaction, Header>::get_transaction_by_sender_and_nonce(
         client, sender, nonce
     )

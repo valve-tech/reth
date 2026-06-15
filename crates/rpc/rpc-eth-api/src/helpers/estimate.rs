@@ -135,10 +135,13 @@ pub trait EstimateCall: Call {
         // Check funds of the sender (only useful to check if transaction gas price is more than 0).
         //
         // The caller allowance is check by doing `(account.balance - tx.value) / tx.gas_price`
+        // PulseChain: track the account gas limit separately for the 20% padding cap.
+        let mut account_gas_limit: u64 = 0;
         if tx_env.gas_price() > 0 {
             // cap the highest gas limit by max gas caller can afford with given gas price
-            highest_gas_limit =
-                highest_gas_limit.min(self.caller_gas_allowance(&mut db, &evm_env, &tx_env)?);
+            let allowance = self.caller_gas_allowance(&mut db, &evm_env, &tx_env)?;
+            account_gas_limit = allowance;
+            highest_gas_limit = highest_gas_limit.min(allowance);
         }
 
         // If the provided gas limit is less than computed cap, use that
@@ -300,6 +303,14 @@ pub trait EstimateCall: Call {
 
             // New midpoint
             mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
+        }
+
+        // PulseChain: add 20% safety margin to gas estimate to mitigate underestimation
+        // from state differences between estimation and actual execution.
+        // Capped by the account's gas affordability limit.
+        highest_gas_limit = highest_gas_limit.saturating_add(highest_gas_limit / 5);
+        if account_gas_limit != 0 && highest_gas_limit > account_gas_limit {
+            highest_gas_limit = account_gas_limit;
         }
 
         Ok(U256::from(highest_gas_limit))

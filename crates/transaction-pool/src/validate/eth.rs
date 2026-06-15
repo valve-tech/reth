@@ -530,10 +530,15 @@ where
         }
 
         // Checks for chainid
+        // PulseChain: also accept chain ID 1 (Ethereum mainnet) transactions. PulseChain
+        // replayed Ethereum history, so legacy transactions signed with chain ID 1 are valid.
         if let Some(chain_id) = transaction.chain_id() &&
             chain_id != self.chain_id()
         {
-            return Err(InvalidTransactionError::ChainIdMismatch.into())
+            let is_pulsechain = matches!(self.chain_id(), 369 | 943);
+            if !(is_pulsechain && chain_id == 1) {
+                return Err(InvalidTransactionError::ChainIdMismatch.into())
+            }
         }
 
         if transaction.is_eip7702() {

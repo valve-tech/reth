@@ -36,6 +36,7 @@ reth-trie-sparse = { workspace = true, features = ["std", "metrics"] }
 reth-trie.workspace = true
 reth-trie-common.workspace = true
 reth-trie-db.workspace = true
+reth-firehose.workspace = true
 
 # alloy
 alloy-evm.workspace = true

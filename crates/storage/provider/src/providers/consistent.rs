@@ -18,13 +18,16 @@ use reth_chainspec::ChainInfo;
 use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
 use reth_execution_types::ExecutionOutcome;
 use reth_node_types::{BlockTy, HeaderTy, ReceiptTy, TxTy};
-use reth_primitives_traits::{Account, BlockBody, RecoveredBlock, SealedHeader, StorageEntry};
+use reth_primitives_traits::{
+    Account, BlockBody, NodePrimitives, RecoveredBlock, SealedHeader, StorageEntry,
+};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BlockBodyIndicesProvider, DatabaseProviderFactory, NodePrimitivesProvider, StateProvider,
-    StateProviderBox, StorageChangeSetReader, TryIntoHistoricalStateProvider,
+    AccountHistoryReader, BlockBodyIndicesProvider, DatabaseProviderFactory,
+    NodePrimitivesProvider, StateProvider, StateProviderBox, StorageChangeSetReader,
+    TryIntoHistoricalStateProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
 use revm_database::states::PlainStorageRevert;
@@ -1463,6 +1466,102 @@ impl<N: ProviderNodeTypes> AccountReader for ConsistentProvider<N> {
         let state_provider = self.latest_ref()?;
         state_provider.basic_account(address)
     }
+}
+
+impl<N: ProviderNodeTypes> AccountHistoryReader for ConsistentProvider<N> {
+    fn account_changed_blocks_before(
+        &self,
+        address: Address,
+        before: BlockNumber,
+        limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        if before == 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Collect matches from the in-memory chain first (newest -> oldest, i.e. already
+        // descending), then fill the remainder from the database index. The database only
+        // covers blocks up to the in-memory chain's anchor.
+        let mut blocks = Vec::new();
+        let mut database_before = before;
+
+        if let Some(head_block) = &self.head_block {
+            database_before = before.min(head_block.anchor().number + 1);
+
+            for state in head_block.chain() {
+                if blocks.len() >= limit {
+                    return Ok(blocks);
+                }
+                if state.number() < before && block_state_changes_account(state, address) {
+                    blocks.push(state.number());
+                }
+            }
+        }
+
+        let remaining = limit - blocks.len();
+        blocks.extend(self.storage_provider.account_changed_blocks_before(
+            address,
+            database_before,
+            remaining,
+        )?);
+
+        Ok(blocks)
+    }
+
+    fn account_changed_blocks_after(
+        &self,
+        address: Address,
+        after: BlockNumber,
+        limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // The database index covers blocks up to the in-memory chain's anchor; query it first
+        // (ascending), then append matches from the in-memory chain (oldest -> newest).
+        let mut blocks =
+            self.storage_provider.account_changed_blocks_after(address, after, limit)?;
+
+        if let Some(head_block) = &self.head_block {
+            // In-memory blocks start above the anchor; drop any database results that overlap
+            // (e.g. if the database view is ahead of this provider's in-memory snapshot).
+            let anchor = head_block.anchor().number;
+            blocks.retain(|block| *block <= anchor);
+
+            if blocks.len() < limit {
+                let mut in_mem = head_block
+                    .chain()
+                    .filter(|state| {
+                        state.number() > after && block_state_changes_account(state, address)
+                    })
+                    .map(|state| state.number())
+                    .collect::<Vec<_>>();
+                // `chain()` iterates newest -> oldest; reverse into ascending order.
+                in_mem.reverse();
+                in_mem.truncate(limit - blocks.len());
+                blocks.extend(in_mem);
+            }
+        }
+
+        Ok(blocks)
+    }
+}
+
+/// Returns `true` if the given in-memory block changed the account's info (balance / nonce /
+/// code), mirroring what gets written to the account changesets (and thus the account-history
+/// index) when the block is persisted.
+fn block_state_changes_account<N: NodePrimitives>(state: &BlockState<N>, address: Address) -> bool {
+    state
+        .block_ref()
+        .execution_output
+        .state
+        .reverts
+        .to_plain_state_reverts()
+        .accounts
+        .into_iter()
+        .flatten()
+        .any(|(changed, _)| changed == address)
 }
 
 impl<N: ProviderNodeTypes> StateReader for ConsistentProvider<N> {

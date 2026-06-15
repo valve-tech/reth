@@ -753,6 +753,28 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> AccountReader for MockEthProvide
     }
 }
 
+impl<T: NodePrimitives, ChainSpec: Send + Sync> reth_storage_api::AccountHistoryReader
+    for MockEthProvider<T, ChainSpec>
+{
+    fn account_changed_blocks_before(
+        &self,
+        _address: Address,
+        _before: BlockNumber,
+        _limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        Ok(Vec::default())
+    }
+
+    fn account_changed_blocks_after(
+        &self,
+        _address: Address,
+        _after: BlockNumber,
+        _limit: usize,
+    ) -> ProviderResult<Vec<BlockNumber>> {
+        Ok(Vec::default())
+    }
+}
+
 impl<T: NodePrimitives, ChainSpec: Send + Sync> StageCheckpointReader
     for MockEthProvider<T, ChainSpec>
 {
