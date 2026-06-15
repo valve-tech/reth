@@ -1,0 +1,108 @@
+VALVE FORK — PROGRESS / FOLLOW-UP TASKS
+=======================================
+
+------------------------------------------------------------------------------
+TASK: Re-review whether the alloy-evm fork can be folded back to upstream
+STATUS: IN PROGRESS (parked — keeping the minimal fork for now)
+OPENED: 2026-06-15 (during the reth v2.2 -> v2.3 upgrade)
+RE-REVIEW: at the next reth upstream bump, OR by 2026-09-15 — whichever is first
+OWNER: valve
+------------------------------------------------------------------------------
+
+WHY THIS EXISTS
+---------------
+Firehose must trace pre-execution system calls (EIP-4788 beacon-root,
+EIP-2935 block-hash history). Stock alloy-evm does NOT route system calls
+through the Inspector: `EthEvm::transact_system_call` (crates/evm/src/eth/mod.rs)
+calls `self.inner.system_call_with_caller(...)` unconditionally. So with stock
+alloy-evm the firehose inspector never sees the system-call frame.
+
+To fix this the valve fork patches alloy-evm via reth's `[patch.crates-io]` to a
+fork that adds:
+
+    fn transact_system_call(&mut self, caller, contract, data) {
+        if self.inspect {
+            self.inner.inspect_system_call_with_caller(caller, contract, data)
+        } else {
+            self.inner.system_call_with_caller(caller, contract, data)
+        }
+    }
+    // + import revm::InspectSystemCallEvm
+
+CURRENT STATE (as of 2026-06-15, reth v2.3.0 upgrade)
+-----------------------------------------------------
+- reth v2.3.0 bumped the workspace alloy-evm requirement to 0.36.
+- The OLD patch pointed at streamingfast/evm branch `sf/v0.34.0`. After the bump
+  the version no longer matched 0.36, so cargo SILENTLY ignored the patch and
+  built against unpatched crates.io alloy-evm 0.36. Result: firehose emitted
+  `system_calls: []` and every event ordinal shifted down by 2. Caught by the
+  golden tests in crates/firehose-tests/tests/prestate.rs (nop_transfer,
+  storage_sstore_oog).
+- FIX: created valve-tech/evm branch `valve/v0.36.0` = upstream alloy-evm tag
+  v0.36.0 + the cherry-picked "Enable system call to be traced by inspector"
+  commit. reth's [patch.crates-io] alloy-evm now points there. Committed in
+  reth e5e33ed15 "fix(firehose): restore system-call tracing via valve
+  alloy-evm 0.36 patch".
+- The valve/v0.36.0 fork is MINIMAL: the upstream release tag + exactly one
+  commit. Nothing else diverges.
+- NOTE on gas: revm 20.x (used by alloy-evm 0.36) sets
+  SYSTEM_CALL_GAS_LIMIT = 30,000,000 + EIP-7928 BAL state-gas reserve
+  = 31,566,720. geth reports 30,000,000. This is a parity nuance on the
+  system-call frame's `gas_limit` field only (gas_consumed is unaffected). The
+  prestate goldens were regenerated to match revm 20.x.
+
+WHY WE CAN'T FOLD BACK TO UPSTREAM YET
+--------------------------------------
+- Upstream PR: alloy-rs/evm#323 "Enable system call to be traced by inspector"
+  (StreamingFast / Matthieu Vachon) — this is the SAME change our fork carries.
+- As of 2026-06-15 #323 is OPEN, unmerged. The latest upstream release is
+  v0.37.0 and `upstream/main` STILL has the un-inspected system_call_with_caller.
+  There is no upstream version we can switch to.
+- Merge is blocked on a maintainer concern (klkvr, alloy member):
+    "i think we should make sure that any reth rpc callsites explicitly disable
+     inspection before pre/post execution hooks before making this change"
+  Rationale: inspecting system calls is a HIDDEN behavioral change for callers
+  that don't want them. geth does NOT trace system calls in debug_traceBlock
+  (it builds the pre/post EVM without a tracer). Landing this upstream first
+  requires auditing reth's RPC callsites (e.g.
+  crates/rpc/rpc-eth-api/src/helpers/trace.rs and likely others) to explicitly
+  disable_inspector around apply_pre/post_execution_changes. That is cross-repo
+  work into reth itself, not a one-liner.
+
+KNOWN SIDE-EFFECT OF OUR PATCH (the maintainer's concern, applied to our build)
+------------------------------------------------------------------------------
+Because our patch inspects system calls whenever `self.inspect` is set, valve's
+debug_traceBlock / trace_* RPC endpoints will ALSO surface the EIP-4788/2935
+system calls — a divergence from geth on those endpoints. Correct/required for
+firehose; possibly over-tracing for the debug RPC. Has not broken anything
+(122/122 valve regression tests pass), but it is exactly why upstream wants the
+callsite guards before merging.
+
+WHAT TO CHECK AT RE-REVIEW
+--------------------------
+1. Has alloy-rs/evm#323 (or an equivalent) merged?
+       gh pr view 323 --repo alloy-rs/evm --json state,mergedAt
+2. Has a RELEASED alloy-evm version shipped the change? Check the latest tag's
+   crates/evm/src/eth/mod.rs transact_system_call for an `if self.inspect` /
+   inspect_system_call_with_caller branch.
+3. Has reth bumped its workspace alloy-evm requirement to a version that
+   includes the change?
+   If all three -> drop the [patch.crates-io] alloy-evm entry from reth's
+   Cargo.toml, delete the valve-tech/evm valve/v0.* branches, re-run the
+   prestate golden tests, done.
+4. If #323 is still stalled and folding back matters: scope the reth RPC
+   callsite-guarding work the maintainer asked for, push it to #323 (or a fresh
+   PR) to unblock the merge.
+
+REFERENCES
+----------
+- reth fix commit:        e5e33ed15
+- reth branch/tag:        feature/update-to-reth-2.3 / v2.3.0-pulse
+- alloy-evm fork:         github.com/valve-tech/evm  branch valve/v0.36.0
+  (= upstream v0.36.0 + 1 commit: "Enable system call to be traced by inspector")
+- upstream PR:            github.com/alloy-rs/evm/pull/323 (OPEN)
+- patch declaration:      reth Cargo.toml [patch.crates-io] alloy-evm
+- failing/regenerated:    crates/firehose-tests/tests/cases/{nop_transfer,
+                          storage_sstore_oog}/*.binpb
+- the patched method:     evm/crates/evm/src/eth/mod.rs::transact_system_call
+- revm gas constant:      revm-handler 20.x SYSTEM_CALL_GAS_LIMIT (= 31,566,720)
