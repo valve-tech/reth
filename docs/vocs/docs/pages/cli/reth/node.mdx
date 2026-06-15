@@ -17,9 +17,9 @@ Options:
           Possible values are either a built-in chain or the path to a chain specification file.
 
           Built-in chains:
-              mainnet, sepolia, holesky, hoodi, dev
+              pulsechain, pulsechain-testnet-v4, mainnet, sepolia, holesky, hoodi, dev
 
-          [default: mainnet]
+          [default: pulsechain]
 
       --instance <INSTANCE>
           Add a new instance of a node.
@@ -998,6 +998,9 @@ Engine:
 
           [default: 128]
 
+      --engine.legacy-state-root
+          Enable legacy state root
+
       --engine.disable-state-cache
           Disable state cache
 
@@ -1158,47 +1161,58 @@ Storage:
           [default: true]
           [possible values: true, false]
 
-JIT:
-      --jit
-          Enable JIT compilation of EVM bytecode
+Msgboard:
+      --msgboard.work-multiplier <MSGBOARD_WORK_MULTIPLIER>
+          Minimum accepted `work_multiplier` value
 
-      --jit.hot-threshold <HOT_THRESHOLD>
-          Number of observed misses before a bytecode is promoted to JIT compilation
+          [default: 10000]
 
-          [default: 8]
+      --msgboard.work-divisor <MSGBOARD_WORK_DIVISOR>
+          Maximum accepted `work_divisor` value
 
-      --jit.worker-count <WORKER_COUNT>
-          Number of JIT compilation worker threads
+          [default: 1000000]
 
-      --jit.channel-capacity <CHANNEL_CAPACITY>
-          Capacity of the lookup-observed event channel. Events are silently dropped when the channel is full
+      --msgboard.size-limit <MSGBOARD_SIZE_LIMIT>
+          Maximum allowed byte length of a single message's data field
 
-          [default: 4096]
+          [default: 8192]
 
-      --jit.max-pending-jobs <MAX_PENDING_JOBS>
-          Maximum number of pending JIT compilation jobs
+      --msgboard.count-limit <MSGBOARD_COUNT_LIMIT>
+          Maximum number of messages retained in the board
 
-          [default: 2048]
+          [default: 10000]
 
-      --jit.max-bytecode-len <MAX_BYTECODE_LEN>
-          Maximum bytecode length eligible for JIT compilation. Contracts with bytecode larger than this are never promoted to JIT. 0 means no limit
+      --msgboard.block-range <MSGBOARD_BLOCK_RANGE>
+          Number of blocks a message remains live before expiry
 
-          [default: 0]
+          [default: 120]
 
-      --jit.code-cache-bytes <CODE_CACHE_BYTES>
-          Maximum total resident compiled code size in bytes. When exceeded, the backend evicts least-recently-used entries. 0 means no limit
+      --msgboard.stale-block-buffer <MSGBOARD_STALE_BLOCK_BUFFER>
+          Stale block buffer for peer filtering (avoid requesting nearly-expired messages)
 
-          [default: 1073741824]
+          [default: 3]
 
-      --jit.idle-evict-duration <IDLE_EVICT_DURATION>
-          Duration after which a compiled program with no lookup hits is evicted
+      --msgboard.db-dir <MSGBOARD_DB_DIR>
+          Database directory for persistent message storage. Defaults to `<datadir>/msgboard`
 
-          [default: 1h]
+      --msgboard.commit-every <MSGBOARD_COMMIT_EVERY>
+          How often to flush in-memory messages to the on-disk MDBX env.
 
-      --jit.debug
-          Enable compiler debug dumps.
+          Accepts humantime durations: `15s`, `2m`, `500ms`. Lower values bound in-flight loss on crash; higher values reduce write amplification.
 
-          IR, assembly, and bytecode are written to `<datadir>/jit/<spec_id>/<code_hash>/` for each compiled contract. Note that this is not ever cleaned up, and has a non negligible performance overhead.
+          [default: 15s]
+
+      --msgboard.log-every <MSGBOARD_LOG_EVERY>
+          How often to emit a periodic msgboard stats line at INFO level.
+
+          Useful for log-scraped observability. Set to a very large duration to effectively disable.
+
+          [default: 30s]
+
+      --msgboard.gossip-disable
+          Disable outbound P2P gossip of msgboard messages.
+
+          When set, the node still **receives** announcements and full messages from peers and serves `GetBoardMessages` requests, but it does **not** announce its own message IDs (neither the bulk announce on peer connect nor per-message announces as new messages are accepted). Useful for read-only observability nodes.
 
 Logging:
       --log.stdout.format <FORMAT>

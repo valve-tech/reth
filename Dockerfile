@@ -31,6 +31,10 @@ ENV RUSTFLAGS="$RUSTFLAGS"
 ARG FEATURES=""
 ENV FEATURES=$FEATURES
 
+# Limit parallel compile jobs to avoid OOM
+ARG CARGO_BUILD_JOBS="4"
+ENV CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS
+
 # Builds dependencies
 RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path recipe.json
 
