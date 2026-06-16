@@ -48,11 +48,28 @@ DEFERRED (tracked here — not worth shipping brittle tests for):
      run (incl. PulseChain), so there is no realistic block to exercise it; and the
      dispatch lives in the validator (same scaffolding problem as #1). Revisit when
      Amsterdam/EIP-7928 is on the roadmap.
-  Also worth adding later (lower priority): end-to-end golden cases for a block WITH
-  withdrawals, contract creation, selfdestruct, logs, multi-tx ordinal ordering,
-  EIP-7702 set-code, and a PrimordialPulse fork block; plus otterscan
-  ots_searchTransactions index-vs-full-scan equivalence and the PulseChain estimate_gas
-  margin + block_overrides forwarding.
+  DONE since (2026-06-15, batch 2):
+    - crates/pulsechain/node/src/consensus.rs: 3 tests for the Shanghai-timestamp-gap
+      validate_header logic (pre-fork blocks validate withdrawals_root against the
+      Ethereum mainnet Shanghai timestamp).
+    - crates/pulsechain/node/src/gas.rs: extracted apply_gas_margin + 4 unit tests
+      (+20% margin, zero, truncation, saturating overflow).
+  STILL worth adding later (lower priority):
+    - otterscan ots_searchTransactions index-vs-full-scan EQUIVALENCE. BLOCKED on test
+      scaffolding: MockEthProvider's AccountHistoryReader impl is a stub (both methods
+      return Ok(vec![])), so the index path finds nothing in tests. Needs either (a)
+      enhancing MockEthProvider to derive account-change blocks from its stored
+      blocks/changesets (shared crate — may affect other tests), or (b) a DB-backed
+      integration test with a populated changeset index. The pure pagination helper
+      block_transaction_page_range is already unit-tested.
+    - End-to-end firehose golden cases for a block WITH withdrawals, contract creation,
+      selfdestruct, logs, multi-tx ordinal ordering, EIP-7702 set-code, and a
+      PrimordialPulse fork block. Needs new prestate fixtures; goldens would be
+      self-generated (regression locks) unless produced from a geth oracle like the
+      existing two cases.
+    - PulseChain estimate_gas end-to-end (margin applied + block_overrides forwarded
+      through the RPC stack): needs a mock EthApiServer + jsonrpsee invocation. The
+      margin arithmetic itself is now unit-tested via apply_gas_margin.
 
 ------------------------------------------------------------------------------
 TASK: Re-review whether the alloy-evm fork can be folded back to upstream
