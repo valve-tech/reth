@@ -18,7 +18,7 @@ use alloy_eips::{eip7685::Requests, Decodable2718, Encodable2718};
 use alloy_evm::{
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockExecutorFactory,
-        BlockValidationError, ExecutableTx, GasOutput, OnStateHook, StateDB,
+        BlockValidationError, ExecutableTx, GasOutput, StateDB,
     },
     eth::{
         receipt_builder::ReceiptBuilder, spec::EthExecutorSpec, EthBlockExecutionCtx,
