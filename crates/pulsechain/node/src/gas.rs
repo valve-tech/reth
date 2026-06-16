@@ -20,6 +20,14 @@ use std::sync::Arc;
 const GAS_MARGIN_NUMERATOR: u64 = 6;
 const GAS_MARGIN_DENOMINATOR: u64 = 5;
 
+/// Applies the PulseChain gas-estimation margin (+20%) to a raw `eth_estimateGas` result.
+///
+/// Uses saturating multiplication so a pathologically large estimate can never overflow (it
+/// saturates at `U256::MAX` instead of panicking).
+fn apply_gas_margin(gas: U256) -> U256 {
+    gas.saturating_mul(U256::from(GAS_MARGIN_NUMERATOR)) / U256::from(GAS_MARGIN_DENOMINATOR)
+}
+
 /// Replaces `eth_estimateGas` in all configured transports with a wrapper that
 /// applies a 20% margin to the result.
 ///
@@ -61,13 +69,42 @@ where
             EthApiServer::estimate_gas(&**ctx, request, block_id, state_override, block_overrides)
                 .await;
 
-        estimate.map(|gas| {
-            gas.saturating_mul(U256::from(GAS_MARGIN_NUMERATOR)) /
-                U256::from(GAS_MARGIN_DENOMINATOR)
-        })
+        estimate.map(apply_gas_margin)
     })?;
 
     modules.replace_configured(module)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wrapper adds a +20% margin: result = gas * 6 / 5.
+    #[test]
+    fn applies_twenty_percent_margin() {
+        assert_eq!(apply_gas_margin(U256::from(100u64)), U256::from(120u64));
+        assert_eq!(apply_gas_margin(U256::from(21_000u64)), U256::from(25_200u64));
+    }
+
+    /// Zero in, zero out.
+    #[test]
+    fn zero_estimate_stays_zero() {
+        assert_eq!(apply_gas_margin(U256::ZERO), U256::ZERO);
+    }
+
+    /// Integer division truncates toward zero (matches the original inline `gas * 6 / 5`).
+    #[test]
+    fn margin_truncates_toward_zero() {
+        // 7 * 6 / 5 = 42 / 5 = 8
+        assert_eq!(apply_gas_margin(U256::from(7u64)), U256::from(8u64));
+    }
+
+    /// A pathologically large estimate saturates instead of overflowing/panicking.
+    #[test]
+    fn margin_saturates_instead_of_overflowing() {
+        let expected = U256::MAX / U256::from(GAS_MARGIN_DENOMINATOR);
+        assert_eq!(apply_gas_margin(U256::MAX), expected);
+    }
 }
