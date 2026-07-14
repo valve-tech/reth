@@ -14,7 +14,7 @@ static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 use std::sync::Arc;
 
 use clap::Parser;
-use reth::{cli::Cli, PulsechainFirehoseExecutorBuilder};
+use reth::{cli::Cli, FirehoseExecutorBuilder, PulsechainFirehoseExecutorBuilder};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_msgboard::{args::MsgboardArgs, MsgboardLauncher};
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
@@ -94,20 +94,47 @@ fn requested_ethereum_chain() -> bool {
 /// Uses upstream [`EthereumNode`] with stock components. Msgboard is wired
 /// identically to the PulseChain path so the same binary serves both.
 fn run_ethereum_node() -> eyre::Result<()> {
+    // Initialise the firehose tracer on the Ethereum dispatch path too. Safe
+    // here because we swap in `FirehoseExecutorBuilder` below — its chain-init
+    // pass fires `on_blockchain_init`, satisfying the contract the tracer's
+    // `on_block_execution_start` hook asserts (the same contract the PulseChain
+    // path satisfies via PulsechainFirehoseExecutorBuilder). Without the
+    // executor wired in, this init panics at firehose-tracer tracer.rs:1739 —
+    // which is why upstream `EthereumNode` alone could not carry firehose and
+    // `--chain mainnet` emitted no FIRE data (chain-1 firehose was inert).
+    reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer::config::Config {
+        chain_client: firehose_tracer::config::ChainClient::Reth,
+        ..Default::default()
+    }));
+
     Cli::<EthereumChainSpecParser, MsgboardArgs>::parse().run(
         async move |builder, msgboard_args: MsgboardArgs| {
-            info!(target: "reth::cli", "Launching Ethereum node");
+            info!(target: "reth::cli", "Launching Ethereum node (firehose-instrumented)");
 
             let launcher = MsgboardLauncher::new(msgboard_args);
             let launcher_for_rpc = launcher.clone();
 
-            let node = builder.node(EthereumNode::default()).extend_rpc_modules(move |ctx| {
-                let datadir = ctx.config().datadir().data_dir().to_path_buf();
-                launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
-                Ok(())
-            });
+            // Swap in FirehoseExecutorBuilder (wraps EthEvmConfig in
+            // FirehoseEvmConfig) + install the firehose ExEx, mirroring
+            // run_pulsechain_node. This is what makes `--chain mainnet` emit
+            // FIRE data for the fireeth reader-node.
+            let handle = builder
+                .with_types::<EthereumNode>()
+                .with_components(
+                    EthereumNode::components().executor(FirehoseExecutorBuilder::default()),
+                )
+                .with_add_ons(EthereumAddOns::default())
+                .extend_rpc_modules(move |ctx| {
+                    let datadir = ctx.config().datadir().data_dir().to_path_buf();
+                    launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
+                    Ok(())
+                })
+                .install_exex("firehose", |ctx| async move {
+                    Ok(async move { reth_firehose::run_exex(ctx).await })
+                })
+                .launch()
+                .await?;
 
-            let handle = node.launch().await?;
             launcher.install_post_launch_tasks(
                 handle.node.network.clone(),
                 handle.node.provider.clone(),
