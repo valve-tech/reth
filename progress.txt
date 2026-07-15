@@ -72,10 +72,81 @@ DEFERRED (tracked here — not worth shipping brittle tests for):
       margin arithmetic itself is now unit-tested via apply_gas_margin.
 
 ------------------------------------------------------------------------------
+TASK: Track upstream reth releases / keep the fork current
+STATUS: v2.4.0 assessed; patch branch pre-built. Bump itself NOT done.
+OPENED: 2026-07-15
+OWNER: valve
+------------------------------------------------------------------------------
+
+UPSTREAM STATE (checked 2026-07-15)
+  - We are based on v2.3.0 (tagged 2026-06-10). Our branch:
+    feature/update-to-reth-2.3, tag v2.3.0-pulse.
+  - paradigmxyz/reth **v2.4.0** released 2026-07-14: 206 commits, 398 files,
+    +22,470/-18,004. Release notes:
+    https://github.com/paradigmxyz/reth/releases/tag/v2.4.0
+
+WHAT A v2.4.0 BUMP REQUIRES (pre-flighted 2026-07-15)
+
+  1. alloy-evm patch — READY.
+     v2.4.0 bumps alloy-evm 0.36.0 -> 0.37.0 (its lockfile resolves 0.37.1),
+     revm 40.0.3 -> 41.0.0, alloy-consensus 2.0.5 -> 2.1.1, alloy-eip7928
+     0.4.0 -> 0.4.5, revm-inspectors -> 0.41.0.
+     Our existing patch (valve/v0.36.0) would STOP version-matching ^0.37.0, so
+     cargo would silently drop it and firehose would stop tracing system calls
+     (the 2.2->2.3 regression, again).
+     -> Pre-built **valve-tech/evm branch `valve/v0.37.1`** = upstream alloy-evm
+        tag v0.37.1 + the cherry-picked "Enable system call to be traced by
+        inspector" commit. Cherry-picked clean; `cargo check -p alloy-evm` passes
+        against revm 41.0.0 (`inspect_system_call_with_caller` still exists there).
+     -> On the bump: repoint reth Cargo.toml [patch.crates-io] alloy-evm to
+        `branch = "valve/v0.37.1"`, then `cargo update -p alloy-evm` and confirm
+        Cargo.lock's alloy-evm `source` is the valve fork.
+     -> The guards added 2026-06-15 (firehose-tests/tests/setup_guards.rs) will
+        fail loudly if this is forgotten — that is exactly what they are for.
+
+  2. Breaking changes that land on code we modify:
+     - #26330 `PayloadValidator::validate_block_post_execution_with_hashed_state`
+       now takes a lazy overlay-aware parent-state provider and returns
+       `PostExecutionValidationError`. Custom impls MUST update signatures. We
+       heavily rework payload_validator.rs for the firehose live path, so expect
+       to touch it again.
+     - #26121 `ParallelStateRoot` removed; #25453 `ParallelSparseTrie` removed
+       (ArenaParallelSparseTrie is now default); #26132 `ParallelStateRootError`
+       -> `StateRootTaskError`. May hit our chain-state/deferred_trie.rs changes
+       (the rayon-worker debug_assert).
+     - `--engine.legacy-state-root` dropped -> `--engine.state-root-fallback`.
+
+  3. Worth watching (not blocking):
+     - Experimental revmc JIT EVM (`--jit.enabled`, #23230). If a JIT'd EVM
+       bypasses inspector call hooks, that is a firehose-fidelity risk of the
+       same class as the system-call patch. Opt-in today; do NOT enable on
+       firehose boxes without probing field presence first.
+     - Amsterdam / EIP-7928 BAL work continues (BAL validation in
+       flashbots_validateBuilderSubmissionV6, BAL-capable download clients).
+       Brings the deferred "BAL x firehose" test closer to being testable.
+
+RECIPE — new alloy-evm patch branch per reth bump
+  1. Find the alloy-evm version reth resolves to:
+       git show <reth-tag>:Cargo.lock | grep -A2 'name = "alloy-evm"'
+  2. In ../evm (valve-tech/evm):
+       git fetch upstream --tags
+       git checkout -b valve/vX.Y.Z vX.Y.Z
+       git cherry-pick 95a512e     # "Enable system call to be traced by inspector"
+       cargo check -p alloy-evm
+       git push -u origin valve/vX.Y.Z
+  3. Repoint reth Cargo.toml [patch.crates-io] alloy-evm at the new branch.
+  4. `cargo test -p reth-firehose-tests` — the setup guards verify the patch is live.
+
+------------------------------------------------------------------------------
 TASK: Re-review whether the alloy-evm fork can be folded back to upstream
-STATUS: IN PROGRESS (parked — keeping the minimal fork for now)
+STATUS: IN PROGRESS (parked — keeping the minimal fork; re-reviewed 2026-07-15)
 OPENED: 2026-06-15 (during the reth v2.2 -> v2.3 upgrade)
 RE-REVIEW: at the next reth upstream bump, OR by 2026-09-15 — whichever is first
+  - 2026-07-15 re-review (trigger: v2.4.0 released). VERDICT: KEEP THE FORK.
+    alloy-rs/evm#323 is still OPEN and untouched since 2026-03-31, and upstream
+    alloy-evm v0.37.0 AND v0.37.1 still call the un-inspected
+    `system_call_with_caller`. No released upstream version carries the fix, so
+    the patch cannot be dropped. Next re-review: the next reth bump after v2.4.0.
 OWNER: valve
 ------------------------------------------------------------------------------
 
