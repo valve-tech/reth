@@ -73,21 +73,40 @@ DEFERRED (tracked here — not worth shipping brittle tests for):
 
 ------------------------------------------------------------------------------
 TASK: Track upstream reth releases / keep the fork current
-STATUS: v2.4.0 assessed; patch branch pre-built. Bump itself NOT done.
+STATUS: **v2.4.0 BUMP DONE** (2026-07-15) — branch feature/update-to-reth-2.4,
+        tag v2.4.0-pulse. 132/132 valve tests pass. NOT yet deployed.
 OPENED: 2026-07-15
 OWNER: valve
 ------------------------------------------------------------------------------
 
 UPSTREAM STATE (checked 2026-07-15)
-  - We are based on v2.3.0 (tagged 2026-06-10). Our branch:
-    feature/update-to-reth-2.3, tag v2.3.0-pulse.
   - paradigmxyz/reth **v2.4.0** released 2026-07-14: 206 commits, 398 files,
     +22,470/-18,004. Release notes:
     https://github.com/paradigmxyz/reth/releases/tag/v2.4.0
+  - We rebased our 10 curated valve commits onto v2.4.0 (true `git rebase
+    --onto v2.4.0 v2.3.0`; our history is clean enough that no squash-merge was
+    needed). Only 3 code conflicts, all in files the release notes predicted.
+  - Previous base v2.3.0 (tagged 2026-06-10) lives on at
+    feature/update-to-reth-2.3 / tag v2.3.0-pulse; safety tag
+    pre-2.4-rebase-backup.
 
-WHAT A v2.4.0 BUMP REQUIRES (pre-flighted 2026-07-15)
+!! NEW BUILD-TOOLCHAIN REQUIREMENT IN v2.4.0 (deploy-affecting) !!
+  v2.4.0 ADDED `jit` and `gmp` to bin/reth's DEFAULT features (v2.3.0 had
+  neither). That means a default `cargo build -p reth` now needs:
+    - **LLVM** (revmc JIT -> revmc-llvm -> inkwell -> llvm-sys), and
+    - **GMP/MPFR** (gmp-mpfr-sys, builds via make).
+  Firehose-box provisioning must install these, OR build with
+  `--no-default-features` + the v2.3-era feature set:
+    jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,
+    asm-keccak,min-trace-logs
+  (verified: the binary compiles clean with that set on v2.4.0, no LLVM needed).
+  NOTE the `jit` feature only COMPILES the JIT in; it stays off at runtime
+  unless `--jit.enabled` is passed. Do NOT pass it on firehose boxes until the
+  inspector-vs-JIT question below is settled.
 
-  1. alloy-evm patch — READY.
+WHAT THE v2.4.0 BUMP REQUIRED (done 2026-07-15 — kept for the next bump)
+
+  1. alloy-evm patch — DONE.
      v2.4.0 bumps alloy-evm 0.36.0 -> 0.37.0 (its lockfile resolves 0.37.1),
      revm 40.0.3 -> 41.0.0, alloy-consensus 2.0.5 -> 2.1.1, alloy-eip7928
      0.4.0 -> 0.4.5, revm-inspectors -> 0.41.0.
@@ -104,23 +123,36 @@ WHAT A v2.4.0 BUMP REQUIRES (pre-flighted 2026-07-15)
      -> The guards added 2026-06-15 (firehose-tests/tests/setup_guards.rs) will
         fail loudly if this is forgotten — that is exactly what they are for.
 
-  2. Breaking changes that land on code we modify:
-     - #26330 `PayloadValidator::validate_block_post_execution_with_hashed_state`
-       now takes a lazy overlay-aware parent-state provider and returns
-       `PostExecutionValidationError`. Custom impls MUST update signatures. We
-       heavily rework payload_validator.rs for the firehose live path, so expect
-       to touch it again.
-     - #26121 `ParallelStateRoot` removed; #25453 `ParallelSparseTrie` removed
-       (ArenaParallelSparseTrie is now default); #26132 `ParallelStateRootError`
-       -> `StateRootTaskError`. May hit our chain-state/deferred_trie.rs changes
-       (the rayon-worker debug_assert).
-     - `--engine.legacy-state-root` dropped -> `--engine.state-root-fallback`.
+  2. Breaking changes that landed on code we modify — all RESOLVED:
+     - payload_validator: v2.4.0 moved the execution state hook out of
+       `PayloadHandle` into an explicit param sourced from
+       `state_root_job.take_execution_hook()`, and replaced
+       `payload_processor.executor()` with `self.runtime`. Our
+       `execute_and_trace_block` (firehose twin of `execute_block`) now takes a
+       `state_hook` param and spawns via `self.runtime`; the dispatch forwards
+       `execution_state_hook`.
+     - payload_validator: the `changeset_provider` acquisition was removed (the
+       deferred trie task now takes `changed_paths`). Our firehose
+       `mark_verified` flush was kept; the removed block dropped.
+     - chain-state/deferred_trie.rs: DELETED upstream by the state-root rework,
+       so our rayon-worker debug_assert went with it (it guarded upstream code,
+       not a valve feature — nothing lost).
+     - otterscan: revm 41 dropped the `revm_primitives` re-export; `FixedBytes`
+       now imports from `alloy_primitives`.
+     - .github/workflows/pr-audit.yml deleted upstream -> dropped our disabled copy.
+     - `--engine.legacy-state-root` dropped -> `--engine.state-root-fallback`
+       (deploy flag check if anything passes it).
 
   3. Worth watching (not blocking):
-     - Experimental revmc JIT EVM (`--jit.enabled`, #23230). If a JIT'd EVM
-       bypasses inspector call hooks, that is a firehose-fidelity risk of the
-       same class as the system-call patch. Opt-in today; do NOT enable on
-       firehose boxes without probing field presence first.
+     - revmc JIT EVM (#23230). The `jit` FEATURE is now on by default in
+       bin/reth (so it compiles in, and drags LLVM into the build), but the JIT
+       only runs when `--jit.enabled` is passed. OPEN QUESTION: does a JIT'd EVM
+       still fire Inspector call hooks? If not, enabling it would silently gut
+       firehose tracing — the same class of bug as the system-call patch. Do NOT
+       pass `--jit.enabled` on firehose boxes until this is probed.
+     - Goldens did NOT need regenerating on this bump: revm 41 kept
+       SYSTEM_CALL_GAS_LIMIT at 31,566,720, so the prestate goldens matched
+       byte-for-byte.
      - Amsterdam / EIP-7928 BAL work continues (BAL validation in
        flashbots_validateBuilderSubmissionV6, BAL-capable download clients).
        Brings the deferred "BAL x firehose" test closer to being testable.
