@@ -726,9 +726,11 @@ reth-firehose-tests = { path = "crates/firehose-tests" }
 # Valve fork of alloy-evm that routes system calls (EIP-4788, EIP-2935, etc.) through the Inspector.
 # The branch MUST version-match the workspace `alloy-evm` requirement, otherwise cargo silently
 # ignores this patch and falls back to unpatched crates.io (firehose then stops tracing system
-# calls). `valve/v0.36.0` = upstream alloy-evm v0.36.0 + the system-call inspector commit.
-# See https://github.com/alloy-rs/evm/pull/323 for the upstream PR.
-alloy-evm = { git = "https://github.com/valve-tech/evm.git", branch = "valve/v0.36.0" }
+# calls). `valve/v0.37.1` = upstream alloy-evm v0.37.1 + the system-call inspector commit.
+# reth v2.4.0 requires ^0.37.0 and resolves 0.37.1, so the branch must track 0.37.1.
+# See https://github.com/alloy-rs/evm/pull/323 for the upstream PR (still open as of
+# 2026-07-15, so this patch cannot yet be dropped).
+alloy-evm = { git = "https://github.com/valve-tech/evm.git", branch = "valve/v0.37.1" }
 
 ## Firehose additions
 # This is needed otherwise we get flooding of debug logs around a problem that seems to happen in Reth directly.

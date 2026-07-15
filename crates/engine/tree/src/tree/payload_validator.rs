@@ -752,7 +752,14 @@ where
             // gated to chains without block access lists.
             match make_state_provider(false) {
                 Ok(state_provider) => self
-                    .execute_and_trace_block(state_provider, env, &input, tracer, &mut handle)
+                    .execute_and_trace_block(
+                        state_provider,
+                        env,
+                        &input,
+                        tracer,
+                        &mut handle,
+                        execution_state_hook,
+                    )
                     .map(|(output, senders, receipt_root_rx)| {
                         (output, senders, receipt_root_rx, None)
                     }),
@@ -954,7 +961,6 @@ where
         if let Some(guard) = fh_tracer.take() {
             guard.mark_verified();
         }
-
 
         let executed_block = self.spawn_deferred_trie_task(
             Arc::new(block),
@@ -1286,6 +1292,7 @@ where
         input: &BlockOrPayload<T>,
         tracer: &mut reth_firehose::FirehoseBlockTracer,
         handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt>,
+        state_hook: Option<Box<dyn OnStateHook + 'static>>,
     ) -> Result<
         (
             BlockExecutionOutput<N::Receipt>,
@@ -1381,17 +1388,15 @@ where
         let (receipt_tx, receipt_rx) = crossbeam_channel::unbounded();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let task_handle = ReceiptRootTaskHandle::new(receipt_rx, result_tx);
-        self.payload_processor
-            .executor()
-            .spawn_blocking_named("receipt-root", move || task_handle.run(receipts_len));
+        self.runtime.spawn_blocking_named("receipt-root", move || task_handle.run(receipts_len));
 
         let transaction_count = input.transaction_count();
         let executed_tx_index = Arc::clone(handle.executed_tx_index());
-        // v2.3.0 removed the `with_state_hook` builder from `BlockExecutor`; install the hook on
-        // the EVM's underlying state db instead (mirrors `execute_block`).
-        executor.evm_mut().db_mut().set_state_hook(
-            handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook + 'static>),
-        );
+        // v2.3.0 removed the `with_state_hook` builder from `BlockExecutor`, so the hook is
+        // installed on the EVM's underlying state db. v2.4.0 additionally moved ownership of the
+        // hook out of `PayloadHandle` and into an explicit parameter sourced from
+        // `state_root_job.take_execution_hook()` — mirrors `execute_block`.
+        executor.evm_mut().db_mut().set_state_hook(state_hook);
 
         let execution_start = Instant::now();
 
