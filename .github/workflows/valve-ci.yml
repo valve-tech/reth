@@ -12,7 +12,10 @@ name: valve-ci
 
 on:
   push:
-    branches: [main]
+    # feature/update-to-reth-2.4 is temporarily included so valve-ci runs on the
+    # 2.4 branch directly: it conflicts with 2.2 `main`, so a PR can't build the
+    # merge ref the pull_request event needs. Remove once 2.4 lands.
+    branches: [main, feature/update-to-reth-2.4]
   pull_request:
 
 env:
