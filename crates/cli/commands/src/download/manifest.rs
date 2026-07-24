@@ -107,6 +107,11 @@ pub struct ChunkedArchive {
     /// Explicit inclusive [start,end] block range of each chunk, ordered first→last.
     /// Authoritative when present. Legacy manifests omit it → ranges derived from the
     /// uniform `blocks_per_file` stride (the degenerate case).
+    ///
+    /// Forward compatibility: an OLD `reth download` binary reading a NEW mixed-span
+    /// manifest ignores this field, derives uniform stride names, and fails loudly with a
+    /// 404 on the first nonexistent archive (`error_for_status` in fetch) — not silent
+    /// corruption. Still, deploy producer and consumer from the same build.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chunk_ranges: Vec<ChunkRange>,
 }
@@ -469,6 +474,10 @@ impl ChunkedArchive {
         if !self.chunk_ranges.is_empty() {
             self.chunk_ranges.iter().map(|r| (r.start, r.end)).collect()
         } else {
+            if self.blocks_per_file == 0 {
+                // Malformed manifest — avoid a div-by-zero panic; treat as no chunks.
+                return Vec::new();
+            }
             let n = self.total_blocks.div_ceil(self.blocks_per_file);
             (0..n)
                 .map(|i| (i * self.blocks_per_file, (i + 1) * self.blocks_per_file - 1))
@@ -1593,6 +1602,68 @@ mod tests {
     }
 
     #[test]
+    fn malformed_zero_blocks_per_file_yields_no_chunks() {
+        // A malformed legacy manifest with blocks_per_file: 0 must not panic on div-by-zero.
+        let chunked = ChunkedArchive {
+            blocks_per_file: 0,
+            total_blocks: 1_000_000,
+            chunk_sizes: vec![1, 2],
+            chunk_decompressed_sizes: vec![],
+            chunk_output_files: vec![vec![], vec![]],
+            chunk_ranges: vec![],
+        };
+        assert!(chunked.ranges().is_empty());
+        assert_eq!(chunked.num_chunks(), 0);
+
+        let mut components = BTreeMap::new();
+        components.insert("transactions".to_string(), ComponentManifest::Chunked(chunked));
+        let m = SnapshotManifest {
+            block: 1_000_000,
+            chain_id: 1,
+            storage_version: 2,
+            timestamp: 0,
+            base_url: Some("https://example.com".to_string()),
+            reth_version: None,
+            components,
+        };
+        assert!(m.archive_urls(SnapshotComponentType::Transactions).is_empty());
+        assert_eq!(m.chunks_for_distance(SnapshotComponentType::Transactions, Some(64)), 0);
+    }
+
+    #[test]
+    fn legacy_manifest_reserialization_keeps_chunk_ranges_absent() {
+        // A legacy manifest (no chunk_ranges key) must deserialize and reserialize WITHOUT
+        // growing a chunk_ranges key, so old consumers see byte-compatible semantics.
+        let json = r#"{
+            "block": 1500000,
+            "chain_id": 1,
+            "storage_version": 2,
+            "timestamp": 0,
+            "components": {
+                "transactions": {
+                    "blocks_per_file": 500000,
+                    "total_blocks": 1500000,
+                    "chunk_sizes": [1, 2, 3],
+                    "chunk_output_files": [[], [], []]
+                }
+            }
+        }"#;
+        let manifest: SnapshotManifest = serde_json::from_str(json).unwrap();
+        let ComponentManifest::Chunked(chunked) =
+            manifest.component(SnapshotComponentType::Transactions).unwrap()
+        else {
+            panic!("transactions should be chunked")
+        };
+        assert!(chunked.chunk_ranges.is_empty());
+
+        let reserialized = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !reserialized.contains("chunk_ranges"),
+            "legacy manifest must not grow a chunk_ranges key: {reserialized}"
+        );
+    }
+
+    #[test]
     fn ranges_falls_back_to_uniform_stride_when_empty() {
         // Legacy manifest: empty chunk_ranges → derive from the uniform stride.
         let chunked = ChunkedArchive {
@@ -1731,6 +1802,30 @@ mod tests {
         );
         assert_eq!(chunked.chunk_sizes.len(), 3);
         assert_eq!(chunked.chunk_output_files.len(), 3);
+
+        // Each chunk carries ALL THREE sidecars (.jar/.jar.conf/.jar.off) — guards against a
+        // dedup or prefix bug silently dropping files from an archive.
+        for (i, (start, end)) in [(0u64, 49_999u64), (50_000, 99_999), (100_000, 599_999)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut paths: Vec<_> =
+                chunked.chunk_output_files[i].iter().map(|f| f.path.clone()).collect();
+            paths.sort();
+            assert_eq!(
+                paths,
+                vec![
+                    format!("static_files/static_file_headers_{start}_{end}.jar"),
+                    format!("static_files/static_file_headers_{start}_{end}.jar.conf"),
+                    format!("static_files/static_file_headers_{start}_{end}.jar.off"),
+                ],
+                "chunk {i} must contain exactly its three sidecars"
+            );
+        }
+
+        // A segment with zero files on disk must produce NO component key at all.
+        assert!(manifest.component(SnapshotComponentType::Transactions).is_none());
+        assert!(manifest.component(SnapshotComponentType::Receipts).is_none());
 
         // Archives named by their real ranges exist on disk.
         assert!(output.path().join("headers-0-49999.tar.zst").exists());
