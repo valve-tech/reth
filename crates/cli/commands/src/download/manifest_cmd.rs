@@ -37,9 +37,12 @@ pub struct SnapshotManifestCommand {
     #[arg(long, default_value = "1")]
     chain_id: u64,
 
-    /// Blocks per archive file for chunked components.
+    /// Forward block-span written into the downloaded node's config (the span
+    /// it will use for NEW static files). Does NOT control how this manifest is
+    /// chunked — archives are packaged from the real on-disk segment ranges.
     ///
-    /// If omitted, this is inferred from header static file ranges in the source datadir.
+    /// If omitted, inferred as the span of the newest existing static file
+    /// (falling back to the reth default when the datadir has none).
     #[arg(long)]
     blocks_per_file: Option<u64>,
 }
