@@ -100,4 +100,5 @@ jobs:
             -p reth-firehose \
             -p reth-firehose-tests \
             -p reth-pulsechain-node \
-            -p reth-pulsechain-forks
+            -p reth-pulsechain-forks \
+            -p reth-cli-commands
