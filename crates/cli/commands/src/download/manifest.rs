@@ -479,9 +479,7 @@ impl ChunkedArchive {
                 return Vec::new();
             }
             let n = self.total_blocks.div_ceil(self.blocks_per_file);
-            (0..n)
-                .map(|i| (i * self.blocks_per_file, (i + 1) * self.blocks_per_file - 1))
-                .collect()
+            (0..n).map(|i| (i * self.blocks_per_file, (i + 1) * self.blocks_per_file - 1)).collect()
         }
     }
 
@@ -709,17 +707,17 @@ pub fn generate_manifest(
 /// Validates the enumerated on-disk static-file ranges for one chunked segment before
 /// packaging.
 ///
-/// - Consecutive sorted ranges must be contiguous (`next.start == prev.end + 1`). An interior
-///   gap means the source datadir is missing a segment file (e.g. a partial rsync); packaging
-///   it would publish a manifest with a hole that every downloaded node inherits, with all
-///   blake3 checksums green.
-/// - Overlapping ranges (`next.start <= prev.end`) mean stale/duplicate segment files whose
-///   blocks would be packaged twice.
-/// - The last range must reach the snapshot height `block`, otherwise the state archive
-///   disagrees with the static files on every downloaded node. The final range END exceeding
-///   `block` is normal — the tip file is named by its full fixed bucket while still filling.
-/// - Leading absence (first range starting above 0) stays allowed: pruned segments
-///   legitimately start late.
+/// - Consecutive sorted ranges must be contiguous (`next.start == prev.end + 1`). An interior gap
+///   means the source datadir is missing a segment file (e.g. a partial rsync); packaging it would
+///   publish a manifest with a hole that every downloaded node inherits, with all blake3 checksums
+///   green.
+/// - Overlapping ranges (`next.start <= prev.end`) mean stale/duplicate segment files whose blocks
+///   would be packaged twice.
+/// - The last range must reach the snapshot height `block`, otherwise the state archive disagrees
+///   with the static files on every downloaded node. The final range END exceeding `block` is
+///   normal — the tip file is named by its full fixed bucket while still filling.
+/// - Leading absence (first range starting above 0) stays allowed: pruned segments legitimately
+///   start late.
 fn validate_segment_ranges(key: &str, ranges: &[(u64, u64)], block: u64) -> Result<()> {
     for pair in ranges.windows(2) {
         let (prev_start, prev_end) = pair[0];
@@ -1445,9 +1443,8 @@ mod tests {
         seed_segment(source.path(), "receipts", &[(100_000, 149_999)]);
         seed_state_db(source.path());
 
-        let manifest =
-            generate_manifest(source.path(), output.path(), None, 149_999, 1, 100_000)
-                .expect("leading absence must stay packageable");
+        let manifest = generate_manifest(source.path(), output.path(), None, 149_999, 1, 100_000)
+            .expect("leading absence must stay packageable");
         let ComponentManifest::Chunked(receipts) =
             manifest.component(SnapshotComponentType::Receipts).unwrap()
         else {
@@ -1473,10 +1470,8 @@ mod tests {
         let files =
             source_files_for_chunk(source.path(), SnapshotComponentType::Headers, 0, 49_999)
                 .unwrap();
-        let names: Vec<_> = files
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
+        let names: Vec<_> =
+            files.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
         assert_eq!(
             names,
             vec![
@@ -1520,7 +1515,8 @@ mod tests {
     }
 
     fn transactions_chunked(m: &SnapshotManifest) -> &ChunkedArchive {
-        let ComponentManifest::Chunked(c) = m.component(SnapshotComponentType::Transactions).unwrap()
+        let ComponentManifest::Chunked(c) =
+            m.component(SnapshotComponentType::Transactions).unwrap()
         else {
             panic!("transactions should be chunked")
         };
@@ -1709,19 +1705,15 @@ mod tests {
     fn snapshot_archives_over_mixed_ranges_distance_tail() {
         let m = mixed_manifest();
         // Strictly inside the tip chunk's data (cutoff = 100_000 = tip start) → tip alone.
-        let one = m.snapshot_archives_for_distance(
-            SnapshotComponentType::Transactions,
-            Some(499_999),
-        );
+        let one =
+            m.snapshot_archives_for_distance(SnapshotComponentType::Transactions, Some(499_999));
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].file_name, "transactions-100000-599999.tar.zst");
 
         // Boundary: dist=500_000 → cutoff = 99_999 == the previous chunk's end. The cutoff
         // rule is conservative at exact boundaries and includes that chunk too.
-        let two = m.snapshot_archives_for_distance(
-            SnapshotComponentType::Transactions,
-            Some(500_000),
-        );
+        let two =
+            m.snapshot_archives_for_distance(SnapshotComponentType::Transactions, Some(500_000));
         assert_eq!(two.len(), 2);
         assert_eq!(two[0].file_name, "transactions-50000-99999.tar.zst");
         assert_eq!(two[1].file_name, "transactions-100000-599999.tar.zst");
@@ -1766,7 +1758,8 @@ mod tests {
         // Mixed-span headers: two 50k seed segments + one 500k tip segment, each with the three
         // real reth sidecars (.jar data, .jar.conf, .jar.off).
         for (start, end) in [(0u64, 49_999u64), (50_000, 99_999), (100_000, 599_999)] {
-            std::fs::write(sf.join(format!("static_file_headers_{start}_{end}.jar")), b"h").unwrap();
+            std::fs::write(sf.join(format!("static_file_headers_{start}_{end}.jar")), b"h")
+                .unwrap();
             std::fs::write(sf.join(format!("static_file_headers_{start}_{end}.jar.conf")), b"c")
                 .unwrap();
             std::fs::write(sf.join(format!("static_file_headers_{start}_{end}.jar.off")), b"o")
@@ -1777,15 +1770,9 @@ mod tests {
         std::fs::write(db_dir.join("mdbx.dat"), b"state-data").unwrap();
 
         // blocks_per_file (500k) is the forward span only — the real ranges come from disk.
-        let manifest = generate_manifest(
-            source.path(),
-            output.path(),
-            Some("https://x"),
-            599_999,
-            1,
-            500_000,
-        )
-        .expect("mixed-span datadir must NOT bail");
+        let manifest =
+            generate_manifest(source.path(), output.path(), Some("https://x"), 599_999, 1, 500_000)
+                .expect("mixed-span datadir must NOT bail");
 
         let ComponentManifest::Chunked(chunked) =
             manifest.component(SnapshotComponentType::Headers).unwrap()
@@ -1805,9 +1792,8 @@ mod tests {
 
         // Each chunk carries ALL THREE sidecars (.jar/.jar.conf/.jar.off) — guards against a
         // dedup or prefix bug silently dropping files from an archive.
-        for (i, (start, end)) in [(0u64, 49_999u64), (50_000, 99_999), (100_000, 599_999)]
-            .into_iter()
-            .enumerate()
+        for (i, (start, end)) in
+            [(0u64, 49_999u64), (50_000, 99_999), (100_000, 599_999)].into_iter().enumerate()
         {
             let mut paths: Vec<_> =
                 chunked.chunk_output_files[i].iter().map(|f| f.path.clone()).collect();

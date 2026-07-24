@@ -272,7 +272,10 @@ mod tests {
         // A lower range written after → must sort ahead.
         std::fs::write(sf.join("static_file_headers_0_49999.jar"), []).unwrap();
 
-        assert_eq!(segment_ranges(dir.path(), "headers").unwrap(), vec![(0, 49_999), (50_000, 99_999)]);
+        assert_eq!(
+            segment_ranges(dir.path(), "headers").unwrap(),
+            vec![(0, 49_999), (50_000, 99_999)]
+        );
     }
 
     #[test]

@@ -389,7 +389,8 @@ mod tests {
         let sf = source.join("static_files");
         std::fs::create_dir_all(&sf).unwrap();
         for (start, end) in ranges {
-            std::fs::write(sf.join(format!("static_file_headers_{start}_{end}.jar")), b"h").unwrap();
+            std::fs::write(sf.join(format!("static_file_headers_{start}_{end}.jar")), b"h")
+                .unwrap();
             std::fs::write(sf.join(format!("static_file_headers_{start}_{end}.jar.conf")), b"c")
                 .unwrap();
             std::fs::write(sf.join(format!("static_file_headers_{start}_{end}.jar.off")), b"o")
@@ -410,15 +411,9 @@ mod tests {
         let output = tempdir().unwrap();
         seed_header_datadir(source.path(), &[(0, 49_999), (50_000, 99_999), (100_000, 599_999)]);
 
-        let manifest = generate_manifest(
-            source.path(),
-            output.path(),
-            Some("https://x"),
-            599_999,
-            1,
-            500_000,
-        )
-        .unwrap();
+        let manifest =
+            generate_manifest(source.path(), output.path(), Some("https://x"), 599_999, 1, 500_000)
+                .unwrap();
 
         let selections =
             BTreeMap::from([(SnapshotComponentType::Headers, ComponentSelection::All)]);
