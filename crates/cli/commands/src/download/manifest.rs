@@ -592,6 +592,7 @@ pub fn generate_manifest(
         if ranges.is_empty() {
             continue;
         }
+        validate_segment_ranges(key, &ranges, block)?;
 
         let mut planned_chunks = Vec::with_capacity(ranges.len());
         for (idx, (start, end)) in ranges.iter().copied().enumerate() {
@@ -696,6 +697,47 @@ pub fn generate_manifest(
     })
 }
 
+/// Validates the enumerated on-disk static-file ranges for one chunked segment before
+/// packaging.
+///
+/// - Consecutive sorted ranges must be contiguous (`next.start == prev.end + 1`). An interior
+///   gap means the source datadir is missing a segment file (e.g. a partial rsync); packaging
+///   it would publish a manifest with a hole that every downloaded node inherits, with all
+///   blake3 checksums green.
+/// - Overlapping ranges (`next.start <= prev.end`) mean stale/duplicate segment files whose
+///   blocks would be packaged twice.
+/// - The last range must reach the snapshot height `block`, otherwise the state archive
+///   disagrees with the static files on every downloaded node. The final range END exceeding
+///   `block` is normal — the tip file is named by its full fixed bucket while still filling.
+/// - Leading absence (first range starting above 0) stays allowed: pruned segments
+///   legitimately start late.
+fn validate_segment_ranges(key: &str, ranges: &[(u64, u64)], block: u64) -> Result<()> {
+    for pair in ranges.windows(2) {
+        let (prev_start, prev_end) = pair[0];
+        let (start, end) = pair[1];
+        if start <= prev_end {
+            eyre::bail!(
+                "Overlapping static-file ranges for {key}: {prev_start}-{prev_end} and {start}-{end}"
+            );
+        }
+        if start != prev_end + 1 {
+            eyre::bail!(
+                "Gap in static-file ranges for {key}: {prev_start}-{prev_end} is followed by {start}-{end} (blocks {}-{} missing from the source datadir)",
+                prev_end + 1,
+                start - 1
+            );
+        }
+    }
+    if let Some(&(_, last_end)) = ranges.last() {
+        if last_end < block {
+            eyre::bail!(
+                "Static files for {key} end at block {last_end} but the snapshot height is {block}; the source datadir is missing tip segments"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Resolves an archive file path from a component key and naming convention.
 pub fn chunk_filename(component_key: &str, start: u64, end: u64) -> String {
     format!("{component_key}-{start}-{end}.tar.zst")
@@ -742,8 +784,15 @@ fn source_files_for_chunk(
         if !entry.file_type()?.is_file() {
             continue;
         }
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            files.push(entry.path());
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        // The prefix must match the EXACT range: the character after it has to be `.` (a
+        // sidecar suffix) or end-of-string, so `..._0_49999` cannot also sweep in
+        // `..._0_499999.jar`.
+        if let Some(rest) = file_name.strip_prefix(&prefix) {
+            if rest.is_empty() || rest.starts_with('.') {
+                files.push(entry.path());
+            }
         }
     }
 
@@ -1307,6 +1356,127 @@ mod tests {
         assert!(!rocksdb.output_files.is_empty());
         assert_eq!(rocksdb.output_files[0].path, "rocksdb/CURRENT");
         assert!(output.path().join("rocksdb_indices.tar.zst").exists());
+    }
+
+    /// Seeds the three real reth sidecars (`.jar`, `.jar.conf`, `.jar.off`) for each `(start,
+    /// end)` range of `segment` under `source/static_files/`.
+    fn seed_segment(source: &Path, segment: &str, ranges: &[(u64, u64)]) {
+        let sf = source.join("static_files");
+        std::fs::create_dir_all(&sf).unwrap();
+        for (start, end) in ranges {
+            for suffix in [".jar", ".jar.conf", ".jar.off"] {
+                std::fs::write(
+                    sf.join(format!("static_file_{segment}_{start}_{end}{suffix}")),
+                    b"x",
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Seeds a minimal state DB so `generate_manifest` can package the state component.
+    fn seed_state_db(source: &Path) {
+        let db_dir = source.join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::write(db_dir.join("mdbx.dat"), b"state-data").unwrap();
+    }
+
+    /// CRITICAL: an interior gap (e.g. a partial rsync that lost a segment file) must fail
+    /// manifest generation — otherwise every downloaded node silently misses those blocks
+    /// with all checksums green.
+    #[test]
+    fn generate_manifest_rejects_interior_gap() {
+        let source = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        seed_segment(source.path(), "headers", &[(0, 49_999), (100_000, 149_999)]);
+        seed_state_db(source.path());
+
+        let err = generate_manifest(source.path(), output.path(), None, 149_999, 1, 500_000)
+            .expect_err("a datadir with an interior gap must not package");
+        assert!(err.to_string().contains("Gap"), "unexpected error: {err}");
+    }
+
+    /// CRITICAL: overlapping ranges (e.g. a stale wider segment left beside a re-split one)
+    /// must fail manifest generation instead of double-packaging the overlap.
+    #[test]
+    fn generate_manifest_rejects_overlapping_ranges() {
+        let source = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        seed_segment(source.path(), "headers", &[(0, 49_999), (0, 499_999)]);
+        seed_state_db(source.path());
+
+        let err = generate_manifest(source.path(), output.path(), None, 499_999, 1, 500_000)
+            .expect_err("a datadir with overlapping ranges must not package");
+        assert!(err.to_string().contains("Overlap"), "unexpected error: {err}");
+    }
+
+    /// CRITICAL: static files must actually reach the snapshot height. Files ending at
+    /// 99_999 with a DB checkpoint of 599_999 would publish a manifest whose state archive
+    /// disagrees with the static files on every downloaded node.
+    #[test]
+    fn generate_manifest_rejects_coverage_short_of_block() {
+        let source = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        seed_segment(source.path(), "headers", &[(0, 49_999), (50_000, 99_999)]);
+        seed_state_db(source.path());
+
+        let err = generate_manifest(source.path(), output.path(), None, 599_999, 1, 500_000)
+            .expect_err("static files ending below the snapshot height must not package");
+        assert!(err.to_string().contains("snapshot height"), "unexpected error: {err}");
+    }
+
+    /// Leading absence stays allowed: a pruned segment legitimately starts late (first range
+    /// start > 0). Only interior gaps/overlaps and short tip coverage are fatal.
+    #[test]
+    fn generate_manifest_allows_pruned_segment_starting_late() {
+        let source = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        seed_segment(source.path(), "headers", &[(0, 49_999), (50_000, 149_999)]);
+        // Receipts pruned below 100_000 — starts late but is contiguous and reaches block.
+        seed_segment(source.path(), "receipts", &[(100_000, 149_999)]);
+        seed_state_db(source.path());
+
+        let manifest =
+            generate_manifest(source.path(), output.path(), None, 149_999, 1, 100_000)
+                .expect("leading absence must stay packageable");
+        let ComponentManifest::Chunked(receipts) =
+            manifest.component(SnapshotComponentType::Receipts).unwrap()
+        else {
+            panic!("receipts should be chunked")
+        };
+        assert_eq!(receipts.chunk_ranges, vec![ChunkRange { start: 100_000, end: 149_999 }]);
+    }
+
+    /// IMPORTANT: the chunk source-file prefix must match the exact range — the prefix
+    /// `static_file_headers_0_49999` must not also sweep `static_file_headers_0_499999.jar`
+    /// into the `(0, 49999)` chunk.
+    #[test]
+    fn source_files_for_chunk_requires_exact_range_match() {
+        let source = tempdir().unwrap();
+        seed_segment(source.path(), "headers", &[(0, 49_999), (0, 499_999)]);
+        // A bare data file without any sidecar suffix must still match its own range.
+        std::fs::write(
+            source.path().join("static_files").join("static_file_headers_0_49999"),
+            b"bare",
+        )
+        .unwrap();
+
+        let files =
+            source_files_for_chunk(source.path(), SnapshotComponentType::Headers, 0, 49_999)
+                .unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "static_file_headers_0_49999".to_string(),
+                "static_file_headers_0_49999.jar".to_string(),
+                "static_file_headers_0_49999.jar.conf".to_string(),
+                "static_file_headers_0_49999.jar.off".to_string(),
+            ]
+        );
     }
 
     /// A manifest whose transactions component has MIXED block-spans (50k seed segments below a
