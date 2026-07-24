@@ -477,11 +477,26 @@ impl ChunkedArchive {
     }
 
     /// Returns the index of the first chunk to include so the selected tail covers at least
-    /// `distance` blocks. `None` (All mode) selects every chunk (index 0).
+    /// `distance` blocks of ACTUAL data. `None` (All mode) selects every chunk (index 0);
+    /// `Some(0)` selects none.
     ///
-    /// Walks [`Self::ranges`] from the tail accumulating each chunk's `(end - start + 1)` span
-    /// until coverage reaches `distance`. This is the single source of truth for tail selection
-    /// so every distance-aware method agrees, on both uniform and mixed-span manifests.
+    /// Selection is anchored to `total_blocks` (the snapshot height), NOT to the chunks'
+    /// nominal filename spans: reth names the tip static file by its full fixed bucket
+    /// (`find_fixed_range`) regardless of how many blocks it actually contains, so walking
+    /// nominal spans from the tail under-covers whenever the tip bucket is still filling —
+    /// the normal production state. Instead, compute the cutoff block
+    /// `total_blocks - min(distance, total_blocks)` and include every chunk whose range
+    /// reaches it (`end >= cutoff`).
+    ///
+    /// On a uniform manifest whose `total_blocks` is a multiple of `blocks_per_file` this is
+    /// provably identical to the historical `num_chunks - distance.div_ceil(blocks_per_file)`
+    /// selection. At exact chunk boundaries the cutoff rule is deliberately conservative (it
+    /// may include one chunk more than the minimal cover) — it never under-covers. Note
+    /// `ComponentSelection::Since` already adds `+1` when converted to a distance (planning),
+    /// so the cutoff must not re-add it.
+    ///
+    /// This is the single source of truth for tail selection so every distance-aware method
+    /// agrees, on both uniform and mixed-span manifests.
     fn start_index_for_distance(&self, distance: Option<u64>) -> usize {
         let ranges = self.ranges();
         let Some(dist) = distance else {
@@ -490,15 +505,9 @@ impl ChunkedArchive {
         if dist == 0 {
             return ranges.len();
         }
-        let mut covered = 0u64;
-        for i in (0..ranges.len()).rev() {
-            let (start, end) = ranges[i];
-            covered += end - start + 1;
-            if covered >= dist {
-                return i;
-            }
-        }
-        0
+        let clamped = dist.min(self.total_blocks);
+        let cutoff = self.total_blocks.saturating_sub(clamped);
+        ranges.iter().position(|&(_, end)| end >= cutoff).unwrap_or(ranges.len())
     }
 
     /// Returns the number of chunks.
@@ -1339,6 +1348,71 @@ mod tests {
         c
     }
 
+    /// Mixed manifest where the tip chunk's NOMINAL filename span exceeds the actual data:
+    /// the tip chunk is named `100000-599999` (its full fixed bucket, per `find_fixed_range`)
+    /// but the snapshot height (`total_blocks`) is only 150_000 — the NORMAL production state
+    /// while the tip bucket is still filling. `total_blocks < last range end` is the shape
+    /// that distinguishes the cutoff-block selection from a naive nominal-span walk.
+    fn mixed_manifest_partial_tip() -> SnapshotManifest {
+        let mut components = BTreeMap::new();
+        components.insert(
+            "transactions".to_string(),
+            ComponentManifest::Chunked(ChunkedArchive {
+                blocks_per_file: 500_000,
+                total_blocks: 150_000,
+                chunk_sizes: vec![10, 20, 30],
+                chunk_decompressed_sizes: vec![100, 200, 300],
+                chunk_output_files: vec![vec![], vec![], vec![]],
+                chunk_ranges: vec![
+                    ChunkRange { start: 0, end: 49_999 },
+                    ChunkRange { start: 50_000, end: 99_999 },
+                    ChunkRange { start: 100_000, end: 599_999 },
+                ],
+            }),
+        );
+        SnapshotManifest {
+            block: 150_000,
+            chain_id: 1,
+            storage_version: 2,
+            timestamp: 0,
+            base_url: Some("https://example.com".to_string()),
+            reth_version: None,
+            components,
+        }
+    }
+
+    /// CRITICAL regression: tail selection must anchor to `total_blocks`, never to the tip
+    /// chunk's nominal filename span. A nominal-span walk sees the tip chunk as 500k blocks
+    /// and under-covers whenever the tip bucket is only partially filled.
+    #[test]
+    fn tail_selection_anchors_to_total_blocks_not_nominal_spans() {
+        let m = mixed_manifest_partial_tip();
+        let tx = SnapshotComponentType::Transactions;
+
+        // The whole chain (150k blocks) → ALL 3 chunks. The naive walk saw the tip chunk's
+        // nominal 500k span as already covering 150k and selected only 1 chunk.
+        assert_eq!(m.chunks_for_distance(tx, Some(150_000)), 3);
+        // Past the tip chunk's ~50k of actual data → the previous chunk is needed too.
+        // cutoff = 150_000 - 50_001 = 99_999 → first chunk with end >= 99_999 is index 1.
+        assert_eq!(m.chunks_for_distance(tx, Some(50_001)), 2);
+        // Boundary: dist=50_000 → cutoff = 100_000 = tip chunk start → tip chunk alone.
+        assert_eq!(m.chunks_for_distance(tx, Some(50_000)), 1);
+        // dist=0 → nothing (matches baseline behavior).
+        assert_eq!(m.chunks_for_distance(tx, Some(0)), 0);
+        // dist >= total_blocks (clamped) → all chunks.
+        assert_eq!(m.chunks_for_distance(tx, Some(150_001)), 3);
+        assert_eq!(m.chunks_for_distance(tx, Some(u64::MAX)), 3);
+        assert_eq!(m.chunks_for_distance(tx, None), 3);
+
+        // Every distance-aware method agrees (chunk_sizes = [10, 20, 30]).
+        assert_eq!(m.size_for_distance(tx, Some(150_000)), 60);
+        assert_eq!(m.size_for_distance(tx, Some(50_001)), 50);
+        assert_eq!(m.size_for_distance(tx, Some(50_000)), 30);
+        // chunk_decompressed_sizes = [100, 200, 300].
+        assert_eq!(m.output_size_for_distance(tx, Some(150_000)), 600);
+        assert_eq!(m.output_size_for_distance(tx, Some(50_001)), 500);
+    }
+
     #[test]
     fn ranges_uses_explicit_chunk_ranges_when_present() {
         let m = mixed_manifest();
@@ -1393,18 +1467,19 @@ mod tests {
     #[test]
     fn snapshot_archives_over_mixed_ranges_distance_tail() {
         let m = mixed_manifest();
-        // 500k covers exactly the last (500k-span) chunk.
+        // Strictly inside the tip chunk's data (cutoff = 100_000 = tip start) → tip alone.
         let one = m.snapshot_archives_for_distance(
             SnapshotComponentType::Transactions,
-            Some(500_000),
+            Some(499_999),
         );
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].file_name, "transactions-100000-599999.tar.zst");
 
-        // 550k spills into the previous (50k-span) chunk too.
+        // Boundary: dist=500_000 → cutoff = 99_999 == the previous chunk's end. The cutoff
+        // rule is conservative at exact boundaries and includes that chunk too.
         let two = m.snapshot_archives_for_distance(
             SnapshotComponentType::Transactions,
-            Some(550_000),
+            Some(500_000),
         );
         assert_eq!(two.len(), 2);
         assert_eq!(two[0].file_name, "transactions-50000-99999.tar.zst");
@@ -1416,21 +1491,28 @@ mod tests {
         let m = mixed_manifest();
         let tx = SnapshotComponentType::Transactions;
 
-        // chunks_for_distance
+        // chunks_for_distance. Cutoff = total_blocks - dist; a chunk is included when its
+        // end >= cutoff, so a dist landing exactly on a chunk's end conservatively includes
+        // that chunk (never under-covers).
         assert_eq!(m.chunks_for_distance(tx, None), 3);
-        assert_eq!(m.chunks_for_distance(tx, Some(500_000)), 1);
-        assert_eq!(m.chunks_for_distance(tx, Some(550_000)), 2);
+        assert_eq!(m.chunks_for_distance(tx, Some(499_999)), 1);
+        // Boundary: cutoff = 99_999 == middle chunk's end → included.
+        assert_eq!(m.chunks_for_distance(tx, Some(500_000)), 2);
+        // Boundary: cutoff = 49_999 == first chunk's end → all included.
+        assert_eq!(m.chunks_for_distance(tx, Some(550_000)), 3);
         assert_eq!(m.chunks_for_distance(tx, Some(10_000_000)), 3);
 
         // size_for_distance (chunk_sizes = [10, 20, 30])
         assert_eq!(m.size_for_distance(tx, None), 60);
-        assert_eq!(m.size_for_distance(tx, Some(500_000)), 30);
-        assert_eq!(m.size_for_distance(tx, Some(550_000)), 50);
+        assert_eq!(m.size_for_distance(tx, Some(499_999)), 30);
+        assert_eq!(m.size_for_distance(tx, Some(500_000)), 50);
+        assert_eq!(m.size_for_distance(tx, Some(550_000)), 60);
 
         // output_size_for_distance (chunk_decompressed_sizes = [100, 200, 300])
         assert_eq!(m.output_size_for_distance(tx, None), 600);
-        assert_eq!(m.output_size_for_distance(tx, Some(500_000)), 300);
-        assert_eq!(m.output_size_for_distance(tx, Some(550_000)), 500);
+        assert_eq!(m.output_size_for_distance(tx, Some(499_999)), 300);
+        assert_eq!(m.output_size_for_distance(tx, Some(500_000)), 500);
+        assert_eq!(m.output_size_for_distance(tx, Some(550_000)), 600);
     }
 
     #[test]
