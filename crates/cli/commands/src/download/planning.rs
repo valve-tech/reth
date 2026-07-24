@@ -321,6 +321,68 @@ mod tests {
         assert_eq!(planned.archives.len(), 2);
     }
 
+    /// CRITICAL regression for the default receipts path: `mod.rs` auto-selects
+    /// `Since(paris)` for receipts, which planning converts to a distance
+    /// (`snapshot_block - since + 1`). Over a mixed manifest whose tip chunk is a partially
+    /// filled fixed bucket (`total_blocks` 150_000 < nominal tip end 599_999), a
+    /// `Since(0)`-derived distance spans the whole chain and MUST select every chunk — the
+    /// naive nominal-span walk selected only the tip chunk.
+    #[test]
+    fn since_selection_over_partial_tip_mixed_manifest_selects_full_set() {
+        let chunk_ranges = [(0u64, 49_999u64), (50_000, 99_999), (100_000, 599_999)];
+        let mut components = BTreeMap::new();
+        components.insert(
+            "receipts".to_string(),
+            ComponentManifest::Chunked(ChunkedArchive {
+                blocks_per_file: 500_000,
+                total_blocks: 150_000,
+                chunk_sizes: vec![10, 20, 30],
+                chunk_decompressed_sizes: vec![100, 200, 300],
+                chunk_output_files: chunk_ranges
+                    .iter()
+                    .map(|(start, end)| {
+                        vec![OutputFileChecksum {
+                            path: format!("static_files/static_file_receipts_{start}_{end}.jar"),
+                            size: 1,
+                            blake3: "h".to_string(),
+                        }]
+                    })
+                    .collect(),
+                chunk_ranges: chunk_ranges
+                    .iter()
+                    .map(|(start, end)| ChunkRange { start: *start, end: *end })
+                    .collect(),
+            }),
+        );
+        let manifest = SnapshotManifest {
+            block: 150_000,
+            chain_id: 1,
+            storage_version: 2,
+            timestamp: 0,
+            base_url: Some("https://example.com".to_string()),
+            reth_version: None,
+            components,
+        };
+
+        let selections =
+            BTreeMap::from([(SnapshotComponentType::Receipts, ComponentSelection::Since(0))]);
+        let planned = collect_planned_archives(&manifest, &selections).unwrap();
+
+        assert_eq!(planned.archives.len(), 3, "Since(0) must select every chunk");
+        let mut names: Vec<_> =
+            planned.archives.iter().map(|p| p.archive.file_name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "receipts-0-49999.tar.zst".to_string(),
+                "receipts-100000-599999.tar.zst".to_string(),
+                "receipts-50000-99999.tar.zst".to_string(),
+            ]
+        );
+        assert_eq!(planned.total_download_size, 60);
+    }
+
     /// Seeds `static_files/` under `source` with the three real reth sidecars for each `(start,
     /// end)` header range, plus a minimal state DB so `generate_manifest` succeeds.
     fn seed_header_datadir(source: &Path, ranges: &[(u64, u64)]) {
