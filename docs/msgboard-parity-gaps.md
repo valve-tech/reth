@@ -256,8 +256,309 @@ Ten new gaps surfaced — all closed in this round:
 - `add_remote_msgs_skips_invalid_and_counts_accepted` updated for the new `(accepted, kickable)` return tuple
 
 **Closed for byte-for-byte erigon parity (no remaining ambiguity):**
-- **M1** ✅ `MsgIndex::insert` comparator switched to erigon's `OR` predicate (`newMsg.block < m.block || newMsg.ratio < m.ratio`), expressed as `partition_point(|m| newMsg.block >= m.block && newMsg.ratio >= m.ratio)`. Insert position is byte-identical to erigon's `sort.Search`, including under mixed `(block, ratio)` distributions where the OR-comparator is not a true total order. New test `insert_position_matches_erigon_or_comparator` locks this. (Trade-off: reth is no longer *more correct* than erigon in the audit's narrow sense; the goal here is wire/eviction parity, not algorithmic perfection — operators must see the same evicted message under the same input.)
+- **M1** ⚠️ **superseded — see §11.** `MsgIndex::insert` comparator switched to erigon's `OR` predicate (`newMsg.block < m.block || newMsg.ratio < m.ratio`), expressed as `partition_point(|m| newMsg.block >= m.block && newMsg.ratio >= m.ratio)`. The claim recorded here — that this is "byte-identical to erigon's `sort.Search`, including under mixed `(block, ratio)` distributions" — **was wrong**, and wrong precisely in the case it claimed to cover. (Trade-off as recorded: reth is no longer *more correct* than erigon in the audit's narrow sense; the goal is wire/eviction parity, not algorithmic perfection — operators must see the same evicted message under the same input. That goal stands; the implementation did not achieve it until §11.)
 - **M2** ✅ `validate()` moved out of `add_local_msg` and `add_remote_msgs` to the decode boundary, mirroring erigon's `PoWMsgFromRLP` / `DecodeRLPMsgList` split. New helper `decode_validated_pow_msg` is used by `msgboard_addMessage`. Wire-side `decode_pow_msg_list` already validates. The board's hot path now matches `addMsgLocked` exactly: only size, work-ratio, block-window, and PoW. RPC clients see the same error variant erigon would surface.
 - **M3** ✅ `MsgboardError::BlockUnknown` and `MsgboardError::BlockExpired` collapsed into a single `BlockTooOld` variant matching erigon's `ErrMsgTooOld`. Both call sites (`add_local_msg`'s unknown-hash path and `insert_checked`'s aged-out race-condition path) now return the same variant, eliminating the API-surface divergence for clients that pattern-match on the error type.
 
 **Tests after this round:** 44 pass, 0 fail (3 internal-validate tests in `board.rs` removed since their semantics now live in `pow.rs::test_validate_rejects_*`; `add_remote_msgs_skips_invalid_and_counts_accepted` updated to exercise an oversized-payload kickable case which is post-decode-deterministic).
+
+---
+
+## 11. Round-3: `partition_point` is not `sort.Search` (M1 reopened and closed)
+
+**Audit date:** 2026-07-28
+**Trigger:** a developer report of a "message index bug".
+
+### 11.1 The defect
+
+§10 M1 recorded `MsgIndex::insert` as achieving byte-identical insert positions
+to erigon by expressing erigon's `sort.Search` predicate as a negated
+`slice::partition_point`. The De Morgan negation is correct. The reasoning
+underneath it was not.
+
+**Go's `sort.Search` and Rust's `slice::partition_point` return the same index
+only when the predicate is monotonic over the slice.** They use different probe
+sequences — Go a classic `lo`/`hi` midpoint loop, Rust a `base`/`size` descent —
+and on a non-monotonic predicate those land on different answers.
+
+Erigon's OR-comparator is not monotonic. `index.rs` said so in its own module
+docs, five lines above the code that depended on it not mattering.
+
+### 11.2 Measured impact
+
+Replaying identical insert sequences through both implementations:
+
+| Metric | Rate |
+|---|---|
+| Sequences producing a different board order | **12.17%** |
+| Sequences producing a different eviction target (`msgs[0]`) | **1.38%** |
+
+At `count_limit`, reth evicted a different message than erigon on ~1.4% of
+sequences — the exact wire-observable parity property M1 existed to guarantee.
+It also flows into the `BoardOverflow` self-displacement path
+(`board.rs`): reth could reject-and-not-broadcast a message erigon accepts,
+and the reverse.
+
+### 11.3 Why CI did not catch it
+
+The guard test `insert_position_matches_erigon_or_comparator` used a
+**two-element board**. At that size both algorithms probe the same single index
+and cannot disagree, so the test passed under either implementation. Divergence
+requires ≥5 entries. The test asserted the right property on an input too small
+to falsify it.
+
+### 11.4 Fix
+
+`MsgIndex::insert` now calls `erigon_insert_pos`, a literal port of Go's
+`sort.Search` loop. Parity on a non-monotonic predicate requires reproducing the
+*search*, not just the comparator.
+
+Verified against **real Go 1.23 `sort.Search`** over 200,000 randomized insert
+sequences (~1.7M inserts), FNV-1a digesting every resulting board order:
+
+```
+Go sort.Search (reference) : 11128719865354962318
+reth, after fix            : 11128719865354962318   match
+reth, before fix           :  1127759515664285576   differ
+```
+
+Two tests lock this, both verified to fail against the pre-fix implementation:
+
+- `insert_position_matches_erigon_on_deep_board` — minimised 9-message case
+- `insert_order_matches_go_sort_search_over_200k_sequences` — the full differential, with the Go reference program embedded in the test docs so the digest constant can be regenerated
+
+### 11.5 Ordering gaps found in the same pass
+
+Two further non-determinism bugs, same family (`HashMap` iteration order
+leaking into wire-visible output):
+
+- **O1** ✅ `msgboard_categories` returned `HashMap` keys unsorted. `specs/02-msgboard.md` §9.2 specifies a **sorted** list. `MsgBoard::categories` now sorts. Test: `categories_are_returned_sorted` (16 categories, so an unsorted implementation cannot pass by chance).
+- **O2** ✅ `MsgIndex::category_msgs{,_filtered}` iterated `HashMap::values()`, so `msgboard_content` returned an arbitrary per-node order for the category-filtered path while the unfiltered path returned precedence order. Both now walk the ordered `msgs` vec. Tests: `content_returns_messages_in_board_precedence_order`, `content_category_order_matches_the_unfiltered_order`.
+
+  Note: precedence order is **not** recoverable by sorting the collected values — it is defined by the non-total OR-comparator plus insertion history, not by any key. Walking the ordered vec is the only correct source.
+
+  **Erigon's ordering for `Content` could not be verified** — the reference source was not available during this pass. What is asserted is internal consistency and determinism, not erigon parity. If erigon returns a different order, this is still open.
+
+- **O3** ✅ `send_board_message_ids`'s doc comment claimed "approximately 826 IDs per chunk". The actual value is `102_400 / 121` = **846**. Comment corrected; `announcing_chunks_at_846_ids_per_frame` pins the arithmetic.
+
+### 11.6 Test coverage added
+
+`protocol.rs`, `rpc.rs`, and `msg_id.rs` had **zero** tests before this pass.
+
+| Crate / file | Before | After |
+|---|---|---|
+| `reth-msgboard` (total) | 45 | **93** |
+| ├ `protocol.rs` | 0 | 26 |
+| ├ `rpc.rs` | 0 | 21 |
+| └ `index.rs` | 13 | 15 |
+| `reth-msgboard-types` (total) | 14 | **26** |
+| └ `msg_id.rs` | 0 | 12 |
+
+`protocol.rs` tests drive `handle_incoming` / `send_board_message_ids` directly
+against a real board and an mpsc sender, asserting opcode bytes, payload bytes,
+frame counts, and reputation calls — covering readiness gating, `gossip_disabled`
+bidirectionality, `BadMessage` vs `BadProtocol` classification, and both chunking
+paths. `rpc.rs` tests drive the registered `RpcModule`, so method names, param
+deserialization, result serialization, error codes, and subscriptions all run the
+same path a client takes.
+
+---
+
+## 12. Round-4: parity constants that nothing could falsify
+
+**Audit date:** 2026-07-28
+
+Round 3 closed the ordering bugs. This pass targets the *other* half of the same
+failure mode: properties this document asserts in prose, where no test would
+fail if the code drifted away from them. Production behavior is unchanged —
+every item below is test-only, plus one derive.
+
+### 12.1 MDBX parameters were prose-only (§4.1)
+
+§4.1 records five erigon-parity MDBX values, and `db.rs` carried two round-trip
+tests — neither of which touched a single one of them. `GrowthStep` has already
+regressed once here (256 GiB against erigon's 16 MiB), so this is a demonstrated
+drift path, not a hypothetical.
+
+- `mdbx_parameters_match_erigon_pulse` pins page size, growth step, dirty-page
+  limit, merge threshold, and map size as literals, plus two derived invariants:
+  the merge threshold stays inside MDBX's accepted `[8192, 32768]` range, and the
+  dirty-page limit times the page size still multiplies out to erigon's 128 MiB
+  (they are coupled — moving one silently changes the effective `DirtySpace`).
+- `table_name_matches_erigon_kv_board_message` pins `kv.BoardMessage`.
+- `opened_env_applies_erigons_page_size_and_map_size` reads the values back off
+  the opened env, proving MDBX *applied* them rather than falling back to its
+  own defaults.
+
+**A §11.3 repeat, caught by negative control.** The read-back test was first
+written comparing `stat().page_size()` against `PAGE_SIZE_BYTES` — the same
+constant that configured the env. That is a tautology: it passes under any
+value, exactly as the M1 guard passed under either implementation. It was only
+caught because each new test was run against a deliberately broken build before
+being kept. The assertions are now against erigon's literals.
+
+### 12.2 Corrupt-record handling (`db_load_all`'s `bad` counter)
+
+Never exercised. `undecodable_records_are_counted_as_bad_and_skipped` writes
+both outright garbage and a truncated RLP prefix (the likelier on-disk failure),
+and asserts both are counted while the good message still loads — a corrupt row
+must not cost the operator the rest of the board.
+
+### 12.3 CLI defaults were written twice with nothing reconciling them
+
+`args.rs` had **zero** tests. Every default exists twice — as a clap
+`default_value_t` and in the hand-rolled `Default` impl — so editing one and not
+the other makes the effective value depend on whether the args came from the CLI
+or from `Default`. `MsgboardArgs` now derives `PartialEq, Eq` (the only
+production change in this round, matching `DatadirArgs` / `DevArgs` upstream) so
+the two can be compared directly.
+
+- `default_impl_agrees_with_the_clap_defaults` — the reconciliation.
+- `defaults_match_erigon_pulse` — each default against erigon's literal value.
+- `into_config_maps_every_field` — every field a distinct value, so a transposed
+  assignment cannot pass. The multiplier/divisor pair is the dangerous one:
+  swapping them inverts the minimum-difficulty check rather than erroring.
+- `every_documented_flag_name_parses` — the §7 flag names are an operator-facing
+  contract; renaming one breaks existing systemd units.
+- `duration_flags_parse_humantime_units` — `2m` means two minutes, and a
+  unitless `15` is rejected rather than silently reinterpreted.
+
+### 12.4 `difficulty()` wrapping — a documented wire gap with no test
+
+The doc comment on `PoWMsg::difficulty` explains that it must wrap like erigon's
+plain `uint64` arithmetic rather than saturate, because a message crafted with
+`base × multiplier > 2⁶⁴` would otherwise have reth reject what erigon accepts.
+Nothing tested it. `test_difficulty_wraps_like_erigon_uint64_rather_than_saturating`
+and `test_difficulty_wrapping_to_zero_is_rejected_not_a_panic` (the wrap can land
+on exactly zero, which must not become a division by zero) now pin both, and
+`test_difficulty_matches_the_documented_formula` pins the ordinary-input formula
+so the constants cannot drift under cover of the wrapping cases.
+
+`validate()`'s `InvalidVersion` and `InvalidData` branches were also untested;
+both are now covered, including that a category alone or a body alone is valid.
+
+### 12.5 `pow_scalar` carry handling — unreachable by random input
+
+`pow_scalar` reduces `(nonce × digest + block_hash) mod n` in U256 and handles
+the carry out of the 256-bit add by hand, with a 15-line carry analysis above
+it. No test drove it, and **no random test ever would**: `product < 2¹⁹²`, so a
+uniformly random `block_hash` overflows the add with probability ≈ 2⁻⁶⁴. The
+branch is reachable only by a near-maximal `block_hash` — i.e. by a peer
+deliberately probing for a client split.
+
+`test_pow_scalar_matches_full_precision_arithmetic_including_carry` drives 2,000
+deterministic cases (xorshift64, fixed seed), half with random block hashes and
+half forced just below 2²⁵⁶, against full-precision U512 arithmetic — the
+definition Go's `math/big` computes. It asserts the forced-carry regime actually
+fired (≥500 cases) rather than trusting that it did; verified to fail on the
+first carry iteration when the `nc` adjustment is removed.
+
+**Finding: two carry sub-branches are dead code.** After a carry,
+`sum_wrapped < 2¹⁹²`, and adding `nc = 2²⁵⁶ − n ≈ 2¹²⁸` can neither overflow
+again nor reach `n`. So `carry2` and the `adjusted >= n` reduction are
+unreachable for every possible message. The code is correct and harmless as
+defensive depth — it is documented here so nobody mistakes it for tested,
+exercised logic, and `test_pow_scalar_carry_cannot_overflow_a_second_time` pins
+the bound the claim rests on. Left in place deliberately.
+
+### 12.6 Method
+
+Every test in this round was run against a deliberately broken build before
+being kept — the discipline §11.3 shows was missing. Controls used: page size
+16 KiB → 8 KiB; `bad` counter increment removed; `Default` impl drifted from the
+clap default; multiplier/divisor transposed in `into_config`; `difficulty()`
+switched to saturating; the `nc` carry adjustment zeroed. Each failed only the
+tests it should have, and 12.1's tautology was found this way.
+
+### 12.7 Closing the gossip loop
+
+Every `protocol.rs` test drove **one half** of the exchange against hand-built
+frames: emitters checked against what we believed the parser expects, the parser
+against what we believed the emitters produce. Nothing checked the two halves
+against *each other*, so a consistent misunderstanding on both sides passed the
+entire suite.
+
+Five tests now run announce → request → deliver board-to-board, with no frame
+authored by the test: full convergence, re-announcement to a synced peer
+requesting nothing (otherwise every reconnect re-fetches the board), a
+partially-synced peer requesting only what it lacks, bidirectional exchange of
+disjoint messages, and an out-of-window peer ingesting nothing without earning a
+penalty.
+
+Their value is demonstrable: making `handle_incoming` request *all* announced
+IDs instead of only wanted ones — a plausible refactor slip — leaves all 30
+pre-existing protocol tests green and is caught only by the partial-sync case.
+
+### 12.8 `launch.rs` and the metric gauges
+
+`launch.rs` had zero tests. `db_path` was extracted from `install` (the only
+other production change this round) so the resolution rule is testable: default
+`<datadir>/msgboard`, and an explicit `--msgboard.db-dir` used **verbatim** —
+deliberately not re-rooted under the datadir, since operators point it at a
+separate disk. Also covered: the once-only board publish shared across clones,
+and both post-install entry points staying inert when `install` never ran (a node
+that failed earlier in launch still runs `final_flush` on the way out).
+
+The §3.1 gauges are now asserted to move — `msg_count` and `msg_size` through
+insert and through `set_head`'s prune, with `msg_size` summing data bytes rather
+than counting messages. The test asserts the **whole declared metric set** is
+instantiated, because §3.1's original defect was metrics declared and never
+instantiated: invisible to any test that only reads the ones it already knows
+work.
+
+It lives in `tests/` for a reason worth keeping: the gauges carry no labels, so
+every board in a process writes the same keys, and the parallel board tests in
+the unit binary would clobber each other. Cargo gives each integration-test file
+its own process. (`Snapshotter::snapshot` also *drains* what it reports — take
+one snapshot and query it, or each assertion sees a different, mostly empty
+picture.)
+
+### 12.9 Finding: the request path does not chunk
+
+`send_board_message_ids` chunks announcements at 846 IDs, and the `BoardMessages`
+response chunks at the 100 KiB packet limit. The `GetBoardMessages` request built
+in `handle_incoming` chunks at **neither** — its size is simply whatever the peer
+announced in one frame.
+
+Measured: a single announcement of 2,000 IDs produces one 242,001-byte request,
+2.4× the limit the other two paths respect. Nothing bounds this but the peer's
+own politeness — a peer is not obliged to chunk, and reth does not cap what it
+will ask for in one frame.
+
+This is **not fixed here** — the change is to wire behavior, and the erigon
+request path could not be consulted (same missing source as §11.5 O2). Left as a
+decision for whoever has the reference to hand. What is guarded today is the
+coupling that makes the current code safe in practice:
+`requests_provoked_by_our_own_announcements_stay_within_the_packet_limit` fails
+if the announcement chunk size is ever raised without teaching the request path
+to chunk.
+
+### 12.10 Coverage after this round
+
+| Crate / file | Before | After |
+|---|---|---|
+| `reth-msgboard` (total) | 93 | **114** |
+| ├ `protocol.rs` | 26 | 32 |
+| ├ `db.rs` | 2 | 6 |
+| ├ `args.rs` | 0 | 5 |
+| ├ `launch.rs` | 0 | 5 |
+| └ `tests/metrics.rs` (new) | 0 | 1 |
+| `reth-msgboard-types` (total) | 26 | **34** |
+| └ `pow.rs` | 11 | 19 |
+
+148 tests, 0 failures.
+
+### 12.11 Still open
+
+- The §11.5 O2 caveat is **unchanged**: erigon's `Content` ordering remains
+  unverified, and `~/go/src/gitlab.com/pulsechaincom/private-erigon-pulse` was
+  not present on this machine either. Highest-value remaining parity item, and
+  it now blocks §12.9 as well.
+- The unbounded request frame in §12.9.
+- `install` / `install_post_launch_tasks` bodies remain uncovered — they need a
+  running node (`TransportRpcModules`, a network handle, a canonical-state
+  provider). What was extractable has been extracted.
+- `zepter` and `make lint-toml` (dprint) were not run: neither binary is
+  installed on this machine. One dev-dependency was added
+  (`metrics-util`, `debugging` feature), so both are worth running before this
+  goes up.
