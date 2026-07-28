@@ -16,6 +16,12 @@
 //! matches this exactly so `evict_oldest` removes the **same** message under
 //! the **same** input sequence as erigon, preserving wire-observable parity
 //! when the board is at its count limit.
+//!
+//! Because the predicate is non-monotonic, the resulting order depends on
+//! *which indices the search probes*, not just on the comparator. Go's
+//! `sort.Search` and Rust's `slice::partition_point` probe differently and
+//! disagree here, so [`erigon_insert_pos`] ports Go's loop literally rather
+//! than delegating to `partition_point`.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -42,22 +48,7 @@ impl MsgIndex {
             return false;
         }
 
-        // Erigon's `sort.Search` predicate is `f(i) = newMsg < msgs[i]` under
-        // the OR-comparator (block_number_lt OR ratio_lt). `partition_point`
-        // returns the first index where its predicate is `false`, so we
-        // negate to `!(newMsg < m)`:
-        //
-        //     newMsg.block >= m.block && newMsg.ratio >= m.ratio
-        //
-        // This produces the same insert position as erigon for every input
-        // sequence — including the cases where the OR-comparator is not a
-        // proper total order — so subsequent `evict_oldest` (which pops
-        // `msgs[0]`) removes the same message on both implementations.
-        let new_block = msg.block_number;
-        let new_ratio = msg.msg.difficulty_ratio();
-        let pos = self.msgs.partition_point(|m| {
-            new_block >= m.block_number && new_ratio >= m.msg.difficulty_ratio()
-        });
+        let pos = erigon_insert_pos(&self.msgs, msg.block_number, msg.msg.difficulty_ratio());
         self.total_size += msg.msg.data.len() as u64;
         self.msgs.insert(pos, Arc::clone(&msg));
         self.by_hash.insert(msg.hash, Arc::clone(&msg));
@@ -112,22 +103,33 @@ impl MsgIndex {
         self.categories.keys()
     }
 
-    /// All messages belonging to `category`.
+    /// All messages belonging to `category`, in board precedence order.
+    ///
+    /// Walks the ordered `msgs` vec rather than the `categories` map. Iterating
+    /// a `HashMap`'s values yields an arbitrary order that varies between runs
+    /// and between nodes, which would make `msgboard_content` non-reproducible
+    /// and inconsistent with [`all_msgs_filtered`](Self::all_msgs_filtered)
+    /// (which returns precedence order). Precedence order is not recoverable by
+    /// sorting the collected values afterwards: it is defined by erigon's
+    /// non-total OR-comparator and the insertion history, not by any key.
+    ///
+    /// The cost is `O(len)` rather than `O(category size)`. The board is capped
+    /// at `count_limit` (default 10,000) and this is an RPC-only path, never
+    /// the P2P hot path.
     pub fn category_msgs(&self, category: &B256) -> impl Iterator<Item = &Arc<CheckedPoWMsg>> {
-        self.categories.get(category).into_iter().flat_map(|m| m.values())
+        self.msgs.iter().filter(move |m| &m.msg.category == category)
     }
 
-    /// All messages belonging to `category` filtered by block range.
+    /// All messages belonging to `category` filtered by block range, in board
+    /// precedence order. See [`category_msgs`](Self::category_msgs) for why
+    /// this walks the ordered vec.
     pub fn category_msgs_filtered(
         &self,
         category: &B256,
         from_block: Option<u64>,
         to_block: Option<u64>,
     ) -> Vec<Arc<CheckedPoWMsg>> {
-        self.categories
-            .get(category)
-            .into_iter()
-            .flat_map(|m| m.values())
+        self.category_msgs(category)
             .filter(|m| {
                 from_block.map_or(true, |f| m.block_number >= f) &&
                     to_block.map_or(true, |t| m.block_number <= t)
@@ -166,6 +168,39 @@ impl MsgIndex {
     pub const fn total_size(&self) -> u64 {
         self.total_size
     }
+}
+
+/// Insert position for a message with `(new_block, new_ratio)`, matching
+/// erigon-pulse's `MsgIndex.Insert`.
+///
+/// This is a literal port of Go's `sort.Search` loop, **not** a call to
+/// `slice::partition_point`. The two are interchangeable only when the
+/// predicate is monotonic over the slice, and erigon's OR-comparator is not
+/// (see the module docs). Under a non-monotonic predicate the two probe
+/// different indices and return different positions: replaying identical
+/// insert sequences through both, 12% of sequences end up in a different
+/// order and 1.4% put a different message at index 0 — i.e. `evict_oldest`
+/// would drop a different message than erigon does.
+///
+/// Since the ordering is defined by whatever `sort.Search` happens to return
+/// on a predicate it doesn't hold monotonic for, parity requires reproducing
+/// the search itself, not just the comparator.
+fn erigon_insert_pos(msgs: &[Arc<CheckedPoWMsg>], new_block: u64, new_ratio: f64) -> usize {
+    // Go: sort.Search(n, f) — smallest i in [0, n) for which f(i) is true, or
+    // n if none is. `i + (j - i) / 2` is Go's `int(uint(i+j) >> 1)` written so
+    // it cannot overflow; the two are equal for `i <= j`.
+    let (mut i, mut j) = (0usize, msgs.len());
+    while i < j {
+        let h = i + (j - i) / 2;
+        // f(h) = newMsg < msgs[h] under the OR-comparator.
+        let less = new_block < msgs[h].block_number || new_ratio < msgs[h].msg.difficulty_ratio();
+        if less {
+            j = h;
+        } else {
+            i = h + 1;
+        }
+    }
+    i
 }
 
 #[cfg(test)]
@@ -240,6 +275,29 @@ mod tests {
             }
         }
         panic!("no valid nonce found for category test");
+    }
+
+    /// Build a `CheckedPoWMsg` with an arbitrary `(block, ratio)` pair without
+    /// mining valid `PoW`. Ordering only reads `block_number` and
+    /// `difficulty_ratio`, so the unverified hash is irrelevant here and this
+    /// keeps the comparator tests off the nonce-search hot path.
+    fn fake_checked(block: u64, mult: u64, div: u64, hash_byte: u8) -> Arc<CheckedPoWMsg> {
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[0] = hash_byte;
+        Arc::new(CheckedPoWMsg {
+            msg: PoWMsg {
+                version: VERSION_V1,
+                block_hash: block_hash_one(),
+                nonce: 1,
+                work_multiplier: mult,
+                work_divisor: div,
+                category: category(0xCA),
+                data: alloy_primitives::Bytes::copy_from_slice(&[hash_byte]),
+            },
+            block_number: block,
+            timestamp: 0,
+            hash: B256::from(hash_bytes),
+        })
     }
 
     // ── tests ─────────────────────────────────────────────────────────────────
@@ -434,25 +492,6 @@ mod tests {
     /// PoW for each combination.
     #[test]
     fn insert_position_matches_erigon_or_comparator() {
-        fn fake_checked(block: u64, mult: u64, div: u64, hash_byte: u8) -> Arc<CheckedPoWMsg> {
-            let mut hash_bytes = [0u8; 32];
-            hash_bytes[0] = hash_byte;
-            Arc::new(CheckedPoWMsg {
-                msg: PoWMsg {
-                    version: VERSION_V1,
-                    block_hash: block_hash_one(),
-                    nonce: 1,
-                    work_multiplier: mult,
-                    work_divisor: div,
-                    category: category(0xCA),
-                    data: alloy_primitives::Bytes::copy_from_slice(&[hash_byte]),
-                },
-                block_number: block,
-                timestamp: 0,
-                hash: B256::from(hash_bytes),
-            })
-        }
-
         // Pre-seed: [(5, 0.10), (10, 0.10)] — same ratio, increasing block.
         let mut idx = MsgIndex::default();
         idx.insert(fake_checked(5, 100_000, 1_000_000, 0xA0));
@@ -472,6 +511,176 @@ mod tests {
             idx.all_msgs()[0].hash,
             new_msg.hash,
             "erigon's OR-comparator places the new lower-ratio same-block msg at index 0",
+        );
+    }
+
+    /// Differential test against real Go `sort.Search`.
+    ///
+    /// Replays `200_000` pseudo-random insert sequences (~1.7M inserts) through
+    /// [`MsgIndex::insert`] and FNV-1a hashes every resulting board order into
+    /// a single digest. [`GO_SORT_SEARCH_DIGEST`] is the value produced by
+    /// erigon's comparator running under Go's actual `sort.Search`, so a match
+    /// means reth's ordering is identical to erigon's across the whole corpus
+    /// — not just on the hand-picked case above.
+    ///
+    /// The digest is deliberately sensitive: the pre-fix `partition_point`
+    /// implementation yields `1127759515664285576` instead. Any future change
+    /// to the insert position, the comparator, or `difficulty_ratio` will move
+    /// it.
+    ///
+    /// To regenerate the constant (requires a Go toolchain), run:
+    ///
+    /// ```text
+    /// package main
+    ///
+    /// import ("fmt"; "sort")
+    ///
+    /// type M struct { block uint64; ratio float64; id uint8 }
+    /// type R struct{ s uint64 }
+    /// func (r *R) next() uint64 { x:=r.s; x^=x<<13; x^=x>>7; x^=x<<17; r.s=x; return x }
+    ///
+    /// func main() {
+    ///     blocks := []uint64{1,2,3,5,8,10,15,20}
+    ///     ratios := []float64{0.01,0.05,0.10,0.20,0.50}
+    ///     rng := &R{0xDEADBEEF}
+    ///     var h uint64 = 14695981039346656037
+    ///     mix := func(b byte) { h ^= uint64(b); h *= 1099511628211 }
+    ///     for t := 0; t < 200000; t++ {
+    ///         n := int(3 + rng.next()%12)
+    ///         seq := make([]M, 0, n)
+    ///         for id := 0; id < n; id++ {
+    ///             b := blocks[rng.next()%uint64(len(blocks))]
+    ///             r := ratios[rng.next()%uint64(len(ratios))]
+    ///             seq = append(seq, M{b, r, uint8(id)})
+    ///         }
+    ///         board := make([]M, 0, n)
+    ///         for _, m := range seq {
+    ///             pos := sort.Search(len(board), func(i int) bool {
+    ///                 return m.block < board[i].block || m.ratio < board[i].ratio
+    ///             })
+    ///             board = append(board, M{})
+    ///             copy(board[pos+1:], board[pos:])
+    ///             board[pos] = m
+    ///         }
+    ///         for _, m := range board { mix(m.id) }
+    ///         mix(255)
+    ///     }
+    ///     fmt.Printf("%d\n", h)
+    /// }
+    /// ```
+    ///
+    /// The Rust side below must mirror that generator exactly: same xorshift
+    /// seed and update, same draw order (`n`, then `block` then `ratio` per
+    /// message), and ratios expressed as `mult / 1_000_000` so the f64 values
+    /// are bit-identical to Go's decimal literals.
+    #[test]
+    fn insert_order_matches_go_sort_search_over_200k_sequences() {
+        /// Digest produced by erigon's comparator under Go's `sort.Search`.
+        const GO_SORT_SEARCH_DIGEST: u64 = 11128719865354962318;
+
+        /// xorshift64 — must match the Go generator bit for bit.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+        }
+
+        const BLOCKS: [u64; 8] = [1, 2, 3, 5, 8, 10, 15, 20];
+        // Ratios 0.01, 0.05, 0.10, 0.20, 0.50 as `mult / 1_000_000`.
+        const MULTS: [u64; 5] = [10_000, 50_000, 100_000, 200_000, 500_000];
+        const DIV: u64 = 1_000_000;
+
+        let mut rng = Rng(0xDEAD_BEEF);
+        let mut digest: u64 = 14695981039346656037; // FNV-1a offset basis
+        let mix = |byte: u8, d: &mut u64| {
+            *d ^= u64::from(byte);
+            *d = d.wrapping_mul(1099511628211); // FNV-1a prime
+        };
+
+        for _ in 0..200_000 {
+            let n = 3 + (rng.next() % 12) as usize;
+            let mut seq = Vec::with_capacity(n);
+            for id in 0..n {
+                let block = BLOCKS[(rng.next() % BLOCKS.len() as u64) as usize];
+                let mult = MULTS[(rng.next() % MULTS.len() as u64) as usize];
+                seq.push((block, mult, id as u8));
+            }
+
+            let mut idx = MsgIndex::default();
+            for (block, mult, id) in seq {
+                idx.insert(fake_checked(block, mult, DIV, id));
+            }
+
+            // Hash the resulting order; the hash byte carries the message id.
+            for msg in idx.all_msgs() {
+                mix(msg.hash[0], &mut digest);
+            }
+            mix(255, &mut digest); // sequence separator
+        }
+
+        assert_eq!(
+            digest, GO_SORT_SEARCH_DIGEST,
+            "board ordering diverged from Go's sort.Search; \
+             pre-fix partition_point produced 1127759515664285576",
+        );
+    }
+
+    /// Regression test for the `partition_point` divergence.
+    ///
+    /// Two-element boards can't distinguish Go's `sort.Search` from Rust's
+    /// `partition_point` — both probe the same single index — so the test
+    /// above passes under either implementation. Divergence needs a board
+    /// deep enough for the two probe sequences to separate, which is ≥5
+    /// entries.
+    ///
+    /// This nine-message sequence is a minimised case found by differentially
+    /// fuzzing a literal port of Go's `sort.Search` against `partition_point`.
+    /// The expected order below is what erigon's `MsgIndex.Insert` produces;
+    /// `partition_point` yields `[6, 5, 3, 7, 8, 1, 0, 4, 2]`, which puts a
+    /// **different message at index 0** and therefore evicts a different
+    /// message than erigon once the board hits `count_limit`.
+    #[test]
+    fn insert_position_matches_erigon_on_deep_board() {
+        const R50: u64 = 500_000; // ratio 0.50
+        const R20: u64 = 200_000; // ratio 0.20
+        const R05: u64 = 50_000; // ratio 0.05
+        const R01: u64 = 10_000; // ratio 0.01
+        const DIV: u64 = 1_000_000;
+
+        // (block, ratio, id) in insertion order; hash byte is 0xA0 + id.
+        let seq = [
+            (2u64, R50, 0u8),
+            (20, R20, 1),
+            (5, R50, 2),
+            (8, R05, 3),
+            (2, R50, 4),
+            (3, R20, 5),
+            (15, R01, 6),
+            (8, R05, 7),
+            (8, R20, 8),
+        ];
+
+        let mut idx = MsgIndex::default();
+        for (block, mult, id) in seq {
+            idx.insert(fake_checked(block, mult, DIV, 0xA0 + id));
+        }
+
+        let order: Vec<u8> = idx.all_msgs().iter().map(|m| m.hash[0] - 0xA0).collect();
+        assert_eq!(
+            order,
+            vec![7, 6, 5, 3, 8, 1, 0, 4, 2],
+            "insert order must match erigon's sort.Search probe sequence",
+        );
+        assert_eq!(
+            idx.all_msgs()[0].hash[0] - 0xA0,
+            7,
+            "eviction target (msgs[0]) must match erigon's",
         );
     }
 }

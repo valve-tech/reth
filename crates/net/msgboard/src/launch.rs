@@ -67,6 +67,15 @@ impl MsgboardLauncher {
         self.board.get().cloned()
     }
 
+    /// Resolve the msgboard DB directory: `--msgboard.db-dir` when given,
+    /// otherwise `<datadir>/msgboard`.
+    ///
+    /// An explicit override is used verbatim — it is deliberately *not* joined
+    /// under the datadir, so operators can park the board on a different disk.
+    pub fn db_path(&self, datadir: PathBuf) -> PathBuf {
+        self.args.msgboard_db_dir.clone().unwrap_or_else(|| datadir.join("msgboard"))
+    }
+
     /// Open the persistent DB, build the in-memory board, register the
     /// `msgboard_*` RPC methods on every transport that requested the module,
     /// install the `msg/1` rlpx sub-protocol with peer-reputation reporting,
@@ -84,7 +93,7 @@ impl MsgboardLauncher {
     where
         N: NetworkProtocols + Peers + Clone + Debug + Send + Sync + 'static,
     {
-        let db_path = self.args.msgboard_db_dir.clone().unwrap_or_else(|| datadir.join("msgboard"));
+        let db_path = self.db_path(datadir);
 
         let board = match open_msgboard_db(&db_path) {
             Ok(env) => {
@@ -202,6 +211,9 @@ impl MsgboardLauncher {
     /// Final flush on shutdown — call after `wait_for_node_exit().await`.
     /// Mirrors erigon-pulse `MainLoop`'s `flushBoard(context.Background())`
     /// on the shutdown branch (`board.go:158-166`).
+    ///
+    /// A no-op if [`Self::install`] never ran — shutdown must stay clean on a
+    /// node that failed before msgboard came up.
     pub fn final_flush(&self) {
         let Some(board) = self.board.get() else {
             return;
@@ -218,5 +230,93 @@ impl MsgboardLauncher {
                 "final flush on shutdown failed",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn launcher_with_db_dir(db_dir: Option<&str>) -> MsgboardLauncher {
+        MsgboardLauncher::new(MsgboardArgs {
+            msgboard_db_dir: db_dir.map(PathBuf::from),
+            ..Default::default()
+        })
+    }
+
+    /// The default lives under the node's datadir, so a msgboard env follows the
+    /// chain it belongs to rather than leaking into a shared location.
+    #[test]
+    fn db_path_defaults_to_msgboard_under_the_datadir() {
+        let launcher = launcher_with_db_dir(None);
+        assert_eq!(
+            launcher.db_path(PathBuf::from("/var/lib/reth")),
+            PathBuf::from("/var/lib/reth/msgboard"),
+        );
+    }
+
+    /// An explicit `--msgboard.db-dir` is used verbatim, *not* re-rooted under
+    /// the datadir — operators point this at a separate disk.
+    #[test]
+    fn db_path_override_is_used_verbatim() {
+        let launcher = launcher_with_db_dir(Some("/mnt/fast/board"));
+        assert_eq!(
+            launcher.db_path(PathBuf::from("/var/lib/reth")),
+            PathBuf::from("/mnt/fast/board"),
+            "the override must not be joined under the datadir",
+        );
+    }
+
+    /// The launcher carries the parsed args through unchanged, and derives its
+    /// config from them — the board's limits are whatever the CLI said.
+    #[test]
+    fn new_derives_config_from_args() {
+        let args = MsgboardArgs {
+            msgboard_count_limit: 4_242,
+            msgboard_gossip_disable: true,
+            ..Default::default()
+        };
+
+        let launcher = MsgboardLauncher::new(args.clone());
+        assert_eq!(launcher.args(), &args);
+        assert_eq!(launcher.config.count_limit, 4_242);
+        assert!(launcher.config.gossip_disabled);
+    }
+
+    /// Shutdown runs on nodes that never got as far as installing msgboard —
+    /// e.g. a failure earlier in launch. Both post-install entry points must be
+    /// inert rather than panicking or unwrapping an absent board.
+    #[test]
+    fn post_install_entry_points_are_inert_before_install() {
+        let launcher = launcher_with_db_dir(None);
+        assert!(launcher.board().is_none(), "no board before install");
+
+        // Must not panic.
+        launcher.final_flush();
+
+        assert!(launcher.board().is_none(), "final_flush must not publish a board");
+    }
+
+    /// The launcher is cloned into the rpc-modules closure while the post-launch
+    /// drivers read from another clone, so every clone has to observe the same
+    /// published board.
+    #[test]
+    fn clones_share_one_board_slot() {
+        let launcher = launcher_with_db_dir(None);
+        let clone = launcher.clone();
+
+        let board = Arc::new(MsgBoard::new(launcher.config.clone()));
+        assert!(launcher.board.set(Arc::clone(&board)).is_ok(), "first publish wins");
+
+        assert!(clone.board().is_some(), "the clone must see the published board");
+        assert!(
+            Arc::ptr_eq(&clone.board().unwrap(), &board),
+            "clones must share the slot, not hold independent boards",
+        );
+
+        // Publishing is once-only; a second attempt leaves the original in place.
+        let other = Arc::new(MsgBoard::new(launcher.config.clone()));
+        assert!(launcher.board.set(other).is_err(), "second publish is rejected");
+        assert!(Arc::ptr_eq(&launcher.board().unwrap(), &board));
     }
 }
