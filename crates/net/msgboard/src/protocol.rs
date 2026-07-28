@@ -298,6 +298,15 @@ fn handle_incoming(
             if wanted.is_empty() {
                 return;
             }
+            // Deliberately unchunked, at parity with erigon-pulse: its
+            // `MessageId_BOARD_MESSAGE_IDS` arm sends `FlattenMsgIDs(mIDs)` in
+            // one `SendMessageById` with no size bound, even though the two
+            // paths around it (announcements at 846 IDs, `BoardMessages` at the
+            // packet limit) both chunk. The frame is therefore as large as the
+            // peer's announcement made it — a peer is not obliged to chunk, and
+            // neither client caps what it will ask for in one frame. Chunking
+            // here unilaterally would be a wire change; see
+            // `docs/msgboard-parity-gaps.md` §13.2.
             let mut buf = BytesMut::with_capacity(1 + wanted.len() * MSG_ID_SIZE);
             buf.put_u8(GET_BOARD_MESSAGES);
             buf.put_slice(&MsgID::encode_list(&wanted));
