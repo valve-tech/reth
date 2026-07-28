@@ -373,6 +373,96 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_zero_multiplier() {
+        let mut msg = make_msg(1, &[1]);
+        msg.work_multiplier = 0;
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidDifficulty)));
+    }
+
+    /// `msg/1` is the only negotiated version, so a message declaring anything
+    /// else is rejected at the decode boundary rather than being interpreted
+    /// under v1 field semantics.
+    #[test]
+    fn test_validate_rejects_non_v1_version() {
+        let mut msg = make_msg(1, &[1]);
+        msg.version = VERSION_V1 + 1;
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidVersion)));
+
+        msg.version = 0;
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidVersion)));
+    }
+
+    /// A message with neither a category nor a body carries no information but
+    /// still costs a board slot, so it is rejected. Either field alone is enough
+    /// to make it meaningful.
+    #[test]
+    fn test_validate_rejects_empty_category_and_data_together() {
+        let mut msg = make_msg(1, &[]);
+        msg.category = B256::ZERO;
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidData)));
+
+        // A body with no category is valid.
+        let mut with_data = make_msg(1, &[7]);
+        with_data.category = B256::ZERO;
+        assert!(with_data.validate().is_ok(), "data alone should be accepted");
+
+        // A category with no body is valid.
+        let with_category = make_msg(1, &[]);
+        assert!(with_category.validate().is_ok(), "category alone should be accepted");
+    }
+
+    /// `difficulty()` must **wrap** like erigon's plain `uint64` arithmetic
+    /// (`pow_message.go`), not saturate. This is a wire gap, not a style
+    /// preference: for a message whose `base × multiplier` exceeds 2⁶⁴, a
+    /// saturating reth computes a different threshold than erigon, so the two
+    /// disagree on whether the very same bytes carry valid work.
+    ///
+    /// `work_multiplier = 2⁴⁰ + 3` against an empty body (`base = 2²⁴`) puts the
+    /// product 3 × 2²⁴ past the u64 boundary.
+    #[test]
+    fn test_difficulty_wraps_like_erigon_uint64_rather_than_saturating() {
+        let mut msg = make_msg(1, &[]);
+        msg.work_multiplier = (1u64 << 40) + 3;
+        msg.work_divisor = 1;
+
+        // base = 2^24; base × multiplier = 2^64 + 3×2^24 → wraps to 3×2^24.
+        assert_eq!(msg.difficulty(), 3 * (1u64 << 24));
+        assert_ne!(msg.difficulty(), u64::MAX, "saturating arithmetic would land here");
+    }
+
+    /// The wrap can land on exactly zero, which would be a division by zero in
+    /// the verification step. `to_checked` must reject it as invalid work
+    /// instead of panicking.
+    #[test]
+    fn test_difficulty_wrapping_to_zero_is_rejected_not_a_panic() {
+        let mut msg = make_msg(1, &[]);
+        msg.work_multiplier = 1u64 << 40; // base × multiplier = exactly 2^64
+        msg.work_divisor = 1;
+
+        assert_eq!(msg.difficulty(), 0);
+        assert!(matches!(msg.to_checked(0, 0), Err(MsgboardError::InvalidWork)));
+    }
+
+    /// Pins the documented formula `(2²⁴ + size × 10_000) × multiplier / divisor`
+    /// on ordinary inputs, so the constants cannot drift under cover of the
+    /// wrapping tests above.
+    #[test]
+    fn test_difficulty_matches_the_documented_formula() {
+        // Empty body at the default ratio: 2^24 × 10_000 / 1_000_000.
+        let mut msg = make_msg(1, &[]);
+        msg.work_multiplier = 10_000;
+        msg.work_divisor = 1_000_000;
+        assert_eq!(msg.difficulty(), (1u64 << 24) * 10_000 / 1_000_000);
+
+        // Each body byte adds 10_000 to the base.
+        let mut sized = make_msg(1, &[0u8; 100]);
+        sized.work_multiplier = 10_000;
+        sized.work_divisor = 1_000_000;
+        assert_eq!(sized.difficulty(), ((1u64 << 24) + 100 * 10_000) * 10_000 / 1_000_000);
+        assert!(sized.difficulty() > msg.difficulty(), "a larger body must cost more work");
+    }
+
+    #[test]
     fn test_rlp_round_trip_single() {
         let n = find_nonce(&[42u8]).expect("nonce found");
         let msg = make_msg(n, &[42u8]);
@@ -505,6 +595,135 @@ mod tests {
             assert_eq!(orig.work_multiplier(), dec.work_multiplier(), "multiplier mismatch");
             assert_eq!(orig.work_divisor(), dec.work_divisor(), "divisor mismatch");
         }
+    }
+
+    /// `pow_scalar` computes `(nonce × digest + block_hash) mod n` in U256, so
+    /// it has to handle the carry out of the 256-bit add by hand. Random inputs
+    /// never reach that code: `product < 2¹⁹²`, so a uniformly random
+    /// `block_hash` overflows the add with probability ≈ 2⁻⁶⁴. The carry branch
+    /// only runs for a near-maximal `block_hash` — which is precisely what a
+    /// peer probing for a client split would send, and getting it wrong yields a
+    /// different challenge, a different `PoW` hash, and a message erigon accepts
+    /// that reth rejects.
+    ///
+    /// Both regimes are checked against full-precision U512 arithmetic, which is
+    /// the definition Go's `math/big` reference computes.
+    #[test]
+    fn test_pow_scalar_matches_full_precision_arithmetic_including_carry() {
+        use alloy_primitives::U512;
+
+        /// xorshift64 — deterministic, so a failure reproduces exactly.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+        }
+
+        let two_256 = U512::from(1u8) << 256;
+        let n_512 = U512::from_be_slice(&{
+            let mut buf = [0u8; 64];
+            buf[32..].copy_from_slice(&SECP256K1_ORDER);
+            buf
+        });
+
+        let mut rng = Rng(0x5EED_1234_ABCD_0001);
+        let mut carries = 0usize;
+        let mut checked = 0usize;
+
+        for i in 0..2_000 {
+            let mut msg = make_msg(rng.next().max(1), &[]);
+            msg.work_multiplier = rng.next().max(1);
+            msg.work_divisor = rng.next().max(1);
+
+            // Half the iterations use a random block hash (the no-carry regime);
+            // half use a block hash just below 2²⁵⁶ so the add overflows.
+            let mut bh = [0u8; 32];
+            if i % 2 == 0 {
+                for chunk in bh.chunks_mut(8) {
+                    chunk.copy_from_slice(&rng.next().to_be_bytes());
+                }
+            } else {
+                bh = [0xFFu8; 32];
+                // Vary the low bytes so the carry lands at different distances
+                // past the boundary rather than repeating one input.
+                bh[24..].copy_from_slice(&(u64::MAX - (rng.next() % 4096)).to_be_bytes());
+            }
+            msg.block_hash = B256::from(bh);
+
+            // Full-precision reference: no wraparound, no hand-rolled reduction.
+            let digest = msg.difficulty_digest();
+            let mut digest_padded = [0u8; 64];
+            digest_padded[48..].copy_from_slice(&digest);
+
+            let product = U512::from(msg.nonce) * U512::from_be_slice(&digest_padded);
+            let sum = product +
+                U512::from_be_slice(&{
+                    let mut buf = [0u8; 64];
+                    buf[32..].copy_from_slice(msg.block_hash.as_slice());
+                    buf
+                });
+            if sum >= two_256 {
+                carries += 1;
+            }
+
+            let expected = sum % n_512;
+            let expected_bytes: [u8; 32] =
+                expected.to_be_bytes::<64>()[32..].try_into().expect("scalar fits in 32 bytes");
+
+            match msg.pow_scalar() {
+                Some(actual) => assert_eq!(
+                    actual, expected_bytes,
+                    "scalar mismatch at i={i}, nonce={}, mult={}, div={}, block_hash={}",
+                    msg.nonce, msg.work_multiplier, msg.work_divisor, msg.block_hash,
+                ),
+                None => assert_eq!(
+                    expected,
+                    U512::ZERO,
+                    "pow_scalar returned None for a non-zero scalar at i={i}",
+                ),
+            }
+            checked += 1;
+        }
+
+        assert_eq!(checked, 2_000);
+        // Without this the test could silently stop covering the carry branch —
+        // the way the M1 guard silently stopped covering deep boards (§11.3).
+        assert!(carries >= 500, "expected the forced-carry regime to fire, got {carries}");
+    }
+
+    /// The carry branch's two inner cases (`carry2`, and `adjusted >= n`) are
+    /// unreachable for any message, and this pins the bound that makes them so.
+    ///
+    /// After a carry, `sum_wrapped = product + block_hash − 2²⁵⁶ < 2¹⁹²`, because
+    /// `nonce < 2⁶⁴` and `digest < 2¹²⁸`. Adding `nc = 2²⁵⁶ − n ≈ 2¹²⁸` cannot
+    /// reach 2²⁵⁶ from below 2¹⁹², nor even reach `n`. Both branches are
+    /// therefore dead defensive code, not paths a test can drive — worth knowing
+    /// before anyone "simplifies" the bound they rest on.
+    #[test]
+    fn test_pow_scalar_carry_cannot_overflow_a_second_time() {
+        use alloy_primitives::U512;
+
+        let n_512 = U512::from_be_slice(&{
+            let mut buf = [0u8; 64];
+            buf[32..].copy_from_slice(&SECP256K1_ORDER);
+            buf
+        });
+        let nc = (U512::from(1u8) << 256) - n_512;
+
+        // The largest post-carry remainder any message can produce.
+        let max_sum_wrapped = (U512::from(1u8) << 192) - U512::from(1u8);
+
+        assert!(
+            nc + max_sum_wrapped < n_512,
+            "carry-branch result must stay below n, leaving carry2 and the \
+             `adjusted >= n` reduction unreachable",
+        );
     }
 
     /// Decodes the hardcoded `CheckedPoWMsg` from Go's `TestEncodeAndDecode`.
