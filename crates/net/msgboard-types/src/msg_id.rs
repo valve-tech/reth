@@ -137,3 +137,180 @@ impl MsgID {
         self.work_multiplier() as f64 / self.work_divisor() as f64
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::B256;
+
+    use super::*;
+    use crate::{MsgboardError, PoWMsg, VERSION_V1};
+
+    fn b256(byte: u8) -> B256 {
+        B256::repeat_byte(byte)
+    }
+
+    fn sample() -> MsgID {
+        MsgID::from_checked(
+            VERSION_V1,
+            &b256(0x11),
+            1234,
+            10_000,
+            1_000_000,
+            &b256(0x22),
+            &b256(0x33),
+        )
+    }
+
+    // ── layout ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn layout_constants_match_the_documented_121_byte_wire_format() {
+        assert_eq!(MSG_ID_SIZE, 121);
+        assert_eq!(VERSION_BYTE, 0);
+        assert_eq!(BLOCK_HASH_START..BLOCK_HASH_END, 1..33);
+        assert_eq!(SIZE_START..SIZE_END, 33..41);
+        assert_eq!(WORK_MULT_START..WORK_MULT_END, 41..49);
+        assert_eq!(WORK_DIV_START..WORK_DIV_END, 49..57);
+        assert_eq!(CATEGORY_HASH_START..CATEGORY_HASH_END, 57..89);
+        assert_eq!(MSG_HASH_START..MSG_HASH_END, 89..121);
+    }
+
+    #[test]
+    fn from_checked_round_trips_through_every_accessor() {
+        let id = sample();
+        assert_eq!(id.version(), VERSION_V1);
+        assert_eq!(id.block_hash(), b256(0x11));
+        assert_eq!(id.size(), 1234);
+        assert_eq!(id.work_multiplier(), 10_000);
+        assert_eq!(id.work_divisor(), 1_000_000);
+        assert_eq!(id.category_hash(), b256(0x22));
+        assert_eq!(id.message_hash(), b256(0x33));
+    }
+
+    /// Locks the byte layout itself, not just accessor agreement. Accessors
+    /// read the same constants `from_checked` writes, so a layout change would
+    /// otherwise round-trip cleanly while breaking erigon interop.
+    #[test]
+    fn field_bytes_land_at_the_erigon_specified_offsets() {
+        let id = sample();
+        let raw = id.as_bytes();
+
+        assert_eq!(raw[0], VERSION_V1);
+        assert_eq!(&raw[1..33], b256(0x11).as_slice());
+        // u64 fields are big-endian.
+        assert_eq!(&raw[33..41], &1234u64.to_be_bytes());
+        assert_eq!(&raw[41..49], &10_000u64.to_be_bytes());
+        assert_eq!(&raw[49..57], &1_000_000u64.to_be_bytes());
+        assert_eq!(&raw[57..89], b256(0x22).as_slice());
+        assert_eq!(&raw[89..121], b256(0x33).as_slice());
+    }
+
+    #[test]
+    fn u64_fields_are_big_endian_not_little_endian() {
+        let id = MsgID::from_checked(VERSION_V1, &b256(0), 1, 1, 1, &b256(0), &b256(0));
+        // Big-endian: the significant byte sits at the END of each 8-byte run.
+        assert_eq!(id.as_bytes()[33..41], [0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(id.as_bytes()[41..49], [0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(id.as_bytes()[49..57], [0, 0, 0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn u64_fields_survive_max_values() {
+        let id = MsgID::from_checked(
+            VERSION_V1,
+            &b256(0),
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            &b256(0),
+            &b256(0),
+        );
+        assert_eq!(id.size(), u64::MAX);
+        assert_eq!(id.work_multiplier(), u64::MAX);
+        assert_eq!(id.work_divisor(), u64::MAX);
+    }
+
+    // ── list encoding ────────────────────────────────────────────────────────
+
+    #[test]
+    fn encode_decode_list_round_trips() {
+        let ids =
+            vec![sample(), MsgID::from_checked(2, &b256(0xAA), 7, 3, 9, &b256(0xBB), &b256(0xCC))];
+        let encoded = MsgID::encode_list(&ids);
+        assert_eq!(encoded.len(), 2 * MSG_ID_SIZE);
+        assert_eq!(MsgID::decode_list(&encoded).unwrap(), ids);
+    }
+
+    #[test]
+    fn encode_list_is_a_flat_concatenation_with_no_framing() {
+        let ids = vec![sample(), sample()];
+        let encoded = MsgID::encode_list(&ids);
+        assert_eq!(&encoded[..MSG_ID_SIZE], sample().as_bytes());
+        assert_eq!(&encoded[MSG_ID_SIZE..], sample().as_bytes());
+    }
+
+    #[test]
+    fn empty_list_round_trips_to_empty() {
+        assert!(MsgID::encode_list(&[]).is_empty());
+        assert!(MsgID::decode_list(&[]).unwrap().is_empty());
+    }
+
+    /// A peer sending a truncated or padded ID list is a wire-protocol
+    /// violation; `handle_incoming` maps this to a `BadProtocol` reputation
+    /// hit, so the error variant matters.
+    #[test]
+    fn decode_list_rejects_lengths_that_are_not_a_multiple_of_msg_id_size() {
+        for bad_len in [1, MSG_ID_SIZE - 1, MSG_ID_SIZE + 1, 2 * MSG_ID_SIZE - 1] {
+            let bytes = vec![0u8; bad_len];
+            assert!(
+                matches!(MsgID::decode_list(&bytes), Err(MsgboardError::MalformedIdList)),
+                "len {bad_len} should be rejected as a malformed ID list",
+            );
+        }
+    }
+
+    #[test]
+    fn decode_list_accepts_exact_multiples() {
+        for n in [1usize, 2, 5] {
+            let bytes = vec![0u8; n * MSG_ID_SIZE];
+            assert_eq!(MsgID::decode_list(&bytes).unwrap().len(), n);
+        }
+    }
+
+    // ── difficulty ratio ─────────────────────────────────────────────────────
+
+    /// `MsgID::difficulty_ratio` and `PoWMsg::difficulty_ratio` are separate
+    /// implementations of the same quantity. `filter_wanted` compares an
+    /// announced ID's ratio against config, and the board later compares the
+    /// fetched message's ratio; if the two ever disagree a node would request
+    /// a message it then rejects, burning a round trip per announcement.
+    #[test]
+    fn difficulty_ratio_agrees_with_the_pow_msg_implementation() {
+        for (mult, div) in
+            [(1u64, 1u64), (10_000, 1_000_000), (1, 1_000_000), (7, 3), (u64::MAX, 1)]
+        {
+            let msg = PoWMsg {
+                version: VERSION_V1,
+                block_hash: b256(0),
+                nonce: 0,
+                work_multiplier: mult,
+                work_divisor: div,
+                category: b256(0),
+                data: Default::default(),
+            };
+            let id = MsgID::from_checked(VERSION_V1, &b256(0), 0, mult, div, &b256(0), &b256(0));
+            assert_eq!(
+                id.difficulty_ratio(),
+                msg.difficulty_ratio(),
+                "ratio mismatch for {mult}/{div}",
+            );
+        }
+    }
+
+    #[test]
+    fn difficulty_ratio_computes_the_expected_value() {
+        let id =
+            MsgID::from_checked(VERSION_V1, &b256(0), 0, 10_000, 1_000_000, &b256(0), &b256(0));
+        assert!((id.difficulty_ratio() - 0.01).abs() < f64::EPSILON);
+    }
+}

@@ -17,7 +17,7 @@ const DEFAULT_LOG_EVERY: &str = "30s";
 ///
 /// The msgboard module is registered unconditionally — there is no
 /// `--msgboard.enabled` flag. These knobs only tune behavior.
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 #[command(next_help_heading = "Msgboard")]
 pub struct MsgboardArgs {
     /// Minimum accepted `work_multiplier` value.
@@ -111,5 +111,127 @@ impl MsgboardArgs {
             stale_block_buffer: self.msgboard_stale_block_buffer,
             gossip_disabled: self.msgboard_gossip_disable,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    /// Helper to parse a bare `Args` impl from an argv, mirroring the pattern in
+    /// `reth-node-core`'s arg tests.
+    #[derive(Parser)]
+    struct CommandParser<T: Args> {
+        #[command(flatten)]
+        args: T,
+    }
+
+    fn parse(argv: &[&str]) -> MsgboardArgs {
+        CommandParser::<MsgboardArgs>::parse_from(argv).args
+    }
+
+    /// Every default is written twice — once as a clap `default_value_t` and
+    /// once in the hand-rolled `Default` impl — with nothing forcing them to
+    /// agree. Editing one and not the other means the value an operator gets
+    /// depends on whether the args came from the CLI or from `Default`.
+    #[test]
+    fn default_impl_agrees_with_the_clap_defaults() {
+        assert_eq!(parse(&["reth"]), MsgboardArgs::default());
+    }
+
+    /// The defaults are erigon-pulse's production values
+    /// (`msgboardcfg/config.go`); a node running different limits than its peers
+    /// silently accepts or rejects messages the rest of the network does not.
+    /// Asserted as literals so this fails if the constants themselves move.
+    #[test]
+    fn defaults_match_erigon_pulse() {
+        let args = parse(&["reth"]);
+        assert_eq!(args.msgboard_work_multiplier, 10_000);
+        assert_eq!(args.msgboard_work_divisor, 1_000_000);
+        assert_eq!(args.msgboard_size_limit, 8192);
+        assert_eq!(args.msgboard_count_limit, 10_000);
+        assert_eq!(args.msgboard_block_range, 120);
+        assert_eq!(args.msgboard_stale_block_buffer, 3);
+        assert_eq!(args.msgboard_commit_every, Duration::from_secs(15), "erigon CommitEvery");
+        assert_eq!(args.msgboard_log_every, Duration::from_secs(30), "erigon LogEvery");
+        assert!(!args.msgboard_gossip_disable, "gossip is on by default");
+        assert_eq!(args.msgboard_db_dir, None, "db dir defaults to <datadir>/msgboard");
+    }
+
+    /// Every value is distinct, so a transposed assignment in `into_config`
+    /// cannot pass. The multiplier/divisor pair is the dangerous one: swapping
+    /// them inverts the minimum-difficulty check rather than erroring.
+    #[test]
+    fn into_config_maps_every_field() {
+        let args = MsgboardArgs {
+            msgboard_work_multiplier: 11,
+            msgboard_work_divisor: 22,
+            msgboard_size_limit: 33,
+            msgboard_count_limit: 44,
+            msgboard_block_range: 55,
+            msgboard_stale_block_buffer: 66,
+            msgboard_db_dir: Some(PathBuf::from("/tmp/board")),
+            msgboard_commit_every: Duration::from_secs(77),
+            msgboard_log_every: Duration::from_secs(88),
+            msgboard_gossip_disable: true,
+        };
+
+        let cfg = args.into_config();
+        assert_eq!(cfg.work_multiplier, 11);
+        assert_eq!(cfg.work_divisor, 22);
+        assert_eq!(cfg.size_limit, 33);
+        assert_eq!(cfg.count_limit, 44);
+        assert_eq!(cfg.block_range, 55);
+        assert_eq!(cfg.stale_block_buffer, 66);
+        assert!(cfg.gossip_disabled);
+    }
+
+    /// Flag names are an operator-facing contract (`docs/msgboard-parity-gaps.md`
+    /// §7): renaming one silently breaks existing systemd units and deploy
+    /// configs, which fail closed at startup rather than falling back.
+    #[test]
+    fn every_documented_flag_name_parses() {
+        let args = parse(&[
+            "reth",
+            "--msgboard.work-multiplier=1",
+            "--msgboard.work-divisor=2",
+            "--msgboard.size-limit=3",
+            "--msgboard.count-limit=4",
+            "--msgboard.block-range=5",
+            "--msgboard.stale-block-buffer=6",
+            "--msgboard.db-dir=/tmp/board",
+            "--msgboard.commit-every=7s",
+            "--msgboard.log-every=8s",
+            "--msgboard.gossip-disable",
+        ]);
+
+        assert_eq!(args.msgboard_work_multiplier, 1);
+        assert_eq!(args.msgboard_work_divisor, 2);
+        assert_eq!(args.msgboard_size_limit, 3);
+        assert_eq!(args.msgboard_count_limit, 4);
+        assert_eq!(args.msgboard_block_range, 5);
+        assert_eq!(args.msgboard_stale_block_buffer, 6);
+        assert_eq!(args.msgboard_db_dir, Some(PathBuf::from("/tmp/board")));
+        assert_eq!(args.msgboard_commit_every, Duration::from_secs(7));
+        assert_eq!(args.msgboard_log_every, Duration::from_secs(8));
+        assert!(args.msgboard_gossip_disable);
+    }
+
+    /// The two duration flags take humantime, not a bare seconds count — `2m`
+    /// must mean two minutes, and a bare integer must be rejected outright
+    /// rather than silently parsed as something else.
+    #[test]
+    fn duration_flags_parse_humantime_units() {
+        let args = parse(&["reth", "--msgboard.commit-every=2m", "--msgboard.log-every=500ms"]);
+        assert_eq!(args.msgboard_commit_every, Duration::from_secs(120));
+        assert_eq!(args.msgboard_log_every, Duration::from_millis(500));
+
+        assert!(
+            CommandParser::<MsgboardArgs>::try_parse_from(["reth", "--msgboard.commit-every=15"])
+                .is_err(),
+            "a unitless duration should be rejected, not silently reinterpreted",
+        );
     }
 }

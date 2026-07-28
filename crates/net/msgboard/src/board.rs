@@ -444,10 +444,18 @@ impl MsgBoard {
         state.index.all_msgs_filtered(from_block, to_block)
     }
 
-    /// All known category hashes (for `msgboard_categories` RPC).
+    /// All known category hashes, sorted ascending (for `msgboard_categories` RPC).
+    ///
+    /// `specs/02-msgboard.md` §9.2 specifies `msgboard_categories` returns a
+    /// sorted list. The index stores categories in a `HashMap`, whose key
+    /// iteration order is arbitrary and varies between runs, so the sort
+    /// happens here.
     pub fn categories(&self) -> Vec<B256> {
         let state = self.state.lock();
-        state.index.categories().copied().collect()
+        let mut cats: Vec<B256> = state.index.categories().copied().collect();
+        drop(state);
+        cats.sort_unstable();
+        cats
     }
 
     /// Fetch a single message by its `PoW` hash (for `msgboard_getMessage` RPC).
