@@ -279,3 +279,98 @@ REFERENCES
                           storage_sstore_oog}/*.binpb
 - the patched method:     evm/crates/evm/src/eth/mod.rs::transact_system_call
 - revm gas constant:      revm-handler 20.x SYSTEM_CALL_GAS_LIMIT (= 31,566,720)
+
+
+------------------------------------------------------------------------------
+TASK: PulseChain consensus-client (lighthouse-pulse) magnitude-overflow fixes
+STATUS: DONE (4 fixes shipped + deployed fleet-wide; harness + audits done)
+OPENED: 2026-07-17
+OWNER: valve
+------------------------------------------------------------------------------
+
+CONTEXT
+-------
+PulseChain scales the beacon constants ~1e6x over ETH mainnet
+(max_effective_balance = 3.2e16 gwei, effective_balance_increment = 1e15,
+base_reward_factor = 64000; inactivity_score grows unbounded during a leak).
+Arithmetic that is safe at mainnet magnitude overflows u64 here. This halted a
+syncing testnet lighthouse node (the trigger for all of this).
+
+THE FORKS (both public, mirrors of the pulsechaincom gitlab repos)
+------------------------------------------------------------------
+- github.com/valve-tech/lighthouse-pulse   (the CL we run; default branch master)
+- github.com/valve-tech/prysm-pulse         (canonical CL reference; clean mirror)
+The monorepo deploy points lighthouseRepo at valve-tech/lighthouse-pulse
+(commit 6b945e2), branch master. Boxes track master (git reset --hard
+origin/master in rpc-build-lighthouse), so a re-deploy pulls whatever master is.
+
+THE PRYSM-PARITY RULE (the discipline — get it wrong and the chain forks)
+------------------------------------------------------------------------
+prysm-pulse is the supermajority/canonical client. lighthouse MUST produce the
+same VALUE, decided by reading prysm, NOT by the spec's arbitrary-precision ideal.
+Two directions, per site:
+  - prysm uses math/big (full precision)  -> lighthouse must WIDEN to u128
+  - prysm uses wrapping uint64            -> lighthouse must WRAP (wrapping_*)
+Widening a site prysm wraps, or wrapping a site prysm widens, is a silent split.
+
+THE 4 FIXES (all on lighthouse-pulse master, signed/verified)
+-------------------------------------------------------------
+  b98679a  inactivity penalty: widen effective_balance*inactivity_score to u128
+           (prysm uses big.Int). HALT class — this is what took the box down.
+  e970792  reward burn (common/pulse.rs): safe wrapping_mul (prysm wraps uint64).
+  718c7ad  slashing product (process_slashings): wrap sum_slashings*multiplier
+           (prysm wraps uint64 at epoch_processing.go:201).
+  5482ff4  PulseChain-magnitude regression harness (see below).
+  56fbe85  slashings-vector accumulation (slash_validator): wrapping_add, not
+           safe_add — prysm accepts+wraps, lighthouse was rejecting -> split at
+           ~577 max-EB validators slashed in one epoch. Found by the prysm audit.
+
+THE PREVENTION HARNESS
+----------------------
+consensus/state_processing/src/per_epoch_processing/tests.rs
+  ::pulsechain_magnitude_epoch_processing_does_not_halt
+Drives full process_epoch against a max-scale state (max-EB validators + deep
+leak + mass-slashing) and asserts no ArithError/panic. Runs in debug so raw
+overflow panics. VERIFIED to fail when a fix is reverted (negative control).
+Plus per-site unit tests: inactivity_penalty, adjusted_total_slashing_balance,
+apply_burn, slash_validator_wraps_slashings_bucket_like_prysm.
+Catches the HALT/PANIC class; the widen-vs-prysm SPLIT class is caught only by
+the parity rule above (a no-fault run can't see a value divergence).
+
+THE AUDIT METHOD (reusable — re-run at the next bump)
+-----------------------------------------------------
+Multi-agent differential audit, default-REFUTED verifiers, every finding
+reachability-proven with real PulseChain numbers and cross-checked vs the OTHER
+client. lighthouse audit found the slashing-product bug; prysm audit (prysm diffed
+vs the now-audited lighthouse) found the slashings-accumulation split. Both came
+back otherwise clean (config parity verified). Toolchain: build/test on Rust 1.81
+(`cargo +1.81.0 test -p state_processing --lib`); the fork does NOT build on newer.
+
+DEPLOY STATE (2026-07-17)
+-------------------------
+All four PulseChain boxes on 56fbe85, synced, no errors:
+  943a (primary, lighthouse.service), 943b (firehose, valve-lighthouse-firehose),
+  369a (primary), 369b (firehose-shed -> standard lighthouse.service).
+Surgical deploy = 3 steps on the primary only (rpc-build/sync/restart-lighthouse),
+reth untouched; firehose b-boxes run the same binary under a different unit.
+
+OPEN / FOLLOW-UP
+----------------
+1. Contribute the 4 fixes upstream to pulsechaincom/lighthouse-pulse (gitlab MR).
+   They affect every PulseChain lighthouse operator. User is checking for known
+   fixes first.
+2. CI: run the regression tests automatically (see valve-regression.yml on the
+   fork). Actions is enabled on the fork; a focused push gate runs
+   `cargo test -p state_processing --lib` on 1.81.
+3. prysm SlashValidator accept+wrap stores a spec-undefined value: latent PROTOCOL
+   quirk, needs coordinated pulsechaincom fix, NOT a unilateral valve change.
+
+REFERENCES
+----------
+- lighthouse fork:   github.com/valve-tech/lighthouse-pulse  master @ 56fbe85
+- prysm fork:        github.com/valve-tech/prysm-pulse        master @ 992805a
+- deploy repoint:    monorepo config/deploy.config.yaml (commit 6b945e2)
+- prysm parity cites: epoch_precompute.go:361 (inactivity big.Int),
+                      reward_burn.go (burn wrap), epoch_processing.go:201 +
+                      precompute/slashing.go:28 (slashing-product wrap),
+                      validators/validator.go SlashValidator (accumulation wrap)
