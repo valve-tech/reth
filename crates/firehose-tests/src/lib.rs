@@ -16,5 +16,5 @@ pub mod prestate;
 
 pub use prestate::{
     assert_block_equals_golden, build_account_info, decode_hex, parse_fire_block_for, run_prestate,
-    seed_cache_db, Prestate, RunOutcome, TraceContext,
+    run_prestate_via_block_executor, seed_cache_db, Prestate, RunOutcome, TraceContext,
 };

@@ -36,6 +36,7 @@ reth-pulsechain-forks.workspace = true
 
 # alloy
 alloy-consensus.workspace = true
+alloy-eip7928.workspace = true
 alloy-eips.workspace = true
 alloy-evm.workspace = true
 alloy-genesis.workspace = true

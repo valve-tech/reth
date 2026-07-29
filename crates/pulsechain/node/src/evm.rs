@@ -18,7 +18,7 @@ use alloy_eips::{eip7685::Requests, Decodable2718, Encodable2718};
 use alloy_evm::{
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockExecutorFactory,
-        BlockValidationError, ExecutableTx, GasOutput, OnStateHook, StateDB,
+        BlockValidationError, ExecutableTx, GasOutput, StateDB,
     },
     eth::{
         receipt_builder::ReceiptBuilder, spec::EthExecutorSpec, EthBlockExecutionCtx,
@@ -49,7 +49,7 @@ use revm::{
     context_interface::block::{BlobExcessGasAndPrice, Block as RevmBlock},
     database::DatabaseCommitExt,
     primitives::hardfork::SpecId,
-    state::{Account, AccountInfo, Bytecode, EvmStorageSlot},
+    state::{Account, AccountInfo, Bytecode, EvmStorageSlot, TransactionId},
 };
 
 use crate::fork::{apply_primordial_pulse, PrimordialPulseStateWriter};
@@ -150,7 +150,11 @@ impl<T: StateDB> PrimordialPulseStateWriter for T {
         // passes the filter inside State<DB>::commit.
         account.storage.insert(
             U256::from_be_bytes(slot.0),
-            EvmStorageSlot::new_changed(U256::ZERO, U256::from_be_bytes(value.0), 0),
+            EvmStorageSlot::new_changed(
+                U256::ZERO,
+                U256::from_be_bytes(value.0),
+                TransactionId::ZERO,
+            ),
         );
         // Successive set_storage commits accumulate: CacheAccount::change() extends
         // the existing cache storage with the new slot via extend().
@@ -203,8 +207,9 @@ where
         tx: impl ExecutableTx<Self>,
     ) -> std::result::Result<Self::Result, BlockExecutionError> {
         // ExecutableTx<PulsechainBlockExecutor> ≡ ExecutableTxParts<E::Tx, R::Transaction>
-        //                                       ≡ ExecutableTx<EthBlockExecutor<'a, E, &'a Spec, &'a R>>
-        // because both executors declare the same Evm and Transaction associated types.
+        //                                       ≡ ExecutableTx<EthBlockExecutor<'a, E, &'a Spec,
+        // &'a R>> because both executors declare the same Evm and Transaction associated
+        // types.
         self.inner.execute_transaction_without_commit(tx)
     }
 
@@ -308,10 +313,6 @@ where
 
             Ok((evm, result))
         }
-    }
-
-    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
-        self.inner.set_state_hook(hook);
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {

@@ -8,8 +8,8 @@ use reth_node_api::{FullNodeComponents, NodePrimitives, PrimitivesTy};
 use reth_primitives_traits::{BlockTy, HeaderTy, ReceiptTy, TxTy};
 use reth_rpc_eth_types::EthStateCache;
 use reth_storage_api::{
-    AccountHistoryReader, BlockReader, BlockReaderIdExt, StageCheckpointReader,
-    StateProviderFactory,
+    AccountHistoryReader, BalProvider, BlockReader, BlockReaderIdExt, PruneCheckpointReader,
+    StageCheckpointReader, StateProviderFactory,
 };
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 
@@ -38,6 +38,8 @@ pub trait RpcNodeCore: Clone + Send + Sync + Unpin + 'static {
         > + StateProviderFactory
         + CanonStateSubscriptions<Primitives = Self::Primitives>
         + StageCheckpointReader
+        + PruneCheckpointReader
+        + BalProvider
         + AccountHistoryReader
         + Send
         + Sync
@@ -132,6 +134,8 @@ where
         > + StateProviderFactory
         + CanonStateSubscriptions<Primitives = Evm::Primitives>
         + StageCheckpointReader
+        + PruneCheckpointReader
+        + BalProvider
         + AccountHistoryReader
         + Send
         + Sync

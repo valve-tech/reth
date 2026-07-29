@@ -14,6 +14,7 @@
 
 use std::{fmt, sync::Arc};
 
+use alloy_primitives::B256;
 use reth_chainspec::EthChainSpec;
 use reth_consensus::{
     Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom, TransactionRoot,
@@ -188,8 +189,14 @@ where
         block: &RecoveredBlock<N::Block>,
         result: &BlockExecutionResult<N::Receipt>,
         receipt_root_bloom: Option<ReceiptRootBloom>,
+        block_access_list_hash: Option<B256>,
     ) -> Result<(), ConsensusError> {
-        self.inner.validate_block_post_execution(block, result, receipt_root_bloom)
+        self.inner.validate_block_post_execution(
+            block,
+            result,
+            receipt_root_bloom,
+            block_access_list_hash,
+        )
     }
 }
 
@@ -218,5 +225,78 @@ where
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         Ok(Arc::new(PulsechainConsensus::new(ctx.chain_spec())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reth_primitives_traits::Header;
+    use reth_pulsechain_forks::chainspec::PULSECHAIN;
+
+    fn mainnet_consensus() -> PulsechainConsensus {
+        PulsechainConsensus::new(Arc::new(PulsechainChainSpec::new(PULSECHAIN.clone())))
+    }
+
+    fn header(number: u64, timestamp: u64, withdrawals_root: Option<B256>) -> SealedHeader {
+        SealedHeader::seal_slow(Header {
+            number,
+            timestamp,
+            withdrawals_root,
+            ..Default::default()
+        })
+    }
+
+    // The three tests below exercise the Shanghai-timestamp-gap fix in `validate_header`.
+    // PulseChain replays Ethereum mainnet history, but its chainspec activates Shanghai at a
+    // LATER timestamp than Ethereum. For pre-PrimordialPulse blocks the wrapper must validate the
+    // `withdrawals_root` field against the ETHEREUM Shanghai timestamp (1,681,338,455), not
+    // PulseChain's. These checks fire before delegating to the inner consensus, so a minimal
+    // synthetic header is sufficient.
+
+    /// Pre-fork block at/after Ethereum Shanghai is a real ETH Shanghai block and MUST carry a
+    /// `withdrawals_root`; a missing one is rejected.
+    #[test]
+    fn pre_pp_post_eth_shanghai_requires_withdrawals_root() {
+        let consensus = mainnet_consensus();
+        let h =
+            header(PRIMORDIAL_PULSE_MAINNET_BLOCK - 1, ETH_MAINNET_SHANGHAI_TIMESTAMP + 60, None);
+        assert!(
+            matches!(
+                HeaderValidator::validate_header(&consensus, &h),
+                Err(ConsensusError::WithdrawalsRootMissing)
+            ),
+            "pre-fork post-ETH-Shanghai block without withdrawals_root must be rejected",
+        );
+    }
+
+    /// Pre-fork block before Ethereum Shanghai must NOT carry a `withdrawals_root`.
+    #[test]
+    fn pre_pp_pre_eth_shanghai_rejects_withdrawals_root() {
+        let consensus = mainnet_consensus();
+        let h = header(
+            PRIMORDIAL_PULSE_MAINNET_BLOCK - 1,
+            ETH_MAINNET_SHANGHAI_TIMESTAMP - 60,
+            Some(B256::ZERO),
+        );
+        assert!(
+            matches!(
+                HeaderValidator::validate_header(&consensus, &h),
+                Err(ConsensusError::WithdrawalsRootUnexpected)
+            ),
+            "pre-fork pre-ETH-Shanghai block with a withdrawals_root must be rejected",
+        );
+    }
+
+    /// The Ethereum Shanghai boundary is inclusive: exactly at the timestamp counts as
+    /// Shanghai-active, so a missing `withdrawals_root` is still rejected.
+    #[test]
+    fn pre_pp_exact_eth_shanghai_boundary_is_shanghai_active() {
+        let consensus = mainnet_consensus();
+        let h = header(PRIMORDIAL_PULSE_MAINNET_BLOCK - 1, ETH_MAINNET_SHANGHAI_TIMESTAMP, None);
+        assert!(matches!(
+            HeaderValidator::validate_header(&consensus, &h),
+            Err(ConsensusError::WithdrawalsRootMissing)
+        ));
     }
 }

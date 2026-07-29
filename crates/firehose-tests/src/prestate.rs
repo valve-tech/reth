@@ -24,8 +24,12 @@ use firehose_tracer::pb::sf::ethereum::r#type::v2::Block as FirehoseBlock;
 use prost::Message;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, TransactionSigned};
+use reth_evm::execute::Executor as _;
 use reth_evm_ethereum::EthEvmConfig;
-use reth_firehose::{run_wrapped_block, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust};
+use reth_firehose::{
+    init_tracer, is_tracer_initialized, run_wrapped_block, FirehoseBlockExecutor,
+    FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust,
+};
 use reth_primitives_traits::{Block as _, RecoveredBlock};
 use reth_revm::State;
 use revm::{
@@ -168,6 +172,85 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
     }
 
     drop(tracer);
+
+    let raw = buffer.get_bytes();
+    let block = parse_fire_block_for(&raw, block_number)?;
+    Ok(RunOutcome { block, raw })
+}
+
+/// Like [`run_prestate`], but drives the block through the pipeline
+/// [`FirehoseBlockExecutor`] (`Executor::execute_and_trace_one`) using the **process-wide**
+/// tracer, exactly as staged sync does — instead of `run_wrapped_block` with a local tracer.
+///
+/// This exercises the parts unique to the pipeline path that the local-tracer harness does not:
+/// the global tracer lifecycle, the `Executor<DB>` trait impl, and the deferred-flush contract
+/// (the per-block guard is stashed in `pending_tracer` and only flushed by the *next*
+/// `execute_and_trace_one` or by `into_state`). The emitted Firehose `Block` should be
+/// byte-identical to the `run_wrapped_block` output, so callers can assert it against the same
+/// golden.
+///
+/// # Panics / once-per-process
+///
+/// Initializes the global tracer via [`init_tracer`], which may only be called once per process.
+/// Call this from a dedicated integration-test file (its own test binary) with a single test.
+pub fn run_prestate_via_block_executor(case_folder: &Path) -> eyre::Result<RunOutcome> {
+    assert!(
+        !is_tracer_initialized(),
+        "run_prestate_via_block_executor initializes the process-wide tracer and must run in its \
+         own test binary; the global tracer is already initialized in this process",
+    );
+
+    let prestate_path = case_folder.join("prestate.json");
+    let prestate: Prestate = serde_json::from_slice(&std::fs::read(&prestate_path)?)
+        .with_context(|| format!("reading prestate.json at {}", prestate_path.display()))?;
+
+    let chain_spec = Arc::new(ChainSpec::from(prestate.genesis.clone()));
+    let parent_hash = chain_spec.genesis_hash();
+
+    let tx_bytes = decode_hex(&prestate.input).context("decoding prestate.input hex")?;
+    let signed_tx = TransactionSigned::network_decode(&mut tx_bytes.as_slice())
+        .context("RLP-decoding prestate.input as a signed transaction")?;
+
+    let transactions = vec![signed_tx];
+    let header = build_header(&prestate.context, parent_hash, &transactions);
+    let block = Block {
+        header,
+        body: BlockBody { transactions, ommers: vec![], withdrawals: Some(Withdrawals::default()) },
+    };
+    let recovered: RecoveredBlock<Block> =
+        block.try_into_recovered().map_err(|_| eyre::eyre!("recovering tx senders"))?;
+    let block_number = recovered.header().number;
+
+    let mut db = CacheDB::new(EmptyDB::default());
+    seed_cache_db(&mut db, &prestate.genesis)?;
+    let state = State::builder().with_database(db).with_bundle_update().build();
+
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+
+    // Initialize the PROCESS-WIDE tracer (vs. the local tracer used by `run_prestate`). The
+    // `FirehoseBlockExecutor` resolves it via `is_tracer_initialized()` / the global handle.
+    let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+        firehose_tracer::config::Config::default(),
+        firehose_tracer::config::ChainConfig {
+            chain_id: prestate.genesis.config.chain_id,
+            shanghai_time: prestate.genesis.config.shanghai_time,
+            cancun_time: prestate.genesis.config.cancun_time,
+            prague_time: prestate.genesis.config.prague_time,
+            verkle_time: None,
+        },
+        "reth-firehose-tests",
+        env!("CARGO_PKG_VERSION"),
+    );
+    init_tracer(tracer);
+
+    let mut executor = FirehoseBlockExecutor::new(evm_config, state);
+    executor
+        .execute_and_trace_one(&recovered)
+        .map_err(|e| eyre::eyre!("execute_and_trace_one failed: {e}"))?;
+    // `execute_and_trace_one` defers the end-of-block flush: the per-block guard is stashed in
+    // `pending_tracer` and only emitted by the next call or by `into_state`. Consume the executor
+    // to flush the (verified) block.
+    let _ = executor.into_state();
 
     let raw = buffer.get_bytes();
     let block = parse_fire_block_for(&raw, block_number)?;
