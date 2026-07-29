@@ -444,10 +444,18 @@ impl MsgBoard {
         state.index.all_msgs_filtered(from_block, to_block)
     }
 
-    /// All known category hashes (for `msgboard_categories` RPC).
+    /// All known category hashes, sorted ascending (for `msgboard_categories` RPC).
+    ///
+    /// `specs/02-msgboard.md` §9.2 specifies `msgboard_categories` returns a
+    /// sorted list. The index stores categories in a `HashMap`, whose key
+    /// iteration order is arbitrary and varies between runs, so the sort
+    /// happens here.
     pub fn categories(&self) -> Vec<B256> {
         let state = self.state.lock();
-        state.index.categories().copied().collect()
+        let mut cats: Vec<B256> = state.index.categories().copied().collect();
+        drop(state);
+        cats.sort_unstable();
+        cats
     }
 
     /// Fetch a single message by its `PoW` hash (for `msgboard_getMessage` RPC).
@@ -661,6 +669,68 @@ mod tests {
     }
 
     // ── tests ─────────────────────────────────────────────────────────────────
+
+    /// Regression test for the zero-work exploit — see
+    /// `docs/msgboard-parity-gaps.md` §14.1.
+    ///
+    /// These `work_multiplier`/`work_divisor` values wrap `difficulty()` onto 1
+    /// under erigon's `uint64` arithmetic, making every nonce a valid solution.
+    /// They also clear `is_work_acceptable` with an enormous declared ratio, so
+    /// before the fix all four were accepted with `nonce: 1` and no mining, and
+    /// their high ratio sorted them above the honest messages — which is what
+    /// `evict_oldest` then dropped.
+    ///
+    /// Reth now computes the threshold exactly and rejects them at
+    /// `to_checked`, which `add_remote_msgs` counts as kickable.
+    #[test]
+    fn zero_work_messages_are_rejected_and_honest_ones_survive() {
+        const EVIL_MULTIPLIER: u64 = 1_014_806_211_241_672_337;
+        const EVIL_DIVISOR: u64 = 16;
+
+        // count_limit 4 so the board would fill after a handful of inserts.
+        let cfg = MsgboardConfig { count_limit: 4, ..easy_cfg() };
+        let board = MsgBoard::new(cfg);
+        board.set_ready();
+        board.set_head(100, block_hash_one());
+
+        let honest: Vec<B256> = [b"honest-a".as_slice(), b"honest-b".as_slice()]
+            .iter()
+            .map(|data| {
+                let nonce = find_nonce(data);
+                board.add_local_msg(make_pow_msg(nonce, data)).expect("honest msg accepted").hash
+            })
+            .collect();
+        assert_eq!(board.all_messages().len(), 2);
+
+        let spam: Vec<PoWMsg> = (0u8..4)
+            .map(|i| PoWMsg {
+                version: VERSION_V1,
+                block_hash: block_hash_one(),
+                nonce: 1,
+                work_multiplier: EVIL_MULTIPLIER,
+                work_divisor: EVIL_DIVISOR,
+                category: category_hash(),
+                data: Bytes::copy_from_slice(&[i]),
+            })
+            .collect();
+        for msg in &spam {
+            assert_eq!(msg.difficulty_checked(), None, "exact threshold exceeds u64::MAX");
+            assert!(
+                board.config().is_work_acceptable(msg.work_multiplier, msg.work_divisor),
+                "the minimum-work gate is not what rejects these",
+            );
+        }
+
+        let (accepted, kickable) = board.add_remote_msgs(spam);
+        assert_eq!(accepted, 0, "no zero-work message may be accepted");
+        assert_eq!(kickable, 4, "and the sender is penalised for each");
+
+        // The honest messages are untouched.
+        assert_eq!(board.all_messages().len(), 2);
+        for hash in honest {
+            assert!(board.get_message(&hash).is_some(), "honest message must survive");
+        }
+    }
 
     #[test]
     fn new_board_starts_empty() {

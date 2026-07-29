@@ -9228,6 +9228,7 @@ dependencies = [
  "humantime",
  "jsonrpsee",
  "metrics",
+ "metrics-util",
  "parking_lot",
  "reth-eth-wire",
  "reth-fs-util",

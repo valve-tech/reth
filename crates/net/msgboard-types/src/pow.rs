@@ -99,6 +99,13 @@ impl PoWMsg {
         if self.work_multiplier == 0 || self.work_divisor == 0 {
             return Err(MsgboardError::InvalidDifficulty);
         }
+        // Reject the difficulty overflow here as well as in `to_checked`, so a
+        // crafted message dies at the decode boundary — before the secp256k1
+        // scalar multiplication the `PoW` check would otherwise pay for it, and
+        // early enough for the sender to earn a reputation penalty.
+        if self.difficulty_checked().is_none() {
+            return Err(MsgboardError::InvalidDifficulty);
+        }
         if self.category == B256::ZERO && self.data.is_empty() {
             return Err(MsgboardError::InvalidData);
         }
@@ -110,21 +117,54 @@ impl PoWMsg {
         self.data.len() as u64
     }
 
-    /// Difficulty threshold: `(2^24 + size × 10_000) × multiplier / divisor`.
+    /// Difficulty threshold: `(2^24 + size × 10_000) × multiplier / divisor`,
+    /// computed exactly. `None` if the true value does not fit in a `u64`, or
+    /// if `work_divisor` is zero.
     ///
     /// The `PoW` hash (as a big-endian integer) must be divisible by this value.
     ///
-    /// Uses `wrapping_mul` to mirror erigon-pulse's plain `uint64` arithmetic
-    /// (`pow_message.go`: `(1<<24 + pm.Size()*10_000) * multiplier / divisor`).
-    /// An attacker that picks `multiplier × base > 2^64` would otherwise see
-    /// reth saturate to `u64::MAX` (rejecting) while erigon silently wraps
-    /// (accepting) — and any divergence in the verification function is a wire
-    /// gap. Caller-side bounds (`is_work_acceptable`, validate) keep honest
-    /// inputs far from the wrap regime; `validate` also rejects
-    /// `work_divisor == 0` before this function is reachable.
+    /// # Deliberate divergence from erigon-pulse
+    ///
+    /// Erigon evaluates this in plain `uint64`, which wraps
+    /// (`pow_message.go`: `(1<<24 + pm.Size()*10_000) * multiplier / divisor`),
+    /// and reth mirrored the wrap for wire parity until the overflow was shown
+    /// to be exploitable — see `docs/msgboard-parity-gaps.md` §14.1.
+    ///
+    /// `multiplier` is an attacker-chosen wire field. Writing
+    /// `base = 2^k × odd`, `odd` is invertible mod `2^64`, so an attacker can
+    /// solve `base × multiplier ≡ 2^k (mod 2^64)`, set `divisor = 2^k`, and
+    /// wrap the threshold to **1**. Every hash is divisible by 1, so the `PoW`
+    /// becomes free for any nonce. The minimum-work gate does not stop it: that
+    /// gate constrains the declared *ratio* `multiplier / divisor`, which the
+    /// wrap decouples from the difficulty actually enforced — and clearing it
+    /// requires a *large* ratio, which then sorts the free messages to the top
+    /// of the precedence order so honest messages are what `evict_oldest`
+    /// drops.
+    ///
+    /// Computing exactly and rejecting the overflow closes this. It costs
+    /// strict wire parity: reth now rejects messages erigon accepts. Every
+    /// such message is one whose declared work is unsatisfiable under any
+    /// honest reading of the formula — the true `base × multiplier / divisor`
+    /// exceeds `u64::MAX`, so no hash could legitimately clear it, and only the
+    /// wrap made it look cheap.
+    pub fn difficulty_checked(&self) -> Option<u64> {
+        let divisor = u128::from(self.work_divisor);
+        if divisor == 0 {
+            return None;
+        }
+        let base = (1u128 << 24) + u128::from(self.size()) * 10_000;
+        u64::try_from(base * u128::from(self.work_multiplier) / divisor).ok()
+    }
+
+    /// Difficulty threshold, saturating to `u64::MAX` when the exact value does
+    /// not fit (or `work_divisor` is zero).
+    ///
+    /// Saturation makes this total for display and logging. It is **not** the
+    /// verification path: [`to_checked`](Self::to_checked) uses
+    /// [`difficulty_checked`](Self::difficulty_checked) and rejects the
+    /// overflow outright rather than treating it as a `u64::MAX` threshold.
     pub fn difficulty(&self) -> u64 {
-        let base: u64 = (1u64 << 24).wrapping_add(self.size().wrapping_mul(10_000));
-        base.wrapping_mul(self.work_multiplier).wrapping_div(self.work_divisor)
+        self.difficulty_checked().unwrap_or(u64::MAX)
     }
 
     /// `work_multiplier / work_divisor` as a float. Used for minimum-ratio checks.
@@ -151,7 +191,11 @@ impl PoWMsg {
         block_number: u64,
         timestamp: u64,
     ) -> Result<CheckedPoWMsg, MsgboardError> {
-        let difficulty = self.difficulty();
+        // Rejects both the zero threshold (a division by zero below) and the
+        // overflow the wrap used to hide — see `difficulty_checked`.
+        let Some(difficulty) = self.difficulty_checked() else {
+            return Err(MsgboardError::InvalidDifficulty);
+        };
         if difficulty == 0 {
             return Err(MsgboardError::InvalidWork);
         }
@@ -373,6 +417,115 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_zero_multiplier() {
+        let mut msg = make_msg(1, &[1]);
+        msg.work_multiplier = 0;
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidDifficulty)));
+    }
+
+    /// `msg/1` is the only negotiated version, so a message declaring anything
+    /// else is rejected at the decode boundary rather than being interpreted
+    /// under v1 field semantics.
+    #[test]
+    fn test_validate_rejects_non_v1_version() {
+        let mut msg = make_msg(1, &[1]);
+        msg.version = VERSION_V1 + 1;
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidVersion)));
+
+        msg.version = 0;
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidVersion)));
+    }
+
+    /// A message with neither a category nor a body carries no information but
+    /// still costs a board slot, so it is rejected. Either field alone is enough
+    /// to make it meaningful.
+    #[test]
+    fn test_validate_rejects_empty_category_and_data_together() {
+        let mut msg = make_msg(1, &[]);
+        msg.category = B256::ZERO;
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidData)));
+
+        // A body with no category is valid.
+        let mut with_data = make_msg(1, &[7]);
+        with_data.category = B256::ZERO;
+        assert!(with_data.validate().is_ok(), "data alone should be accepted");
+
+        // A category with no body is valid.
+        let with_category = make_msg(1, &[]);
+        assert!(with_category.validate().is_ok(), "category alone should be accepted");
+    }
+
+    /// `difficulty()` must **not** wrap. Erigon's plain `uint64` arithmetic
+    /// does, and reth mirrored it for wire parity until the wrap was shown to
+    /// be exploitable (§14.1) — the divergence is now deliberate.
+    ///
+    /// `work_multiplier = 2⁴⁰ + 3` against an empty body (`base = 2²⁴`) puts the
+    /// product 3 × 2²⁴ past the u64 boundary: erigon computes `3 × 2²⁴`, a
+    /// trivially cheap threshold, from a message whose declared work is
+    /// astronomically expensive.
+    #[test]
+    fn test_difficulty_does_not_wrap_like_erigons_uint64() {
+        let mut msg = make_msg(1, &[]);
+        msg.work_multiplier = (1u64 << 40) + 3;
+        msg.work_divisor = 1;
+
+        assert_eq!(msg.difficulty_checked(), None, "the exact value exceeds u64::MAX");
+        assert_ne!(msg.difficulty(), 3 * (1u64 << 24), "erigon's wrapped value");
+        assert_eq!(msg.difficulty(), u64::MAX, "display path saturates");
+
+        // Both gates reject it, so no path can turn it into a CheckedPoWMsg.
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidDifficulty)));
+        assert!(matches!(msg.to_checked(0, 0), Err(MsgboardError::InvalidDifficulty)));
+    }
+
+    /// Erigon's wrap can land on exactly zero, which would be a division by
+    /// zero in the verification step. Reth no longer wraps, so this case is now
+    /// an ordinary overflow rejection — but the input is kept as a regression
+    /// guard, since it is the one that would panic if the exact computation
+    /// were ever reverted to `wrapping_div`.
+    #[test]
+    fn test_difficulty_overflowing_to_zero_is_rejected_not_a_panic() {
+        let mut msg = make_msg(1, &[]);
+        msg.work_multiplier = 1u64 << 40; // base × multiplier = exactly 2^64
+        msg.work_divisor = 1;
+
+        assert_eq!(msg.difficulty_checked(), None);
+        assert!(matches!(msg.to_checked(0, 0), Err(MsgboardError::InvalidDifficulty)));
+    }
+
+    /// `work_divisor == 0` must not divide by zero. `validate` rejects it
+    /// first, but `difficulty_checked` is public and total on its own.
+    #[test]
+    fn test_zero_divisor_returns_none_rather_than_panicking() {
+        let mut msg = make_msg(1, &[]);
+        msg.work_divisor = 0;
+
+        assert_eq!(msg.difficulty_checked(), None);
+        assert_eq!(msg.difficulty(), u64::MAX);
+        assert!(matches!(msg.validate(), Err(MsgboardError::InvalidDifficulty)));
+        assert!(matches!(msg.to_checked(0, 0), Err(MsgboardError::InvalidDifficulty)));
+    }
+
+    /// Pins the documented formula `(2²⁴ + size × 10_000) × multiplier / divisor`
+    /// on ordinary inputs, so the constants cannot drift under cover of the
+    /// wrapping tests above.
+    #[test]
+    fn test_difficulty_matches_the_documented_formula() {
+        // Empty body at the default ratio: 2^24 × 10_000 / 1_000_000.
+        let mut msg = make_msg(1, &[]);
+        msg.work_multiplier = 10_000;
+        msg.work_divisor = 1_000_000;
+        assert_eq!(msg.difficulty(), (1u64 << 24) * 10_000 / 1_000_000);
+
+        // Each body byte adds 10_000 to the base.
+        let mut sized = make_msg(1, &[0u8; 100]);
+        sized.work_multiplier = 10_000;
+        sized.work_divisor = 1_000_000;
+        assert_eq!(sized.difficulty(), ((1u64 << 24) + 100 * 10_000) * 10_000 / 1_000_000);
+        assert!(sized.difficulty() > msg.difficulty(), "a larger body must cost more work");
+    }
+
+    #[test]
     fn test_rlp_round_trip_single() {
         let n = find_nonce(&[42u8]).expect("nonce found");
         let msg = make_msg(n, &[42u8]);
@@ -507,6 +660,135 @@ mod tests {
         }
     }
 
+    /// `pow_scalar` computes `(nonce × digest + block_hash) mod n` in U256, so
+    /// it has to handle the carry out of the 256-bit add by hand. Random inputs
+    /// never reach that code: `product < 2¹⁹²`, so a uniformly random
+    /// `block_hash` overflows the add with probability ≈ 2⁻⁶⁴. The carry branch
+    /// only runs for a near-maximal `block_hash` — which is precisely what a
+    /// peer probing for a client split would send, and getting it wrong yields a
+    /// different challenge, a different `PoW` hash, and a message erigon accepts
+    /// that reth rejects.
+    ///
+    /// Both regimes are checked against full-precision U512 arithmetic, which is
+    /// the definition Go's `math/big` reference computes.
+    #[test]
+    fn test_pow_scalar_matches_full_precision_arithmetic_including_carry() {
+        use alloy_primitives::U512;
+
+        /// xorshift64 — deterministic, so a failure reproduces exactly.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+        }
+
+        let two_256 = U512::from(1u8) << 256;
+        let n_512 = U512::from_be_slice(&{
+            let mut buf = [0u8; 64];
+            buf[32..].copy_from_slice(&SECP256K1_ORDER);
+            buf
+        });
+
+        let mut rng = Rng(0x5EED_1234_ABCD_0001);
+        let mut carries = 0usize;
+        let mut checked = 0usize;
+
+        for i in 0..2_000 {
+            let mut msg = make_msg(rng.next().max(1), &[]);
+            msg.work_multiplier = rng.next().max(1);
+            msg.work_divisor = rng.next().max(1);
+
+            // Half the iterations use a random block hash (the no-carry regime);
+            // half use a block hash just below 2²⁵⁶ so the add overflows.
+            let mut bh = [0u8; 32];
+            if i % 2 == 0 {
+                for chunk in bh.chunks_mut(8) {
+                    chunk.copy_from_slice(&rng.next().to_be_bytes());
+                }
+            } else {
+                bh = [0xFFu8; 32];
+                // Vary the low bytes so the carry lands at different distances
+                // past the boundary rather than repeating one input.
+                bh[24..].copy_from_slice(&(u64::MAX - (rng.next() % 4096)).to_be_bytes());
+            }
+            msg.block_hash = B256::from(bh);
+
+            // Full-precision reference: no wraparound, no hand-rolled reduction.
+            let digest = msg.difficulty_digest();
+            let mut digest_padded = [0u8; 64];
+            digest_padded[48..].copy_from_slice(&digest);
+
+            let product = U512::from(msg.nonce) * U512::from_be_slice(&digest_padded);
+            let sum = product +
+                U512::from_be_slice(&{
+                    let mut buf = [0u8; 64];
+                    buf[32..].copy_from_slice(msg.block_hash.as_slice());
+                    buf
+                });
+            if sum >= two_256 {
+                carries += 1;
+            }
+
+            let expected = sum % n_512;
+            let expected_bytes: [u8; 32] =
+                expected.to_be_bytes::<64>()[32..].try_into().expect("scalar fits in 32 bytes");
+
+            match msg.pow_scalar() {
+                Some(actual) => assert_eq!(
+                    actual, expected_bytes,
+                    "scalar mismatch at i={i}, nonce={}, mult={}, div={}, block_hash={}",
+                    msg.nonce, msg.work_multiplier, msg.work_divisor, msg.block_hash,
+                ),
+                None => assert_eq!(
+                    expected,
+                    U512::ZERO,
+                    "pow_scalar returned None for a non-zero scalar at i={i}",
+                ),
+            }
+            checked += 1;
+        }
+
+        assert_eq!(checked, 2_000);
+        // Without this the test could silently stop covering the carry branch —
+        // the way the M1 guard silently stopped covering deep boards (§11.3).
+        assert!(carries >= 500, "expected the forced-carry regime to fire, got {carries}");
+    }
+
+    /// The carry branch's two inner cases (`carry2`, and `adjusted >= n`) are
+    /// unreachable for any message, and this pins the bound that makes them so.
+    ///
+    /// After a carry, `sum_wrapped = product + block_hash − 2²⁵⁶ < 2¹⁹²`, because
+    /// `nonce < 2⁶⁴` and `digest < 2¹²⁸`. Adding `nc = 2²⁵⁶ − n ≈ 2¹²⁸` cannot
+    /// reach 2²⁵⁶ from below 2¹⁹², nor even reach `n`. Both branches are
+    /// therefore dead defensive code, not paths a test can drive — worth knowing
+    /// before anyone "simplifies" the bound they rest on.
+    #[test]
+    fn test_pow_scalar_carry_cannot_overflow_a_second_time() {
+        use alloy_primitives::U512;
+
+        let n_512 = U512::from_be_slice(&{
+            let mut buf = [0u8; 64];
+            buf[32..].copy_from_slice(&SECP256K1_ORDER);
+            buf
+        });
+        let nc = (U512::from(1u8) << 256) - n_512;
+
+        // The largest post-carry remainder any message can produce.
+        let max_sum_wrapped = (U512::from(1u8) << 192) - U512::from(1u8);
+
+        assert!(
+            nc + max_sum_wrapped < n_512,
+            "carry-branch result must stay below n, leaving carry2 and the \
+             `adjusted >= n` reduction unreachable",
+        );
+    }
+
     /// Decodes the hardcoded `CheckedPoWMsg` from Go's `TestEncodeAndDecode`.
     ///
     /// This vector was captured from a real run of the Go reference implementation and is
@@ -536,5 +818,90 @@ mod tests {
 
         // Sanity-check the version byte.
         assert_eq!(msg.msg.version, VERSION_V1);
+    }
+}
+
+#[cfg(test)]
+mod difficulty_overflow_regression {
+    use super::*;
+    use crate::MsgboardConfig;
+    use alloy_primitives::keccak256;
+
+    /// `work_multiplier`/`work_divisor` that wrap [`PoWMsg::difficulty`] onto 1
+    /// for a 1-byte message under erigon's `uint64` arithmetic, found by
+    /// solving `base × multiplier ≡ 2^v2(base) (mod 2^64)`.
+    ///
+    /// `base = 2^24 + 1 × 10_000 = 16_787_216 = 2^4 × 1_049_201`, so the
+    /// multiplier is the inverse of `1_049_201` mod `2^60` and the divisor is
+    /// `2^4`.
+    const EVIL_MULTIPLIER: u64 = 1_014_806_211_241_672_337;
+    const EVIL_DIVISOR: u64 = 16;
+
+    fn evil_msg(nonce: u64) -> PoWMsg {
+        let mut b = [0u8; 32];
+        b[0] = 0x01;
+        PoWMsg {
+            version: VERSION_V1,
+            block_hash: B256::from(b),
+            nonce,
+            work_multiplier: EVIL_MULTIPLIER,
+            work_divisor: EVIL_DIVISOR,
+            category: keccak256(b"spam"),
+            data: Bytes::copy_from_slice(&[0u8]),
+        }
+    }
+
+    /// Regression test for the zero-work exploit — see
+    /// `docs/msgboard-parity-gaps.md` §14.1.
+    ///
+    /// Under erigon's wrapping arithmetic these parameters make
+    /// `difficulty == 1`, and every hash is divisible by 1, so any nonce is a
+    /// valid solution and the message costs no work at all. Reth computes the
+    /// threshold exactly, sees it exceed `u64::MAX`, and rejects.
+    #[test]
+    fn crafted_overflow_no_longer_makes_pow_free() {
+        // The exact threshold is ~2^80 — unsatisfiable, which is why erigon's
+        // wrapped `1` was never a legitimate reading of these parameters.
+        assert_eq!(evil_msg(1).difficulty_checked(), None);
+
+        for nonce in 1..=64u64 {
+            assert!(
+                matches!(evil_msg(nonce).to_checked(100, 0), Err(MsgboardError::InvalidDifficulty)),
+                "nonce {nonce} must be rejected, not accepted for free",
+            );
+        }
+
+        // Rejected at the decode boundary too, before the secp256k1 work.
+        assert!(matches!(evil_msg(1).validate(), Err(MsgboardError::InvalidDifficulty)));
+    }
+
+    /// The minimum-work gate never defended against this, and still does not —
+    /// which is why the fix had to be in the difficulty computation.
+    ///
+    /// The gate constrains the declared ratio `multiplier / divisor`, and the
+    /// crafted ratio is enormous precisely because that is what the overflow
+    /// requires. Board precedence is `(block, ratio)` ascending with eviction
+    /// popping `msgs[0]`, so had these messages been accepted they would have
+    /// outranked every honest one.
+    #[test]
+    fn the_minimum_work_gate_still_accepts_the_crafted_ratio() {
+        let cfg = MsgboardConfig::default();
+        assert!(
+            cfg.is_work_acceptable(EVIL_MULTIPLIER, EVIL_DIVISOR),
+            "the gate is not what rejects these messages",
+        );
+
+        let evil = evil_msg(1).difficulty_ratio();
+        let honest = cfg.work_multiplier as f64 / cfg.work_divisor as f64;
+        assert!(evil > honest * 1e18, "declared ratio {evil} dwarfs the honest {honest}");
+    }
+
+    /// An honest message with the same body is unaffected by the fix.
+    #[test]
+    fn honest_parameters_are_unchanged_by_the_exact_computation() {
+        let honest = PoWMsg { work_multiplier: 10_000, work_divisor: 1_000_000, ..evil_msg(1) };
+        assert_eq!(honest.difficulty_checked(), Some(167_872));
+        assert_eq!(honest.difficulty(), 167_872);
+        assert!(honest.validate().is_ok());
     }
 }

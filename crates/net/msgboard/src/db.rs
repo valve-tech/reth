@@ -171,6 +171,104 @@ mod tests {
         assert_eq!(loaded.len(), 3);
     }
 
+    /// The MDBX geometry is an erigon-pulse parity contract, not a tuning
+    /// preference: a reth-built msgboard env must open cleanly under erigon and
+    /// vice versa (`docs/msgboard-parity-gaps.md` §4.1, erigon `msgboard/util.go`).
+    /// `GrowthStep` already regressed once — reth shipped 256 GiB against
+    /// erigon's 16 MiB — so each value is pinned here against silent drift.
+    ///
+    /// MDBX exposes no getters for growth step, dirty-page limit, or merge
+    /// threshold, so those are asserted at the constant. Page size and map size
+    /// are read back from the opened env by
+    /// `opened_env_applies_erigons_page_size_and_map_size`.
+    #[test]
+    fn mdbx_parameters_match_erigon_pulse() {
+        assert_eq!(PAGE_SIZE_BYTES, 16 * 1024, "erigon PageSize = 16 KiB");
+        assert_eq!(GROWTH_STEP_BYTES, 16 * 1024 * 1024, "erigon GrowthStep = 16 MiB");
+        assert_eq!(TXN_DIRTY_PAGE_LIMIT, 8192, "erigon DirtySpace = 128 MiB over 16 KiB pages");
+        assert_eq!(MERGE_THRESHOLD_16DOT16_PERCENT, 24576, "erigon WriteMergeThreshold = 3 * 8192",);
+        assert_eq!(TEBIBYTE, 1024 * 1024 * 1024 * 1024, "erigon MapSize = 1 TiB");
+
+        // MDBX rejects a merge threshold outside [8192, 32768] at open time, so
+        // an out-of-range edit here would break every node's DB open, not just parity.
+        assert!(
+            (8192..=32768).contains(&MERGE_THRESHOLD_16DOT16_PERCENT),
+            "merge threshold must stay inside MDBX's accepted 16.16-percent range",
+        );
+
+        // The dirty-page limit is derived from the page size; if one moves
+        // without the other, the effective DirtySpace silently stops being 128 MiB.
+        assert_eq!(
+            TXN_DIRTY_PAGE_LIMIT as usize * PAGE_SIZE_BYTES,
+            128 * MEBIBYTE,
+            "dirty-page limit and page size must still multiply out to erigon's 128 MiB",
+        );
+    }
+
+    /// The on-disk table name is what makes the env interchangeable with erigon
+    /// (`kv.BoardMessage`). Renaming it orphans every persisted message.
+    #[test]
+    fn table_name_matches_erigon_kv_board_message() {
+        assert_eq!(TABLE_NAME, "BoardMessage");
+    }
+
+    /// Proves MDBX actually *applied* erigon's geometry rather than silently
+    /// falling back to its own defaults (4 KiB pages).
+    ///
+    /// Asserted against erigon's literal values, not against `PAGE_SIZE_BYTES` /
+    /// `TEBIBYTE` — comparing a read-back to the same constant that produced it
+    /// is a tautology that passes under any value, which is precisely how the
+    /// M1 guard test slipped through (§11.3).
+    #[test]
+    fn opened_env_applies_erigons_page_size_and_map_size() {
+        let dir = TempDir::new().expect("tempdir");
+        let env = open_msgboard_db(dir.path()).expect("open");
+
+        assert_eq!(
+            env.stat().expect("stat").page_size(),
+            16 * 1024,
+            "MDBX did not apply erigon's 16 KiB page size",
+        );
+        assert_eq!(
+            env.info().expect("info").map_size(),
+            1024 * 1024 * 1024 * 1024,
+            "MDBX did not apply erigon's 1 TiB map size",
+        );
+    }
+
+    /// A single corrupt record must not cost us the rest of the board. Erigon
+    /// tolerates undecodable rows the same way; `db_load_all` counts them into
+    /// `bad` and keeps going, and that counter is what surfaces the corruption
+    /// to the operator.
+    #[test]
+    fn undecodable_records_are_counted_as_bad_and_skipped() {
+        let dir = TempDir::new().expect("tempdir");
+        let env = open_msgboard_db(dir.path()).expect("open");
+
+        let good = sample_msg(1);
+        db_flush(&env, std::slice::from_ref(&good), &[]).expect("flush");
+
+        // Write two rows that decode to nothing useful: outright garbage, and a
+        // truncated prefix of a real RLP encoding (the likelier on-disk failure).
+        let mut valid_rlp = Vec::new();
+        sample_msg(2).encode(&mut valid_rlp);
+        let truncated = &valid_rlp[..valid_rlp.len() / 2];
+        {
+            let tx = env.begin_rw_txn().expect("rw txn");
+            let db = tx.open_db(Some(TABLE_NAME)).expect("open table");
+            tx.put(db.dbi(), B256::from([0xAAu8; 32]).as_slice(), b"not rlp", WriteFlags::empty())
+                .expect("put garbage");
+            tx.put(db.dbi(), B256::from([0xBBu8; 32]).as_slice(), truncated, WriteFlags::empty())
+                .expect("put truncated");
+            tx.commit().expect("commit");
+        }
+
+        let (loaded, bad) = db_load_all(&env).expect("load");
+        assert_eq!(bad, 2, "both undecodable rows should be counted");
+        assert_eq!(loaded.len(), 1, "the good message should still load");
+        assert_eq!(loaded[0].hash, good.hash);
+    }
+
     #[test]
     fn discarded_hashes_are_deleted_on_flush() {
         let dir = TempDir::new().expect("tempdir");
