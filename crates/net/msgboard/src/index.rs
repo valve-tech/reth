@@ -166,7 +166,7 @@ impl MsgIndex {
     /// containing none of it, and the parity argument that governs
     /// [`erigon_insert_pos`] does not reach this far: nothing about the filter
     /// is wire-observable, so a peer cannot tell the two apart and no eviction,
-    /// gossip, or PoW decision depends on it. `msgboard_content` clients that
+    /// gossip, or `PoW` decision depends on it. `msgboard_content` clients that
     /// pass a block range see a narrower, correct result.
     ///
     /// [`category_msgs_filtered`](Self::category_msgs_filtered) is **not**
