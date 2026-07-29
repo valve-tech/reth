@@ -1,0 +1,171 @@
+# Valve-owned release workflow for the firehose-instrumented PulseChain reth.
+#
+# The upstream (paradigm) release workflows target Depot runners and external
+# infra and never pass on this fork — same reason valve-ci.yml exists as the
+# fork-friendly CI replacement. This is its release counterpart.
+#
+# Why this matters more here than anywhere else in the fleet:
+#
+#   * Every fleet deploy currently COMPILES reth on the box. `rpc-cargo-rebuild`
+#     budgets ~30 min and a 1-hour step timeout, and the build trees are the
+#     largest thing on some disks (369b carries 11G reth-firehose/target +
+#     6.1G reth/target + 2.6G .rustup + 1.1G .cargo).
+#   * valve-node-app offers `reth` as an execution client, but every client's
+#     ReleaseURL is noReleaseURL, so setup falls back to BuildCmd — a user
+#     setting up a PulseChain node compiles reth FROM SOURCE on their own
+#     machine. For a large Rust workspace that is hours. This is the single
+#     worst first-run experience we ship.
+#
+# NATIVE RUNNERS PER TARGET — deliberately not a cross-compile matrix. Emulated
+# (QEMU) Rust builds of a workspace this size are pathologically slow, and
+# cross-linking reth's C dependencies (mdbx, secp256k1) is its own tar pit.
+# All four repos here are public, so GitHub's arm64 Linux and Apple Silicon
+# runners are free — the reason this is cheap rather than clever.
+#
+# Tag-triggered only. Cutting a reth release is a production event: it changes
+# what the fleet runs.
+name: valve-release
+
+on:
+  push:
+    tags:
+      - 'v*-pulse'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g. v2.4.1-pulse)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: valve-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      # Validate BEFORE the tag reaches checkout's ref: (ref injection) or any
+      # run: block. Two checks, both load-bearing: a lone `v*-pulse` case glob
+      # is NOT sufficient because a trailing/leading `*` matches ANY characters,
+      # so something like `v1;rm -rf /-pulse` would pass it. Prefix/suffix shape
+      # first, then reject any character outside the allowed class anywhere.
+      - name: Validate tag input
+        id: vars
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$RAW_TAG" in
+            v?*-pulse) ;;
+            *) echo "::error::refusing tag '$RAW_TAG' — must look like vX.Y.Z-pulse"; exit 1 ;;
+          esac
+          case "$RAW_TAG" in
+            *[!A-Za-z0-9._-]*)
+              echo "::error::refusing tag '$RAW_TAG' — characters outside [A-Za-z0-9._-]"
+              exit 1 ;;
+          esac
+          printf 'tag=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.vars.outputs.tag }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build reth
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # --release --bin reth mirrors what rpc-cargo-rebuild runs on the box,
+          # so the published artifact is the same thing the fleet would have
+          # compiled for itself.
+          cargo build --release --bin reth --target "$TARGET"
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BIN="target/${TARGET}/release/reth"
+          test -x "$BIN" || { echo "::error::no binary at $BIN"; exit 1; }
+          # Smoke the binary on the two targets that can execute here (the
+          # linux-arm64 runner is native arm64, macos-14 is native Apple
+          # Silicon), so a broken build can't ship silently.
+          "$BIN" --version || { echo "::error::reth --version failed"; exit 1; }
+          tar -czf "dist/reth-${TAG}-${TARGET}.tar.gz" -C "target/${TARGET}/release" reth
+          cd dist && sha256sum "reth-${TAG}-${TARGET}.tar.gz" > "reth-${TAG}-${TARGET}.tar.gz.sha256"
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reth-${{ matrix.target }}
+          path: dist/*
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Re-validate tag
+        id: vars
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$RAW_TAG" in v?*-pulse) ;; *) echo "::error::bad tag"; exit 1 ;; esac
+          case "$RAW_TAG" in *[!A-Za-z0-9._-]*) echo "::error::bad tag"; exit 1 ;; esac
+          printf 'tag=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: |
+          set -euo pipefail
+          cd dist && cat ./*.sha256 > SHA256SUMS && rm -f ./*.sha256 && cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          files: dist/*
+          body: |
+            Firehose-instrumented PulseChain reth, `${{ steps.vars.outputs.tag }}`.
+
+            Built `--release --bin reth` on native runners per target — the same
+            build `rpc-cargo-rebuild` performs on the box.
+
+            | target | platform |
+            |---|---|
+            | `x86_64-unknown-linux-gnu` | the fleet, and most self-hosters |
+            | `aarch64-unknown-linux-gnu` | ARM servers |
+            | `aarch64-apple-darwin` | Apple Silicon (valve-node local setup) |
+
+            Verify:
+            ```
+            sha256sum -c SHA256SUMS --ignore-missing
+            ```
