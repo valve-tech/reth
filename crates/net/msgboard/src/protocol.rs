@@ -572,6 +572,49 @@ mod tests {
         out
     }
 
+    /// Measures the reflection amplification available on `GetBoardMessages`,
+    /// documented in `docs/msgboard-parity-gaps.md` §14.3 — **asserts the
+    /// current behaviour**, so it fails if a cap or dedup is ever added.
+    ///
+    /// Two properties combine, both shared with erigon-pulse: the handler
+    /// accepts an unbounded number of IDs in one frame, and it does not
+    /// deduplicate them. `get_messages_for_ids` maps each requested ID to a
+    /// message independently, so one ID repeated N times is served N times.
+    /// An attacker therefore needs to know only a single message on the board.
+    #[test]
+    fn get_board_messages_serves_duplicate_ids_without_dedup_or_cap() {
+        let board = board_at(10);
+        // A single message at the default 8 KiB `size_limit`, so the served
+        // bytes reflect what an attacker would actually target.
+        let big = vec![0x9u8; 8 * 1024];
+        let id = board.add_local_msg(mined(&big, 10)).unwrap().msg_id();
+
+        const REPEATS: usize = 500;
+        let payload: Vec<u8> =
+            std::iter::repeat_n(id, REPEATS).flat_map(|i| i.as_bytes().to_vec()).collect();
+        let request_bytes = 1 + payload.len();
+
+        let (tx, mut rx) = channel();
+        handle_incoming(&board, None, &tx, frame(GET_BOARD_MESSAGES, &payload), peer());
+
+        let frames = drain(&mut rx);
+        let response_bytes: usize = frames.iter().map(|f| f.len()).sum();
+        let served: usize = frames
+            .iter()
+            .map(|f| decode_pow_msg_list(&f[1..]).expect("valid response").len())
+            .sum();
+
+        assert_eq!(served, REPEATS, "every duplicate is served, not deduplicated");
+
+        // Each 121-byte ID costs the responder a full ~8 KiB message.
+        let amplification = response_bytes / request_bytes;
+        assert!(
+            amplification >= 60,
+            "expected ~68x reflection amplification, got {amplification}x \
+             (response {response_bytes} B vs request {request_bytes} B)",
+        );
+    }
+
     /// Build a raw frame: opcode byte followed by payload.
     fn frame(opcode: u8, payload: &[u8]) -> BytesMut {
         let mut b = BytesMut::with_capacity(1 + payload.len());
