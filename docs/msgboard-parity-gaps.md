@@ -770,7 +770,7 @@ vulnerabilities reth inherited by matching erigon faithfully, and (2) is the one
 place reth had already diverged in the safe direction. Each is backed by a test
 that asserts the *current* behavior, so each fails the day it is fixed.
 
-### 14.1 Difficulty overflow — free `PoW`, and it outranks honest messages
+### 14.1 Difficulty overflow — free `PoW`, and it outranks honest messages — ✅ FIXED
 
 `PoWMsg::difficulty` is erigon's expression in wrapping `u64`:
 
@@ -805,25 +805,49 @@ board precedence is `(block, difficulty_ratio)` ascending with `evict_oldest`
 popping `msgs[0]` — so the free messages sort to the **top** and the honest ones
 are what get evicted.
 
-Demonstrated end to end by
-`board::tests::zero_work_messages_evict_honest_ones_from_a_full_board`: four
-messages with `nonce: 1` and no mining are accepted (`accepted == 4`,
-`kickable == 0` — the sender is not even penalised), and both honest mined
-messages are gone from the board. `pow::difficulty_overflow_vuln` covers the
-arithmetic and the gate separately.
+Before the fix this was demonstrated end to end: four messages with `nonce: 1`
+and no mining were accepted (`accepted == 4`, `kickable == 0` — the sender was
+not even penalised), and both honest mined messages were gone from the board.
 
-**Not fixed — needs a coordinated decision.** Erigon computes the same value in
-plain `uint64`, which wraps identically; the wrap is why reth uses
-`wrapping_mul` rather than saturating (§12.4). Rejecting these messages
-unilaterally means reth rejects what erigon accepts, i.e. a wire split on a
-consensus-adjacent gossip path — the same shape as the prysm `SlashValidator`
-quirk, and the same conclusion: it needs a pulsechaincom fix, not a valve one.
+#### Fixed — accepted wire divergence
 
-The cheap mitigation, if a unilateral change is acceptable: compute `difficulty`
-in `u128` and reject anything whose true value exceeds `u64::MAX`, or simply
-require `base × multiplier` not to overflow. Both reject only messages that are
-already invalid under any honest reading of the formula, but both are wire
-changes.
+pulsechaincom is already aware of the issue, so reth no longer waits on a
+coordinated fix. `PoWMsg::difficulty_checked` computes the threshold exactly in
+`u128` and returns `None` when the true value exceeds `u64::MAX` (or when
+`work_divisor` is zero, which previously made this a potential division-by-zero
+panic on any caller reaching it before `validate`).
+
+Rejection happens in two places:
+
+- `to_checked` — the choke point every `CheckedPoWMsg` passes through, so no
+  code path can construct one from an overflowing message. Returns
+  `InvalidDifficulty`; in `add_remote_msgs` that counts as **kickable**, so the
+  sender now takes a reputation hit instead of getting free board space.
+- `validate` — the decode boundary, so a crafted message dies before the
+  secp256k1 scalar multiplication the `PoW` check would otherwise pay for. This
+  matters independently of the spam vector: without it, the cheapest way to burn
+  a reth node's CPU was to send messages that fail `PoW` expensively.
+
+`difficulty()` is kept as a total `u64` accessor that saturates to `u64::MAX`,
+for display and logging only. Verification does not use it.
+
+**What this costs.** Strict wire parity: reth now rejects messages erigon
+accepts. Every such message is one whose exact `base × multiplier / divisor`
+exceeds `u64::MAX` — declared work that no hash could legitimately satisfy, and
+which only erigon's wrap made look cheap. No honest client produces one; the
+crafted example's true threshold is ≈2^80. An erigon peer that relays such a
+message to reth will see it rejected and be penalised, which is the intended
+outcome. Honest messages are bit-identical before and after
+(`honest_parameters_are_unchanged_by_the_exact_computation`).
+
+**Tests.** `pow::difficulty_overflow_regression` (the crafted parameters over 64
+nonces, plus proof that the minimum-work gate is *not* what rejects them, plus
+the honest-path no-op) and
+`board::tests::zero_work_messages_are_rejected_and_honest_ones_survive`
+(`accepted == 0`, `kickable == 4`, honest messages untouched). The two
+`test_difficulty_*` tests from §12.4 that pinned the wrap were inverted rather
+than deleted, so the behaviour they used to guarantee cannot come back silently.
+All four were verified to fail against a restored wrapping implementation.
 
 ### 14.2 Multiplier/divisor via float — reth already avoids it where it counts
 
@@ -903,10 +927,6 @@ on. That is the recommended first step if only one change is wanted.
 
 ### 14.4 Still open
 
-- §14.1 — the difficulty overflow. **Highest severity of anything in this
-  document**: zero-cost board takeover, exploitable by any peer, and it evicts
-  honest messages rather than merely adding noise. Needs a coordinated
-  pulsechaincom fix; reth cannot fix it alone without a wire split.
 - §14.3 — the request-path cap and dedup. Fixable unilaterally at low risk;
   needs a call on whether to diverge first or raise it upstream first.
 - §13.2's unbounded request frame (the sending half), unchanged.
