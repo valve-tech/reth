@@ -711,17 +711,36 @@ queries return a different set**, and on 30% reth returns empty where erigon
 returns a non-empty slice. Worked case — board holding blocks 1, 2, 3, queried
 `from=10 to=20`: erigon returns all three messages, reth returns none.
 
-**Not fixed, pending a decision.** This is RPC-surface only — nothing here is
-wire-observable, and unlike M1 it cannot affect eviction, gossip, or what a peer
-sees. Matching erigon means handing an operator the whole board when they asked
-for a range containing none of it. The alternative is a documented divergence on
-`msgboard_content`. Recorded on `all_msgs_filtered`; the same call also decides
-whether erigon's contiguous-slice semantics are worth reproducing at all.
+**Decision: keep reth's per-message filter. Divergence accepted and
+documented.** This is the one place in this document where parity loses, and
+the reason it loses is that the parity argument does not reach here. M1 mattered
+because eviction order is wire-observable — two nodes fed the same messages must
+drop the same one, or they gossip different boards. Nothing about the range
+filter is: it is a read-only RPC projection, a peer cannot observe it, and no
+eviction, gossip, or PoW decision depends on it. What is on the other side of
+the scale is an operator asking for blocks 10–20 and being handed the entire
+board, or a range query silently including messages outside the range.
+
+So `msgboard_content` clients that pass a block range get a narrower and correct
+result from reth than from erigon. Clients that pass no range are unaffected —
+`Msgs(nil)` returns `m.msgs` whole on both sides, so the common path is
+identical. Any tooling that compares the two clients' `msgboard_content` output
+under a block filter will see a difference, and that is expected.
+
+**The category-filtered path is not affected.** Erigon's `CategoryMsgs` skips
+per message (`if from != 0 && msg.BlockNumber < from || ...  { continue }`),
+exactly as reth does, so `msgboard_content` with a category is at parity on both
+ordering (§13.3, where erigon has no order to match) and filtering.
+
+`all_msgs_filtered_filters_per_message_where_erigon_slices` pins the decision:
+it asserts both halves of the divergence against erigon's answers computed in
+Go, and asserts the category path stays at parity. It uses a board that is
+deliberately not block-sorted (`[2, 5, 2, 5]`), since neither half of the
+divergence reproduces on a sorted one — the precondition erigon's comment
+assumes.
 
 ### 13.5 Still open
 
-- §13.4 — the range-filter divergence. Needs a parity-vs-correctness call, and
-  it is the last substantive difference known between the two implementations.
 - §13.2's unbounded request frame, now known to be a shared protocol weakness
   rather than a reth bug. Coordinated fix or nothing.
 - `install` / `install_post_launch_tasks` bodies remain uncovered — unchanged
