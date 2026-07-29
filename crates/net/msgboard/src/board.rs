@@ -670,6 +670,64 @@ mod tests {
 
     // ── tests ─────────────────────────────────────────────────────────────────
 
+    /// End-to-end demonstration of the `difficulty()` overflow documented in
+    /// `docs/msgboard-parity-gaps.md` §14.1 — **asserts the broken behaviour**,
+    /// so it fails the day the vulnerability is fixed.
+    ///
+    /// Crafted `work_multiplier`/`work_divisor` wrap `difficulty()` to 1, so
+    /// every nonce is a valid solution. The board's four `addMsgLocked` checks
+    /// (size, minimum work, block window, `PoW`) all pass, and because the
+    /// declared ratio is astronomically high the spam sorts to the top of the
+    /// precedence order — so the honest messages, not the free ones, are what
+    /// `evict_oldest` drops once `count_limit` is reached.
+    #[test]
+    fn zero_work_messages_evict_honest_ones_from_a_full_board() {
+        const EVIL_MULTIPLIER: u64 = 1_014_806_211_241_672_337;
+        const EVIL_DIVISOR: u64 = 16;
+
+        // count_limit 4 so the board fills in a handful of inserts.
+        let cfg = MsgboardConfig { count_limit: 4, ..easy_cfg() };
+        let board = MsgBoard::new(cfg);
+        board.set_ready();
+        board.set_head(100, block_hash_one());
+
+        // Two honest, mined messages.
+        let honest: Vec<B256> = [b"honest-a".as_slice(), b"honest-b".as_slice()]
+            .iter()
+            .map(|data| {
+                let nonce = find_nonce(data);
+                board.add_local_msg(make_pow_msg(nonce, data)).expect("honest msg accepted").hash
+            })
+            .collect();
+        assert_eq!(board.all_messages().len(), 2);
+
+        // Four zero-work messages, nonce 1 every time — no mining at all.
+        let spam: Vec<PoWMsg> = (0u8..4)
+            .map(|i| PoWMsg {
+                version: VERSION_V1,
+                block_hash: block_hash_one(),
+                nonce: 1,
+                work_multiplier: EVIL_MULTIPLIER,
+                work_divisor: EVIL_DIVISOR,
+                category: category_hash(),
+                data: Bytes::copy_from_slice(&[i]),
+            })
+            .collect();
+        for msg in &spam {
+            assert_eq!(msg.difficulty(), 1, "crafted difficulty must be 1");
+        }
+
+        let (accepted, kickable) = board.add_remote_msgs(spam);
+        assert_eq!(accepted, 4, "all four zero-work messages were accepted");
+        assert_eq!(kickable, 0, "and the sender earned no reputation penalty");
+
+        // The board is full and holds only spam: both honest messages evicted.
+        assert_eq!(board.all_messages().len(), 4);
+        for hash in honest {
+            assert!(board.get_message(&hash).is_none(), "honest message was evicted by free spam");
+        }
+    }
+
     #[test]
     fn new_board_starts_empty() {
         let board = MsgBoard::new(easy_cfg());

