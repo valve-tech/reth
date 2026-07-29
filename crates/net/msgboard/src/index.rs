@@ -150,7 +150,7 @@ impl MsgIndex {
 
     /// All messages across all categories filtered by block range.
     ///
-    /// **Known divergence from erigon — see `docs/msgboard-parity-gaps.md`
+    /// **Accepted divergence from erigon — see `docs/msgboard-parity-gaps.md`
     /// §13.4.** Erigon's `MsgIndex.Msgs` does not filter per message. It seeks
     /// a lower and an upper index and returns the contiguous slice between
     /// them, commenting "assuming msgs are sorted by block number" — which the
@@ -161,10 +161,17 @@ impl MsgIndex {
     /// board. Over randomised boards, 68% of range-filtered queries differ, and
     /// on 30% reth returns empty where erigon returns a non-empty slice.
     ///
-    /// Reth filters per message. This is an RPC-surface divergence only —
-    /// nothing about it is wire-observable — and it is not replicated pending
-    /// a decision, since reproducing it means returning the entire board to an
-    /// operator who asked for a range containing none of it.
+    /// Reth filters per message, deliberately. Reproducing erigon here would
+    /// mean handing an operator the entire board when they asked for a range
+    /// containing none of it, and the parity argument that governs
+    /// [`erigon_insert_pos`] does not reach this far: nothing about the filter
+    /// is wire-observable, so a peer cannot tell the two apart and no eviction,
+    /// gossip, or PoW decision depends on it. `msgboard_content` clients that
+    /// pass a block range see a narrower, correct result.
+    ///
+    /// [`category_msgs_filtered`](Self::category_msgs_filtered) is **not**
+    /// divergent — erigon's `CategoryMsgs` skips per message, like reth.
+    /// `all_msgs_filtered_filters_per_message_where_erigon_slices` pins both.
     pub fn all_msgs_filtered(
         &self,
         from_block: Option<u64>,
@@ -730,6 +737,47 @@ mod tests {
             idx.all_msgs()[0].hash[0] - 0xA0,
             7,
             "eviction target (msgs[0]) must match erigon's",
+        );
+    }
+
+    /// Pins the accepted divergence from erigon's `MsgIndex.Msgs` documented on
+    /// [`MsgIndex::all_msgs_filtered`] and in `docs/msgboard-parity-gaps.md`
+    /// §13.4: reth filters per message where erigon returns the contiguous
+    /// slice between two seeked bounds.
+    ///
+    /// Both halves of the divergence are asserted, with erigon's answers taken
+    /// from running its `Msgs` over the same board in Go. The board here is
+    /// deliberately *not* block-sorted — `[2, 5, 2, 5]` — which is the
+    /// precondition erigon's "assuming msgs are sorted by block number"
+    /// comment gets wrong, and without which neither half reproduces.
+    #[test]
+    fn all_msgs_filtered_filters_per_message_where_erigon_slices() {
+        const R10: u64 = 100_000; // ratio 0.10
+        const R50: u64 = 500_000; // ratio 0.50
+        const DIV: u64 = 1_000_000;
+
+        let mut idx = MsgIndex::default();
+        for (block, mult, id) in [(2u64, R10, 0u8), (2, R50, 1), (5, R50, 2), (5, R10, 3)] {
+            idx.insert(fake_checked(block, mult, DIV, 0xA0 + id));
+        }
+        let blocks = |msgs: &[Arc<CheckedPoWMsg>]| -> Vec<u64> {
+            msgs.iter().map(|m| m.block_number).collect()
+        };
+        assert_eq!(blocks(idx.all_msgs()), vec![2, 5, 2, 5], "board must not be block-sorted");
+
+        // Erigon seeks leftIdx=1, rightIdx=4 and returns blocks [5, 2, 5] —
+        // the block-2 message rides along because it sits between the bounds.
+        assert_eq!(blocks(&idx.all_msgs_filtered(Some(5), Some(8))), vec![5, 5]);
+
+        // No message satisfies `from`, so erigon's seek never fires, leftIdx
+        // stays 0, and it returns the whole board: blocks [2, 5, 2, 5].
+        assert!(idx.all_msgs_filtered(Some(10), Some(20)).is_empty());
+
+        // The category-filtered path is *not* divergent: erigon's
+        // `CategoryMsgs` skips per message, like reth.
+        assert_eq!(
+            blocks(&idx.category_msgs_filtered(&category(0xCA), Some(5), Some(8))),
+            vec![5, 5]
         );
     }
 
