@@ -12,7 +12,10 @@ name: valve-ci
 
 on:
   push:
-    branches: [main]
+    # feature/update-to-reth-2.4 is temporarily included so valve-ci runs on the
+    # 2.4 branch directly: it conflicts with 2.2 `main`, so a PR can't build the
+    # merge ref the pull_request event needs. Remove once 2.4 lands.
+    branches: [main, feature/update-to-reth-2.4]
   pull_request:
 
 env:
@@ -83,7 +86,11 @@ jobs:
       # Build the reth binary so the whole dependency graph of our build still
       # compiles end-to-end.
       - name: cargo check (reth binary)
-        run: cargo check -p reth
+        # reth v2.4.0 added `jit`+`gmp` to bin/reth's DEFAULT features, pulling in LLVM +
+        # GMP/MPFR that the runner lacks. Check the config the fleet actually deploys:
+        # --no-default-features + the v2.3-era feature set (verified to build without LLVM,
+        # matches deploy.config.yaml rethBuildFeatures). Harmless on 2.2/2.3 (same set).
+        run: cargo check -p reth --no-default-features --features "jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
 
       # Test our crates.
       - name: cargo nextest (our crates)
@@ -93,4 +100,5 @@ jobs:
             -p reth-firehose \
             -p reth-firehose-tests \
             -p reth-pulsechain-node \
-            -p reth-pulsechain-forks
+            -p reth-pulsechain-forks \
+            -p reth-cli-commands

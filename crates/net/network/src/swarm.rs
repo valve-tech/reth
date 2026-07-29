@@ -4,7 +4,7 @@ use crate::{
     peers::{InboundConnectionError, PeersManager},
     protocol::IntoRlpxSubProtocol,
     session::{Direction, PendingSessionHandshakeError, SessionEvent, SessionId, SessionManager},
-    state::{NetworkState, StateAction},
+    state::{NetworkState, SessionActivation, StateAction},
 };
 use futures::Stream;
 use reth_eth_wire::{
@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tracing::{trace, warn};
+use tracing::trace;
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// Contains the connectivity related state of the network.
@@ -133,15 +133,17 @@ impl<N: NetworkPrimitives> Swarm<N> {
                 direction,
                 timeout,
                 range_info,
+                supports_snap,
             } => {
-                self.state.on_session_activated(
-                    peer_id,
-                    capabilities.clone(),
-                    status.clone(),
-                    messages.clone(),
+                self.state.on_session_activated(SessionActivation {
+                    peer: peer_id,
+                    capabilities: capabilities.clone(),
+                    status: status.clone(),
+                    request_tx: messages.clone(),
                     timeout,
                     range_info,
-                );
+                    supports_snap,
+                });
                 Some(SwarmEvent::SessionEstablished {
                     peer_id,
                     remote_addr,

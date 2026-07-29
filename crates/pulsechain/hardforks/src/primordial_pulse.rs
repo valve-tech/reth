@@ -3,12 +3,11 @@
 //! This module is the canonical source of the data that defines what the
 //! `PrimordialPulse` fork-block transition does. It is kept in the lowest-level
 //! `PulseChain` crate (`reth-pulsechain-forks`) so both:
-//!   - the node crate (`reth-pulsechain-node`) — which actually APPLIES the
-//!     transition by calling `PrimordialPulseStateWriter` methods, and
-//!   - the firehose crate (`reth-firehose`) — which observes the transition
-//!     after-the-fact via the wrapper layer to emit `BalanceChange` /
-//!     `CodeChange` / `NonceChange` / `StorageChange` events for the firehose
-//!     stream,
+//!   - the node crate (`reth-pulsechain-node`) — which actually APPLIES the transition by calling
+//!     `PrimordialPulseStateWriter` methods, and
+//!   - the firehose crate (`reth-firehose`) — which observes the transition after-the-fact via the
+//!     wrapper layer to emit `BalanceChange` / `CodeChange` / `NonceChange` / `StorageChange`
+//!     events for the firehose stream,
 //!
 //! can read from a single, shared definition without introducing a circular
 //! crate dependency. See the project memory's "Bug-5/Bug-6 firehose"
@@ -254,9 +253,9 @@ pub fn decode_sacrifice_credits(data: &[u8]) -> Vec<(Address, U256)> {
 //
 // The 286,833 balance_changes decompose (verified by the asserts below) as:
 //   286,830  sacrifice-credit allocations  (Reason::GenesisBalance)
-//   +     1  testnet treasury allocation   (Reason::GenesisBalance)
-//   +     1  block reward (coinbase)        (Reason::RewardMineBlock)
-//   +     1  ETH deposit contract selfdestruct withdraw (Reason::SuicideWithdraw)
+//   + 1  testnet treasury allocation   (Reason::GenesisBalance)
+//   + 1  block reward (coinbase)        (Reason::RewardMineBlock)
+//   + 1  ETH deposit contract selfdestruct withdraw (Reason::SuicideWithdraw)
 //   = 286,833
 //
 // Note: the original hand-written breakdown described "286,831 GenesisBalance"
@@ -293,10 +292,8 @@ mod tests {
         // Testnet has exactly one treasury allocation (mainnet has none).
         let treasury_count = 1usize;
 
-        let total = credits.len()
-            + treasury_count
-            + REWARD_MINE_BLOCK_COUNT
-            + SUICIDE_WITHDRAW_COUNT;
+        let total =
+            credits.len() + treasury_count + REWARD_MINE_BLOCK_COUNT + SUICIDE_WITHDRAW_COUNT;
 
         assert_eq!(
             total, 286_833,
@@ -308,14 +305,8 @@ mod tests {
     fn testnet_v4_treasury_constants_are_locked() {
         // Treasury is a SEPARATE allocation, NOT part of the sacrifice-credits blob.
         // Source: pulsechain-testnet-v4.json `pulseChain.treasury`.
-        assert_eq!(
-            TESTNET_V4_TREASURY,
-            address!("A592ED65885bcbCeb30442F4902a0D1Cf3AcB8fC"),
-        );
-        assert_eq!(
-            TESTNET_V4_TREASURY_BALANCE,
-            uint!(0x314DC6448D9338C15B0A00000000_U256),
-        );
+        assert_eq!(TESTNET_V4_TREASURY, address!("A592ED65885bcbCeb30442F4902a0D1Cf3AcB8fC"),);
+        assert_eq!(TESTNET_V4_TREASURY_BALANCE, uint!(0x314DC6448D9338C15B0A00000000_U256),);
         assert!(!TESTNET_V4_TREASURY_BALANCE.is_zero(), "treasury balance must be nonzero");
     }
 
@@ -362,14 +353,8 @@ mod tests {
     #[test]
     fn deposit_contract_addresses_and_bytecode_are_locked() {
         // 2 code_changes on-wire: ETH deposit cleared + PULSE deposit installed.
-        assert_eq!(
-            ETH_DEPOSIT_CONTRACT,
-            address!("00000000219ab540356cBB839Cbe05303d7705Fa"),
-        );
-        assert_eq!(
-            PULSE_DEPOSIT_CONTRACT,
-            address!("3693693693693693693693693693693693693693"),
-        );
+        assert_eq!(ETH_DEPOSIT_CONTRACT, address!("00000000219ab540356cBB839Cbe05303d7705Fa"),);
+        assert_eq!(PULSE_DEPOSIT_CONTRACT, address!("3693693693693693693693693693693693693693"),);
         // PULSE deposit contract bytecode is 4898 bytes (the only nonzero code
         // installed — the ETH deposit's code goes to empty on selfdestruct).
         assert_eq!(DEPOSIT_CONTRACT_BYTECODE.len(), 4898, "deposit bytecode length");
