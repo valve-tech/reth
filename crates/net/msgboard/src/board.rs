@@ -670,28 +670,29 @@ mod tests {
 
     // ── tests ─────────────────────────────────────────────────────────────────
 
-    /// End-to-end demonstration of the `difficulty()` overflow documented in
-    /// `docs/msgboard-parity-gaps.md` §14.1 — **asserts the broken behaviour**,
-    /// so it fails the day the vulnerability is fixed.
+    /// Regression test for the zero-work exploit — see
+    /// `docs/msgboard-parity-gaps.md` §14.1.
     ///
-    /// Crafted `work_multiplier`/`work_divisor` wrap `difficulty()` to 1, so
-    /// every nonce is a valid solution. The board's four `addMsgLocked` checks
-    /// (size, minimum work, block window, `PoW`) all pass, and because the
-    /// declared ratio is astronomically high the spam sorts to the top of the
-    /// precedence order — so the honest messages, not the free ones, are what
-    /// `evict_oldest` drops once `count_limit` is reached.
+    /// These `work_multiplier`/`work_divisor` values wrap `difficulty()` onto 1
+    /// under erigon's `uint64` arithmetic, making every nonce a valid solution.
+    /// They also clear `is_work_acceptable` with an enormous declared ratio, so
+    /// before the fix all four were accepted with `nonce: 1` and no mining, and
+    /// their high ratio sorted them above the honest messages — which is what
+    /// `evict_oldest` then dropped.
+    ///
+    /// Reth now computes the threshold exactly and rejects them at
+    /// `to_checked`, which `add_remote_msgs` counts as kickable.
     #[test]
-    fn zero_work_messages_evict_honest_ones_from_a_full_board() {
+    fn zero_work_messages_are_rejected_and_honest_ones_survive() {
         const EVIL_MULTIPLIER: u64 = 1_014_806_211_241_672_337;
         const EVIL_DIVISOR: u64 = 16;
 
-        // count_limit 4 so the board fills in a handful of inserts.
+        // count_limit 4 so the board would fill after a handful of inserts.
         let cfg = MsgboardConfig { count_limit: 4, ..easy_cfg() };
         let board = MsgBoard::new(cfg);
         board.set_ready();
         board.set_head(100, block_hash_one());
 
-        // Two honest, mined messages.
         let honest: Vec<B256> = [b"honest-a".as_slice(), b"honest-b".as_slice()]
             .iter()
             .map(|data| {
@@ -701,7 +702,6 @@ mod tests {
             .collect();
         assert_eq!(board.all_messages().len(), 2);
 
-        // Four zero-work messages, nonce 1 every time — no mining at all.
         let spam: Vec<PoWMsg> = (0u8..4)
             .map(|i| PoWMsg {
                 version: VERSION_V1,
@@ -714,17 +714,21 @@ mod tests {
             })
             .collect();
         for msg in &spam {
-            assert_eq!(msg.difficulty(), 1, "crafted difficulty must be 1");
+            assert_eq!(msg.difficulty_checked(), None, "exact threshold exceeds u64::MAX");
+            assert!(
+                board.config().is_work_acceptable(msg.work_multiplier, msg.work_divisor),
+                "the minimum-work gate is not what rejects these",
+            );
         }
 
         let (accepted, kickable) = board.add_remote_msgs(spam);
-        assert_eq!(accepted, 4, "all four zero-work messages were accepted");
-        assert_eq!(kickable, 0, "and the sender earned no reputation penalty");
+        assert_eq!(accepted, 0, "no zero-work message may be accepted");
+        assert_eq!(kickable, 4, "and the sender is penalised for each");
 
-        // The board is full and holds only spam: both honest messages evicted.
-        assert_eq!(board.all_messages().len(), 4);
+        // The honest messages are untouched.
+        assert_eq!(board.all_messages().len(), 2);
         for hash in honest {
-            assert!(board.get_message(&hash).is_none(), "honest message was evicted by free spam");
+            assert!(board.get_message(&hash).is_some(), "honest message must survive");
         }
     }
 
