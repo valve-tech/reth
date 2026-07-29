@@ -886,7 +886,7 @@ float) is a pre-existing divergence in reth's favour; it can only ever *reject*
 a message erigon accepts by a margin under one `f64` ulp, which no honest client
 produces.
 
-### 14.3 Unlimited `GetBoardMessages` requests — 68× reflection amplification
+### 14.3 Unlimited `GetBoardMessages` requests — 68× reflection amplification — ✅ FIXED
 
 §13.2 established that neither client chunks or caps the **request**. The
 consequence on the responder is worse than the frame size alone suggests,
@@ -914,19 +914,48 @@ with the repeat count: nothing bounds the request, so nothing bounds the
 response. The board also does not rate-limit per peer, so this can be repeated
 continuously on one connection.
 
-**Not fixed — the cap is a wire change, but a cheap and low-risk one.** Unlike
-§14.1 there is a bound that is invisible to honest peers: erigon announces in
-846-ID chunks (§12.10 / `send_board_message_ids`), so a well-behaved peer never
-requests more than 846 IDs in one frame. Capping accepted request IDs at the
-announcement chunk size — and deduplicating before serving — would cost a
-conforming erigon peer nothing while removing the amplification entirely.
+#### Fixed — dedup plus a one-frame cap
 
-Deduplication alone is arguably not even a wire change: serving the same message
-twice in response to a doubled ID is not something a correct client can depend
-on. That is the recommended first step if only one change is wanted.
+`handle_incoming` now deduplicates the requested IDs and honours at most
+`MAX_IDS_PER_FRAME` (= `P2P_MSG_PACKET_LIMIT / MSG_ID_SIZE` = 846) distinct IDs
+per request. That constant is now shared with `send_board_message_ids`, which
+previously computed the same expression inline for the announcement chunk size —
+the two are the same number for a reason, and the shared const records it.
+
+**Why this is invisible to a conforming peer.** A request is built from a single
+inbound announcement; both clients announce in `MAX_IDS_PER_FRAME` chunks; and
+`filter_wanted` returns a *subset* of what was announced. So no honest peer can
+construct a request that reaches either limit. A peer that does is malfunctioning
+or probing, and gets a truncated response with a debug log rather than a
+reputation penalty — neither client documents a bound it could have respected, so
+penalising would punish behaviour that was legal until this change.
+
+**What it does and does not buy.** Dedup is the substantive half: it removes the
+cheap attack entirely, since an attacker must now know N *distinct* live message
+IDs to draw N messages, rather than repeating one. The 68× ratio itself is
+inherent to the protocol — a 121-byte ID names an up-to-8 KiB message — and is
+unchanged for a request of distinct IDs. What the cap adds is an absolute bound:
+one request can now provoke at most ~6.9 MB instead of an unbounded response.
+Sustained abuse across many frames is a rate-limiting problem, which neither
+client does and which is not addressed here.
+
+**Tests.** `get_board_messages_deduplicates_repeated_ids` (500 repeats of one ID
+now serve one message, and the response is *smaller* than the request rather than
+68× larger), `get_board_messages_caps_distinct_ids_at_one_frame` (a request of
+`MAX_IDS_PER_FRAME + 50` distinct IDs serves exactly one frame's worth), and
+`an_honest_request_is_served_in_full` (an ordinary five-ID request is unaffected).
+Both guards were verified to fail against the pre-fix handler; the honest-path
+test correctly passes under both, which is what makes it a control rather than a
+duplicate.
 
 ### 14.4 Still open
 
-- §14.3 — the request-path cap and dedup. Fixable unilaterally at low risk;
-  needs a call on whether to diverge first or raise it upstream first.
-- §13.2's unbounded request frame (the sending half), unchanged.
+- §13.2's unbounded request frame (the **sending** half) is unchanged: reth still
+  emits a request as large as the peer's announcement made it. §14.3 bounds what
+  reth *serves*, not what it asks for. A peer that announces a huge frame gets a
+  huge request back — harmless against erigon, which does not cap either, and
+  self-limiting in practice since the request is a subset of the announcement.
+- Per-connection rate limiting. Both §14.3's cap and erigon's absent one bound a
+  single frame; neither bounds frames per second. This is the remaining
+  amplification surface and would be a genuinely new mechanism rather than a
+  parity fix.

@@ -14,7 +14,7 @@
 //! all locally-held message IDs to the peer. Thereafter it relays new-message
 //! announcements via a `broadcast` subscription on [`MsgBoard`].
 
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 
 use alloy_rlp::Encodable;
 use bytes::BufMut;
@@ -37,6 +37,15 @@ use crate::board::MsgBoard;
 
 /// Approximate per-packet size limit for chunked P2P responses, matching erigon-pulse behavior.
 const P2P_MSG_PACKET_LIMIT: usize = 100 * 1024;
+
+/// `MsgID`s that fit in one `P2P_MSG_PACKET_LIMIT` frame: `102_400 / 121` = 846.
+///
+/// Used for two coupled purposes: the chunk size when announcing our own IDs,
+/// and the cap on how many IDs we will honour from a single inbound
+/// `GetBoardMessages`. They must stay the same value — the cap is safe against
+/// conforming peers precisely because no conforming peer can announce, and so
+/// none can request, more than one frame's worth at a time.
+const MAX_IDS_PER_FRAME: usize = P2P_MSG_PACKET_LIMIT / MSG_ID_SIZE;
 
 /// Msgboard capability: `msg/1`.
 pub const MSG_CAPABILITY: Capability =
@@ -328,7 +337,43 @@ fn handle_incoming(
             if !ready {
                 return;
             }
-            let msgs = board.get_messages_for_ids(&ids);
+
+            // Deduplicate and cap before serving — see
+            // `docs/msgboard-parity-gaps.md` §14.3.
+            //
+            // Erigon maps each requested ID to a message independently, with no
+            // cap and no dedup, so one ID repeated N times is served N times and
+            // an attacker needs to know only a single message on the board.
+            // Reth bounds both: at most one frame's worth of *distinct* IDs is
+            // honoured per request.
+            //
+            // Invisible to a conforming peer. Requests are built from a single
+            // inbound announcement, both clients announce in `MAX_IDS_PER_FRAME`
+            // chunks, and `filter_wanted` returns a subset — so no honest peer
+            // reaches either limit. A peer that does is either malfunctioning or
+            // probing, and gets a truncated response rather than a penalty,
+            // since neither client documents a bound it could have respected.
+            let mut seen = HashSet::with_capacity(ids.len().min(MAX_IDS_PER_FRAME));
+            let mut requested = Vec::with_capacity(ids.len().min(MAX_IDS_PER_FRAME));
+            for id in &ids {
+                if requested.len() == MAX_IDS_PER_FRAME {
+                    break;
+                }
+                if seen.insert(*id) {
+                    requested.push(*id);
+                }
+            }
+            if requested.len() < ids.len() {
+                tracing::debug!(
+                    target: "msgboard",
+                    ?peer_id,
+                    announced = ids.len(),
+                    served = requested.len(),
+                    "GetBoardMessages truncated to distinct IDs within one frame",
+                );
+            }
+
+            let msgs = board.get_messages_for_ids(&requested);
             if msgs.is_empty() {
                 return;
             }
@@ -410,8 +455,7 @@ fn send_board_message_ids(board: &Arc<MsgBoard>, tx: &mpsc::UnboundedSender<Byte
     if ids.is_empty() {
         return;
     }
-    let ids_per_chunk = P2P_MSG_PACKET_LIMIT / MSG_ID_SIZE;
-    for chunk in ids.chunks(ids_per_chunk) {
+    for chunk in ids.chunks(MAX_IDS_PER_FRAME) {
         let mut buf = BytesMut::with_capacity(1 + chunk.len() * MSG_ID_SIZE);
         buf.put_u8(BOARD_MESSAGE_IDS);
         buf.put_slice(&MsgID::encode_list(chunk));
@@ -572,20 +616,17 @@ mod tests {
         out
     }
 
-    /// Measures the reflection amplification available on `GetBoardMessages`,
-    /// documented in `docs/msgboard-parity-gaps.md` §14.3 — **asserts the
-    /// current behaviour**, so it fails if a cap or dedup is ever added.
+    /// Regression test for the reflection amplification closed in §14.3.
     ///
-    /// Two properties combine, both shared with erigon-pulse: the handler
-    /// accepts an unbounded number of IDs in one frame, and it does not
-    /// deduplicate them. `get_messages_for_ids` maps each requested ID to a
-    /// message independently, so one ID repeated N times is served N times.
-    /// An attacker therefore needs to know only a single message on the board.
+    /// Erigon maps each requested ID to a message independently, so one ID
+    /// repeated N times is served N times — an attacker needed to know only a
+    /// single message on the board. Measured before the fix: a 60,501 B request
+    /// of 500 repeats drew 4,135,710 B of response, 68x amplification.
     #[test]
-    fn get_board_messages_serves_duplicate_ids_without_dedup_or_cap() {
+    fn get_board_messages_deduplicates_repeated_ids() {
         let board = board_at(10);
-        // A single message at the default 8 KiB `size_limit`, so the served
-        // bytes reflect what an attacker would actually target.
+        // A message at the default 8 KiB `size_limit`, so the served bytes
+        // reflect what an attacker would actually target.
         let big = vec![0x9u8; 8 * 1024];
         let id = board.add_local_msg(mined(&big, 10)).unwrap().msg_id();
 
@@ -604,15 +645,62 @@ mod tests {
             .map(|f| decode_pow_msg_list(&f[1..]).expect("valid response").len())
             .sum();
 
-        assert_eq!(served, REPEATS, "every duplicate is served, not deduplicated");
-
-        // Each 121-byte ID costs the responder a full ~8 KiB message.
-        let amplification = response_bytes / request_bytes;
+        assert_eq!(served, 1, "the message is served once, not once per duplicate");
         assert!(
-            amplification >= 60,
-            "expected ~68x reflection amplification, got {amplification}x \
-             (response {response_bytes} B vs request {request_bytes} B)",
+            response_bytes < request_bytes,
+            "a duplicate flood must no longer amplify: response {response_bytes} B \
+             vs request {request_bytes} B",
         );
+    }
+
+    /// A request larger than one frame's worth of IDs is truncated to
+    /// `MAX_IDS_PER_FRAME`, bounding the work a single frame can provoke.
+    ///
+    /// No conforming peer reaches this: requests are built from one inbound
+    /// announcement, both clients announce in `MAX_IDS_PER_FRAME` chunks, and
+    /// `filter_wanted` returns a subset of that.
+    #[test]
+    fn get_board_messages_caps_distinct_ids_at_one_frame() {
+        let board = board_at(10);
+
+        // Seed more distinct messages than the cap allows.
+        let over = MAX_IDS_PER_FRAME + 50;
+        let ids: Vec<MsgID> = (0..over)
+            .map(|i| {
+                let data = format!("msg-{i}").into_bytes();
+                board.add_local_msg(mined(&data, 10)).unwrap().msg_id()
+            })
+            .collect();
+        assert_eq!(ids.len(), over);
+
+        let payload: Vec<u8> = ids.iter().flat_map(|i| i.as_bytes().to_vec()).collect();
+        let (tx, mut rx) = channel();
+        handle_incoming(&board, None, &tx, frame(GET_BOARD_MESSAGES, &payload), peer());
+
+        let served: usize = drain(&mut rx)
+            .iter()
+            .map(|f| decode_pow_msg_list(&f[1..]).expect("valid response").len())
+            .sum();
+        assert_eq!(served, MAX_IDS_PER_FRAME, "served exactly one frame's worth of IDs");
+    }
+
+    /// The cap and dedup must not touch an ordinary exchange: a peer asking for
+    /// the handful of IDs it actually lacks still gets all of them.
+    #[test]
+    fn an_honest_request_is_served_in_full() {
+        let board = board_at(10);
+        let ids: Vec<MsgID> =
+            (0..5u8).map(|i| board.add_local_msg(mined(&[i], 10)).unwrap().msg_id()).collect();
+
+        let payload: Vec<u8> = ids.iter().flat_map(|i| i.as_bytes().to_vec()).collect();
+        let (tx, mut rx) = channel();
+        handle_incoming(&board, None, &tx, frame(GET_BOARD_MESSAGES, &payload), peer());
+
+        let served: usize = drain(&mut rx)
+            .iter()
+            .map(|f| decode_pow_msg_list(&f[1..]).expect("valid response").len())
+            .sum();
+        assert_eq!(served, 5, "every distinct requested message is returned");
     }
 
     /// Build a raw frame: opcode byte followed by payload.
