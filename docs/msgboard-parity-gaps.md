@@ -556,6 +556,12 @@ to chunk.
 
 ### 12.11 Still open
 
+> **Every item below is resolved or superseded — see §13 and §13.6.** Kept as
+> written because it is the record of what round 4 believed, and §13.1's finding
+> turns on that record being trustworthy rather than tidied. In particular the
+> first bullet is wrong about the erigon source: it was on this machine, under a
+> different directory name (see the header note).
+
 - The §11.5 O2 caveat is **unchanged**: erigon's `Content` ordering remains
   unverified, and `~/go/src/gitlab.com/pulsechaincom/private-erigon-pulse` was
   not present on this machine either. Highest-value remaining parity item, and
@@ -689,7 +695,7 @@ closed.
 `slices.SortFunc` over the hashes (`board.go:308`). O1's fix matches erigon
 exactly, and `B256`'s `Ord` is the same byte-wise comparison.
 
-### 13.4 New: `msgboard_content`'s range filter diverges (not fixed)
+### 13.4 `msgboard_content`'s range filter diverges — ✅ DECIDED: divergence accepted
 
 Erigon's `MsgIndex.Msgs(filter)` does **not** filter per message. It seeks a
 lower and an upper index and returns the contiguous slice between them:
@@ -747,14 +753,42 @@ assumes.
 
 ### 13.5 Still open
 
-- §13.2's unbounded request frame, now known to be a shared protocol weakness
-  rather than a reth bug. Coordinated fix or nothing.
+- §13.2's unbounded request frame — **superseded by §14.4**, which splits it
+  into the serving half (fixed in §14.3) and the sending half (unchanged).
 - `install` / `install_post_launch_tasks` bodies remain uncovered — unchanged
   from §12.11; they need a running node.
-- `zepter` and `make lint-toml` (dprint) still not run — neither binary is
-  installed on this machine, and `cargo-nextest` is absent too (`cargo test`
-  was used). One dev-dependency was added in round 4 (`metrics-util`,
-  `debugging` feature), so both are worth running before this goes up.
+
+### 13.6 Toolchain gates — now run
+
+Rounds 4 and 5 recorded `zepter`, `make lint-toml` and `cargo-nextest` as
+skipped because none of the three were installed. All three are installed now
+and have been run against this work. Recorded here so a later round does not
+re-skip them or re-discover the same findings.
+
+- **`cargo-nextest`** — 158/158 pass. Worth preferring over `cargo test` here:
+  nextest runs each test in its own process, which is what
+  `tests/metrics.rs` needs (§12.8 — the gauges carry no labels, so parallel
+  boards in one process clobber each other's metric keys).
+- **`zepter`** — reports one issue: `bin/reth`'s `asm-keccak` feature must
+  propagate to `alloy-evm`. **Pre-existing and deliberately not fixed.** It
+  reproduces identically on a pristine pre-msgboard checkout, and no msgboard
+  commit touches `bin/reth` or the workspace `Cargo.toml`. Fixing it means
+  propagating a feature into `alloy-evm` — the crate held at a valve patch so
+  firehose can trace system calls — which is exactly the surface where a
+  careless feature change silently gutted tracing before. It wants a
+  deliberate look, not a lint-driven reflex.
+- **`make lint-toml` (dprint)** — the msgboard `Cargo.toml`s are already
+  clean; the round-4 `metrics-util` dev-dependency needed no reformatting. The
+  only file dprint wants to change is the workspace `Cargo.toml`, which is
+  pre-existing drift unrelated to msgboard. Note for whoever installs it:
+  `cargo install --locked dprint` **fails on arm64 macOS** with an unresolved
+  liblzma symbol at link time; `brew install dprint` works.
+
+  Same caveat applies to `cargo +nightly fmt --all`, which rewrites eight
+  unrelated files. Both tools produce ~10 files of churn on a repo-wide run, so
+  scope them to the crates you touched (`cargo +nightly fmt -p reth-msgboard
+  -p reth-msgboard-types --check`) rather than running them workspace-wide and
+  committing the result.
 
 ---
 
