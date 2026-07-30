@@ -36,6 +36,41 @@ use tracing::info;
 /// produced chain spec — is fixed at parse time.
 const ETHEREUM_CHAIN_NAMES: &[&str] = &["mainnet", "sepolia", "holesky", "hoodi"];
 
+/// Extra CLI args for the Ethereum dispatch path: the msgboard knobs, plus the
+/// firehose opt-in.
+///
+/// Firehose is **opt-in on Ethereum** and unconditional on PulseChain. The
+/// asymmetry is deliberate: PulseChain boxes are all either firehose producers
+/// or already carrying the ExEx, whereas chain-1 has both kinds. `direct-a-evm-1`
+/// is a plain RPC replica with no fireeth reader consuming its output, so
+/// installing the ExEx there would spend WAL writes and journald volume on a
+/// FIRE stream nobody reads. `direct-b-evm-1` is the firehose box and passes
+/// the flag.
+///
+/// Accepts either form, so a fireeth `reader-node-arguments` block and a
+/// systemd `Environment=` line are both viable:
+///
+/// ```text
+/// --firehose.enabled
+/// RETH_FIREHOSE_ENABLED=true
+/// ```
+#[derive(Debug, Clone, clap::Args)]
+struct EthereumExtArgs {
+    #[command(flatten)]
+    msgboard: MsgboardArgs,
+
+    /// Install the firehose tracer, executor wrapper and ExEx on this node.
+    ///
+    /// Off by default. Only turn it on where a fireeth reader-node is actually
+    /// consuming this process's FIRE output.
+    #[arg(
+        long = "firehose.enabled",
+        env = "RETH_FIREHOSE_ENABLED",
+        default_value_t = false
+    )]
+    firehose_enabled: bool,
+}
+
 fn main() {
     #[cfg(feature = "jit")]
     {
@@ -56,9 +91,11 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    // Firehose tracer init is gated inside `run_pulsechain_node` only — see
-    // the comment there for the lifecycle-contract reason this can't run
-    // unconditionally before chain dispatch.
+    // Firehose tracer init happens inside each dispatch path, never before the
+    // branch — see the comment in `run_pulsechain_node` for the
+    // lifecycle-contract reason it cannot run unconditionally here. On the
+    // PulseChain path it is unconditional; on the Ethereum path it is gated
+    // behind `--firehose.enabled` (see `EthereumExtArgs`).
     let result =
         if requested_ethereum_chain() { run_ethereum_node() } else { run_pulsechain_node() };
 
@@ -94,54 +131,84 @@ fn requested_ethereum_chain() -> bool {
 /// Uses upstream [`EthereumNode`] with stock components. Msgboard is wired
 /// identically to the PulseChain path so the same binary serves both.
 fn run_ethereum_node() -> eyre::Result<()> {
-    // Initialise the firehose tracer on the Ethereum dispatch path too. Safe
-    // here because we swap in `FirehoseExecutorBuilder` below — its chain-init
-    // pass fires `on_blockchain_init`, satisfying the contract the tracer's
-    // `on_block_execution_start` hook asserts (the same contract the PulseChain
-    // path satisfies via PulsechainFirehoseExecutorBuilder). Without the
-    // executor wired in, this init panics at firehose-tracer tracer.rs:1739 —
-    // which is why upstream `EthereumNode` alone could not carry firehose and
-    // `--chain mainnet` emitted no FIRE data (chain-1 firehose was inert).
-    reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer::config::Config {
-        chain_client: firehose_tracer::config::ChainClient::Reth,
-        ..Default::default()
-    }));
-
-    Cli::<EthereumChainSpecParser, MsgboardArgs>::parse().run(
-        async move |builder, msgboard_args: MsgboardArgs| {
-            info!(target: "reth::cli", "Launching Ethereum node (firehose-instrumented)");
-
+    Cli::<EthereumChainSpecParser, EthereumExtArgs>::parse().run(
+        async move |builder, ext: EthereumExtArgs| {
+            let EthereumExtArgs { msgboard: msgboard_args, firehose_enabled } = ext;
             let launcher = MsgboardLauncher::new(msgboard_args);
-            let launcher_for_rpc = launcher.clone();
 
-            // Swap in FirehoseExecutorBuilder (wraps EthEvmConfig in
-            // FirehoseEvmConfig) + install the firehose ExEx, mirroring
-            // run_pulsechain_node. This is what makes `--chain mainnet` emit
-            // FIRE data for the fireeth reader-node.
-            let handle = builder
-                .with_types::<EthereumNode>()
-                .with_components(
-                    EthereumNode::components().executor(FirehoseExecutorBuilder::default()),
-                )
-                .with_add_ons(EthereumAddOns::default())
-                .extend_rpc_modules(move |ctx| {
-                    let datadir = ctx.config().datadir().data_dir().to_path_buf();
-                    launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
-                    Ok(())
-                })
-                .install_exex("firehose", |ctx| async move {
-                    Ok(async move { reth_firehose::run_exex(ctx).await })
-                })
-                .launch()
-                .await?;
+            // The tracer, the FirehoseExecutorBuilder and the "firehose" ExEx are
+            // ALL-OR-NOTHING, which is why this branches the whole builder chain
+            // instead of gating the three pieces individually.
+            //
+            // Initialising the tracer without the executor+ExEx is not a
+            // degraded mode, it is a crash: the tracer's
+            // `on_block_execution_start` hook asserts that `on_blockchain_init`
+            // has already fired, and the thing that fires it is the installed
+            // ExEx (`reth_firehose::run_exex`, crates/firehose/src/runner.rs).
+            // Stock `EthereumNode` never fires it, so the first executed block
+            // panics at firehose-tracer tracer.rs:1739. That is exactly the
+            // 2026-05-31 chain-1 incident — 56 restarts before the box was
+            // stopped. Keep these two arms symmetric; do not "simplify" this by
+            // hoisting `init_tracer` above the branch.
+            if firehose_enabled {
+                info!(target: "reth::cli", "Launching Ethereum node (firehose-instrumented)");
 
-            launcher.install_post_launch_tasks(
-                handle.node.network.clone(),
-                handle.node.provider.clone(),
-            );
-            let exit = handle.wait_for_node_exit().await;
-            launcher.final_flush();
-            exit
+                reth_firehose::init_tracer(firehose_tracer::Tracer::new(
+                    firehose_tracer::config::Config {
+                        chain_client: firehose_tracer::config::ChainClient::Reth,
+                        ..Default::default()
+                    },
+                ));
+
+                let launcher_for_rpc = launcher.clone();
+                let handle = builder
+                    .with_types::<EthereumNode>()
+                    .with_components(
+                        EthereumNode::components().executor(FirehoseExecutorBuilder::default()),
+                    )
+                    .with_add_ons(EthereumAddOns::default())
+                    .extend_rpc_modules(move |ctx| {
+                        let datadir = ctx.config().datadir().data_dir().to_path_buf();
+                        launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
+                        Ok(())
+                    })
+                    .install_exex("firehose", |ctx| async move {
+                        Ok(async move { reth_firehose::run_exex(ctx).await })
+                    })
+                    .launch()
+                    .await?;
+
+                launcher.install_post_launch_tasks(
+                    handle.node.network.clone(),
+                    handle.node.provider.clone(),
+                );
+                let exit = handle.wait_for_node_exit().await;
+                launcher.final_flush();
+                exit
+            } else {
+                info!(target: "reth::cli", "Launching Ethereum node (stock, firehose disabled)");
+
+                let launcher_for_rpc = launcher.clone();
+                let handle = builder
+                    .with_types::<EthereumNode>()
+                    .with_components(EthereumNode::components())
+                    .with_add_ons(EthereumAddOns::default())
+                    .extend_rpc_modules(move |ctx| {
+                        let datadir = ctx.config().datadir().data_dir().to_path_buf();
+                        launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
+                        Ok(())
+                    })
+                    .launch()
+                    .await?;
+
+                launcher.install_post_launch_tasks(
+                    handle.node.network.clone(),
+                    handle.node.provider.clone(),
+                );
+                let exit = handle.wait_for_node_exit().await;
+                launcher.final_flush();
+                exit
+            }
         },
     )
 }
