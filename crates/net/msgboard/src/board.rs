@@ -232,11 +232,14 @@ impl MsgBoard {
                 .map(|m| m.hash)
                 .collect();
 
+            let mut expired = 0u64;
             for hash in stale {
                 if let Some(evicted) = state.index.remove(&hash) {
                     state.discarded.push(evicted);
+                    expired += 1;
                 }
             }
+            self.metrics.expired.increment(expired);
             (state.index.len(), state.index.total_size())
         };
 
@@ -335,10 +338,12 @@ impl MsgBoard {
         let mut kickable = 0;
         for msg in msgs {
             if !self.cfg.is_size_acceptable(msg.data.len()) {
+                self.metrics.rejected_oversized.increment(1);
                 kickable += 1;
                 continue;
             }
             if !self.cfg.is_work_acceptable(msg.work_multiplier, msg.work_divisor) {
+                self.metrics.rejected_insufficient_work.increment(1);
                 kickable += 1;
                 continue;
             }
@@ -350,25 +355,46 @@ impl MsgBoard {
             };
             // Unknown block — circumstantial (peer may be one block ahead),
             // mirrors erigon's `ErrMsgTooOld`/`ErrMsgFromTheFuture` branch.
-            let Some(block_number) = block_number else { continue };
+            let Some(block_number) = block_number else {
+                self.metrics.skipped_unknown_block.increment(1);
+                continue
+            };
 
             let checked = match msg.to_checked(block_number, timestamp) {
                 Ok(checked) => checked,
-                Err(_) => {
+                Err(err) => {
+                    // Split by reason: `InvalidDifficulty` is the §14.1
+                    // overflow, where reth and erigon genuinely disagree, and
+                    // must not be lumped in with ordinary bad `PoW`.
+                    match err {
+                        MsgboardError::InvalidDifficulty => {
+                            self.metrics.rejected_invalid_difficulty.increment(1)
+                        }
+                        MsgboardError::InvalidWork => {
+                            self.metrics.rejected_invalid_pow.increment(1)
+                        }
+                        _ => self.metrics.rejected_other.increment(1),
+                    }
                     kickable += 1;
                     continue;
                 }
             };
             match self.insert_checked(checked) {
-                Ok(_) => added += 1,
+                Ok(_) => {
+                    self.metrics.accepted_remote.increment(1);
+                    added += 1
+                }
                 // Circumstantial: don't penalise.
-                Err(
-                    MsgboardError::MessageExists |
-                    MsgboardError::BoardOverflow |
-                    MsgboardError::BlockTooOld,
-                ) => {}
+                Err(MsgboardError::MessageExists) => self.metrics.skipped_duplicate.increment(1),
+                Err(MsgboardError::BoardOverflow) => {
+                    self.metrics.skipped_board_overflow.increment(1)
+                }
+                Err(MsgboardError::BlockTooOld) => self.metrics.skipped_block_too_old.increment(1),
                 // Should not happen post-validation, but treat as kickable.
-                Err(_) => kickable += 1,
+                Err(_) => {
+                    self.metrics.rejected_other.increment(1);
+                    kickable += 1
+                }
             }
         }
         self.metrics.add_remote_msgs_duration_seconds.record(start.elapsed().as_secs_f64());
@@ -405,7 +431,12 @@ impl MsgBoard {
         let block_number = block_number.ok_or(MsgboardError::BlockTooOld)?;
 
         let checked = msg.to_checked(block_number, timestamp)?;
-        self.insert_checked(checked)
+        let inserted = self.insert_checked(checked)?;
+        // Only the success path is counted here. Local submissions return the
+        // specific error to the RPC caller, who sees the reason directly; the
+        // per-reason counters exist for peer traffic, which has no such channel.
+        self.metrics.accepted_local.increment(1);
+        Ok(inserted)
     }
 
     /// Subscribe to new-message notifications.
@@ -537,6 +568,7 @@ impl MsgBoard {
                 if evicted.hash == arc.hash {
                     return Err(MsgboardError::BoardOverflow);
                 }
+                self.metrics.evicted.increment(1);
                 state.discarded.push(evicted);
             }
             (state.index.len(), state.index.total_size())

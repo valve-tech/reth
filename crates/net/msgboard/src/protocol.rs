@@ -236,6 +236,7 @@ async fn run_connection(
                         if tx.send(buf).is_err() {
                             break;
                         }
+                        metrics.announcements_sent.increment(1);
                         metrics.sent_to_peer_duration_seconds
                             .record(start.elapsed().as_secs_f64());
                     }
@@ -286,14 +287,17 @@ fn handle_incoming(
 
     let gossip_disabled = board.config().gossip_disabled;
     let ready = board.is_ready();
+    let metrics = board.metrics();
 
     match opcode {
         BOARD_MESSAGE_IDS => {
+            metrics.announcements_received.increment(1);
             // Peer announced IDs it holds; request the ones we want.
             let ids = match MsgID::decode_list(&payload) {
                 Ok(ids) => ids,
                 Err(err) => {
                     tracing::debug!(target: "msgboard", ?peer_id, %err, "malformed BoardMessageIDs");
+                    metrics.bad_protocol.increment(1);
                     if let Some(r) = reporter {
                         r.report_bad_protocol(peer_id);
                     }
@@ -319,15 +323,18 @@ fn handle_incoming(
             let mut buf = BytesMut::with_capacity(1 + wanted.len() * MSG_ID_SIZE);
             buf.put_u8(GET_BOARD_MESSAGES);
             buf.put_slice(&MsgID::encode_list(&wanted));
+            metrics.requests_sent.increment(1);
             let _ = tx.send(buf);
         }
 
         GET_BOARD_MESSAGES => {
+            metrics.requests_received.increment(1);
             // Peer wants the full messages for these IDs.
             let ids = match MsgID::decode_list(&payload) {
                 Ok(ids) => ids,
                 Err(err) => {
                     tracing::debug!(target: "msgboard", ?peer_id, %err, "malformed GetBoardMessages");
+                    metrics.bad_protocol.increment(1);
                     if let Some(r) = reporter {
                         r.report_bad_protocol(peer_id);
                     }
@@ -364,6 +371,7 @@ fn handle_incoming(
                 }
             }
             if requested.len() < ids.len() {
+                metrics.requests_truncated.increment(1);
                 tracing::debug!(
                     target: "msgboard",
                     ?peer_id,
@@ -377,6 +385,7 @@ fn handle_incoming(
             if msgs.is_empty() {
                 return;
             }
+            metrics.bodies_served.increment(msgs.len() as u64);
             // Chunk messages into ~100KB packets to match erigon-pulse behavior.
             let mut chunk = Vec::new();
             let mut chunk_size = 0usize;
@@ -409,6 +418,7 @@ fn handle_incoming(
                 Ok(msgs) => msgs,
                 Err(err) => {
                     tracing::debug!(target: "msgboard", ?peer_id, %err, "malformed BoardMessages");
+                    metrics.bad_protocol.increment(1);
                     if let Some(r) = reporter {
                         r.report_bad_protocol(peer_id);
                     }
@@ -421,12 +431,14 @@ fn handle_incoming(
             if !ready || gossip_disabled {
                 return;
             }
+            metrics.bodies_received.increment(msgs.len() as u64);
             let (added, kickable) = board.add_remote_msgs(msgs);
             if added > 0 {
                 tracing::debug!(target: "msgboard", ?peer_id, added, "accepted msgboard messages");
             }
             if kickable > 0 {
                 tracing::debug!(target: "msgboard", ?peer_id, kickable, "rejected non-circumstantial messages");
+                metrics.bad_message.increment(kickable as u64);
                 if let Some(r) = reporter {
                     // One reputation hit per malformed/invalid message in the
                     // batch — matches erigon's `PenalizePeer` per-call cost.
@@ -455,10 +467,12 @@ fn send_board_message_ids(board: &Arc<MsgBoard>, tx: &mpsc::UnboundedSender<Byte
     if ids.is_empty() {
         return;
     }
+    let metrics = board.metrics();
     for chunk in ids.chunks(MAX_IDS_PER_FRAME) {
         let mut buf = BytesMut::with_capacity(1 + chunk.len() * MSG_ID_SIZE);
         buf.put_u8(BOARD_MESSAGE_IDS);
         buf.put_slice(&MsgID::encode_list(chunk));
+        metrics.announcements_sent.increment(1);
         let _ = tx.send(buf);
     }
 }
