@@ -374,3 +374,163 @@ REFERENCES
                       reward_burn.go (burn wrap), epoch_processing.go:201 +
                       precompute/slashing.go:28 (slashing-product wrap),
                       validators/validator.go SlashValidator (accumulation wrap)
+
+
+------------------------------------------------------------------------------
+TASK: msgboard hardening — 2 fixes queued, DO MEMORY FIX FIRST
+STATUS: NEXT UP (nothing started). Everything before this is DONE + on main.
+OPENED: 2026-07-29
+OWNER: valve
+------------------------------------------------------------------------------
+
+WHERE THINGS STAND (all pushed to origin/main)
+  main is the reth v2.4.0 line (promoted 91070d7278; old 2.2.0 tip preserved at
+  tag backup/main-pre-2.4-promote-20260728). 158/158 msgboard tests green.
+  Done this round: erigon Insert parity (linear scan, not sort.Search — verified
+  vs real Go over 200k sequences), difficulty-overflow rejection (exact u128),
+  GetBoardMessages dedup + 846-ID cap, 22 new metrics counters. Full audit
+  record in docs/msgboard-parity-gaps.md §§11-14.
+
+  Toolchain now installed: zepter, cargo-nextest, dprint (via brew — NOTE
+  `cargo install dprint` fails on arm64 macOS with an liblzma link error).
+  Repo-wide `cargo +nightly fmt --all` and `dprint fmt` each rewrite ~10
+  unrelated pre-existing-drift files; always scope to the crates you touched.
+
+==============================================================================
+FIX 1 (DO FIRST) — msgboard unbounded outbound channel = remote OOM
+==============================================================================
+Severity: higher than the 68x amplification already fixed in §14.3. Any peer
+can trigger it. This is memory exhaustion, not bandwidth.
+
+THE DEFECT
+  crates/net/msgboard/src/protocol.rs — the per-connection outbound channel is
+  `mpsc::unbounded_channel::<BytesMut>()`, written with `let _ = tx.send(buf)`,
+  which never blocks and never applies backpressure.
+
+  reth's mux stops draining that channel once its own out_buffer hits
+  MAX_MUX_OUT_BUFFER_BYTES = 32 MiB (crates/net/eth-wire/src/multiplex.rs:829,
+  :860; the cap is upstream 01cbe9bdad / PR #25031). But run_connection keeps
+  reading inbound frames and keeps calling tx.send(), so the backlog simply
+  RELOCATES into msgboard's unbounded queue and grows without limit.
+
+  Worse: the mux's inbound read loop (multiplex.rs:641-680) runs BEFORE its
+  `if !conn_ready` exit at :685, so it keeps draining the socket even while the
+  outbound sink is fully stalled.
+
+WHY reth's OWN eth PATH IS IMMUNE (this is the fix to copy)
+  crates/net/network/src/session/active.rs — MAX_QUEUED_OUTGOING_RESPONSES = 4
+  (:84). When exceeded, the receive loop `break`s (:894, :904), reth STOPS
+  READING FROM THE WIRE, the TCP window closes, and the peer is throttled by
+  their own connection. Intent documented at active.rs:72-83 and :226-228.
+  msgboard has nothing playing that role. Those counters are fed only from
+  EthMessage handling (active.rs:181, :258-278), so under a msgboard-only flood
+  they stay at zero and the throttle never fires. RECEIVE_MESSAGE_BUDGET = 16
+  (:97) counts poll_next CALLS — one call drains the whole socket buffer of
+  msgboard frames, so it bounds nothing here either.
+
+THE ATTACK
+  Open one connection, send GetBoardMessages continuously, never read. TCP is
+  full-duplex so the send direction stays open. Our send buffer fills -> mux
+  out_buffer pins at 32 MiB -> msgboard's unbounded channel grows at
+  (inbound request rate x amplification). One 102 KiB request frame (846 x
+  121-byte IDs) yields up to 846 x 8 KiB ~= 6.6 MiB queued, ~66x. ~15 MiB of
+  attacker traffic queues ~1 GiB. Parallelisable across
+  DEFAULT_MAX_COUNT_PEERS_INBOUND = 30
+  (crates/net/network-types/src/peers/config.rs:14).
+
+FIX SHAPE (two parts; part 2 is the one that actually bounds bytes)
+  1. Replace the unbounded channel with `mpsc::channel(N)` and have
+     run_connection await on send. Because run_connection awaits before reading
+     the next inbound frame, a full outbound channel stops it draining
+     ProtocolConnection — that bounds msgboard's own memory. (It does NOT bound
+     the mux's inbound to_satellite queue, which is upstream code and not
+     reachable from msgboard. Part 2 is the practical mitigation.)
+  2. Add a response-BYTE ceiling for one GetBoardMessages response, analogous to
+     reth's SOFT_RESPONSE_LIMIT = 2 MiB (crates/net/network/src/eth_requests.rs:64,
+     enforced by accumulating total_bytes and breaking at :138 / :203 / :325).
+     MAX_IDS_PER_FRAME caps request ITEMS; nothing currently caps response BYTES.
+  3. Consider escalating to report_bad_protocol on sustained overflow. Today an
+     over-limit request is silently truncated with a debug log and no reputation
+     cost — deliberate, because neither client documents a bound. A peer that
+     repeatedly saturates a BOUNDED queue is unambiguously abusive, which is a
+     stronger signal than the current one.
+
+SECONDARY ISSUES FOUND IN THE SAME PASS (fix opportunistically)
+  - get_messages_for_ids (crates/net/msgboard/src/board.rs) holds the shared
+    Mutex<BoardState> while cloning up to ~6.6 MiB of PoWMsg. That lock is
+    shared with every other peer task, the RPC paths and the block filter, so
+    request volume is a lock-contention vector, not just a memory one.
+  - The BOARD_MESSAGE_IDS arm has no cap and no chunking: a peer announcing N
+    IDs that pass filter_wanted gets an N-sized GetBoardMessages queued back
+    (~1:1 in bytes, so not amplifying, but it feeds the same unbounded queue at
+    line rate). filter_wanted rejects only IDs already in the index, so
+    REPEATING the same announcement produces a fresh full-size outbound frame
+    every time.
+  - There is no volume-based reputation anywhere in reth. Evidence:
+    crates/net/network/src/eth_requests.rs:76-79 holds a PeersHandle behind
+    `// TODO use to report spammers` + #[expect(dead_code)] — reth's own request
+    handler intended to punish spammers and never wired it up.
+  - A real rate limiter exists (reth_tokio_util::ratelimit::{Rate, RateLimit},
+    crates/tokio-util/src/ratelimit.rs) but is used ONLY by DNS discovery. Using
+    it here would be unlike reth's convention; prefer bounded queue + wire
+    backpressure.
+
+==============================================================================
+FIX 2 — guard firehose against the revmc JIT (currently safe BY ACCIDENT)
+==============================================================================
+THE HAZARD (confirmed, not hypothetical)
+  revmc's JIT does NOT preserve the Inspector hooks firehose depends on.
+  Source: ~/.cargo/git/checkouts/revmc-*/7e3536d (pinned Cargo.lock:11179 to
+  paradigmxyz/revmc@7e3536d).
+    - crates/revmc-runtime/src/revm_evm.rs:353 InspectorEvmTr::inspect_frame_run
+      hand-reconstructs only a SUBSET of inspector events on the compiled path:
+      log (:379-381), inspect_selfdestruct (:396), frame_end (:406). It falls
+      back to the interpreter only for LookupDecision::Interpret (:367).
+    - step and step_end are NEVER called — there is no step callback in the
+      compiled-code ABI at all (only on_log, crates/revmc-context/src/lib.rs:113).
+    - Logs vanish too: revmc calls Inspector::log, but firehose only overrides
+      log_full (crates/firehose/src/inspector.rs). In revm-inspector 41.0.0
+      log_full's default delegates TO log, not the reverse, and the interpreter
+      path calls log_full — so firehose's `log` is the trait-default no-op.
+  What firehose would silently lose: ALL SSTORE storage changes, ALL KECCAK256
+  preimages, ALL logs from JIT-compiled contracts, and the value-transfer
+  balance changes driven from step. Blocks keep streaming — incomplete.
+  There is NO guard anywhere that disables the JIT when an inspector is attached.
+
+WHY IT CANNOT FIRE TODAY (and why that is fragile)
+  A firehose node has no JIT-capable EVM in its type graph at all.
+  bin/reth/src/firehose.rs:35-39 builds
+    FirehoseEvmConfig<EthEvmConfig<ChainSpec>>  via EthEvmConfig::new(...)
+  and EthEvmConfig's default factory is alloy_evm::EthEvmFactory, NOT reth's
+  RethEvmFactory (crates/ethereum/evm/src/lib.rs:24, :85, :107). revmc is
+  structurally absent. Same for PulsechainFirehoseExecutorBuilder
+  (firehose.rs:67, crates/pulsechain/node/src/evm.rs:405).
+  with_jit_support is called in exactly 3 places repo-wide, none carrying a
+  firehose inspector: crates/engine/tree/src/tree/payload_validator.rs:1093
+  (upstream execute_block, NoOpInspector), crates/ethereum/payload/src/lib.rs:191
+  (payload building), crates/cli/commands/src/re_execute.rs:149.
+  => Passing --jit on a firehose box is SAFE because it is a silent NO-OP.
+     FirehoseExecutorBuilder::build_evm never reads ctx.config().jit (contrast
+     EthereumExecutorBuilder::build_evm, crates/ethereum/node/src/node.rs:606-609),
+     and reth_jit RPC returns Ok(()) when jit_backend() is None
+     (crates/rpc/rpc/src/reth.rs:229-231). It is also NOT a perf win there.
+
+FIX SHAPE
+  Make the safety explicit instead of incidental. Anyone "optimising"
+  FirehoseExecutorBuilder to reuse the node's build_evm_config — plausible,
+  since firehose nodes currently get zero JIT — would be one .with_jit_support()
+  away from silently dropping logs and SSTOREs, with no test failing.
+    - Add a test asserting a firehose EVM config reports jit_backend() == None /
+      jit_support disabled.
+    - Consider a startup warning (or hard error) when --jit is passed together
+      with --firehose.enabled, since today it is silently inert.
+    - Record in crates/firehose/ docs that revmc's compiled path drops
+      step/step_end/log, so the two can never be combined without an upstream
+      revmc fix (inspect_frame_run would need to defer to the interpreter
+      whenever the inspector needs step-level hooks).
+
+DROPPED FROM THE BOARD (user decision 2026-07-29)
+  Upstreaming the msgboard findings to pulsechaincom. pulsechaincom is already
+  aware of the difficulty overflow; the insert-order divergence is not being
+  contributed upstream.
+
