@@ -377,103 +377,73 @@ REFERENCES
 
 
 ------------------------------------------------------------------------------
-TASK: msgboard hardening — 2 fixes queued, DO MEMORY FIX FIRST
-STATUS: NEXT UP (nothing started). Everything before this is DONE + on main.
+TASK: msgboard hardening — FIX 1 DONE, FIX 2 next
+STATUS: FIX 1 (memory) SHIPPED 2026-08-02. FIX 2 (revmc JIT guard) NOT STARTED.
 OPENED: 2026-07-29
 OWNER: valve
 ------------------------------------------------------------------------------
 
-WHERE THINGS STAND (all pushed to origin/main)
+WHERE THINGS STAND
   main is the reth v2.4.0 line (promoted 91070d7278; old 2.2.0 tip preserved at
-  tag backup/main-pre-2.4-promote-20260728). 158/158 msgboard tests green.
-  Done this round: erigon Insert parity (linear scan, not sort.Search — verified
-  vs real Go over 200k sequences), difficulty-overflow rejection (exact u128),
-  GetBoardMessages dedup + 846-ID cap, 22 new metrics counters. Full audit
-  record in docs/msgboard-parity-gaps.md §§11-14.
+  tag backup/main-pre-2.4-promote-20260728). 127/127 msgboard tests green after
+  FIX 1 (was 122 before; 5 new). Full audit record in
+  docs/msgboard-parity-gaps.md §§11-15.
 
   Toolchain now installed: zepter, cargo-nextest, dprint (via brew — NOTE
   `cargo install dprint` fails on arm64 macOS with an liblzma link error).
   Repo-wide `cargo +nightly fmt --all` and `dprint fmt` each rewrite ~10
   unrelated pre-existing-drift files; always scope to the crates you touched.
+  Same for `zepter`: it auto-fixes 13 pre-existing std/serde feature-propagation
+  issues across Cargo.toml, bin/reth, msgboard-types, pulsechain/{hardforks,node}
+  — none caused by msgboard work. Revert those unless the task is that cleanup.
+  This box has no LLVM and cannot build GMP, so `cargo check --workspace` fails
+  on revmc-llvm/gmp-mpfr-sys. Use
+    cargo check --workspace --exclude reth --all-targets
+    cargo check -p reth --no-default-features --features \
+      jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,\
+      keccak-cache-global,asm-keccak,min-trace-logs
+  Both pass.
 
 ==============================================================================
-FIX 1 (DO FIRST) — msgboard unbounded outbound channel = remote OOM
+FIX 1 — msgboard unbounded outbound channel = remote OOM — ✅ DONE 2026-08-02
 ==============================================================================
-Severity: higher than the 68x amplification already fixed in §14.3. Any peer
-can trigger it. This is memory exhaustion, not bandwidth.
+Full write-up: docs/msgboard-parity-gaps.md §15. Summary of what shipped:
 
-THE DEFECT
-  crates/net/msgboard/src/protocol.rs — the per-connection outbound channel is
-  `mpsc::unbounded_channel::<BytesMut>()`, written with `let _ = tx.send(buf)`,
-  which never blocks and never applies backpressure.
+  1. Bounded the per-connection outbound queue:
+     mpsc::unbounded_channel -> mpsc::channel(MAX_QUEUED_OUTGOING_FRAMES = 8).
+     Every frame is <= one 100 KiB packet, so ~800 KiB/peer, ~24 MiB across the
+     30-peer inbound default.
+  2. Made the sends await. handle_incoming / send_board_message_ids are now
+     async. They share a task with the read loop, so a full queue stops us
+     draining ProtocolConnection — that is what bounds the backlog rather than
+     relocating it.
+  3. Added OUTBOUND_SEND_TIMEOUT = 30 s as a deadline PER INBOUND FRAME (not
+     per send). NOT optional and NOT in the original plan: the mux's inbound
+     to_satellite queue is itself unbounded upstream (multiplex.rs:289) and it
+     keeps reading the socket regardless, so waiting forever would just move the
+     unbounded growth upstream. Dropping keeps it drained. Per-send would have
+     let one request stall the reader for chunks x 30 s (measured 60 s).
+  4. Chunked the outbound GetBoardMessages at MAX_IDS_PER_FRAME. This is a
+     CORRECTNESS fix, not just a size bound: §14.3 capped our responder at 846
+     distinct IDs, so an unchunked request over that lost the overflow silently
+     against another reth node. §14.4's first open item, closed.
+  5. New counter msgboard.outbound_dropped.
 
-  reth's mux stops draining that channel once its own out_buffer hits
-  MAX_MUX_OUT_BUFFER_BYTES = 32 MiB (crates/net/eth-wire/src/multiplex.rs:829,
-  :860; the cap is upstream 01cbe9bdad / PR #25031). But run_connection keeps
-  reading inbound frames and keeps calling tx.send(), so the backlog simply
-  RELOCATES into msgboard's unbounded queue and grows without limit.
+  DEPARTURES FROM THE ORIGINAL PLAN (both reasoned in §15):
+   - The response BYTE ceiling was evaluated and REJECTED (§15.2). Response
+     bytes are already bounded by MAX_IDS_PER_FRAME x size_limit, and size_limit
+     is local operator config — nothing attacker-controlled is left to bound.
+     A ceiling would only truncate honest first-connect responses, and truncated
+     messages are never re-requested (reth asks only on announcement).
+   - Reputation escalation on sustained overflow NOT done (§15.5). Backpressure
+     can mean a congested link, not abuse. Revisit if outbound_dropped goes
+     non-zero against otherwise-healthy peers.
+   - The get_messages_for_ids lock-contention concern was OVERSTATED (§15.4):
+     PoWMsg::data is alloy Bytes (refcounted), so the clone under the lock is
+     ~96 B/message, not 8 KiB. ~81 KiB for a full request. No change made.
 
-  Worse: the mux's inbound read loop (multiplex.rs:641-680) runs BEFORE its
-  `if !conn_ready` exit at :685, so it keeps draining the socket even while the
-  outbound sink is fully stalled.
-
-WHY reth's OWN eth PATH IS IMMUNE (this is the fix to copy)
-  crates/net/network/src/session/active.rs — MAX_QUEUED_OUTGOING_RESPONSES = 4
-  (:84). When exceeded, the receive loop `break`s (:894, :904), reth STOPS
-  READING FROM THE WIRE, the TCP window closes, and the peer is throttled by
-  their own connection. Intent documented at active.rs:72-83 and :226-228.
-  msgboard has nothing playing that role. Those counters are fed only from
-  EthMessage handling (active.rs:181, :258-278), so under a msgboard-only flood
-  they stay at zero and the throttle never fires. RECEIVE_MESSAGE_BUDGET = 16
-  (:97) counts poll_next CALLS — one call drains the whole socket buffer of
-  msgboard frames, so it bounds nothing here either.
-
-THE ATTACK
-  Open one connection, send GetBoardMessages continuously, never read. TCP is
-  full-duplex so the send direction stays open. Our send buffer fills -> mux
-  out_buffer pins at 32 MiB -> msgboard's unbounded channel grows at
-  (inbound request rate x amplification). One 102 KiB request frame (846 x
-  121-byte IDs) yields up to 846 x 8 KiB ~= 6.6 MiB queued, ~66x. ~15 MiB of
-  attacker traffic queues ~1 GiB. Parallelisable across
-  DEFAULT_MAX_COUNT_PEERS_INBOUND = 30
-  (crates/net/network-types/src/peers/config.rs:14).
-
-FIX SHAPE (two parts; part 2 is the one that actually bounds bytes)
-  1. Replace the unbounded channel with `mpsc::channel(N)` and have
-     run_connection await on send. Because run_connection awaits before reading
-     the next inbound frame, a full outbound channel stops it draining
-     ProtocolConnection — that bounds msgboard's own memory. (It does NOT bound
-     the mux's inbound to_satellite queue, which is upstream code and not
-     reachable from msgboard. Part 2 is the practical mitigation.)
-  2. Add a response-BYTE ceiling for one GetBoardMessages response, analogous to
-     reth's SOFT_RESPONSE_LIMIT = 2 MiB (crates/net/network/src/eth_requests.rs:64,
-     enforced by accumulating total_bytes and breaking at :138 / :203 / :325).
-     MAX_IDS_PER_FRAME caps request ITEMS; nothing currently caps response BYTES.
-  3. Consider escalating to report_bad_protocol on sustained overflow. Today an
-     over-limit request is silently truncated with a debug log and no reputation
-     cost — deliberate, because neither client documents a bound. A peer that
-     repeatedly saturates a BOUNDED queue is unambiguously abusive, which is a
-     stronger signal than the current one.
-
-SECONDARY ISSUES FOUND IN THE SAME PASS (fix opportunistically)
-  - get_messages_for_ids (crates/net/msgboard/src/board.rs) holds the shared
-    Mutex<BoardState> while cloning up to ~6.6 MiB of PoWMsg. That lock is
-    shared with every other peer task, the RPC paths and the block filter, so
-    request volume is a lock-contention vector, not just a memory one.
-  - The BOARD_MESSAGE_IDS arm has no cap and no chunking: a peer announcing N
-    IDs that pass filter_wanted gets an N-sized GetBoardMessages queued back
-    (~1:1 in bytes, so not amplifying, but it feeds the same unbounded queue at
-    line rate). filter_wanted rejects only IDs already in the index, so
-    REPEATING the same announcement produces a fresh full-size outbound frame
-    every time.
-  - There is no volume-based reputation anywhere in reth. Evidence:
-    crates/net/network/src/eth_requests.rs:76-79 holds a PeersHandle behind
-    `// TODO use to report spammers` + #[expect(dead_code)] — reth's own request
-    handler intended to punish spammers and never wired it up.
-  - A real rate limiter exists (reth_tokio_util::ratelimit::{Rate, RateLimit},
-    crates/tokio-util/src/ratelimit.rs) but is used ONLY by DNS discovery. Using
-    it here would be unlike reth's convention; prefer bounded queue + wire
-    backpressure.
+  Every new test was verified to fail with its fix reverted; the controls are
+  tabulated in §15.1.
 
 ==============================================================================
 FIX 2 — guard firehose against the revmc JIT (currently safe BY ACCIDENT)

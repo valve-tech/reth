@@ -92,6 +92,11 @@ pub struct MsgboardMetrics {
     pub requests_sent: Counter,
     /// `GetBoardMessages` frames received from peers.
     pub requests_received: Counter,
+    /// Frames discarded because a peer left its outbound queue full for
+    /// `OUTBOUND_SEND_TIMEOUT` — see §15.1. Non-zero means a peer stopped
+    /// reading while we still had gossip for it, which is the signature of the
+    /// memory-exhaustion attack that fix closed.
+    pub outbound_dropped: Counter,
     /// Individual messages served in `BoardMessages` responses.
     pub bodies_served: Counter,
     /// Individual messages received in `BoardMessages` payloads.

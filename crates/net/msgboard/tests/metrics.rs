@@ -174,6 +174,7 @@ fn every_metric_is_instantiated_and_moves() {
             "msgboard.expired",
             "msgboard.msg_count",
             "msgboard.msg_size",
+            "msgboard.outbound_dropped",
             "msgboard.rejected_insufficient_work",
             "msgboard.rejected_invalid_difficulty",
             "msgboard.rejected_invalid_pow",
