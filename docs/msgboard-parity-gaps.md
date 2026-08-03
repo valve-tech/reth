@@ -993,3 +993,184 @@ duplicate.
   single frame; neither bounds frames per second. This is the remaining
   amplification surface and would be a genuinely new mechanism rather than a
   parity fix.
+
+---
+
+## 15. Round-7: the outbound queue was unbounded
+
+§14.3 bounded what one request can make reth *serve*. It did not bound where
+that response goes. The queue between the protocol handler and reth's
+multiplexer was `mpsc::unbounded_channel`, so the response had somewhere
+unlimited to accumulate — which is the more serious of the two, because it is
+memory rather than bandwidth and any peer can trigger it.
+
+### 15.1 Unbounded outbound queue — remote memory exhaustion — ✅ FIXED
+
+**The defect.** `crates/net/msgboard/src/protocol.rs` created the per-connection
+outbound channel with `mpsc::unbounded_channel::<BytesMut>()` and wrote to it
+with `let _ = tx.send(buf)`, which never blocks and never applies backpressure.
+
+reth's multiplexer does stop draining a protocol once its own out-buffer reaches
+`MAX_MUX_OUT_BUFFER_BYTES` = 32 MiB (`crates/net/eth-wire/src/multiplex.rs:829`,
+enforced at `poll_outbound_producers`). But `run_connection` kept reading inbound
+frames and kept calling `tx.send()`, so the backlog simply *relocated* into
+msgboard's queue and grew without limit. The multiplexer's own read loop
+(`multiplex.rs:641-680`) runs before its `if !conn_ready` exit at `:685`, so it
+keeps draining the socket even while the outbound sink is fully stalled.
+
+**Why reth's own `eth` path is immune.** `crates/net/network/src/session/active.rs`
+caps `MAX_QUEUED_OUTGOING_RESPONSES` at 4 (`:84`) and `break`s out of its receive
+loop when exceeded (`:894`, `:904`). reth then stops reading the socket, the TCP
+window closes, and the peer throttles itself. Those counters are fed only from
+`EthMessage` handling (`:181`, `:258-278`), so under a msgboard-only flood they
+stay at zero and the throttle never fires. `RECEIVE_MESSAGE_BUDGET` = 16 (`:97`)
+counts `poll_next` *calls*, and one call drains the whole socket buffer, so it
+bounds nothing here either.
+
+**The attack.** Open one connection, send `GetBoardMessages` continuously, never
+read. TCP is full-duplex, so the send direction stays open. Our send buffer
+fills, the mux out-buffer pins at 32 MiB, and msgboard's queue grows at
+(request rate × amplification). One 102 KiB request frame (846 × 121-byte IDs)
+yields up to 846 × 8 KiB ≈ 6.6 MiB queued — ~66× — so ~15 MiB of attacker
+traffic queues ~1 GiB. Parallelisable across `DEFAULT_MAX_COUNT_PEERS_INBOUND`
+= 30 (`crates/net/network-types/src/peers/config.rs:14`).
+
+#### Fixed — a bounded queue, an awaited send, and a per-frame deadline
+
+Three parts, and all three are needed:
+
+1. **`mpsc::channel(MAX_QUEUED_OUTGOING_FRAMES)`**, `MAX_QUEUED_OUTGOING_FRAMES`
+   = 8. Every frame we emit is at most one `P2P_MSG_PACKET_LIMIT` packet, so
+   msgboard's per-peer outbound memory is now ~800 KiB, about 24 MiB across 30
+   inbound peers.
+2. **Sends are awaited.** `handle_incoming` and `send_board_message_ids` became
+   `async`. Because they run in the same task as the read loop, a full queue
+   stops us pulling the next frame off `ProtocolConnection` — which is what
+   actually stops the backlog, rather than moving it. Honest bursts exceed 8
+   frames (a bulk announce is `count_limit / 846` = 12 at the default; one full
+   response is up to ~69) and that is fine: a peer that reads drains as fast as
+   we fill.
+3. **A deadline per inbound frame**, `OUTBOUND_SEND_TIMEOUT` = 30 s, after which
+   the rest of that frame's output is dropped and the read loop resumes.
+
+Part 3 is not optional, and it is the part the original write-up missed. The
+multiplexer's inbound queue to a satellite protocol is itself an **unbounded**
+channel (`multiplex.rs:289`, `install_protocol`) that it keeps filling from the
+socket regardless of what we do. Waiting indefinitely on part 2 would therefore
+relocate the unbounded growth *upstream* rather than remove it — the attacker
+would need 1 byte sent per byte queued instead of 1 per 66, which is a 66×
+improvement but not a fix. Dropping keeps that queue drained. A satellite
+protocol has no way to stop the multiplexer reading the socket, so this is the
+strongest bound available from inside msgboard.
+
+The deadline covers the whole inbound frame, not each send within it. Serving
+one request emits dozens of chunks; a per-send timeout would let a single
+request hold the read loop for `chunks × 30 s`. Measured at 60 s across a
+3-chunk response before this was corrected.
+
+Dropped frames are counted by the new `msgboard.outbound_dropped` counter.
+Nothing is lost that the peer was going to receive: it is not reading.
+
+**Tests** (`protocol.rs`, each verified to fail with its fix reverted):
+
+| Test | Property | Negative control |
+|---|---|---|
+| `the_outbound_queue_is_bounded` | queue capacity is `MAX_QUEUED_OUTGOING_FRAMES`, and `OUTBOUND_SEND_TIMEOUT` ≤ 60 s | — (structural) |
+| `a_full_outbound_queue_makes_the_handler_wait_instead_of_buffering` | handler parks on a full queue and resumes one frame at a time as the mux drains | `try_send` → completes on first poll |
+| `a_peer_that_stops_reading_gets_frames_dropped_not_queued_forever` | terminates; nothing beyond capacity accumulates | plain `tx.send().await` → test hangs, SIGTERM |
+| `one_inbound_frame_stalls_the_read_loop_for_at_most_the_timeout` | total wait for one inbound frame ≤ `OUTBOUND_SEND_TIMEOUT` | per-send deadline → 60 s |
+| `a_closed_outbound_queue_reports_the_connection_gone` | `Sent::Closed` propagates so `run_connection` exits | — |
+
+The magnitude of `OUTBOUND_SEND_TIMEOUT` is pinned in
+`the_outbound_queue_is_bounded` rather than in the timeout tests: those pass for
+*any* finite value, because `start_paused` auto-advances to whatever deadline is
+registered.
+
+### 15.2 A response byte ceiling — evaluated and **rejected**
+
+The original plan paired the bounded queue with a per-response byte ceiling
+analogous to reth's `SOFT_RESPONSE_LIMIT` = 2 MiB
+(`crates/net/network/src/eth_requests.rs:64`), on the reasoning that
+`MAX_IDS_PER_FRAME` caps request *items* and nothing caps response *bytes*.
+
+It is not worth having, for two reasons:
+
+- **There is no attacker-controlled quantity left to bound.** Response bytes are
+  already bounded by `MAX_IDS_PER_FRAME × size_limit` = 846 × 8 KiB ≈ 6.9 MB.
+  `size_limit` is local operator config, not something a peer can influence, and
+  §14.3 already caps the item count. A ceiling would only defend against our own
+  misconfiguration, and the queue bound in §15.1 caps memory regardless of how
+  large a single response is.
+- **It would silently lose messages.** A ceiling below ~6.9 MB truncates honest
+  responses: on first connect to a peer with a full board of 8 KiB messages, the
+  first 846-ID request legitimately draws the whole ~6.6 MB. Truncated messages
+  are not re-requested on any timer — reth requests only in response to an
+  announcement, and a new-message announcement carries just the one new ID — so
+  they would linger unfetched until a reconnect or a broadcast `Lagged`.
+
+Recorded here so the next round does not re-derive it. The bound §15.1 provides
+is the one that matters.
+
+### 15.3 The request frame is now chunked — §14.4's first item closed
+
+§13.2 established that erigon's `BOARD_MESSAGE_IDS` arm sends the filtered ID
+list as one unchunked `SendMessageById`, and concluded reth should match. §14.3
+then capped reth's *responder* at `MAX_IDS_PER_FRAME` distinct IDs per request —
+and that combination is lossy in a way neither section noticed: **a reth node
+asking a reth node for more than 846 IDs in one frame silently never receives the
+overflow.** The responder truncates, and nothing re-requests.
+
+`handle_incoming` now chunks the outbound `GetBoardMessages` at
+`MAX_IDS_PER_FRAME`, the same constant the announcement path and the responder
+cap already use. Against erigon this is invisible — it serves each frame
+independently and has no cap of its own. Against reth it is the difference
+between converging and not. It also removes the last outbound frame whose size
+was set by the peer rather than by us, which is what makes the §15.1 memory
+arithmetic hold: without it, one frame could be as large as the peer's
+announcement.
+
+No honest peer is affected either way: both clients announce in 846-ID chunks,
+and `filter_wanted` returns a subset, so a request over the cap cannot arise from
+a conforming announcement.
+
+**Tests.** `requests_are_chunked_at_one_frame_of_ids` (a single announcement of
+`MAX_IDS_PER_FRAME + 54` wanted IDs produces 846 + 54, in order, nothing
+dropped) and `every_announced_message_transfers_when_one_frame_announces_more_than_the_cap`
+(the same case end-to-end against a real responder — every message transfers).
+Both fail against the unchunked handler.
+
+### 15.4 Correction to §14.3's lock-contention note
+
+An earlier pass flagged `get_messages_for_ids` (`board.rs`) as holding the shared
+`Mutex<BoardState>` while cloning "up to ~6.6 MiB of `PoWMsg`", making request
+volume a lock-contention vector. That overstates it: `PoWMsg::data` is
+`alloy_primitives::Bytes`, which is reference-counted, so the clone is a refcount
+bump and a ~96-byte struct copy — about 81 KiB of memcpy for a full 846-message
+request, not 6.6 MiB. The message bodies are never copied. No change made.
+
+### 15.5 Still open
+
+- **Per-connection rate limiting** (carried over from §14.4). §15.1 bounds
+  memory and bounds how long one inbound frame can stall the reader; neither
+  bounds frames per second. `reth_tokio_util::ratelimit::{Rate, RateLimit}`
+  exists (`crates/tokio-util/src/ratelimit.rs`) but is used only by DNS
+  discovery, so using it here would be unlike reth's convention.
+- **No volume-based reputation anywhere in reth.** `eth_requests.rs:76-79` holds
+  a `PeersHandle` behind `// TODO use to report spammers` and
+  `#[expect(dead_code)]` — reth's own request handler intended to punish spammers
+  and never wired it up. A peer that saturates a *bounded* queue is a stronger
+  signal than anything available before §15.1, so escalating
+  `outbound_dropped` to `report_bad_protocol` is now defensible. Deliberately not
+  done here: sustained backpressure can also mean a congested link or our own
+  slow uplink, and disconnecting an honest slow peer is worse than dropping
+  gossip it was not reading. Revisit if `outbound_dropped` is non-zero in
+  production against peers that are otherwise healthy.
+- **The multiplexer's inbound `to_satellite` queue is unbounded** upstream
+  (`multiplex.rs:289`). §15.1 bounds our exposure to it but cannot remove it —
+  no satellite protocol can stop the multiplexer reading the socket. Bounding it
+  is an upstream reth change, and would benefit every subprotocol, not just
+  msgboard.
+- **`BOARD_MESSAGE_IDS` re-announcement.** `filter_wanted` rejects only IDs
+  already in the index, so a peer repeating the same announcement gets a fresh
+  full-size request every time. Bounded by §15.1 and 1:1 in bytes, so not
+  amplifying, but it is avoidable work.

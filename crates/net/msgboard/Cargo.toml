@@ -44,3 +44,6 @@ tracing = { workspace = true }
 metrics-util = { workspace = true, features = ["debugging"] }
 serde_json = { workspace = true, features = ["std"] }
 tempfile = { workspace = true }
+# `test-util` gives `#[tokio::test(start_paused = true)]`, which drives the
+# outbound-send timeout without the test sleeping for it.
+tokio = { workspace = true, features = ["test-util"] }
