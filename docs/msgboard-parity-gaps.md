@@ -1030,19 +1030,45 @@ bounds nothing here either.
 **The attack.** Open one connection, send `GetBoardMessages` continuously, never
 read. TCP is full-duplex, so the send direction stays open. Our send buffer
 fills, the mux out-buffer pins at 32 MiB, and msgboard's queue grows at
-(request rate × amplification). One 102 KiB request frame (846 × 121-byte IDs)
-yields up to 846 × 8 KiB ≈ 6.6 MiB queued — ~66× — so ~15 MiB of attacker
-traffic queues ~1 GiB. Parallelisable across `DEFAULT_MAX_COUNT_PEERS_INBOUND`
-= 30 (`crates/net/network-types/src/peers/config.rs:14`).
+(request rate × amplification).
 
-#### Fixed — a bounded queue, an awaited send, and a per-frame deadline
+Two numbers, and it is worth not confusing them the way an earlier draft of this
+section did:
+
+- The **ratio** is `encoded_message_size / MSG_ID_SIZE` — the same 68× §14.3
+  measured, since it is the same quantity. It does **not** require a large
+  request. After §14.3's dedup, a 122-byte request naming *one* known 8 KiB
+  message draws one ~8.3 KiB frame: still 68×. **The attacker needs one live
+  message ID, not 846**, and a node hands its entire ID set to any peer on
+  connect (`send_board_message_ids`). So ~15 MiB of attacker traffic queues
+  ~1 GiB.
+- The **per-request ceiling** is 846 × 8 KiB ≈ 6.6 MiB, which is where
+  `MAX_IDS_PER_FRAME` and a 102 KiB request frame come in. That bounds one
+  response, not the ratio.
+
+Both figures assume the board actually holds max-`size_limit` messages — the
+ratio tracks real message sizes, so on a board of small messages it approaches
+1×. That condition is cheap for an attacker to arrange: the default minimum work
+ratio is `10_000/1_000_000` = 0.01 (`msgboard-types/src/config.rs:71-76`), so
+mining a max-size message is on the order of 10^6 nonce trials — seconds of CPU,
+as the crate's own test miner demonstrates.
+
+Parallelisable across every established `msg/1` session — 30 inbound
+(`DEFAULT_MAX_COUNT_PEERS_INBOUND`) plus up to 100 outbound
+(`DEFAULT_MAX_COUNT_PEERS_OUTBOUND`, `crates/net/network-types/src/peers/config.rs:11`,
+`:14`).
+
+#### Fixed — a bounded queue, an awaited send, and a deadline paid once
 
 Three parts, and all three are needed:
 
 1. **`mpsc::channel(MAX_QUEUED_OUTGOING_FRAMES)`**, `MAX_QUEUED_OUTGOING_FRAMES`
-   = 8. Every frame we emit is at most one `P2P_MSG_PACKET_LIMIT` packet, so
-   msgboard's per-peer outbound memory is now ~800 KiB, about 24 MiB across 30
-   inbound peers.
+   = 8. Every frame we emit is at most one `P2P_MSG_PACKET_LIMIT` packet — the
+   response chunker flushes *before* pushing a message that would exceed the
+   limit, so it never overshoots by a whole message, and
+   `get_board_messages_chunks_large_responses` now pins that at
+   `P2P_MSG_PACKET_LIMIT + 8` bytes because this arithmetic depends on it. So
+   msgboard's per-peer outbound memory is ~800 KiB.
 2. **Sends are awaited.** `handle_incoming` and `send_board_message_ids` became
    `async`. Because they run in the same task as the read loop, a full queue
    stops us pulling the next frame off `ProtocolConnection` — which is what
@@ -1050,23 +1076,41 @@ Three parts, and all three are needed:
    frames (a bulk announce is `count_limit / 846` = 12 at the default; one full
    response is up to ~69) and that is fine: a peer that reads drains as fast as
    we fill.
-3. **A deadline per inbound frame**, `OUTBOUND_SEND_TIMEOUT` = 30 s, after which
-   the rest of that frame's output is dropped and the read loop resumes.
+3. **A deadline, `OUTBOUND_SEND_TIMEOUT` = 30 s, paid once per stalled peer.**
+   When it expires the rest of that frame's output is dropped, the peer is
+   marked stalled on its [`OutboundQueue`], and until it accepts a frame again
+   we drop without waiting. The flag clears on the first successful send.
 
 Part 3 is not optional, and it is the part the original write-up missed. The
 multiplexer's inbound queue to a satellite protocol is itself an **unbounded**
 channel (`multiplex.rs:289`, `install_protocol`) that it keeps filling from the
 socket regardless of what we do. Waiting indefinitely on part 2 would therefore
 relocate the unbounded growth *upstream* rather than remove it — the attacker
-would need 1 byte sent per byte queued instead of 1 per 66, which is a 66×
-improvement but not a fix. Dropping keeps that queue drained. A satellite
-protocol has no way to stop the multiplexer reading the socket, so this is the
-strongest bound available from inside msgboard.
+would need 1 byte sent per byte queued instead of 1 per 68, which is a 68×
+improvement but not a fix.
 
-The deadline covers the whole inbound frame, not each send within it. Serving
-one request emits dozens of chunks; a per-send timeout would let a single
-request hold the read loop for `chunks × 30 s`. Measured at 60 s across a
-3-chunk response before this was corrected.
+**The scoping of that deadline matters more than its value, and two earlier
+versions of it were wrong.** Both were caught by adversarial review, and each
+now has a test:
+
+- *Per send.* Serving one request emits dozens of chunks, so one request could
+  hold the read loop for `chunks × 30 s`. Measured at 60 s over a 3-chunk
+  response. Fixed by sharing one deadline across everything emitted for a single
+  inbound frame (`frame_deadline`), pinned by
+  `one_inbound_frame_stalls_the_read_loop_for_at_most_the_timeout`.
+- *Per inbound frame.* Still wrong, and worse, because a flooding peer sends
+  many frames: each got a fresh 30 s budget against a queue that never drains,
+  so the read loop advanced **one frame per 30 s** — about 3 KiB/s — while the
+  mux filled its unbounded inbound queue at the peer's line rate. Measured at
+  300 s for 10 frames. That is the same outcome as waiting forever, so the fix
+  was not achieving what this section originally claimed for it ("dropping keeps
+  that queue drained" — it did not). Fixed by the stalled flag, pinned by
+  `a_flooding_peer_cannot_throttle_our_read_loop_frame_by_frame`.
+
+With the flag, a peer that has stopped reading costs one 30 s wait for the whole
+episode, after which we drain `ProtocolConnection` at full speed and simply drop
+what it will not take. An honest peer that is merely slow never sets the flag —
+it is waited on and loses nothing.
 
 Dropped frames are counted by the new `msgboard.outbound_dropped` counter.
 Nothing is lost that the peer was going to receive: it is not reading.
@@ -1079,6 +1123,8 @@ Nothing is lost that the peer was going to receive: it is not reading.
 | `a_full_outbound_queue_makes_the_handler_wait_instead_of_buffering` | handler parks on a full queue and resumes one frame at a time as the mux drains | `try_send` → completes on first poll |
 | `a_peer_that_stops_reading_gets_frames_dropped_not_queued_forever` | terminates; nothing beyond capacity accumulates | plain `tx.send().await` → test hangs, SIGTERM |
 | `one_inbound_frame_stalls_the_read_loop_for_at_most_the_timeout` | total wait for one inbound frame ≤ `OUTBOUND_SEND_TIMEOUT` | per-send deadline → 60 s |
+| `a_flooding_peer_cannot_throttle_our_read_loop_frame_by_frame` | 10 frames from a non-reading peer cost ≤ 2 × the timeout, not 10 × | stalled flag disabled → 300 s |
+| `a_peer_that_resumes_reading_is_waited_on_again` | the stall clears on the first accepted frame, so the peer is waited on again | flag never cleared → handler no longer parks |
 | `a_closed_outbound_queue_reports_the_connection_gone` | `Sent::Closed` propagates so `run_connection` exits | — |
 
 The magnitude of `OUTBOUND_SEND_TIMEOUT` is pinned in
@@ -1166,11 +1212,87 @@ request, not 6.6 MiB. The message bodies are never copied. No change made.
   gossip it was not reading. Revisit if `outbound_dropped` is non-zero in
   production against peers that are otherwise healthy.
 - **The multiplexer's inbound `to_satellite` queue is unbounded** upstream
-  (`multiplex.rs:289`). §15.1 bounds our exposure to it but cannot remove it —
-  no satellite protocol can stop the multiplexer reading the socket. Bounding it
-  is an upstream reth change, and would benefit every subprotocol, not just
-  msgboard.
+  (`multiplex.rs:289`). §15.1 bounds our exposure to it but cannot remove it.
+
+  An earlier draft said a satellite protocol "has no way to stop the multiplexer
+  reading the socket". That is overstated, and the correction matters because it
+  is the design alternative we did not take. There **is** a lever: if the
+  satellite's stream ends, `poll_outbound_producers` returns
+  `ProducerPoll::Closed` (`multiplex.rs:565`) and `RlpxSatelliteStream::poll_next`
+  returns `Ready(None)`, which disconnects the session — permanently stopping the
+  socket read. For msgboard that is one line: return from `run_connection`. The
+  accurate statement is that there is **no backpressure lever short of dropping
+  the whole connection**, eth session included.
+
+  We deliberately do not take it. The trigger — "this peer has not accepted a
+  frame in 30 s" — is not specific to abuse; a congested uplink produces the
+  same signal, and a node whose own upstream is saturated would mass-disconnect
+  otherwise-healthy peers over a msgboard-only condition. Dropping gossip is the
+  proportionate response; dropping the peer's block sync is not. Reconsider only
+  if `outbound_dropped` shows sustained stalling from peers that are otherwise
+  fine.
 - **`BOARD_MESSAGE_IDS` re-announcement.** `filter_wanted` rejects only IDs
   already in the index, so a peer repeating the same announcement gets a fresh
   full-size request every time. Bounded by §15.1 and 1:1 in bytes, so not
   amplifying, but it is avoidable work.
+
+### 15.6 Upstream prior art — this was reported, and rejected
+
+The unbounded `to_satellite` queue in §15.5 is not an unnoticed corner of reth.
+It was reported twice, and both reports were closed unmerged:
+
+| PR | What it proposed | Outcome |
+|---|---|---|
+| [#18702](https://github.com/paradigmxyz/reth/pull/18702) (2025-09-25) | `to_primary` **and** `to_satellite` → `mpsc::channel(256)`, `try_send` with drop-on-`Full`, `ReceiverStream`, `send().await` during the handshake | Closed unmerged 2025-09-26 |
+| [#18739](https://github.com/paradigmxyz/reth/pull/18739) (2025-09-26) | Primary path → `mpsc::channel(1024)`, same shape | Closed unmerged two minutes after opening |
+
+#18702's diff is essentially the fix §15.5 asks for. The only recorded rationale
+is a one-line review from mattsse: *"this has been working fine"*. No technical
+objection was given. Both submitters look like drive-by contributors (adjacent
+account IDs, `patch-6`/`patch-8` branches), which plausibly explains a summary
+close — but the idea was not engaged with on merit.
+
+Eight months later the same maintainer opened
+[#25031](https://github.com/paradigmxyz/reth/pull/25031) — "fix(rlpx): bound mux
+outbound buffer fairly", labelled `C-bug`, merged 2026-06-09 — which added the
+32 MiB `MAX_MUX_OUT_BUFFER_BYTES` cap that §15.1's attack relocates into. So the
+**outbound** half was independently rediscovered and shipped as a bug fix; the
+**inbound** half is still `mpsc::unbounded_channel()` on `main` today.
+
+Two consequences for us:
+
+1. **Do not wait for upstream.** Nothing is in flight on the inbound half, and
+   the one serious attempt was closed without a counter-argument. §15.1's
+   stalled-flag design has to stand on its own.
+2. **If this is reported upstream, it goes to security@tempo.xyz**, per reth's
+   one-line `SECURITY.md` — not a public issue or PR. A public "here is how to
+   grow an unbounded queue on any reth node running a subprotocol" is a
+   disclosure in itself.
+
+### 15.7 msgboard deviated from reth's documented subprotocol pattern
+
+Worth recording as the actual root cause, because an earlier draft of this
+analysis got it backwards and claimed reth's own example carries the same bug.
+It does not.
+
+`examples/custom-rlpx-subprotocol/src/subprotocol/connection/handler.rs` does
+call `mpsc::unbounded_channel()` in `into_connection`, but that channel carries
+`CustomCommand` — *locally issued* commands, handed out via
+`ProtocolEvent::Established { to_connection }`. **A peer cannot enqueue into it.**
+Peer-provoked responses are generated lazily inside
+`CustomRlpxConnection::poll_next` (`connection/mod.rs:35-75`): a `Ping` is turned
+into a `Pong` and returned as `Poll::Ready(Some(..))`, one at a time, and
+`conn.poll_next_unpin` is only called when the multiplexer polls the stream. When
+the mux stops polling, the example stops reading and stops producing. That is
+backpressure by construction. The in-tree test protocol
+(`crates/net/network/tests/it/multiplex.rs`) has the same shape.
+
+msgboard instead spawns a task that reads `ProtocolConnection` on its own
+schedule and pushes peer-provoked responses through a channel. That decoupling
+is what made an unbounded queue reachable — the producer no longer stops when the
+consumer does. The bounded queue plus the stalled flag reintroduce the coupling
+the lazy-stream pattern gets for free.
+
+The lesson generalises: a satellite protocol that buffers peer-provoked output
+must bound that buffer itself, because the multiplexer's cap protects the
+multiplexer, not the protocol.

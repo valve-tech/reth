@@ -417,12 +417,19 @@ Full write-up: docs/msgboard-parity-gaps.md §15. Summary of what shipped:
      async. They share a task with the read loop, so a full queue stops us
      draining ProtocolConnection — that is what bounds the backlog rather than
      relocating it.
-  3. Added OUTBOUND_SEND_TIMEOUT = 30 s as a deadline PER INBOUND FRAME (not
-     per send). NOT optional and NOT in the original plan: the mux's inbound
-     to_satellite queue is itself unbounded upstream (multiplex.rs:289) and it
-     keeps reading the socket regardless, so waiting forever would just move the
-     unbounded growth upstream. Dropping keeps it drained. Per-send would have
-     let one request stall the reader for chunks x 30 s (measured 60 s).
+  3. Added OUTBOUND_SEND_TIMEOUT = 30 s, paid ONCE PER STALLED PEER via a
+     stalled flag on OutboundQueue. NOT optional and NOT in the original plan:
+     the mux's inbound to_satellite queue is itself unbounded upstream
+     (multiplex.rs:289) and it keeps reading the socket regardless, so waiting
+     forever would just move the unbounded growth upstream.
+     TWO EARLIER SCOPINGS WERE WRONG, both caught by adversarial review:
+       - per send   -> one request stalled the reader chunks x 30 s (meas. 60 s)
+       - per frame  -> a flooding peer throttled the reader to ONE FRAME PER
+                       30 s (meas. 300 s for 10 frames) while the unbounded
+                       inbound queue filled at line rate. Same outcome as
+                       waiting forever, i.e. the fix wasn't doing what §15.1
+                       claimed. Fixed by the stalled flag.
+     Both now have tests + negative controls.
   4. Chunked the outbound GetBoardMessages at MAX_IDS_PER_FRAME. This is a
      CORRECTNESS fix, not just a size bound: §14.3 capped our responder at 846
      distinct IDs, so an unchunked request over that lost the overflow silently
@@ -443,7 +450,24 @@ Full write-up: docs/msgboard-parity-gaps.md §15. Summary of what shipped:
      ~96 B/message, not 8 KiB. ~81 KiB for a full request. No change made.
 
   Every new test was verified to fail with its fix reverted; the controls are
-  tabulated in §15.1.
+  tabulated in §15.1. 129/129 msgboard tests green.
+
+  UPSTREAM (checked 2026-08-04, recorded in §15.6)
+   - The unbounded inbound to_satellite queue was reported upstream TWICE and
+     both were closed unmerged: PR #18702 (2025-09-25, bounds to_primary AND
+     to_satellite at 256 with try_send — essentially the fix we want) and
+     PR #18739. Sole rationale, from mattsse: "this has been working fine".
+     No technical objection.
+   - 8 months later the same maintainer shipped PR #25031 (merged 2026-06-09,
+     labelled C-bug) adding the 32 MiB out-buffer cap our attack relocates into.
+     So the OUTBOUND half was rediscovered and fixed; the INBOUND half is still
+     unbounded on main. DO NOT wait for upstream.
+   - reth's SECURITY.md: report vulns to security@tempo.xyz, NOT a public issue.
+   - CORRECTION (§15.7): reth's custom-rlpx-subprotocol EXAMPLE does NOT have
+     this bug. Its unbounded channel carries locally-issued CustomCommands; peer
+     responses are generated lazily inside poll_next, so it stops producing when
+     the mux stops polling. msgboard DEVIATED from that pattern by spawning a
+     task and buffering peer-provoked output. That deviation is the root cause.
 
 ==============================================================================
 FIX 2 — guard firehose against the revmc JIT (currently safe BY ACCIDENT)

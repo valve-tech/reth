@@ -17,7 +17,10 @@
 use std::{
     collections::HashSet,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -68,12 +71,8 @@ const MAX_IDS_PER_FRAME: usize = P2P_MSG_PACKET_LIMIT / MSG_ID_SIZE;
 /// queue as fast as we fill it, so the wait is not observable.
 const MAX_QUEUED_OUTGOING_FRAMES: usize = 8;
 
-/// How long the outbound side of *one* inbound frame may wait for the
-/// multiplexer before the rest of it is dropped and the read loop resumes.
-///
-/// The budget covers the whole frame, not each send within it: serving one
-/// `GetBoardMessages` emits dozens of chunks, and a per-send timeout would let
-/// a single request hold the read loop for `chunks x` this value.
+/// How long to wait for the multiplexer before giving up on a peer and
+/// dropping what it will not take.
 ///
 /// Waiting on a full queue is the backpressure that bounds our own memory, but
 /// it also stops us draining [`ProtocolConnection`], and the multiplexer's
@@ -81,12 +80,24 @@ const MAX_QUEUED_OUTGOING_FRAMES: usize = 8;
 /// filling from the socket regardless
 /// (`reth_eth_wire::multiplex`, `install_protocol` / the `poll_next` read loop).
 /// Waiting indefinitely would therefore relocate unbounded growth upstream
-/// instead of removing it. Dropping the frame and resuming keeps that queue
-/// drained; the peer loses gossip it was not reading anyway.
+/// instead of removing it.
+///
+/// Two scopings of this budget were wrong before the current one, so the
+/// scoping matters more than the value:
+///
+///  - Per *send* let one request hold the read loop for `chunks x` this value. Fixed by
+///    [`frame_deadline`], one deadline for everything emitted in response to a single inbound
+///    frame.
+///  - Per *inbound frame* was worse: a flooding peer sends many, each getting a fresh budget
+///    against a queue that never drains, so the read loop advanced one frame per 30 s while the
+///    multiplexer filled its unbounded inbound queue at line rate. Fixed by [`OutboundQueue`]'s
+///    stalled flag, which pays this cost once per episode rather than once per frame.
 ///
 /// 30 s is far longer than any healthy peer needs — the multiplexer accepts a
 /// frame as soon as it is polled with room in its own 32 MiB out-buffer — so
 /// reaching it means the peer's receive window has been shut for half a minute.
+/// Note there is no *backpressure* lever short of ending the stream, which
+/// disconnects the whole session including eth; §15.5 records why we don't.
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Msgboard capability: `msg/1`.
@@ -219,8 +230,94 @@ impl ConnectionHandler for MsgboardConnectionHandler {
 /// Split out from [`MsgboardConnectionHandler::into_connection`] so the bound
 /// is reachable from tests: an unbounded queue here is the defect §15.1 closed,
 /// and nothing else would fail if it came back.
-fn outbound_channel() -> (mpsc::Sender<BytesMut>, mpsc::Receiver<BytesMut>) {
-    mpsc::channel(MAX_QUEUED_OUTGOING_FRAMES)
+fn outbound_channel() -> (OutboundQueue, mpsc::Receiver<BytesMut>) {
+    let (tx, rx) = mpsc::channel(MAX_QUEUED_OUTGOING_FRAMES);
+    (OutboundQueue::new(tx), rx)
+}
+
+/// The sending half of a peer's outbound queue, plus whether that peer has
+/// stopped draining it.
+///
+/// The flag is what keeps the deadline in [`OUTBOUND_SEND_TIMEOUT`] from being
+/// paid once per inbound frame. Waiting is only useful against a peer that is
+/// *slow*; against one that has stopped reading it is pure cost, and the cost
+/// is paid in the one place we cannot afford it — the read loop, which is what
+/// keeps the multiplexer's unbounded inbound queue drained. So the wait happens
+/// once, and until the peer takes another frame we drop without waiting.
+#[derive(Debug)]
+struct OutboundQueue {
+    tx: mpsc::Sender<BytesMut>,
+    /// Set when a frame is dropped on the deadline, cleared as soon as the peer
+    /// accepts anything again. Only ever touched from the connection task;
+    /// atomic rather than [`std::cell::Cell`] so the task's future stays `Send`.
+    stalled: AtomicBool,
+}
+
+impl OutboundQueue {
+    const fn new(tx: mpsc::Sender<BytesMut>) -> Self {
+        Self { tx, stalled: AtomicBool::new(false) }
+    }
+
+    /// Queue one frame for the peer, waiting for room until `deadline`.
+    ///
+    /// Waiting is deliberate: the caller runs in the same task as the read
+    /// loop, so a full queue stops us pulling further frames off
+    /// [`ProtocolConnection`] and the backlog stops growing. See
+    /// [`MAX_QUEUED_OUTGOING_FRAMES`] and [`OUTBOUND_SEND_TIMEOUT`].
+    ///
+    /// `deadline` is shared across every frame emitted for one inbound frame —
+    /// see [`frame_deadline`] — so once it passes, the remainder of that
+    /// response is dropped without waiting again.
+    async fn send(
+        &self,
+        metrics: &MsgboardMetrics,
+        peer_id: PeerId,
+        deadline: tokio::time::Instant,
+        buf: BytesMut,
+    ) -> Sent {
+        if self.stalled.load(Ordering::Relaxed) {
+            return match self.tx.try_send(buf) {
+                Ok(()) => {
+                    // It is reading again; go back to waiting for it.
+                    self.stalled.store(false, Ordering::Relaxed);
+                    Sent::Ok
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    metrics.outbound_dropped.increment(1);
+                    Sent::Dropped
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Sent::Closed,
+            };
+        }
+
+        match tokio::time::timeout_at(deadline, self.tx.send(buf)).await {
+            Ok(Ok(())) => Sent::Ok,
+            Ok(Err(_)) => Sent::Closed,
+            Err(_) => {
+                self.stalled.store(true, Ordering::Relaxed);
+                metrics.outbound_dropped.increment(1);
+                tracing::debug!(
+                    target: "msgboard",
+                    ?peer_id,
+                    timeout_secs = OUTBOUND_SEND_TIMEOUT.as_secs(),
+                    "peer is not draining its msgboard queue; dropping frames until it resumes",
+                );
+                Sent::Dropped
+            }
+        }
+    }
+
+    /// Queue depth the multiplexer has yet to take, for tests.
+    #[cfg(test)]
+    fn max_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+
+    /// Free slots remaining, for tests.
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.tx.capacity()
+    }
 }
 
 /// The instant by which everything emitted in response to one inbound frame
@@ -241,39 +338,6 @@ enum Sent {
     Closed,
 }
 
-/// Queue one frame for the peer, waiting for room until `deadline`.
-///
-/// Waiting is deliberate: the caller runs in the same task as the read loop, so
-/// a full queue stops us pulling further frames off [`ProtocolConnection`] and
-/// the backlog stops growing. See [`MAX_QUEUED_OUTGOING_FRAMES`] and
-/// [`OUTBOUND_SEND_TIMEOUT`] for the two halves of that bound.
-///
-/// `deadline` is shared across every frame emitted for one inbound frame — see
-/// [`frame_deadline`] — so once it passes, the remainder is dropped without
-/// waiting again.
-async fn send_frame(
-    tx: &mpsc::Sender<BytesMut>,
-    metrics: &MsgboardMetrics,
-    peer_id: PeerId,
-    deadline: tokio::time::Instant,
-    buf: BytesMut,
-) -> Sent {
-    match tokio::time::timeout_at(deadline, tx.send(buf)).await {
-        Ok(Ok(())) => Sent::Ok,
-        Ok(Err(_)) => Sent::Closed,
-        Err(_) => {
-            metrics.outbound_dropped.increment(1);
-            tracing::debug!(
-                target: "msgboard",
-                ?peer_id,
-                timeout_secs = OUTBOUND_SEND_TIMEOUT.as_secs(),
-                "peer is not draining its msgboard queue; dropping frame",
-            );
-            Sent::Dropped
-        }
-    }
-}
-
 /// Drives a single msgboard peer connection.
 ///
 /// Once the board reports `is_ready()`, announces current message IDs and then
@@ -288,7 +352,7 @@ async fn run_connection(
     reporter: Option<Arc<dyn PeerReporter>>,
     peer_id: PeerId,
     mut conn: ProtocolConnection,
-    tx: mpsc::Sender<BytesMut>,
+    tx: OutboundQueue,
 ) {
     let metrics = board.metrics();
     let mut new_msg_rx: broadcast::Receiver<_> = board.subscribe();
@@ -346,7 +410,7 @@ async fn run_connection(
                         let mut buf = BytesMut::with_capacity(1 + MSG_ID_SIZE);
                         buf.put_u8(BOARD_MESSAGE_IDS);
                         buf.put_slice(&MsgID::encode_list(&ids));
-                        match send_frame(&tx, &metrics, peer_id, frame_deadline(), buf).await {
+                        match tx.send(&metrics, peer_id, frame_deadline(), buf).await {
                             Sent::Closed => break,
                             Sent::Dropped => continue,
                             Sent::Ok => {}
@@ -397,7 +461,7 @@ fn reporter_as_deref(opt: Option<&Arc<dyn PeerReporter>>) -> Option<&dyn PeerRep
 async fn handle_incoming(
     board: &Arc<MsgBoard>,
     reporter: Option<&dyn PeerReporter>,
-    tx: &mpsc::Sender<BytesMut>,
+    tx: &OutboundQueue,
     mut raw: BytesMut,
     peer_id: PeerId,
 ) -> Sent {
@@ -452,7 +516,7 @@ async fn handle_incoming(
                 buf.put_u8(GET_BOARD_MESSAGES);
                 buf.put_slice(&MsgID::encode_list(chunk));
                 metrics.requests_sent.increment(1);
-                match send_frame(tx, &metrics, peer_id, deadline, buf).await {
+                match tx.send(&metrics, peer_id, deadline, buf).await {
                     Sent::Closed => return Sent::Closed,
                     Sent::Ok | Sent::Dropped => {}
                 }
@@ -528,7 +592,7 @@ async fn handle_incoming(
                     let mut buf = BytesMut::with_capacity(1 + encoded_chunk.len());
                     buf.put_u8(BOARD_MESSAGES);
                     buf.put_slice(&encoded_chunk);
-                    match send_frame(tx, &metrics, peer_id, deadline, buf).await {
+                    match tx.send(&metrics, peer_id, deadline, buf).await {
                         Sent::Closed => return Sent::Closed,
                         Sent::Ok | Sent::Dropped => {}
                     }
@@ -543,7 +607,7 @@ async fn handle_incoming(
                 let mut buf = BytesMut::with_capacity(1 + encoded_chunk.len());
                 buf.put_u8(BOARD_MESSAGES);
                 buf.put_slice(&encoded_chunk);
-                match send_frame(tx, &metrics, peer_id, deadline, buf).await {
+                match tx.send(&metrics, peer_id, deadline, buf).await {
                     Sent::Closed => return Sent::Closed,
                     Sent::Ok | Sent::Dropped => {}
                 }
@@ -609,7 +673,7 @@ async fn handle_incoming(
 /// once the queue has no receiver.
 async fn send_board_message_ids(
     board: &Arc<MsgBoard>,
-    tx: &mpsc::Sender<BytesMut>,
+    tx: &OutboundQueue,
     peer_id: PeerId,
 ) -> Sent {
     let ids = board.all_message_ids();
@@ -623,7 +687,7 @@ async fn send_board_message_ids(
         buf.put_u8(BOARD_MESSAGE_IDS);
         buf.put_slice(&MsgID::encode_list(chunk));
         metrics.announcements_sent.increment(1);
-        match send_frame(tx, &metrics, peer_id, deadline, buf).await {
+        match tx.send(&metrics, peer_id, deadline, buf).await {
             Sent::Closed => return Sent::Closed,
             Sent::Ok | Sent::Dropped => {}
         }
@@ -776,8 +840,9 @@ mod tests {
     /// generous so tests that are not about backpressure never hit it; the
     /// production bound is `MAX_QUEUED_OUTGOING_FRAMES` and is asserted by
     /// `the_outbound_queue_is_bounded`.
-    fn channel() -> (mpsc::Sender<BytesMut>, Receiver<BytesMut>) {
-        mpsc::channel(4096)
+    fn channel() -> (OutboundQueue, Receiver<BytesMut>) {
+        let (tx, rx) = mpsc::channel(4096);
+        (OutboundQueue::new(tx), rx)
     }
 
     /// Drain every frame currently queued on the receiver.
@@ -932,6 +997,7 @@ mod tests {
 
         // Capacity 1 so the second frame has nowhere to go.
         let (tx, mut rx) = mpsc::channel::<BytesMut>(1);
+        let tx = OutboundQueue::new(tx);
         let mut serving = Box::pin(handle_incoming(
             &board,
             None,
@@ -973,6 +1039,7 @@ mod tests {
         // A live receiver that is never polled: the peer is connected but has
         // stopped reading.
         let (tx, rx) = mpsc::channel::<BytesMut>(1);
+        let tx = OutboundQueue::new(tx);
         let sent = handle_incoming(
             &board,
             None,
@@ -997,6 +1064,7 @@ mod tests {
         let ids = seed_multi_frame_response(&board);
 
         let (tx, _rx) = mpsc::channel::<BytesMut>(1);
+        let tx = OutboundQueue::new(tx);
         let start = tokio::time::Instant::now();
         handle_incoming(
             &board,
@@ -1013,6 +1081,74 @@ mod tests {
              budget for a single inbound frame",
             start.elapsed(),
         );
+    }
+
+    /// The deadline bounds one inbound frame, but a peer that has stopped
+    /// reading sends many. If each frame gets a fresh budget, the read loop
+    /// drains one frame per `OUTBOUND_SEND_TIMEOUT` — ~3 KiB/s — while the
+    /// multiplexer keeps filling its *unbounded* inbound queue at the peer's
+    /// line rate. Bounding our own queue would then buy nothing: the growth
+    /// just moves upstream, which is the whole thing the deadline exists to
+    /// prevent.
+    ///
+    /// So the wait is not repeated once a peer is known not to be draining.
+    #[tokio::test(start_paused = true)]
+    async fn a_flooding_peer_cannot_throttle_our_read_loop_frame_by_frame() {
+        let board = board_at(10);
+        let ids = seed_multi_frame_response(&board);
+        let request = frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids));
+
+        let (tx, _rx) = mpsc::channel::<BytesMut>(1);
+        let tx = OutboundQueue::new(tx);
+        let start = tokio::time::Instant::now();
+
+        const FRAMES: usize = 10;
+        for _ in 0..FRAMES {
+            handle_incoming(&board, None, &tx, request.clone(), peer()).await;
+        }
+
+        assert!(
+            start.elapsed() <= OUTBOUND_SEND_TIMEOUT * 2,
+            "{FRAMES} frames from a peer that never reads cost {:?}; the read loop is being \
+             throttled to one frame per timeout while the mux's unbounded inbound queue fills",
+            start.elapsed(),
+        );
+    }
+
+    /// The converse: giving up on a stalled peer must not be permanent. Once it
+    /// takes a frame again it goes back to being waited on, so it is served in
+    /// full rather than being dropped for the rest of the connection.
+    ///
+    /// Asserted as "the handler waits again", because that is what distinguishes
+    /// a cleared flag from a stuck one — a stuck flag still delivers whatever
+    /// happens to fit, so counting delivered frames proves nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_resumes_reading_is_waited_on_again() {
+        let board = board_at(10);
+        let ids = seed_multi_frame_response(&board);
+        let request = frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids));
+
+        let (raw_tx, mut rx) = mpsc::channel::<BytesMut>(1);
+        let tx = OutboundQueue::new(raw_tx);
+
+        // Stall it: the one slot fills and the rest of the response is dropped.
+        handle_incoming(&board, None, &tx, request.clone(), peer()).await;
+        assert!(
+            tx.stalled.load(Ordering::Relaxed),
+            "a peer that never read must be marked stalled"
+        );
+
+        // The peer drains what it was given.
+        while rx.try_recv().is_ok() {}
+
+        // Serving it again: the first frame is taken, which clears the flag, so
+        // the handler must go back to waiting once the queue refills.
+        let mut serving = Box::pin(handle_incoming(&board, None, &tx, request, peer()));
+        assert!(
+            poll!(serving.as_mut()).is_pending(),
+            "a recovered peer must be waited on again, not dropped for the rest of the connection",
+        );
+        assert!(!tx.stalled.load(Ordering::Relaxed), "the stall must clear once the peer reads");
     }
 
     /// Once the multiplexer drops the receiver the connection is gone, and the
@@ -1391,7 +1527,16 @@ mod tests {
         let mut total = 0;
         for f in &frames {
             assert_eq!(f[0], BOARD_MESSAGES);
-            assert!(f.len() - 1 <= P2P_MSG_PACKET_LIMIT + 8192, "chunk overshot the limit badly");
+            // Tight, because MAX_QUEUED_OUTGOING_FRAMES x this is the per-peer
+            // memory bound in §15.1. The chunker flushes *before* pushing a
+            // message that would exceed the limit, so a frame is one packet
+            // plus the RLP list header and the opcode byte — it does not
+            // overshoot by a whole message.
+            assert!(
+                f.len() <= P2P_MSG_PACKET_LIMIT + 8,
+                "frame of {} B exceeds one packet; the per-peer memory bound assumes it does not",
+                f.len(),
+            );
             total += decode_pow_msg_list(&f[1..]).expect("each chunk decodes independently").len();
         }
         assert_eq!(total, 64, "every requested message must be delivered exactly once");
@@ -1581,7 +1726,7 @@ mod tests {
     struct Node {
         board: Arc<MsgBoard>,
         rep: Arc<RecordingReporter>,
-        tx: mpsc::Sender<BytesMut>,
+        tx: OutboundQueue,
         rx: Receiver<BytesMut>,
     }
 
