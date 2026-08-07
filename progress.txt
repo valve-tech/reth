@@ -114,6 +114,45 @@ v2.4.1 BUMP (2026-08-06) — a trivial one, recorded so the next is calibrated
   file (§§14-15, FIX 1) is therefore ungated in CI and was only ever verified
   by hand. Fold into the msgboard task below.
 
+FLEET DEPLOY 2026-08-07 — 5 of 6 boxes now on 2.4.1 @ 6fa9aa1bbd
+
+  ROOT CAUSE OF THE DRIFT, worth stating plainly: the two msgboard OOM fixes
+  (ba1e123a34, 74f7d25234) were committed 2026-08-02 and NEVER PUSHED. main on
+  valve-tech/reth sat at 79441479d3 — the docs checkpoint — so no box could
+  have picked them up no matter how often it was redeployed. The fleet was not
+  behind because deploys were skipped; it was behind because the fixes never
+  left the laptop. Push before assuming a deploy gap is a deploy problem.
+
+  Deployed (all verified: new binary, restarted, synced, sibling at identical
+  height, 14/14 caddy auth probes on each a-box):
+    direct-b-evm-943  rpc-cargo-rebuild + systemctl restart valve-fireeth-reader
+    direct-a-evm-943  rpc-fleet-deploy
+    direct-b-evm-369  rpc-cargo-rebuild + systemctl restart valve-fireeth-reader
+    direct-a-evm-369  rpc-fleet-deploy
+    direct-a-evm-1    rpc-fleet-deploy
+    direct-b-evm-1    HELD — see its own task below. Still 2.2.0-pulse.
+
+  THE b-BOX / a-BOX ASYMMETRY (cost time; write it down once)
+    `rpc-fleet-deploy` does NOT build or restart reth on a b-box. b-boxes carry
+    roles [caddy, firehose], and rpc-build-reth/rpc-restart-reth are
+    roles: [chain-service], so they are filtered out silently — the plan runs
+    green having touched no reth at all. b-boxes need:
+        --plan rpc-cargo-rebuild        (runs firehose-build-reth)
+        systemctl restart valve-fireeth-reader
+    The restart is deliberately not in the step: the reader owns the process
+    lifecycle, and the restart wants a sibling serving.
+
+  VERIFYING A FIREHOSE BOX means checking BOTH log lines, not one:
+      exex{id="firehose"}: ... Chain committed, tracing N blocks   <- ExEx live
+      (bstream) processing block {"block_number": ...}             <- fireeth consuming
+    They should appear 1:1. The reader logs the second happily while the first
+    is absent, which is exactly what a firehose-disabled node looks like.
+
+  COSMETIC: 369a, 369b and 943b report `2.4.1-pulse-dev` rather than
+  `2.4.1-pulse` — an untracked `.claude/` directory in /root/reth makes the
+  tree dirty, and vergen appends -dev. Harmless, but it means the version
+  string is not a reliable deploy identity; use the embedded Commit SHA.
+
 UPSTREAM STATE (checked 2026-07-15, re-checked 2026-08-06)
   - **v2.4.1** released 2026-07-17 — merged into our line 2026-08-06 (above).
   - Nothing newer as of 2026-08-06: v2.4.1 is still the latest tag, though
@@ -206,6 +245,65 @@ RECIPE — new alloy-evm patch branch per reth bump
        git push -u origin valve/vX.Y.Z
   3. Repoint reth Cargo.toml [patch.crates-io] alloy-evm at the new branch.
   4. `cargo test -p reth-firehose-tests` — the setup guards verify the patch is live.
+
+------------------------------------------------------------------------------
+TASK: direct-b-evm-1 — chain-1 firehose gateway is 2 minor versions behind
+STATUS: INVESTIGATED 2026-08-07, NOT deployed. Blocked on a config change that
+        MUST land with the binary. Held out of the 2.4.1 rollout deliberately.
+OPENED: 2026-08-07
+OWNER: valve
+------------------------------------------------------------------------------
+
+WHAT IT IS RUNNING
+  reth 2.2.0-pulse, Commit SHA de4b96a40b, built 2026-07-02.
+  /root/reth contains ONLY target/release/reth — no source, no .git. That is
+  not corruption: firehose boxes had no repo-managed build until the
+  `firehose-build-reth` step (roles: [firehose]) was added, so the binary was
+  hand-built and shipped. The box was also migrated to new hardware
+  (136.243.144.118) on 2026-08-02 and simply never had the step run against it.
+  deploy.config.yaml already declares rethBranch/rethBuildFeatures for it, and
+  firehose-build-reth git-clones when /root/reth/.git is absent — so the build
+  side needs no new work.
+
+THE TRAP — a plain rebuild would silently kill chain-1 firehose
+  reth on this box is spawned as a CHILD of valve-fireeth-reader
+  (/etc/fireeth/firehose-reader.yaml `reader-node-path`), and since
+  c8872a8102 the Ethereum dispatch path gates tracer + executor + ExEx behind
+  an opt-in that DEFAULTS TO OFF. de4b96a40b predates that commit, which is the
+  only reason the box emits FIRE today.
+
+  VERIFIED 2026-08-07: RETH_FIREHOSE_ENABLED is set NOWHERE on this box —
+  not in /etc/default/valve-fireeth (the reader unit's EnvironmentFile), and
+  not in the running reth's /proc/<pid>/environ. So building main tip and
+  restarting the reader WITHOUT the switch yields a node that syncs and serves
+  RPC perfectly while emitting ZERO FIRE. Silent; nothing fails loudly.
+
+  This is the exact failure deploy.config.yaml:468-485 warns about ("the box
+  would sync and serve perfectly while emitting zero FIRE").
+
+REMEDIATION — all three, in order, or none
+  1. Add to /etc/default/valve-fireeth ON THIS BOX (it is box-managed, not
+     repo-templated):
+         RETH_FIREHOSE_ENABLED=true
+     Use the ENV form, never `--firehose.enabled` in a shared
+     reader-node-arguments template — the CLI flag does not exist on the
+     PulseChain dispatch path and is fatal there ("unexpected argument").
+  2. yarn deploy --env rpc-ethereum --limit direct-b-evm-1 \
+       --plan rpc-cargo-rebuild        # firehose-build-reth clones + builds
+  3. systemctl restart valve-fireeth-reader, then CONFIRM firehose is live:
+       journalctl -u valve-fireeth-reader -f | grep -E "exex.*firehose|bstream"
+     Expect BOTH `exex{id="firehose"}: Chain committed, tracing N blocks` and
+     `(bstream) processing block`. Only the first proves the ExEx installed;
+     without it the reader still logs plenty and looks healthy.
+
+  Do 1 BEFORE 2/3. A rebuild alone is the silent-failure case.
+
+WORTH FIXING PROPERLY
+  The env var is invisible to the repo, so nothing detects its absence. The
+  chain-1 reader could carry a startup assertion, or firehose-build-reth could
+  refuse to build for a chain-1 firehose host whose reader environment lacks
+  RETH_FIREHOSE_ENABLED. Same failure class as the alloy-evm patch drop: a
+  silent no-op that only a loud guard catches.
 
 ------------------------------------------------------------------------------
 TASK: Re-review whether the alloy-evm fork can be folded back to upstream
