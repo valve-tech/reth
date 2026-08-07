@@ -504,11 +504,55 @@ reth untouched; firehose b-boxes run the same binary under a different unit.
 OPEN / FOLLOW-UP
 ----------------
 1. Contribute the 4 fixes upstream to pulsechaincom/lighthouse-pulse (gitlab MR).
-   They affect every PulseChain lighthouse operator. User is checking for known
-   fixes first.
-2. CI: run the regression tests automatically (see valve-regression.yml on the
-   fork). Actions is enabled on the fork; a focused push gate runs
-   `cargo test -p state_processing --lib` on 1.81.
+   NOT YET OPENED — needs a human to file it under their own gitlab identity.
+
+   UPSTREAM DIFFED 2026-08-07 against pulsechaincom/lighthouse-pulse @ v2.5.1
+   ("checking for known fixes first", now done). Three of the four are still
+   broken upstream; the fourth is a DISAGREEMENT rather than a gap, which
+   changes how the MR has to be argued.
+
+     SITE 1 — altair inactivity penalty: STILL BROKEN upstream
+       (per_epoch_processing/altair/rewards_and_penalties.rs:120-127):
+         let penalty_numerator = validator.effective_balance
+             .safe_mul(state.get_inactivity_score(index)?)?;      // u64 * u64
+         delta.penalize((penalty_numerator as u128).safe_div(...))?;
+       The widen to u128 happens AFTER the multiply, so the multiply is what
+       overflows and safe_mul converts it to an ArithError. That is exactly the
+       HALT that took our box down. Our b98679a widens the multiply itself.
+       Cleanest of the four to contribute: a plain bug, no parity argument.
+
+     SITE 2 — reward burn (common/pulse.rs): upstream uses RAW arithmetic —
+         let after_burn = base_reward * seconds_per_slot / 12;
+         after_burn * 3 / 4
+       which panics in debug and wraps in release. Prysm wraps, so upstream is
+       accidentally right in release and crashes in debug. Our e970792 makes
+       the wrap explicit. Easy sell.
+
+     SITE 3 — slashing product: UPSTREAM DISAGREES WITH US. It has already
+       widened (per_epoch_processing/slashings.rs:12-16):
+         let sum_slashings = ... .safe_sum()? as u128;
+         let adjusted = min(sum_slashings.safe_mul(multiplier as u128)?, total);
+       We WRAP instead (718c7ad) because prysm wraps uint64 at
+       epoch_processing.go:201, and prysm is the supermajority client. By the
+       PRYSM-PARITY RULE above, upstream's widening is a silent consensus split
+       waiting for a large enough sum_slashings — not a safer version of our
+       fix but the opposite choice. Expect pushback; lead with the prysm
+       citation, not with overflow.
+
+     SITE 4 — slashings-vector accumulation: STILL BROKEN upstream
+       (common/slash_validator.rs:33-38) — `.safe_add(validator_effective_
+       balance)?` REJECTS on overflow where prysm accepts and wraps. Split at
+       ~577 max-EB validators slashed in one epoch. Our 56fbe85 wraps.
+
+   PRACTICAL NOTE: upstream is at v2.5.1 and our fork branched earlier, so the
+   four commits will NOT cherry-pick clean — site 3's code has already changed
+   under us. Rebase onto upstream master before filing, and expect site 3 to be
+   a rewrite plus an argument rather than a patch.
+
+2. CI regression gate — ✅ DONE; this entry was stale. valve-regression.yml is
+   on valve-tech/lighthouse-pulse MASTER at b6c1871, triggers on push to
+   master, installs Rust 1.81.0 and runs `cargo test -p state_processing
+   --lib`. Last run 2026-07-19: success in 4m57s. Nothing to do.
 3. prysm SlashValidator accept+wrap stores a spec-undefined value: latent PROTOCOL
    quirk, needs coordinated pulsechaincom fix, NOT a unilateral valve change.
 
