@@ -130,7 +130,8 @@ FLEET DEPLOY 2026-08-07 — 5 of 6 boxes now on 2.4.1 @ 6fa9aa1bbd
     direct-b-evm-369  rpc-cargo-rebuild + systemctl restart valve-fireeth-reader
     direct-a-evm-369  rpc-fleet-deploy
     direct-a-evm-1    rpc-fleet-deploy
-    direct-b-evm-1    HELD — see its own task below. Still 2.2.0-pulse.
+    direct-b-evm-1    done later the same day once three blockers cleared —
+                      see its own task below. Fleet is 6/6 on the 2.4.1 line.
 
   THE b-BOX / a-BOX ASYMMETRY (cost time; write it down once)
     `rpc-fleet-deploy` does NOT build or restart reth on a b-box. b-boxes carry
@@ -248,10 +249,41 @@ RECIPE — new alloy-evm patch branch per reth bump
 
 ------------------------------------------------------------------------------
 TASK: direct-b-evm-1 — chain-1 firehose gateway is 2 minor versions behind
-STATUS: INVESTIGATED 2026-08-07, NOT deployed. Blocked on a config change that
-        MUST land with the binary. Held out of the 2.4.1 rollout deliberately.
+STATUS: ✅ DONE 2026-08-07. On 2.4.1 @ 5f4c994938, firehose verified live.
+        Fleet is now 6/6 on the 2.4.1 line.
 OPENED: 2026-08-07
 OWNER: valve
+
+WHAT IT TOOK (three blockers, none of them the version bump itself)
+
+  0. RETH_FIREHOSE_ENABLED first, as a systemd drop-in at
+     /etc/systemd/system/valve-fireeth-reader.service.d/firehose-enabled.conf,
+     + daemon-reload, BEFORE any rebuild. Scoped to the reader unit rather than
+     /etc/default/valve-fireeth, which valve-fireeth-firehose also reads.
+  1. `firehose-build-reth` hard-failed: it branches to `git clone` when
+     /root/reth/.git is absent, but this box's /root/reth was non-empty (a
+     hand-dropped binary, no source), and clone refuses a non-empty target.
+     Fixed in the monorepo (6184f70) to `git init` + fetch + checkout, which is
+     equivalent on an empty dir and also works on a populated one.
+  2. Then it failed GitHub auth — no github_deploy_reth key on this box, only
+     the leftover migrate_key. Pointed rethRepo at the HTTPS URL, as the indexer
+     host already does: valve-tech/reth is public, so no key and no secret are
+     needed. Verified with `git ls-remote` from the box first.
+
+  Rollback point kept at /root/reth-2.2.0-pulse-de4b96a40b.bak (not needed).
+
+  VERIFIED per evm1b-migration.md §7 probe 4 — all three gates:
+    - `Launching Ethereum node (firehose-instrumented)`, NOT "stock, firehose
+      disabled". This is the line that proves the env var took.
+    - 606 exex{id="firehose"} lines vs 605 `(bstream) processing block` since
+      restart — 1:1, so the ExEx is tracing AND fireeth is consuming.
+    - NRestarts=0, unchanged from baseline (a climbing count with tracer.rs:1739
+      is the opposite failure mode).
+    - chainId 0x1, head advancing in lockstep with direct-a-evm-1.
+
+  Note the check that nearly fooled me: the first post-restart look showed exex
+  lines timestamped BEFORE the restart — the old process's. Always window the
+  journal to after the restart timestamp, or you are reading the corpse.
 ------------------------------------------------------------------------------
 
 WHAT IT IS RUNNING
