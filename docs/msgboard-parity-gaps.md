@@ -1196,6 +1196,39 @@ request, not 6.6 MiB. The message bodies are never copied. No change made.
 
 ### 15.5 Still open
 
+> **Production evidence, 2026-08-07.** The two items below that are deferred
+> "pending a production signal" were checked against seven days of fleet
+> telemetry rather than left as an intention. Across `direct-{a,b}-evm-{1,369,943}`:
+>
+> | counter | `max_over_time(...[7d])` |
+> |---|---|
+> | `reth_msgboard_outbound_dropped` | **0** on every box |
+> | `reth_msgboard_requests_truncated` | **0** on every box |
+> | `reth_msgboard_bad_protocol` | **0** on every box |
+>
+> So no peer has saturated the bounded queue, none has exceeded
+> `MAX_IDS_PER_FRAME`, and none has sent a malformed frame. Every trigger
+> condition named below is measurably absent, which is the reason these stay
+> unbuilt — building per-connection rate limiting now would add a false-positive
+> risk to a network-facing subprotocol to solve a problem with no evidence of
+> existing.
+>
+> The counters were previously unwatched, so "revisit if it goes non-zero" had
+> no mechanism. Two Prometheus alerts now carry it (monorepo
+> `deploy/monitoring/valve.rules.yml`, group `valve-fleet-reth`):
+> `MsgboardOutboundDropped` and `MsgboardBadProtocol`, both `warning` — a
+> non-zero counter means the queue bound *worked*, not that anything is down.
+> Verified against live Prometheus: the expressions match five real series and
+> currently return empty, so they can fire but are not firing.
+>
+> `direct-b-evm-1` is absent from those five: it still runs a build predating
+> the counters (added in `5d238f5f85`). See `progress.txt`.
+>
+> Re-announcement (fourth bullet) got a partial answer too: `943a` shows 428
+> `announcements_received` against 5 `requests_sent`, so `filter_wanted` is
+> rejecting essentially all of it. The avoidable-work path is real but is not
+> costing anything measurable in practice.
+
 - **Per-connection rate limiting** (carried over from §14.4). §15.1 bounds
   memory and bounds how long one inbound frame can stall the reader; neither
   bounds frames per second. `reth_tokio_util::ratelimit::{Rate, RateLimit}`
