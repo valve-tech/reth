@@ -73,13 +73,51 @@ DEFERRED (tracked here — not worth shipping brittle tests for):
 
 ------------------------------------------------------------------------------
 TASK: Track upstream reth releases / keep the fork current
-STATUS: **v2.4.0 BUMP DONE** (2026-07-15) — branch feature/update-to-reth-2.4,
-        tag v2.4.0-pulse. 132/132 valve tests pass. NOT yet deployed.
+STATUS: **v2.4.1 BUMP DONE** (2026-08-06) — branch chore/update-to-reth-2.4.1.
+        443/443 valve tests pass. Deploy state: see the fleet task below.
 OPENED: 2026-07-15
 OWNER: valve
 ------------------------------------------------------------------------------
 
-UPSTREAM STATE (checked 2026-07-15)
+v2.4.1 BUMP (2026-08-06) — a trivial one, recorded so the next is calibrated
+
+  upstream v2.4.1 (tagged 2026-07-17) is a patch release: 3 files vs v2.4.0
+  (Cargo.toml, Cargo.lock, docs/vocs/vocs.config.ts), the substance being an
+  alloy core 1.6.0 -> 1.6.1 bump. Nothing we patch or wrap moved.
+
+  DONE BY MERGE, NOT REBASE — a deliberate departure from the v2.4.0 recipe.
+  Our fork carries 139 commits on top of v2.4.0 (incl. merge commits), so
+  `git rebase --onto v2.4.1 v2.4.0` would replay all of them and flatten the
+  merges to absorb a 3-file delta. `git merge v2.4.1` was the proportionate
+  tool. Use rebase again when the delta is a real release (v2.3->v2.4 was 206
+  commits / 398 files) and linear history is worth the replay.
+
+  CONFLICTS: Cargo.lock only (Cargo.toml auto-merged, keeping our
+  [patch.crates-io] alloy-evm entry intact). Resolved by keeping OUR lock —
+  upstream's is missing every valve crate — and letting cargo re-resolve
+  against the new ^1.6.1 requirement. Verified afterwards that alloy-evm still
+  resolves to `git+https://github.com/valve-tech/evm.git?branch=valve/v0.37.1`.
+
+  alloy-evm needed NO new patch branch: v2.4.1 still resolves alloy-evm 0.37.1,
+  so `valve/v0.37.1` continues to version-match. First bump since the patch
+  was introduced that cost nothing.
+
+  VERIFICATION: goldens byte-identical (so the patch is live and revm's gas
+  constants did not move); 443/443 across reth-firehose, reth-firehose-tests,
+  reth-pulsechain-{node,forks}, reth-cli-commands, reth-msgboard{,-types};
+  `cargo check --workspace --exclude reth --all-targets` and the reth binary's
+  --no-default-features set both clean.
+  Safety tag: backup/pre-2.4.1-bump-20260806.
+
+  GAP FOUND, NOT YET FIXED: .github/workflows/valve-ci.yml's nextest job does
+  NOT include reth-msgboard or reth-msgboard-types. Every msgboard fix in this
+  file (§§14-15, FIX 1) is therefore ungated in CI and was only ever verified
+  by hand. Fold into the msgboard task below.
+
+UPSTREAM STATE (checked 2026-07-15, re-checked 2026-08-06)
+  - **v2.4.1** released 2026-07-17 — merged into our line 2026-08-06 (above).
+  - Nothing newer as of 2026-08-06: v2.4.1 is still the latest tag, though
+    paradigm/main has moved on (9253c0f8bc, 2026-08-06).
   - paradigmxyz/reth **v2.4.0** released 2026-07-14: 206 commits, 398 files,
     +22,470/-18,004. Release notes:
     https://github.com/paradigmxyz/reth/releases/tag/v2.4.0
@@ -174,6 +212,17 @@ TASK: Re-review whether the alloy-evm fork can be folded back to upstream
 STATUS: IN PROGRESS (parked — keeping the minimal fork; re-reviewed 2026-07-15)
 OPENED: 2026-06-15 (during the reth v2.2 -> v2.3 upgrade)
 RE-REVIEW: at the next reth upstream bump, OR by 2026-09-15 — whichever is first
+  - 2026-08-06 re-review (trigger: the v2.4.1 bump). VERDICT: KEEP THE FORK.
+    All three re-review checks re-run, all still negative:
+      1. alloy-rs/evm#323 is still OPEN, `mergedAt: null`, and has not been
+         touched since 2026-03-31 — no movement in the 4 months since it was
+         first checked.
+      2. No released alloy-evm carries the fix. v0.37.0 is still the latest
+         release (2026-06-12), and alloy-evm `main`'s `transact_system_call`
+         still calls `self.inner.system_call_with_caller(...)` unconditionally
+         with no `if self.inspect` branch.
+      3. reth v2.4.1 still resolves alloy-evm 0.37.1 — no bump past the fix.
+    Next re-review: the next reth bump, or 2026-09-15.
   - 2026-07-15 re-review (trigger: v2.4.0 released). VERDICT: KEEP THE FORK.
     alloy-rs/evm#323 is still OPEN and untouched since 2026-03-31, and upstream
     alloy-evm v0.37.0 AND v0.37.1 still call the un-inspected
