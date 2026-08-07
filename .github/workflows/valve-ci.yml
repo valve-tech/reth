@@ -93,12 +93,20 @@ jobs:
         run: cargo check -p reth --no-default-features --features "jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
 
       # Test our crates.
+      #
+      # reth-msgboard{,-types} were missing here until 2026-08-07, which left
+      # every fix in docs/msgboard-parity-gaps.md §§14-15 — the erigon parity
+      # work and the remote-OOM hardening — verified only by hand. The board is
+      # a network-facing subprotocol we serve to any peer; it belongs in the
+      # gate more than anything else in this list.
       - name: cargo nextest (our crates)
         run: |
           cargo nextest run \
             --no-fail-fast \
             -p reth-firehose \
             -p reth-firehose-tests \
+            -p reth-msgboard \
+            -p reth-msgboard-types \
             -p reth-pulsechain-node \
             -p reth-pulsechain-forks \
             -p reth-cli-commands
