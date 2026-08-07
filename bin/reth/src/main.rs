@@ -63,11 +63,7 @@ struct EthereumExtArgs {
     ///
     /// Off by default. Only turn it on where a fireeth reader-node is actually
     /// consuming this process's FIRE output.
-    #[arg(
-        long = "firehose.enabled",
-        env = "RETH_FIREHOSE_ENABLED",
-        default_value_t = false
-    )]
+    #[arg(long = "firehose.enabled", env = "RETH_FIREHOSE_ENABLED", default_value_t = false)]
     firehose_enabled: bool,
 }
 
@@ -152,6 +148,7 @@ fn run_ethereum_node() -> eyre::Result<()> {
             // hoisting `init_tracer` above the branch.
             if firehose_enabled {
                 info!(target: "reth::cli", "Launching Ethereum node (firehose-instrumented)");
+                warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
 
                 reth_firehose::init_tracer(firehose_tracer::Tracer::new(
                     firehose_tracer::config::Config {
@@ -259,6 +256,8 @@ fn run_pulsechain_node() -> eyre::Result<()> {
         components,
         async move |mut builder, msgboard_args: MsgboardArgs| {
             info!(target: "reth::cli", "Launching PulseChain node");
+            // Firehose is unconditional on this path, so `--jit` is always inert here.
+            warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
 
             let chain_id = builder.config().chain.chain().id();
             inject_pulsechain_bootnodes_if_unset(
@@ -305,4 +304,31 @@ fn run_pulsechain_node() -> eyre::Result<()> {
             exit
         },
     )
+}
+
+/// Warns when `--jit` is passed on a firehose-instrumented node, where it does nothing.
+///
+/// A firehose node builds its EVM through `FirehoseExecutorBuilder` /
+/// `PulsechainFirehoseExecutorBuilder`, neither of which reads `ctx.config().jit` — unlike
+/// `EthereumExecutorBuilder`, the only launch-path consumer of those args. So every `--jit*` flag
+/// is inert here: no revmc backend, no compiler workers, no metrics task.
+///
+/// That inertness is enforced, not incidental: `FirehoseEvmConfig::new` panics on a JIT-capable
+/// inner config, because revmc's compiled path never fires `Inspector::step`/`step_end` and routes
+/// logs through `Inspector::log` (which firehose does not override), which would make firehose
+/// silently drop every SSTORE, KECCAK256 preimage, log and value-transfer balance change from
+/// JIT-compiled contracts. See `reth_firehose::reject_jit_capable_inner`.
+///
+/// So this is a warning rather than a hard error: the combination is provably harmless today, and
+/// failing startup would break existing units that pass the flag for no safety gain. It exists so
+/// an operator expecting a speedup learns they are not getting one.
+fn warn_if_jit_requested_with_firehose(jit_enabled: bool) {
+    if jit_enabled {
+        tracing::warn!(
+            target: "reth::cli",
+            "--jit has no effect on a firehose node and is being ignored. Firehose and the revmc \
+             JIT are mutually exclusive: the JIT's compiled path does not fire the Inspector \
+             hooks firehose reads from. Drop the flag to silence this warning."
+        );
+    }
 }

@@ -9,6 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
+use reth_chainspec::MAINNET;
+use reth_evm::ConfigureEvm;
+use reth_evm_ethereum::EthEvmConfig;
+use reth_firehose::FirehoseEvmConfig;
 use reth_firehose_tests::run_prestate;
 
 fn case_dir(name: &str) -> PathBuf {
@@ -76,5 +80,40 @@ fn alloy_evm_resolves_to_valve_fork() {
          inspector patch is not active, so firehose will not trace pre-execution system calls. \
          Re-point reth Cargo.toml's [patch.crates-io] alloy-evm at a valve-tech/evm branch that \
          version-matches the workspace alloy-evm requirement. See progress.txt.",
+    );
+}
+
+/// Structural guard: the EVM config a firehose node actually builds must never expose a JIT
+/// backend, and must not acquire one when asked to.
+///
+/// This mirrors `FirehoseExecutorBuilder::build_evm` (`bin/reth/src/firehose.rs`), which wraps
+/// `EthEvmConfig::new(...)` — whose default factory is `alloy_evm::EthEvmFactory`, not reth's
+/// `RethEvmFactory` — so revmc is structurally absent from a firehose node's type graph.
+///
+/// The hazard being guarded: revmc's compiled path never calls `Inspector::step`/`step_end` and
+/// routes logs through `Inspector::log`, which firehose does not override (it implements
+/// `log_full`). A JIT-backed firehose node would keep streaming blocks while silently dropping
+/// every SSTORE storage change, KECCAK256 preimage, log and value-transfer balance change from
+/// JIT-compiled contracts. `FirehoseEvmConfig::new` rejects a JIT-capable inner config outright;
+/// this test pins the property from the other side, on the exact type the node constructs.
+#[test]
+fn firehose_evm_config_never_exposes_a_jit_backend() {
+    let config = FirehoseEvmConfig::new(EthEvmConfig::new(MAINNET.clone()));
+
+    assert!(
+        config.jit_backend().is_none(),
+        "a firehose EVM config handed out a JIT backend. revmc's compiled path drops the \
+         Inspector step/step_end hooks, so firehose would emit silently incomplete blocks. See \
+         reth_firehose::reject_jit_capable_inner.",
+    );
+
+    // `with_jit_support` must be swallowed by the wrapper rather than delegated to `inner`.
+    let config = config.with_jit_support();
+
+    assert!(
+        config.jit_backend().is_none(),
+        "a firehose EVM config acquired a JIT backend after with_jit_support(). \
+         FirehoseEvmConfig must override with_jit_support_enabled as a no-op — delegating it to \
+         the inner config reintroduces the silent-data-loss hazard.",
     );
 }

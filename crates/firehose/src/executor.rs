@@ -42,7 +42,7 @@ use alloy_evm::{
 use alloy_primitives::{Address, Log, Sealable, U256};
 use reth_evm::{
     execute::{BlockExecutionError, Executor},
-    ConfigureEvm, Evm as _, OnStateHook,
+    ConfigureEvm, Evm as _, JitBackend, OnStateHook,
 };
 use reth_execution_types::BlockExecutionResult;
 use reth_node_api::NodePrimitives;
@@ -1087,7 +1087,15 @@ pub struct FirehoseEvmConfig<F> {
 
 impl<F: ConfigureEvm> FirehoseEvmConfig<F> {
     /// Wraps an existing EVM configuration.
-    pub const fn new(inner: F) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `inner` can execute JIT-compiled code (its
+    /// [`ConfigureEvm::jit_backend`] is `Some`). Firehose and the revmc JIT are
+    /// mutually exclusive — see [`reject_jit_capable_inner`] for why, and why
+    /// refusing to start is the correct response.
+    pub fn new(inner: F) -> Self {
+        reject_jit_capable_inner(inner.jit_backend());
         Self { inner }
     }
 }
@@ -1156,6 +1164,69 @@ where
     ) -> impl Executor<DB, Primitives = Self::Primitives, Error = BlockExecutionError> {
         FirehoseBlockExecutor::new(self.inner.clone(), db)
     }
+
+    /// Deliberately **not** delegated to `inner`: a firehose config never enables JIT support.
+    ///
+    /// revmc's compiled path does not preserve the Inspector hooks firehose reads from, so a
+    /// JIT-backed firehose node would stream incomplete blocks. See [`reject_jit_capable_inner`].
+    ///
+    /// Delegating this to `self.inner` would silently reintroduce that hazard, which is why the
+    /// override is written out rather than left to the trait default.
+    fn with_jit_support_enabled(self, _enabled: bool) -> Self
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    /// Always `None`. See [`Self::with_jit_support_enabled`].
+    ///
+    /// [`Self::new`] already rejects a JIT-capable `inner`, so this cannot mask a live backend.
+    fn jit_backend(&self) -> Option<&dyn JitBackend> {
+        None
+    }
+}
+
+/// Panics if a config that firehose is about to wrap can execute JIT-compiled code.
+///
+/// # Why firehose and the revmc JIT cannot be combined
+///
+/// revmc's compiled path reconstructs only a *subset* of Inspector events. Its
+/// `InspectorEvmTr::inspect_frame_run` re-emits `log`, `inspect_selfdestruct` and `frame_end`, and
+/// falls back to the interpreter only for `LookupDecision::Interpret`. Two consequences:
+///
+/// * `step` / `step_end` are never called — there is no step callback in the compiled-code ABI at
+///   all. Firehose drives SSTORE storage changes, KECCAK256 preimages and value-transfer balance
+///   changes from `step`, so all of those vanish for any JIT-compiled contract.
+/// * Logs vanish too, for a subtler reason: revmc calls `Inspector::log`, while firehose overrides
+///   only `log_full`. `log_full`'s default delegates *to* `log`, not the reverse, so firehose's
+///   `log` is the trait-default no-op.
+///
+/// Blocks would keep streaming, silently incomplete. That is worse than not starting: downstream
+/// consumers (fireeth readers, substreams sinks) cannot distinguish a partial block from a real
+/// one, and the resulting index corruption is only fixable by a re-sync. So this is a hard failure,
+/// not a warning.
+///
+/// # Why this is reachable at all
+///
+/// Today it is not: `FirehoseExecutorBuilder` builds `EthEvmConfig::new(...)`, whose default
+/// factory is `alloy_evm::EthEvmFactory` rather than reth's `RethEvmFactory`, so revmc is
+/// structurally absent from a firehose node's type graph. That safety is *incidental*. Anyone
+/// reusing the node's own `build_evm_config` — plausible, since firehose nodes currently get zero
+/// JIT — would be one `.with_jit_support()` away from the failure above, with nothing to catch it.
+/// This check makes the invariant explicit and load-bearing.
+pub fn reject_jit_capable_inner(backend: Option<&dyn JitBackend>) {
+    assert!(
+        backend.is_none(),
+        "refusing to wrap a JIT-capable EVM config in FirehoseEvmConfig: revmc's compiled path \
+         drops the Inspector step/step_end hooks entirely and routes logs through Inspector::log \
+         (which firehose does not override), so a JIT-backed firehose node would silently emit \
+         blocks missing all SSTORE storage changes, KECCAK256 preimages, logs and value-transfer \
+         balance changes for every JIT-compiled contract. Build the firehose EVM config from a \
+         factory without JIT support (alloy_evm::EthEvmFactory, as FirehoseExecutorBuilder does), \
+         or fix revmc to defer to the interpreter whenever the attached inspector needs \
+         step-level hooks.",
+    );
 }
 
 impl<F, ExecutionData> reth_evm::ConfigureEngineEvm<ExecutionData> for FirehoseEvmConfig<F>
@@ -1187,5 +1258,35 @@ where
         payload: &ExecutionData,
     ) -> Result<impl reth_evm::ExecutableTxIterator<Self>, Self::Error> {
         self.inner.tx_iterator_for_payload(payload)
+    }
+}
+
+#[cfg(test)]
+mod jit_guard_tests {
+    use super::*;
+
+    /// Minimal [`JitBackend`] stand-in. The trait is behaviour-free for our purposes — we only
+    /// care whether a config hands one out at all, which is what "this EVM can run compiled
+    /// code" means.
+    struct FakeJitBackend;
+
+    impl JitBackend for FakeJitBackend {
+        fn set_enabled(&self, _enabled: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pause(&self) {}
+        fn resume(&self) {}
+        fn clear(&self) {}
+    }
+
+    #[test]
+    fn accepts_a_config_without_a_jit_backend() {
+        reject_jit_capable_inner(None);
+    }
+
+    #[test]
+    #[should_panic(expected = "refusing to wrap a JIT-capable EVM config")]
+    fn rejects_a_config_with_a_jit_backend() {
+        reject_jit_capable_inner(Some(&FakeJitBackend));
     }
 }

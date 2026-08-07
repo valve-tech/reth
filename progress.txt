@@ -377,8 +377,8 @@ REFERENCES
 
 
 ------------------------------------------------------------------------------
-TASK: msgboard hardening — FIX 1 DONE, FIX 2 next
-STATUS: FIX 1 (memory) SHIPPED 2026-08-02. FIX 2 (revmc JIT guard) NOT STARTED.
+TASK: msgboard hardening — FIX 1 DONE, FIX 2 DONE
+STATUS: FIX 1 (memory) SHIPPED 2026-08-02. FIX 2 (revmc JIT guard) SHIPPED 2026-08-06.
 OPENED: 2026-07-29
 OWNER: valve
 ------------------------------------------------------------------------------
@@ -470,8 +470,58 @@ Full write-up: docs/msgboard-parity-gaps.md §15. Summary of what shipped:
      task and buffering peer-provoked output. That deviation is the root cause.
 
 ==============================================================================
-FIX 2 — guard firehose against the revmc JIT (currently safe BY ACCIDENT)
+FIX 2 — guard firehose against the revmc JIT — ✅ DONE 2026-08-06
 ==============================================================================
+WHAT SHIPPED (the analysis below was re-verified against the tree first; it held)
+
+  1. crates/firehose/src/executor.rs — FirehoseEvmConfig::new now REJECTS a
+     JIT-capable inner config (panics via the new pub fn
+     reject_jit_capable_inner, which carries the whole rationale as its doc).
+     `new` is no longer `const`; the only two callsites are the two executor
+     builders in bin/reth/src/firehose.rs, neither in a const context.
+     This is the load-bearing guard: it is the one that catches the documented
+     regression path (reusing the node's own build_evm_config).
+     A HARD FAILURE, deliberately — not a warning. A JIT-backed firehose node
+     keeps streaming blocks that are silently incomplete, and downstream
+     consumers cannot tell a partial block from a real one. Refusing to start
+     is strictly better than corrupting an index that only a re-sync fixes.
+  2. Same file — the ConfigureEvm impl now WRITES OUT with_jit_support_enabled
+     (no-op) and jit_backend (None) instead of inheriting the trait defaults.
+     Behaviourally identical today; the point is that a future "the wrapper is
+     missing a delegation" cleanup now has to delete a comment that says why
+     the non-delegation is the whole point.
+  3. bin/reth/src/main.rs — warn_if_jit_requested_with_firehose() on BOTH
+     dispatch paths (Ethereum, gated on --firehose.enabled; PulseChain, where
+     firehose is unconditional). Warning, NOT an error: given (1) and (2) the
+     combination is provably inert, so erroring would only break existing units
+     that pass the flag, for zero safety gain. It exists so an operator
+     expecting a speedup learns they are not getting one.
+  4. crates/firehose/src/lib.rs — crate-level docs recording the revmc analysis
+     (step/step_end absent from the compiled-code ABI; logs lost via the
+     log vs log_full asymmetry) and what an upstream revmc fix would require.
+  5. Tests — 3 new, all with negative controls:
+       executor.rs::jit_guard_tests::{accepts_a_config_without_a_jit_backend,
+         rejects_a_config_with_a_jit_backend}  (unit, via a FakeJitBackend
+         double — JitBackend is a 4-method behaviour-free trait in reth-evm,
+         so no revmc dependency is needed to exercise the guard)
+       firehose-tests/tests/setup_guards.rs::
+         firehose_evm_config_never_exposes_a_jit_backend  (structural, on the
+         exact FirehoseEvmConfig<EthEvmConfig<ChainSpec>> the node builds)
+     VERIFIED: neutering the assert in reject_jit_capable_inner makes
+     rejects_a_config_with_a_jit_backend fail ("test did not panic as
+     expected"). 30/30 firehose tests green; workspace check clean.
+
+  NOTE for whoever revisits this: the setup_guards test is only non-vacuous
+  because of (1). Without the `jit` cargo feature compiled in, EthEvmConfig's
+  jit_backend() returns None regardless, so asserting None on a hand-built
+  config proves nothing on its own. It is the constructor rejection that makes
+  the property hold for real, and that is what the unit tests exercise.
+
+  NOT DONE (deliberate): no `jit` passthrough feature was added to
+  reth-firehose-tests to run the guard under a real revmc build. This box has
+  no LLVM (see WHERE THINGS STAND above), so it could not be verified locally,
+  and the constructor rejection is feature-independent anyway.
+
 THE HAZARD (confirmed, not hypothetical)
   revmc's JIT does NOT preserve the Inspector hooks firehose depends on.
   Source: ~/.cargo/git/checkouts/revmc-*/7e3536d (pinned Cargo.lock:11179 to
@@ -509,7 +559,7 @@ WHY IT CANNOT FIRE TODAY (and why that is fragile)
      and reth_jit RPC returns Ok(()) when jit_backend() is None
      (crates/rpc/rpc/src/reth.rs:229-231). It is also NOT a perf win there.
 
-FIX SHAPE
+FIX SHAPE (as planned 2026-07-29 — all three items shipped, see above)
   Make the safety explicit instead of incidental. Anyone "optimising"
   FirehoseExecutorBuilder to reuse the node's build_evm_config — plausible,
   since firehose nodes currently get zero JIT — would be one .with_jit_support()
