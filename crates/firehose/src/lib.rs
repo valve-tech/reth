@@ -1,6 +1,30 @@
 //! Firehose crate providing blockchain data processing modules.
 //!
 //! This crate contains modules for inspection, mapping, prelude utilities, and running tasks.
+//!
+//! # Firehose is incompatible with the revmc JIT
+//!
+//! Firehose reconstructs a block from Inspector callbacks, so it can only observe what the
+//! executing EVM actually reports. revmc's compiled path reports a strict subset:
+//!
+//! * **`step` / `step_end` are never called.** There is no step callback in the compiled-code ABI
+//!   at all — only `on_log`. revmc's `InspectorEvmTr::inspect_frame_run` hand-reconstructs just
+//!   `log`, `inspect_selfdestruct` and `frame_end`, falling back to the interpreter only for
+//!   `LookupDecision::Interpret`. Firehose drives SSTORE storage changes, KECCAK256 preimages and
+//!   value-transfer balance changes from `step`, so all of those are lost.
+//! * **Logs are lost too**, for a subtler reason: revmc calls `Inspector::log`, while
+//!   [`inspector::FirehoseInspector`] overrides only `log_full`. In revm-inspector, `log_full`'s
+//!   default delegates *to* `log`, not the reverse — and the interpreter path calls `log_full` — so
+//!   firehose's `log` is the trait-default no-op.
+//!
+//! The failure mode is silent: blocks keep streaming, missing data. Downstream consumers cannot
+//! tell a partial block from a complete one, and the resulting index corruption is only fixable by
+//! a re-sync. So [`FirehoseEvmConfig::new`] **panics** on a JIT-capable inner config rather than
+//! degrading — see [`reject_jit_capable_inner`].
+//!
+//! Combining the two safely would require an upstream revmc change: `inspect_frame_run` would have
+//! to defer to the interpreter whenever the attached inspector needs step-level hooks. Until then
+//! `--jit` is inert on a firehose node, and the CLI warns when it is passed.
 
 /// Block-level drop guard that manages the Firehose tracer lifecycle across validation.
 pub mod block_tracer;
@@ -19,9 +43,9 @@ pub mod runner;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
-    run_wrapped_block, ChainHooks, FirehoseBlockExecutor, FirehoseEvmConfig,
-    FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras, NoPreTxAdjust, PostTxExtras,
-    PreTxAdjust,
+    reject_jit_capable_inner, run_wrapped_block, ChainHooks, FirehoseBlockExecutor,
+    FirehoseEvmConfig, FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras, NoPreTxAdjust,
+    PostTxExtras, PreTxAdjust,
 };
 pub use runner::run_exex;
 
