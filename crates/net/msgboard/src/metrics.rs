@@ -27,6 +27,12 @@ pub struct MsgboardMetrics {
 
     /// Number of live messages currently held in the in-memory board.
     pub msg_count: Gauge,
+    /// Message IDs requested from a peer whose reply has not yet arrived.
+    ///
+    /// Sits near zero in steady state. A value pinned at
+    /// `MAX_PENDING_REQUESTS` means the tracker is failing open and duplicate
+    /// requests are no longer suppressed.
+    pub pending_requests: Gauge,
     /// Sum of `data` bytes across all live messages (an approximation of board RAM use).
     pub msg_size: Gauge,
     /// Bytes written by the most recent `flush_to_db` call.
@@ -90,6 +96,13 @@ pub struct MsgboardMetrics {
     pub announcements_received: Counter,
     /// `GetBoardMessages` frames sent to peers.
     pub requests_sent: Counter,
+    /// Announced IDs not requested because a request was already in flight.
+    ///
+    /// This is the work the in-flight tracker saves. Each suppressed ID would
+    /// otherwise have cost one request, one reply, and one secp256k1 scalar
+    /// multiplication to discover we already had the message. Read it against
+    /// `skipped_duplicate`, which counts the ones that still get through.
+    pub requests_suppressed: Counter,
     /// `GetBoardMessages` frames received from peers.
     pub requests_received: Counter,
     /// Frames discarded because a peer left its outbound queue full for

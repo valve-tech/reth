@@ -23,7 +23,10 @@ use reth_msgboard_types::{
     CheckedPoWMsg, MsgID, MsgboardConfig, MsgboardError, PoWMsg, VERSION_V1,
 };
 
-use crate::{block_filter::BlockFilter, db, index::MsgIndex, metrics::MsgboardMetrics};
+use crate::{
+    block_filter::BlockFilter, db, index::MsgIndex, metrics::MsgboardMetrics,
+    pending::PendingRequests,
+};
 
 /// Capacity of the broadcast channel for new-message notifications.
 ///
@@ -42,6 +45,9 @@ struct BoardState {
     block_filter: BlockFilter,
     /// Messages evicted from the index (pending DB deletion or metrics).
     discarded: Vec<Arc<CheckedPoWMsg>>,
+    /// IDs already requested from some peer, so a second peer announcing the
+    /// same message does not earn a second request.
+    pending: PendingRequests,
 }
 
 /// Shared in-memory msgboard.
@@ -73,6 +79,7 @@ impl MsgBoard {
             index: MsgIndex::default(),
             block_filter: BlockFilter::new(cfg.block_range),
             discarded: Vec::new(),
+            pending: PendingRequests::default(),
         };
         Self {
             cfg,
@@ -91,6 +98,7 @@ impl MsgBoard {
             index: MsgIndex::default(),
             block_filter: BlockFilter::new(cfg.block_range),
             discarded: Vec::new(),
+            pending: PendingRequests::default(),
         };
         Self {
             cfg,
@@ -250,12 +258,33 @@ impl MsgBoard {
 
     /// Filter a slice of peer-announced [`MsgID`]s, returning the subset we want to fetch.
     ///
-    /// An ID is wanted if we don't already have it, it passes the configured
-    /// size and work limits, and the block is not within the stale buffer zone.
+    /// An ID is wanted if we don't already have it, no request for it is
+    /// already in flight, it passes the configured size and work limits, and
+    /// the block is not within the stale buffer zone.
+    ///
+    /// **This method mutates.** Every returned ID is claimed in
+    /// [`PendingRequests`], so calling it twice with the same live ID returns
+    /// it only once. The caller owns the request it just claimed: if the frame
+    /// does not reach the peer it must hand the IDs back via
+    /// [`release_pending`](Self::release_pending), or nothing re-requests them
+    /// until the claim expires.
+    ///
+    /// The name still mirrors erigon's `FilterMessageIDs`, which does the same
+    /// filtering minus the in-flight check.
     pub fn filter_wanted(&self, ids: &[MsgID]) -> Vec<MsgID> {
-        let state = self.state.lock();
+        let now = Instant::now();
+        let mut state = self.state.lock();
         let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
-        ids.iter()
+
+        // Sweeping here rather than on a timer keeps the map bounded without a
+        // background task: it can only grow on this path, so it can only need
+        // trimming on this path.
+        state.pending.sweep(now);
+
+        let BoardState { index, block_filter, pending, .. } = &mut *state;
+        let mut suppressed = 0u64;
+        let wanted: Vec<MsgID> = ids
+            .iter()
             .filter(|id| {
                 // Mirrors erigon's `FilterMessageIDs`: drop announcements with a
                 // version we don't speak before requesting the body, instead of
@@ -263,7 +292,7 @@ impl MsgBoard {
                 if id.version() != VERSION_V1 {
                     return false;
                 }
-                if state.index.has(&id.message_hash()) {
+                if index.has(&id.message_hash()) {
                     return false;
                 }
                 if !self.cfg.is_size_acceptable(id.size() as usize) {
@@ -273,15 +302,43 @@ impl MsgBoard {
                     return false;
                 }
                 // Skip messages anchored to blocks about to expire.
-                if let Some(block_num) = state.block_filter.block_number(&id.block_hash()) {
-                    block_num >= stale_lower
+                if let Some(block_num) = block_filter.block_number(&id.block_hash()) {
+                    if block_num < stale_lower {
+                        return false;
+                    }
                 } else {
                     // Block hash not in our window — skip.
+                    return false;
+                }
+                // Claimed last, so an ID rejected above never occupies a slot.
+                if pending.claim(**id, now) {
+                    true
+                } else {
+                    suppressed += 1;
                     false
                 }
             })
             .copied()
-            .collect()
+            .collect();
+
+        let live_claims = pending.len();
+        drop(state);
+
+        self.metrics.requests_suppressed.increment(suppressed);
+        self.metrics.pending_requests.set(live_claims as f64);
+        wanted
+    }
+
+    /// Hand back claims taken by [`filter_wanted`](Self::filter_wanted) for a
+    /// request that never reached its peer.
+    ///
+    /// Without this a dropped frame would stall the message until the claim
+    /// expired, because the peers still announcing it would all be suppressed.
+    pub fn release_pending(&self, ids: &[MsgID]) {
+        let mut state = self.state.lock();
+        for id in ids {
+            state.pending.release(id);
+        }
     }
 
     /// All current message IDs (for announcing to a newly connected peer).

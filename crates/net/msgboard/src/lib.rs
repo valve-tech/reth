@@ -30,6 +30,7 @@ pub mod db;
 pub mod index;
 pub mod launch;
 pub mod metrics;
+mod pending;
 pub mod protocol;
 pub mod rpc;
 pub mod rpc_api;
