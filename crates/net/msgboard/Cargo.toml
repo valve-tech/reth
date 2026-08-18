@@ -20,7 +20,13 @@ reth-fs-util = { workspace = true }
 reth-libmdbx = { workspace = true }
 reth-metrics = { workspace = true }
 reth-primitives-traits = { workspace = true }
-reth-provider = { workspace = true }
+# `launch.rs` needs three provider traits and nothing else, so it names the
+# crates that define them instead of `reth-provider`, which only re-exports
+# them. This does not shrink the build: `reth-rpc-builder` below reaches
+# `reth-provider` anyway, via `reth-rpc` → `reth-node-api`. It is here so the
+# declared dependencies say what msgboard actually uses.
+reth-chain-state = { workspace = true }
+reth-storage-api = { workspace = true }
 reth-rpc-builder = { workspace = true }
 
 alloy-primitives = { workspace = true }
