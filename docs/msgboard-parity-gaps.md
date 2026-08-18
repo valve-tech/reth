@@ -1329,3 +1329,111 @@ the lazy-stream pattern gets for free.
 The lesson generalises: a satellite protocol that buffers peer-provoked output
 must bound that buffer itself, because the multiplexer's cap protects the
 multiplexer, not the protocol.
+
+---
+
+## 16. Round-8: nine out of ten requests were for messages we were already fetching
+
+### 16.1 The measurement
+
+§15.5 closed with `BOARD_MESSAGE_IDS` re-announcement listed as "avoidable work"
+and left it there, because nothing measured it. The counters on the fleet
+(2026-08-17, taken directly off `:9001/metrics`) do measure it:
+
+| box | `requests_sent` | `accepted_remote` | `skipped_duplicate` | uptime |
+|---|---|---|---|---|
+| `direct-a-evm-943` | 445 | 45 | **400 (90%)** | 2h14m |
+| `direct-a-evm-1` | 65 | 1 | **64 (98%)** | 9m |
+| `direct-a-evm-369` | 0 | 0 | 0 | — |
+
+Nine out of ten messages the board asked for, it already had.
+
+### 16.2 Why it happens
+
+`filter_wanted` (`board.rs`) rejected an announced ID only once that ID was **in
+the index**, which happens after the reply arrives and its `PoW` verifies. There
+was no in-flight set. Between sending a request and inserting the reply, every
+other peer announcing the same ID still read as wanted.
+
+Gossip guarantees that window is crowded: every peer announces every message. So
+N peers announcing one new message bought N requests, N replies, and N secp256k1
+scalar multiplications, to keep one copy.
+
+This is not §15.5's re-announcement bullet, which is about a single peer
+repeating an announcement. It is the multi-peer convergence case, and it is
+structural rather than adversarial — the honest protocol produces it.
+
+### 16.3 Why the fix cannot live in verification
+
+The obvious fix — dedupe before the `PoW` check in `add_remote_msgs` — is
+impossible. A message's index key is its `PoW` hash:
+
+```text
+hash = sha256(challenge ‖ category ‖ data)
+challenge = x-coordinate of G × scalar
+```
+
+`challenge` **is** the elliptic curve point. Nothing can look a message up
+without first paying for the exact computation the lookup would avoid. The order
+inside `add_remote_msgs` is already optimal: the cheap field checks and the block
+lookup run first, and `insert_checked`'s duplicate check cannot be hoisted above
+`to_checked` because it has no key to work with until `to_checked` returns.
+
+The only place to spend less is upstream of the request.
+
+### 16.4 The fix
+
+`PendingRequests` (`crates/net/msgboard/src/pending.rs`) tracks claimed IDs with
+a TTL. `filter_wanted` claims what it returns, so the second peer to announce a
+message in flight is not asked.
+
+Three properties matter, and each is the reason for a test:
+
+- **Claims expire** (`PENDING_REQUEST_TTL`, 10s). A peer that never answers must
+  not hold a message hostage. Ten seconds is well above any RTT and under 1% of
+  the ~20 minute window in which the message stays fetchable.
+- **Claims are released on a failed send.** `filter_wanted` claims optimistically,
+  before the frame reaches the peer. A dropped or closed frame hands its claims
+  back (`release_pending`), or the message stalls for the full TTL while every
+  peer announcing it stays suppressed.
+- **The map fails open at `MAX_PENDING_REQUESTS`** (8192, ≈1.3 MB). IDs are
+  peer-supplied and pass `filter_wanted` on declared fields alone, so a peer can
+  mint unlimited IDs anchored to a live block. Past the cap the tracker grants
+  claims without recording them: the request goes out and deduplication stops.
+  Failing open costs the duplicate requests this exists to avoid; failing closed
+  would let a flood of synthetic IDs suppress real ones, which is worse.
+
+### 16.5 What to watch after deploy
+
+Two new metrics:
+
+- `reth_msgboard_requests_suppressed` — requests not made. Read against
+  `skipped_duplicate`, which counts the duplicates that still get through. On the
+  numbers in §16.1 this should absorb most of the gap between `requests_sent` and
+  `accepted_remote`.
+- `reth_msgboard_pending_requests` — gauge of live claims. Near zero in steady
+  state. **Pinned at 8192 means the tracker is failing open** and suppression has
+  stopped; that is the signal to look for a peer minting synthetic IDs.
+
+A `requests_suppressed` stuck at zero after deploy means the tracker is not
+running, not that there is nothing to suppress.
+
+### 16.6 Honest accounting of the win
+
+The CPU saving is negligible and should not be the justification. 400 scalar
+multiplications over two hours is microseconds of work. What the change actually
+buys is roughly a 10× cut in request frames on `943a`, and the removal of a lever
+where announcement volume multiplied into request volume with nothing bounding
+the ratio. §15.5's per-connection rate limiting stays unbuilt — `outbound_dropped`,
+`requests_truncated` and `bad_protocol` are all still flat 0.
+
+### 16.7 Still open
+
+- The §15.5 items are unchanged: per-connection rate limiting, the multiplexer's
+  unbounded inbound `to_satellite` queue, and volume-based reputation. All three
+  still lack a production signal, and the alerts added in §15.5 remain the
+  mechanism that would produce one.
+- Erigon has no equivalent of the in-flight set. This is a **reth-only
+  divergence** in the same class as §14.3's request cap: invisible on the wire,
+  strictly less traffic than erigon emits, and safe against either client
+  because a suppressed request is one erigon would also have found redundant.

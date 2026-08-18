@@ -175,6 +175,7 @@ fn every_metric_is_instantiated_and_moves() {
             "msgboard.msg_count",
             "msgboard.msg_size",
             "msgboard.outbound_dropped",
+            "msgboard.pending_requests",
             "msgboard.rejected_insufficient_work",
             "msgboard.rejected_invalid_difficulty",
             "msgboard.rejected_invalid_pow",
@@ -182,6 +183,7 @@ fn every_metric_is_instantiated_and_moves() {
             "msgboard.rejected_oversized",
             "msgboard.requests_received",
             "msgboard.requests_sent",
+            "msgboard.requests_suppressed",
             "msgboard.requests_truncated",
             "msgboard.sent_to_peer_duration_seconds",
             "msgboard.skipped_block_too_old",
@@ -288,4 +290,34 @@ fn every_metric_is_instantiated_and_moves() {
     let snap = Snap::take(&snapshotter);
     assert_eq!(snap.counter("msgboard.evicted"), 1, "one message displaced at count_limit");
     assert_eq!(snap.gauge("msgboard.msg_count"), Some(2.0), "board stays at count_limit");
+
+    // ── phase 6: the in-flight tracker is observable ─────────────────────────
+    //
+    // `requests_suppressed` is how the saving is measured in production: each
+    // increment is one request, one reply, and one secp256k1 scalar
+    // multiplication not spent on a message already being fetched. It was
+    // 90–98% of all requests on the fleet before the tracker existed, so a
+    // counter stuck at zero after deploy means the tracker is not running.
+    let board = board_at(10);
+    let id = mined(&[9], 10).to_checked(10, 0).expect("valid pow").msg_id();
+
+    assert_eq!(board.filter_wanted(&[id]).len(), 1, "the first announcement is wanted");
+    let snap = Snap::take(&snapshotter);
+    assert_eq!(
+        snap.gauge("msgboard.pending_requests"),
+        Some(1.0),
+        "a claimed id must show as in flight",
+    );
+    assert_eq!(snap.counter("msgboard.requests_suppressed"), 0, "nothing suppressed yet");
+
+    assert!(board.filter_wanted(&[id]).is_empty(), "the second announcement is suppressed");
+    let snap = Snap::take(&snapshotter);
+    assert_eq!(
+        snap.counter("msgboard.requests_suppressed"),
+        1,
+        "suppressing a duplicate request must be counted, not just done",
+    );
+
+    board.release_pending(&[id]);
+    assert_eq!(board.filter_wanted(&[id]).len(), 1, "a released id is wanted again");
 }

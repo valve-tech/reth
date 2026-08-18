@@ -511,14 +511,23 @@ async fn handle_incoming(
             // exchange is unchanged against either client. It also makes this
             // the last outbound frame whose size the peer controls — see
             // `docs/msgboard-parity-gaps.md` §15.3.
-            for chunk in wanted.chunks(MAX_IDS_PER_FRAME) {
+            for (i, chunk) in wanted.chunks(MAX_IDS_PER_FRAME).enumerate() {
                 let mut buf = BytesMut::with_capacity(1 + chunk.len() * MSG_ID_SIZE);
                 buf.put_u8(GET_BOARD_MESSAGES);
                 buf.put_slice(&MsgID::encode_list(chunk));
                 metrics.requests_sent.increment(1);
                 match tx.send(&metrics, peer_id, deadline, buf).await {
-                    Sent::Closed => return Sent::Closed,
-                    Sent::Ok | Sent::Dropped => {}
+                    Sent::Ok => {}
+                    // `filter_wanted` claimed every ID in `wanted`. A frame that
+                    // never reached the peer must give its claims back, or the
+                    // peers still announcing those messages stay suppressed for
+                    // the full claim TTL and we fetch nothing. On `Closed` that
+                    // also covers the chunks this loop will now never send.
+                    Sent::Dropped => board.release_pending(chunk),
+                    Sent::Closed => {
+                        board.release_pending(&wanted[i * MAX_IDS_PER_FRAME..]);
+                        return Sent::Closed;
+                    }
                 }
             }
         }
@@ -1905,7 +1914,13 @@ mod tests {
         let board = board_at(10);
         let over = MAX_IDS_PER_FRAME + 54;
         let announced = wantable_ids(over);
-        assert_eq!(board.filter_wanted(&announced).len(), over, "all must be wanted");
+
+        let wanted = board.filter_wanted(&announced);
+        assert_eq!(wanted.len(), over, "all must be wanted");
+        // `filter_wanted` claims every ID it returns, so this precondition
+        // check would otherwise suppress the request the handler makes below.
+        // Hand the claims back to leave the board as a first-time peer finds it.
+        board.release_pending(&wanted);
 
         let (tx, mut rx) = channel();
         handle_incoming(
@@ -1933,6 +1948,67 @@ mod tests {
             requested.extend(ids);
         }
         assert_eq!(requested, announced, "chunking must not drop or reorder any wanted ID");
+    }
+
+    /// Gossip means every peer announces every message. Only the first
+    /// announcement should cost a request: the rest arrive while that request
+    /// is still in flight, and each one the board acted on would buy a second
+    /// copy of a message it is already fetching — paid for with a secp256k1
+    /// scalar multiplication to discover the duplicate.
+    ///
+    /// Measured at 90–98% of all requests on the production fleet before the
+    /// in-flight tracker existed. See `crates/net/msgboard/src/pending.rs`.
+    #[tokio::test]
+    async fn only_the_first_peer_to_announce_a_message_is_asked_for_it() {
+        let board = board_at(10);
+        let announced = wantable_ids(3);
+        let frame_in = frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&announced));
+
+        let (tx_first, mut rx_first) = channel();
+        handle_incoming(&board, None, &tx_first, frame_in.clone(), peer()).await;
+        let first = drain(&mut rx_first);
+        assert_eq!(first.len(), 1, "the first peer to announce should be asked");
+        assert_eq!(
+            MsgID::decode_list(&first[0][1..]).expect("valid id list"),
+            announced,
+            "and asked for every announced id",
+        );
+
+        // A second peer announcing the same messages, before any reply lands.
+        let (tx_second, mut rx_second) = channel();
+        handle_incoming(&board, None, &tx_second, frame_in, peer()).await;
+        assert!(
+            drain(&mut rx_second).is_empty(),
+            "a second peer announcing an in-flight message must not be asked again",
+        );
+    }
+
+    /// A claim is taken on the assumption the request reaches its peer. When
+    /// the frame is dropped instead, holding the claim would stall the message
+    /// for the full TTL while every other peer announcing it stays suppressed.
+    #[tokio::test]
+    async fn a_request_that_never_reaches_its_peer_releases_its_claim() {
+        let board = board_at(10);
+        let announced = wantable_ids(3);
+
+        let wanted = board.filter_wanted(&announced);
+        assert_eq!(wanted.len(), 3, "all must be wanted");
+        assert!(board.filter_wanted(&announced).is_empty(), "and now claimed");
+
+        board.release_pending(&wanted);
+
+        let (tx, mut rx) = channel();
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&announced)),
+            peer(),
+        )
+        .await;
+        let frames = drain(&mut rx);
+        assert_eq!(frames.len(), 1, "a released id must be requestable again");
+        assert_eq!(MsgID::decode_list(&frames[0][1..]).expect("valid id list"), announced,);
     }
 
     /// The reason chunking is a correctness fix and not just a size bound: an
