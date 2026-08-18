@@ -18,12 +18,13 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use reth_chain_state::CanonStateSubscriptions;
 use reth_msgboard_types::MsgboardConfig;
 use reth_network::{protocol::IntoRlpxSubProtocol, NetworkProtocols};
 use reth_network_api::{NetworkInfo, Peers, PeersInfo};
 use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives};
-use reth_provider::{BlockNumReader, CanonStateSubscriptions, NodePrimitivesProvider};
 use reth_rpc_builder::TransportRpcModules;
+use reth_storage_api::{BlockNumReader, NodePrimitivesProvider};
 use tokio::{sync::broadcast::error::RecvError, time::sleep};
 
 use crate::{
