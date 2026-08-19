@@ -1540,11 +1540,22 @@ message would fail our verification and `rejected_invalid_pow` would climb.
 Shipping the new construction now would isolate our nodes from the live board
 completely — every inbound message rejected, every outbound message refused.
 
-**We do not have a reference for the new algorithm.** The erigon-pulse checkout
-at `~/go/src/gitlab.com/pulsechaincom/erigon-pulse` (`v3.0.0-RC8`, fetched
-2026-05-31) implements the old construction in all 3 distinct historical versions
-of `pow_message.go` across all 26 refs that contain it. The
-`TestPoWGoldenVector` the spec points at **does not exist** in any of them.
+**No reference for the new algorithm exists anywhere.** Not "we lack access" —
+it has not been written. Three independent checks agree:
+
+- the erigon-pulse checkout (`v3.0.0-RC8`) implements the old construction in all
+  3 distinct historical versions of `pow_message.go`, across all 26 refs that
+  contain it, and the `TestPoWGoldenVector` the spec cites **does not exist** in
+  any of them;
+- every published `@pulsechain/msgboard` release, 0.0.17 through 0.0.28,
+  implements the old construction — `challenge.getX()`, `hash % difficulty === 0n`;
+- `gitlab.com/pulsechaincom/msgboard`, which the spec names as the TypeScript
+  reference, has had **no push in four months** (checked by the team, 2026-08-19).
+
+So the spec is a **design document, not a description of shipped code**. Its
+citations are forward-looking: it points at `pow_message.go`, `board_test.go` and
+`TestPoWGoldenVector` as if they already describe the new construction, and none
+of them does.
 
 That matters more than it sounds. `msgboard-erigon-parity-method` records two
 audit rounds that produced wrong "fixes" by reasoning from prose instead of the
@@ -1585,13 +1596,14 @@ fleet, which runs it on.
 Adopt — the security argument in §17.2 is strong and it retires two of our own
 divergences — but in this order, and not before the first step:
 
-1. **Get the reference.** The upstream Go (`pow_message.go` + the golden vector
-   in `pow_message_test.go`), or the TypeScript at
-   `gitlab.com/pulsechaincom/msgboard` — that repo exists and the team can reach
-   it; it is simply not readable from this environment. Re-fetch the erigon-pulse remote first;
-   our checkout is 2.5 months stale and the algorithm may have landed since.
-   Until this exists, write no PoW code.
+1. **Establish the spec's provenance.** This is now the blocking question, and it
+   is a human one, not a code one. Who wrote it, is it ratified, and is anyone
+   upstream implementing it? Building an unratified proposal is how a network ends
+   up with two incompatible things both called version 1 — and the spec keeps
+   `version = 1` for the new construction, so the wire cannot tell them apart.
 2. **Ask upstream the version question** in §17.4, and when mainnet switches.
+   If the answer is "nobody is building it yet", then adopting means *becoming*
+   the reference — see §17.7.
 3. **Implement behind a switch**, with the golden vector as the acceptance test,
    both constructions compiled in and selected by message version.
 4. **Fix the `mod n` reduction** (§17.3) — it is a conformance bug today and does
@@ -1603,6 +1615,35 @@ divergences — but in this order, and not before the first step:
    depend on the version question in §17.4.
 
 Items 4 and 5 are independent of the PoW change and shipped ahead of it.
+
+### 17.7 If we adopt, we are the reference
+
+With no upstream implementation, "conform to the reference" is not available.
+Whoever writes this first defines what the golden vector says, which changes the
+job in three ways.
+
+**Write it twice, independently.** A single implementation cannot catch a
+misreading of the spec — it just encodes the misreading and agrees with itself,
+which is exactly how §19.5's client bug survived a parity test built for the
+purpose. Two implementations from two codebases (reth's Rust and the msgboard
+repo's TypeScript), written against the spec rather than against each other, and
+reconciled only at the vector, is the cheapest way to find an ambiguity. Both
+codebases already exist.
+
+**Publish the vector before flipping the fleet.** The point of going first is to
+make our reading the one upstream adopts. That only works if the vector is
+offered for ratification rather than discovered later as a divergence. Flipping
+first and publishing afterwards gets the risk without the benefit.
+
+**Know what we are accepting.** If upstream eventually ships a detail
+differently, we redo the work and re-flip the board. That is survivable — the
+board drains in 120 blocks — but it should be a decision, not a surprise.
+
+Against that, the case for waiting is weak: the spec has sat for four months with
+no code behind it, and the weakness it fixes (§17.2) is not under exploitation —
+the board carries ~385 messages, almost all from our own arcade bots. Neither
+shipping nor waiting is urgent. The deciding factor is whether we want to set the
+spec rather than follow it.
 
 ---
 
