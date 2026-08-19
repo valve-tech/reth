@@ -1437,3 +1437,166 @@ the ratio. §15.5's per-connection rate limiting stays unbuilt — `outbound_dro
   divergence** in the same class as §14.3's request cap: invisible on the wire,
   strictly less traffic than erigon emits, and safe against either client
   because a suppressed request is one erigon would also have found redundant.
+
+---
+
+## 17. Round-9: the upstream spec changes the PoW construction
+
+`specs/04-msgboard-pow-v2.md` (supplied 2026-08-18) specifies a different proof
+of work. This section records what changes, what it buys, what it costs, and why
+we should not ship it yet.
+
+### 17.1 The two constructions
+
+| step | what reth does today | what the spec specifies |
+|---|---|---|
+| scalar input | `nonce × sha256(M‖Div)[16..] + blockHash` | `sha256(ver ‖ blockHash ‖ payloadHash ‖ M ‖ Div ‖ nonce)` |
+| out-of-range scalar | reduced `mod n` | **rejected**, try another nonce |
+| point encoding | uncompressed x, 32 bytes | **compressed**, 33 bytes with parity prefix |
+| payload binding | in the final hash | in the scalar, via `payloadHash = sha256(category ‖ data)` |
+| work hash | `sha256(x ‖ category ‖ data)` | `sha256(compressed_point)` |
+| difficulty | `(2²⁴ + 10⁴·len)·M/Div` as `u64`, wraps | same value as a bigint, no wrap |
+| acceptance | `hash % difficulty == 0` (divisibility) | `hash < 2²⁵⁶ / D` (threshold) |
+
+Every step differs. A message valid under one is invalid under the other.
+
+### 17.2 The gain is real, and larger than the spec claims
+
+The current scalar is **linear in the nonce**. From erigon-pulse
+`msgboard/pow_message.go:174-192`, over the integers:
+
+```text
+scalar(nonce)     = nonce · digest + blockHash
+scalar(nonce+1)   = scalar(nonce) + digest
+G·scalar(nonce+1) = G·scalar(nonce) + G·digest
+```
+
+`digest` depends only on `workMultiplier` and `workDivisor`, which a miner holds
+fixed. So `Q = G·digest` is a constant, and a miner walks the nonce space with
+**one point addition** per attempt (~0.3–1 µs) where a verifier always pays a
+full scalar multiplication (~60–120 µs). Verified numerically against the
+reference inputs: the incremental walk reproduces the full scalar multiplication
+exactly.
+
+The PoW therefore costs a competent miner **50–500× less than its difficulty
+parameter implies**. Spam resistance is deflated by that factor.
+
+There is a second, larger amplification. `challenge()` reads only `Nonce`,
+`WorkMultiplier`, `WorkDivisor` and `BlockHash` — it never touches `Category` or
+`Data`, which enter only afterward at `pow_message.go:170`. So one challenge
+table `P(1), P(2), …` is **shared by every message in the same block at the same
+difficulty**. An attacker builds it once and then mines unlimited distinct spam
+messages with pure SHA-256 and no further elliptic-curve work: for K messages the
+EC cost is O(N), not O(K·N).
+
+The new construction kills both. `scalar = sha256(… ‖ nonce)` is not additively
+homomorphic, so consecutive scalars are unrelated and each attempt needs its own
+scalar multiplication; and because the scalar commits to `payloadHash`, every
+message body gets its own sequence.
+
+A residual 2–5× miner edge remains — a miner can use a fixed-base comb where the
+verifier uses the generic constant-time path, and can batch-invert across
+attempts. That is an implementation artifact common to every EC-based PoW, not an
+algebraic break.
+
+### 17.3 Two of our own divergences disappear
+
+**§14.1's overflow exploit becomes structurally impossible.** That attack worked
+because `difficulty` was computed in wrapping `u64`, so an attacker could solve
+`base × M ≡ 2ᵏ (mod 2⁶⁴)`, set `Div = 2ᵏ`, and wrap the threshold to 1 — free
+`PoW` for any nonce. Under the spec `D` is a bigint and the target is `2²⁵⁶ / D`,
+so a larger `D` makes the work *harder*, never free. There is nothing to wrap.
+
+That also makes the minimum-work gate sound for the first time. §14.1's real
+damage was that the wrap **decoupled** the declared ratio `M/Div` from the
+difficulty actually enforced, so clearing `is_work_acceptable` and paying nothing
+were compatible. With no wrap, `D` is monotone in `M/Div` and the gate constrains
+what it appears to constrain.
+
+Adopting therefore lets us drop the §14.1 fix, its
+`rejected_invalid_difficulty` counter, and the wire divergence it created.
+
+**Our `mod n` reduction is already wrong.** `pow_scalar()`
+(`crates/net/msgboard-types/src/pow.rs:261-290`) reduces the scalar modulo the
+curve order. The Go does **not** — it passes the raw sum to `ScalarBaseMult`,
+whose binding rejects an out-of-range scalar
+(`secp256k1@v1.0.0/ext.h:115-117`: `if (overflow || is_zero) ret = 0`). The spec
+states the rule explicitly: *"Reject rather than reduce: must match Go's
+secp256k1 ScalarBaseMult behavior."* About 2⁻⁶⁴ of block hashes are affected, so
+this is a conformance gap rather than a live exploit — but it is a real one, and
+it exists today, independent of whether we adopt the new construction.
+
+### 17.4 The cost, and why we must not ship it yet
+
+**The network is still on the old algorithm.** Fleet counters, 2026-08-18:
+
+| box | `accepted_remote` | `rejected_invalid_pow` |
+|---|---|---|
+| `direct-a-evm-943` | 45 | **0** |
+| `direct-a-evm-1` | 1 | **0** |
+
+We are accepting peer messages and rejecting none. If peers had switched, every
+message would fail our verification and `rejected_invalid_pow` would climb.
+Shipping the new construction now would isolate our nodes from the live board
+completely — every inbound message rejected, every outbound message refused.
+
+**We do not have a reference for the new algorithm.** The erigon-pulse checkout
+at `~/go/src/gitlab.com/pulsechaincom/erigon-pulse` (`v3.0.0-RC8`, fetched
+2026-05-31) implements the old construction in all 3 distinct historical versions
+of `pow_message.go` across all 26 refs that contain it. The
+`TestPoWGoldenVector` the spec points at **does not exist** in any of them.
+
+That matters more than it sounds. `msgboard-erigon-parity-method` records two
+audit rounds that produced wrong "fixes" by reasoning from prose instead of the
+Go, one of which left reth further from erigon than the code it replaced.
+Implementing this from the spec's TypeScript excerpt alone would repeat exactly
+that mistake, on the consensus-critical path of a network-facing subprotocol.
+
+**Version ambiguity.** The spec says the wire *limits* are part of `msg/1` and
+changing them requires `msg/2`. It says nothing about what version the new PoW
+belongs to — yet two nodes both advertising `msg/1` and disagreeing about message
+validity is a worse failure than a limit change. This needs an answer from
+upstream before we write code.
+
+### 17.5 Wire-limit deltas in the same spec
+
+Independent of the PoW, the `msg/1 wire limits` section states requirements reth
+does not meet:
+
+| requirement | reth today | evidence |
+|---|---|---|
+| inbound packet ≤ 100 KiB | **no inbound check at all**; the real cap is `MAX_PAYLOAD_SIZE` = 16 MiB, 160× the spec | `eth-wire/src/p2pstream.rs:34`, `:501-506` |
+| oversized packet → disconnect | nothing between 100 KiB and 16 MiB | as above |
+| duplicate IDs in `GET_BOARD_MESSAGES` → kick | dedupes and truncates, no penalty (§14.3) | `msgboard/src/protocol.rs:553-587` |
+| duplicate IDs in `BOARD_MESSAGE_IDS` → kick | **no duplicate check exists** | `protocol.rs:498` |
+| `--msgboard.enabled`, off by default | no such flag; msgboard is registered unconditionally | `msgboard/src/args.rs:18-19` |
+
+Two notes. The duplicate-kick rule inverts §14.3's stated reasoning — we declined
+to penalise because *"neither client documents a bound it could have respected"*,
+and this spec documents one. And the §16 in-flight tracker must **not** be
+mistaken for duplicate detection: `PendingRequests` fails open at capacity by
+design (`pending.rs:80-94`), so past 8192 claims a repeated ID is requested twice.
+
+Making msgboard opt-in and off by default is a behaviour change for the existing
+fleet, which runs it on.
+
+### 17.6 Recommendation
+
+Adopt — the security argument in §17.2 is strong and it retires two of our own
+divergences — but in this order, and not before the first step:
+
+1. **Get the reference.** The upstream Go (`pow_message.go` + the golden vector
+   in `pow_message_test.go`), or the TypeScript at
+   `gitlab.com/pulsechaincom/msgboard`. Re-fetch the erigon-pulse remote first;
+   our checkout is 2.5 months stale and the algorithm may have landed since.
+   Until this exists, write no PoW code.
+2. **Ask upstream the version question** in §17.4, and when mainnet switches.
+3. **Implement behind a switch**, with the golden vector as the acceptance test,
+   both constructions compiled in and selected by message version.
+4. **Fix the `mod n` reduction** (§17.3) — it is a conformance bug today and does
+   not depend on any of the above.
+5. **Close the wire-limit gaps** in §17.5. The inbound size check is worth doing
+   on its own merits regardless of this spec: 16 MiB of attacker-controlled frame
+   decodes to ~138,000 IDs before anything rejects it.
+
+Items 4 and 5 are independent of the PoW change and can ship now.
