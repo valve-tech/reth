@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tracing::info;
+use url::Url;
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -20,13 +21,17 @@ fn is_zero(value: &u64) -> bool {
 /// segments like transactions, receipts, etc). Chunked components use `blocks_per_file` to
 /// define the block range per archive, matching reth's static file segment boundaries.
 ///
-/// Archive naming convention for chunked components:
-///   `{component}-{start_block}-{end_block}.tar.zst`
+/// Archive paths are resolved relative to [`SnapshotManifest::base_url`] via URL joining.
+/// Single archives use [`SingleArchive::file`]; chunked archives default to
+/// `{component}-{start_block}-{end_block}.tar.zst`, or use [`ChunkedArchive::chunk_files`]
+/// when present so publishers can place finalized and tip chunks under different prefixes:
 ///
-/// For example with `blocks_per_file: 500000` and `total_blocks: 1500000`:
-///   `transactions-0-499999.tar.zst`
-///   `transactions-500000-999999.tar.zst`
-///   `transactions-1000000-1499999.tar.zst`
+/// ```text
+/// base_url = https://example.com/mainnet
+///   static_files/transactions-0-499999.tar.zst
+///   1700000/transactions-500000-999999.tar.zst
+///   1700000/state.tar.zst
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifest {
     /// Block number this snapshot was taken at.
@@ -63,6 +68,9 @@ pub enum ComponentManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SingleArchive {
     /// Archive file name (relative to base_url).
+    ///
+    /// Must be a relative path (no leading `/`). Nested paths like `1700000/state.tar.zst`
+    /// are supported when `base_url` points at the snapshot root.
     pub file: String,
     /// Compressed archive size in bytes.
     pub size: u64,
@@ -99,6 +107,19 @@ pub struct ChunkedArchive {
     /// `chunk_output_files`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chunk_decompressed_sizes: Vec<u64>,
+    /// Archive path for each chunk, relative to [`SnapshotManifest::base_url`], ordered from
+    /// first to last.
+    ///
+    /// When empty (older manifests), downloaders fall back to the default
+    /// `{component}-{start}-{end}.tar.zst` name. When set, the length must equal the chunk
+    /// count and each entry is joined with `base_url` so publishers can place chunks under
+    /// different prefixes (for example `static_files/…` for finalized chunks and
+    /// `{timestamp}/…` for the tip chunk).
+    ///
+    /// Paths must be relative (no leading `/`). A leading slash is treated as host-absolute by
+    /// URL joining and would drop the `base_url` path prefix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunk_files: Vec<String>,
     /// Expected extracted plain files per chunk, ordered from first to last.
     ///
     /// This is the authoritative integrity source for the modular download path.
@@ -300,15 +321,16 @@ impl SnapshotManifest {
 
         match component {
             ComponentManifest::Single(single) => {
-                vec![format!("{}/{}", self.base_url_or_empty(), single.file)]
+                vec![resolve_archive_url(self.base_url_or_empty(), &single.file)]
             }
             ComponentManifest::Chunked(chunked) => {
                 let key = ty.key();
-                chunked
-                    .ranges()
-                    .into_iter()
-                    .map(|(start, end)| {
-                        format!("{}/{key}-{start}-{end}.tar.zst", self.base_url_or_empty())
+                (0..chunked.ranges().len())
+                    .map(|i| {
+                        resolve_archive_url(
+                            self.base_url_or_empty(),
+                            &chunked.chunk_relative_path(key, i),
+                        )
                     })
                     .collect()
             }
@@ -328,17 +350,19 @@ impl SnapshotManifest {
 
         match component {
             ComponentManifest::Single(single) => {
-                vec![format!("{}/{}", self.base_url_or_empty(), single.file)]
+                vec![resolve_archive_url(self.base_url_or_empty(), &single.file)]
             }
             ComponentManifest::Chunked(chunked) => {
                 let key = ty.key();
                 let ranges = chunked.ranges();
                 let start_chunk = chunked.start_index_for_distance(distance);
 
-                ranges[start_chunk..]
-                    .iter()
-                    .map(|(start, end)| {
-                        format!("{}/{key}-{start}-{end}.tar.zst", self.base_url_or_empty())
+                (start_chunk..ranges.len())
+                    .map(|i| {
+                        resolve_archive_url(
+                            self.base_url_or_empty(),
+                            &chunked.chunk_relative_path(key, i),
+                        )
                     })
                     .collect()
             }
@@ -358,7 +382,7 @@ impl SnapshotManifest {
         match component {
             ComponentManifest::Single(single) => {
                 vec![SnapshotArchive {
-                    url: format!("{}/{}", self.base_url_or_empty(), single.file),
+                    url: resolve_archive_url(self.base_url_or_empty(), &single.file),
                     file_name: single.file.clone(),
                     size: single.size,
                     blake3: single.blake3.clone(),
@@ -372,14 +396,13 @@ impl SnapshotManifest {
 
                 (start_chunk..ranges.len())
                     .map(|i| {
-                        let (start, end) = ranges[i];
-                        let file_name = format!("{key}-{start}-{end}.tar.zst");
+                        let file_name = chunked.chunk_relative_path(key, i);
                         let size = chunked.chunk_sizes.get(i).copied().unwrap_or_default();
                         let output_files =
                             chunked.chunk_output_files.get(i).cloned().unwrap_or_default();
 
                         SnapshotArchive {
-                            url: format!("{}/{}", self.base_url_or_empty(), file_name),
+                            url: resolve_archive_url(self.base_url_or_empty(), &file_name),
                             file_name,
                             size,
                             blake3: None,
@@ -522,6 +545,47 @@ impl ChunkedArchive {
         self.ranges().len() as u64
     }
 
+    /// Returns the number of tail chunks required to cover at least `distance` blocks from the
+    /// tip.
+    pub fn tail_chunks_for_distance(&self, distance: u64) -> u64 {
+        let needed = distance.min(self.total_blocks);
+        if needed == 0 {
+            return 0;
+        }
+
+        // The first needed block determines the earliest chunk, including for a partial tail.
+        let first_chunk = (self.total_blocks - needed) / self.blocks_per_file;
+        self.num_chunks() - first_chunk
+    }
+
+    /// Returns `true` when `chunk_files` is empty or has exactly one path per chunk.
+    pub fn chunk_files_are_consistent(&self) -> bool {
+        self.chunk_files.is_empty() || self.chunk_files.len() as u64 == self.num_chunks()
+    }
+
+    /// Returns the archive path for chunk `index`, relative to the manifest base URL.
+    ///
+    /// Uses [`Self::chunk_files`] when it has exactly one entry per chunk; otherwise the
+    /// default `{key}-{start}-{end}.tar.zst` name.
+    ///
+    /// The default name comes from [`Self::ranges`], not from the uniform `blocks_per_file`
+    /// stride, so a manifest carrying explicit `chunk_ranges` (mixed-span datadirs) names each
+    /// file by the span it actually holds. On a legacy manifest `ranges()` *is* the uniform
+    /// stride, so the name is unchanged.
+    ///
+    /// Returns an empty string for an index past the last chunk. Every caller iterates over
+    /// `ranges()`, so that is unreachable rather than a case to handle.
+    pub fn chunk_relative_path(&self, key: &str, index: usize) -> String {
+        let ranges = self.ranges();
+        if self.chunk_files.len() == ranges.len() &&
+            let Some(path) = self.chunk_files.get(index)
+        {
+            return path.clone();
+        }
+        let Some(&(start, end)) = ranges.get(index) else { return String::new() };
+        format!("{key}-{start}-{end}.tar.zst")
+    }
+
     /// Returns the extracted plain-output size for one chunk.
     pub fn chunk_output_size(&self, index: usize) -> u64 {
         self.chunk_decompressed_sizes.get(index).copied().unwrap_or_else(|| {
@@ -542,6 +606,36 @@ impl ChunkedArchive {
                 .map(|files| files.iter().map(|file| file.size).sum::<u64>())
                 .sum()
         }
+    }
+}
+
+/// Joins an archive path relative to `base_url`.
+///
+/// Ensures directory semantics for `base_url` so the last path segment is not replaced when
+/// joining nested paths like `static_files/headers-0-499999.tar.zst`. Leading slashes on
+/// `relative_path` are stripped so publisher paths stay relative to the base prefix.
+fn resolve_archive_url(base_url: &str, relative_path: &str) -> String {
+    let relative_path = relative_path.trim_start_matches('/');
+
+    if base_url.is_empty() {
+        return relative_path.to_string();
+    }
+
+    let Ok(mut base) = Url::parse(base_url) else {
+        return format!("{}/{}", base_url.trim_end_matches('/'), relative_path);
+    };
+
+    // Url::join replaces the final path segment unless the base path ends with `/`.
+    let path = base.path();
+    if !path.ends_with('/') {
+        let mut with_slash = path.to_string();
+        with_slash.push('/');
+        base.set_path(&with_slash);
+    }
+
+    match base.join(relative_path) {
+        Ok(joined) => joined.to_string(),
+        Err(_) => format!("{}/{}", base_url.trim_end_matches('/'), relative_path),
     }
 }
 
@@ -653,6 +747,7 @@ pub fn generate_manifest(
                     .iter()
                     .map(|files| files.iter().map(|file| file.size).sum())
                     .collect(),
+                chunk_files: vec![],
                 chunk_output_files,
                 chunk_ranges,
             }),
@@ -829,7 +924,7 @@ fn state_source_files(source_datadir: &Path) -> Result<Vec<PlannedFile>> {
         return collect_files_recursive(source_datadir, Path::new("db"));
     }
 
-    eyre::bail!("Could not find source state DB directory under {}", source_datadir.display())
+    eyre::bail!("Could not find source state DB directory under {}", source_datadir.display());
 }
 
 fn rocksdb_source_files(source_datadir: &Path) -> Result<Vec<PlannedFile>> {
@@ -1013,6 +1108,7 @@ mod tests {
                 total_blocks: 1_500_000,
                 chunk_sizes: vec![80_000, 100_000, 120_000],
                 chunk_decompressed_sizes: vec![],
+                chunk_files: vec![],
                 chunk_output_files: vec![vec![], vec![], vec![]],
                 chunk_ranges: vec![],
             }),
@@ -1024,6 +1120,7 @@ mod tests {
                 total_blocks: 1_500_000,
                 chunk_sizes: vec![40_000, 50_000, 60_000],
                 chunk_decompressed_sizes: vec![],
+                chunk_files: vec![],
                 chunk_output_files: vec![vec![], vec![], vec![]],
                 chunk_ranges: vec![],
             }),
@@ -1123,6 +1220,86 @@ mod tests {
         assert_eq!(m.chunks_for_distance(SnapshotComponentType::State, Some(100)), 1);
     }
 
+    /// A snapshot whose final chunk is partial: `total_blocks` is not a multiple of
+    /// `blocks_per_file`, so the last chunk holds fewer than `blocks_per_file` blocks.
+    /// Three chunks: `[0, 500k)`, `[500k, 1M)`, and `[1M, 1.005M)` — the last holds 5_000 blocks.
+    fn partial_tail_manifest() -> SnapshotManifest {
+        let mut components = BTreeMap::new();
+        components.insert(
+            "transactions".to_string(),
+            ComponentManifest::Chunked(ChunkedArchive {
+                blocks_per_file: 500_000,
+                total_blocks: 1_005_000,
+                chunk_sizes: vec![10, 20, 30],
+                chunk_decompressed_sizes: vec![100, 200, 300],
+                chunk_files: vec![],
+                chunk_output_files: vec![vec![], vec![], vec![]],
+                chunk_ranges: vec![],
+            }),
+        );
+        SnapshotManifest {
+            block: 1_005_000,
+            chain_id: 1,
+            storage_version: 2,
+            timestamp: 0,
+            base_url: Some("https://example.com".to_string()),
+            reth_version: None,
+            components,
+        }
+    }
+
+    #[test]
+    fn tail_chunks_for_distance_accounts_for_partial_final_chunk() {
+        let chunked = ChunkedArchive {
+            blocks_per_file: 500_000,
+            total_blocks: 1_005_000,
+            chunk_sizes: vec![10, 20, 30],
+            chunk_decompressed_sizes: vec![],
+            chunk_files: vec![],
+            chunk_output_files: vec![],
+            chunk_ranges: vec![],
+        };
+        // The final chunk holds only 5_000 blocks, so covering 10_064 blocks needs the last two
+        // chunks. The naive `distance.div_ceil(blocks_per_file)` returns 1 here and falls short.
+        assert_eq!(chunked.tail_chunks_for_distance(10_064), 2);
+        // A distance that fits inside the final chunk still needs just one.
+        assert_eq!(chunked.tail_chunks_for_distance(5_000), 1);
+        // One block more than the final chunk holds must pull in the previous chunk.
+        assert_eq!(chunked.tail_chunks_for_distance(5_001), 2);
+        assert_eq!(chunked.tail_chunks_for_distance(1), 1);
+        // Covering everything selects all chunks and never exceeds the chunk count.
+        assert_eq!(chunked.tail_chunks_for_distance(1_005_000), 3);
+        assert_eq!(chunked.tail_chunks_for_distance(u64::MAX), 3);
+    }
+
+    #[test]
+    fn partial_final_chunk_downloads_enough_history() {
+        let m = partial_tail_manifest();
+        // The published snapshot's final chunk is partial (5_000 blocks). A --full download
+        // asking for 10_064 blocks must pull the last two chunks, then prune the surplus,
+        // rather than the single short tail chunk the old distance math selected.
+        assert_eq!(m.chunks_for_distance(SnapshotComponentType::Transactions, Some(10_064)), 2);
+
+        let urls = m.archive_urls_for_distance(SnapshotComponentType::Transactions, Some(10_064));
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "https://example.com/transactions-500000-999999.tar.zst");
+        assert_eq!(urls[1], "https://example.com/transactions-1000000-1499999.tar.zst");
+
+        let archives =
+            m.snapshot_archives_for_distance(SnapshotComponentType::Transactions, Some(10_064));
+        assert_eq!(archives.len(), 2);
+
+        // Reported sizes cover the selected tail chunks (indices 1 and 2).
+        assert_eq!(m.size_for_distance(SnapshotComponentType::Transactions, Some(10_064)), 20 + 30);
+        assert_eq!(
+            m.output_size_for_distance(SnapshotComponentType::Transactions, Some(10_064)),
+            200 + 300
+        );
+
+        // A distance that fits inside the final chunk still selects a single chunk.
+        assert_eq!(m.chunks_for_distance(SnapshotComponentType::Transactions, Some(5_000)), 1);
+    }
+
     #[test]
     fn chunks_for_distance_missing() {
         let m = test_manifest();
@@ -1149,6 +1326,7 @@ mod tests {
                 total_blocks: 24_396_822,
                 chunk_sizes: vec![100; 49], // 49 chunks
                 chunk_decompressed_sizes: vec![],
+                chunk_files: vec![],
                 chunk_output_files: vec![vec![]; 49],
                 chunk_ranges: vec![],
             }),
@@ -1219,6 +1397,7 @@ mod tests {
                 total_blocks: 1_000_000,
                 chunk_sizes: vec![80_000, 120_000],
                 chunk_decompressed_sizes: vec![111, 222],
+                chunk_files: vec![],
                 chunk_output_files: vec![
                     vec![OutputFileChecksum {
                         path: "static_files/static_file_transactions_0_499999.bin".to_string(),
@@ -1279,6 +1458,7 @@ mod tests {
                 total_blocks: 1_000_000,
                 chunk_sizes: vec![80_000, 120_000],
                 chunk_decompressed_sizes: vec![111, 222],
+                chunk_files: vec![],
                 chunk_output_files: vec![
                     vec![OutputFileChecksum {
                         path: "static_files/static_file_transactions_0_499999.bin".to_string(),
@@ -1501,6 +1681,7 @@ mod tests {
                     ChunkRange { start: 50_000, end: 99_999 },
                     ChunkRange { start: 100_000, end: 599_999 },
                 ],
+                chunk_files: vec![],
             }),
         );
         SnapshotManifest {
@@ -1543,6 +1724,7 @@ mod tests {
                     ChunkRange { start: 50_000, end: 99_999 },
                     ChunkRange { start: 100_000, end: 599_999 },
                 ],
+                chunk_files: vec![],
             }),
         );
         SnapshotManifest {
@@ -1607,6 +1789,7 @@ mod tests {
             chunk_decompressed_sizes: vec![],
             chunk_output_files: vec![vec![], vec![]],
             chunk_ranges: vec![],
+            chunk_files: vec![],
         };
         assert!(chunked.ranges().is_empty());
         assert_eq!(chunked.num_chunks(), 0);
@@ -1669,6 +1852,7 @@ mod tests {
             chunk_decompressed_sizes: vec![],
             chunk_output_files: vec![vec![], vec![], vec![]],
             chunk_ranges: vec![],
+            chunk_files: vec![],
         };
         assert_eq!(
             chunked.ranges(),
@@ -1827,5 +2011,163 @@ mod tests {
                 "https://x/headers-100000-599999.tar.zst",
             ]
         );
+    }
+
+    #[test]
+    fn resolve_archive_url_joins_nested_paths_under_base() {
+        assert_eq!(
+            resolve_archive_url(
+                "https://example.com/mainnet",
+                "static_files/headers-0-499999.tar.zst"
+            ),
+            "https://example.com/mainnet/static_files/headers-0-499999.tar.zst"
+        );
+        assert_eq!(
+            resolve_archive_url("https://example.com/mainnet/", "1700000/state.tar.zst"),
+            "https://example.com/mainnet/1700000/state.tar.zst"
+        );
+        assert_eq!(
+            resolve_archive_url("https://example.com/mainnet", "headers-0-499999.tar.zst"),
+            "https://example.com/mainnet/headers-0-499999.tar.zst"
+        );
+    }
+
+    #[test]
+    fn chunk_files_resolve_relative_to_root_base_url() {
+        let mut components = BTreeMap::new();
+        components.insert(
+            "headers".to_string(),
+            ComponentManifest::Chunked(ChunkedArchive {
+                blocks_per_file: 500_000,
+                total_blocks: 1_000_000,
+                chunk_sizes: vec![40_000, 50_000],
+                chunk_decompressed_sizes: vec![],
+                chunk_files: vec![
+                    "static_files/headers-0-499999.tar.zst".to_string(),
+                    "1700000/headers-500000-999999.tar.zst".to_string(),
+                ],
+                chunk_output_files: vec![vec![], vec![]],
+                chunk_ranges: vec![],
+            }),
+        );
+        components.insert(
+            "state".to_string(),
+            ComponentManifest::Single(SingleArchive {
+                file: "1700000/state.tar.zst".to_string(),
+                size: 100,
+                decompressed_size: 0,
+                blake3: None,
+                output_files: vec![],
+            }),
+        );
+
+        let m = SnapshotManifest {
+            block: 1_000_000,
+            chain_id: 1,
+            storage_version: 2,
+            timestamp: 1_700_000,
+            base_url: Some("https://example.com/mainnet".to_string()),
+            reth_version: None,
+            components,
+        };
+
+        let urls = m.archive_urls(SnapshotComponentType::Headers);
+        assert_eq!(urls.len(), 2, "exactly 2 header chunk URLs");
+        assert_eq!(
+            urls[0], "https://example.com/mainnet/static_files/headers-0-499999.tar.zst",
+            "finalized chunk stays under static_files/"
+        );
+        assert_eq!(
+            urls[1], "https://example.com/mainnet/1700000/headers-500000-999999.tar.zst",
+            "tip chunk resolves under the run timestamp directory"
+        );
+
+        let state = m.snapshot_archives_for_distance(SnapshotComponentType::State, None);
+        assert_eq!(state.len(), 1, "exactly one state archive");
+        assert_eq!(
+            state[0].url, "https://example.com/mainnet/1700000/state.tar.zst",
+            "single archive file path joins under root base_url without ../"
+        );
+        assert_eq!(state[0].file_name, "1700000/state.tar.zst");
+
+        let headers =
+            m.snapshot_archives_for_distance(SnapshotComponentType::Headers, Some(500_000));
+        assert_eq!(headers.len(), 1, "distance selection returns only the tip chunk");
+        assert_eq!(
+            headers[0].file_name, "1700000/headers-500000-999999.tar.zst",
+            "file_name keeps the relative path from chunk_files"
+        );
+        assert_eq!(
+            headers[0].url,
+            "https://example.com/mainnet/1700000/headers-500000-999999.tar.zst"
+        );
+    }
+
+    #[test]
+    fn chunk_files_absent_keeps_default_chunk_names() {
+        let m = test_manifest();
+        let archives = m.snapshot_archives_for_distance(SnapshotComponentType::Transactions, None);
+        assert_eq!(archives.len(), 3);
+        assert_eq!(archives[0].file_name, "transactions-0-499999.tar.zst");
+        assert_eq!(archives[0].url, "https://example.com/transactions-0-499999.tar.zst");
+    }
+
+    #[test]
+    fn resolve_archive_url_normalizes_parent_dirs_and_leading_slashes() {
+        assert_eq!(
+            resolve_archive_url("https://example.com/static_files", "../1700000/state.tar.zst"),
+            "https://example.com/1700000/state.tar.zst",
+            "../ under a static_files base resolves to the run directory"
+        );
+        assert_eq!(
+            resolve_archive_url(
+                "https://example.com/mainnet",
+                "/static_files/headers-0-499999.tar.zst"
+            ),
+            "https://example.com/mainnet/static_files/headers-0-499999.tar.zst",
+            "leading slash is stripped so the base path prefix is preserved"
+        );
+    }
+
+    #[test]
+    fn mismatched_chunk_files_length_falls_back_to_default_names() {
+        let mut components = BTreeMap::new();
+        components.insert(
+            "headers".to_string(),
+            ComponentManifest::Chunked(ChunkedArchive {
+                blocks_per_file: 500_000,
+                total_blocks: 1_000_000,
+                chunk_sizes: vec![40_000, 50_000],
+                chunk_decompressed_sizes: vec![],
+                // Only one entry for two chunks — ignored in favor of default names.
+                chunk_files: vec!["static_files/headers-0-499999.tar.zst".to_string()],
+                chunk_output_files: vec![vec![], vec![]],
+                chunk_ranges: vec![],
+            }),
+        );
+        let m = SnapshotManifest {
+            block: 1_000_000,
+            chain_id: 1,
+            storage_version: 2,
+            timestamp: 0,
+            base_url: Some("https://example.com/mainnet".to_string()),
+            reth_version: None,
+            components,
+        };
+
+        let ComponentManifest::Chunked(chunked) =
+            m.component(SnapshotComponentType::Headers).unwrap()
+        else {
+            panic!("headers should be chunked");
+        };
+        assert!(!chunked.chunk_files_are_consistent());
+
+        let urls = m.archive_urls(SnapshotComponentType::Headers);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(
+            urls[0], "https://example.com/mainnet/headers-0-499999.tar.zst",
+            "mismatched chunk_files must not partially apply"
+        );
+        assert_eq!(urls[1], "https://example.com/mainnet/headers-500000-999999.tar.zst");
     }
 }
