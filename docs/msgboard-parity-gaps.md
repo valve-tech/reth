@@ -1594,9 +1594,202 @@ divergences — but in this order, and not before the first step:
 3. **Implement behind a switch**, with the golden vector as the acceptance test,
    both constructions compiled in and selected by message version.
 4. **Fix the `mod n` reduction** (§17.3) — it is a conformance bug today and does
-   not depend on any of the above.
+   not depend on any of the above. ✅ DONE, §19.
 5. **Close the wire-limit gaps** in §17.5. The inbound size check is worth doing
    on its own merits regardless of this spec: 16 MiB of attacker-controlled frame
-   decodes to ~138,000 IDs before anything rejects it.
+   decodes to ~138,000 IDs before anything rejects it. ✅ inbound size check DONE,
+   §18. The duplicate-kick rules and `--msgboard.enabled` stay open, since both
+   depend on the version question in §17.4.
 
-Items 4 and 5 are independent of the PoW change and can ship now.
+Items 4 and 5 are independent of the PoW change and shipped ahead of it.
+
+---
+
+## 18. Round-10: the inbound packet limit, and what it makes unreachable
+
+### 18.1 The gap
+
+§17.5 listed it: msgboard performed **no inbound frame-size check at all**.
+`P2P_MSG_PACKET_LIMIT` (100 KiB) was used only for outbound chunking and to
+derive `MAX_IDS_PER_FRAME`. The only real cap was eth-wire's `MAX_PAYLOAD_SIZE`
+= 16 MiB (`p2pstream.rs:34`, enforced `:501-506`), 160× the spec — and a 16 MiB
+`BOARD_MESSAGE_IDS` frame decodes to ~138,000 `MsgID`s before anything rejects
+it, because `MsgID::decode_list` sizes its `Vec` from the payload.
+
+### 18.2 The bound is 102,408, not 102,400
+
+`handle_incoming` now drops any frame over `MAX_INBOUND_FRAME_SIZE` =
+`P2P_MSG_PACKET_LIMIT + FRAME_OVERHEAD_ALLOWANCE` = **102,408 bytes**, before
+the opcode is read.
+
+The 8-byte allowance is not slack for its own sake. `P2P_MSG_PACKET_LIMIT`
+measures the *payload* our packers build; the frame on the wire adds the RLP
+list header (up to four bytes at this size) and the opcode byte. The
+`BOARD_MESSAGES` packer flushes only once the **next** message would cross the
+limit, so reth legitimately emits frames past 102,400 —
+`get_board_messages_chunks_large_responses` has asserted
+`f.len() <= P2P_MSG_PACKET_LIMIT + 8` since §15.1. **Enforcing a bare 102,400
+inbound would have two reth nodes ban each other over their own largest legal
+frames.**
+
+The alternative was to reserve the header in the packer so our frames fit
+102,400 exactly, then enforce the exact figure. Rejected: it changes the frames
+we put on the wire to buy nothing. Erigon-pulse applies no inbound size check at
+all, so no peer in the network is strict today, and 8 bytes on a 100 KiB bound
+does not weaken it. `the_inbound_bound_admits_our_own_largest_frame` pins the
+choice.
+
+Erigon interop is unaffected. Both clients chunk their bulk announce at 846 IDs;
+a request is `filter_wanted`'s subset of one announcement frame, so erigon's
+unchunked `GET_BOARD_MESSAGES` (§13.2) is at most 846 IDs = 102,367 bytes; and
+`BOARD_MESSAGES` is chunked at the packet limit by both. The spec's claim —
+"honest implementations already chunk at 100 KiB" — holds against the reference.
+
+### 18.3 Penalty: `report_bad_protocol`, not disconnect
+
+The spec says the peer is disconnected. A satellite protocol has no disconnect
+lever short of ending the stream, which tears down the whole `RLPx` session
+including eth; §15.5 records why that was avoided. `report_bad_protocol` is the
+closest equivalent already wired: `BadProtocol` weighs `i32::MIN`
+(`network-types/src/peers/reputation.rs:32`), so the peer is banned on the first
+offence. This follows the existing malformed-frame path exactly.
+
+New counter `msgboard.rejected_oversized_frame`. The frame is dropped undecoded,
+so nothing else records it — this counter is the only production signal that a
+peer is sending oversized frames.
+
+### 18.4 §14.3's cap and §15.3's chunk loop are now unreachable from the wire
+
+This is the part worth reading before touching either.
+
+The bound admits at most `floor(102_407 / 121)` = **846 IDs** in one frame,
+which is exactly `MAX_IDS_PER_FRAME`. So:
+
+- §14.3's responder cap (`requested.len() == MAX_IDS_PER_FRAME`) needs a request naming *more*
+  than 846 distinct IDs. That frame is now rejected before it is decoded. The **dedup** half of
+  §14.3 is unaffected and still fires — 500 repeats of one ID is a 60,501-byte frame, well inside
+  the bound — and it was always the substantive half.
+- §15.3's outbound chunk loop (`wanted.chunks(MAX_IDS_PER_FRAME)`) needs an announcement of more
+  than 846 IDs to produce a second chunk. Same rejection, same conclusion.
+
+Both were kept. They are the inner guard: the frame bound and the chunk size are
+separate constants, and only the inner guard keeps them from drifting apart
+silently if either is ever changed. The call sites now say so.
+
+§12.9's premise — "a peer is not obliged to chunk its announcements" — is
+retired. Under this spec it is obliged, and a peer that does not is banned.
+
+### 18.5 Tests
+
+New, in `protocol.rs`:
+
+- `the_inbound_bound_admits_our_own_largest_frame` — the §18.2 self-ban guard.
+- `a_frame_at_the_inbound_limit_is_accepted` — a valid `BOARD_MESSAGES` frame of exactly 102,408
+  bytes is handled normally and costs no reputation. The body length is solved for, not guessed.
+- `a_frame_one_byte_over_the_limit_is_rejected_and_reported` — the same frame at 102,409 bytes:
+  nothing decoded, nothing served, one `BadProtocol` hit. Otherwise perfectly valid, so it pins the
+  bound rather than the payload.
+- `oversize_is_decided_before_the_payload_is_decoded` — an oversized frame whose ID list decodes and
+  one whose length is not a whole number of IDs take the same path.
+
+Three existing tests fed `handle_incoming` a single over-846-ID frame and now
+hit the bound instead of the behaviour they were written for. They were
+converted, not weakened:
+
+| was | is | now asserts |
+|---|---|---|
+| `requests_are_chunked_at_one_frame_of_ids` | `a_full_frame_of_announced_ids_is_requested_in_one_legal_frame` | the largest legal announcement provokes one legal request, nothing dropped or reordered |
+| `get_board_messages_caps_distinct_ids_at_one_frame` | `get_board_messages_over_one_frame_of_ids_is_rejected_not_truncated` | over-cap request draws nothing and one `BadProtocol` hit; the board is still seeded past the cap, so the old truncating path would visibly serve 846 |
+| `every_announced_message_transfers_when_one_frame_announces_more_than_the_cap` | `every_message_transfers_when_the_board_spans_several_announcement_frames` | the same end-to-end convergence, driven through the chunked announce path |
+
+Negative control: with the size check neutered, the three rejection tests fail
+and the two boundary controls still pass.
+
+### 18.6 Still open from §17.5
+
+- Duplicate IDs in `BOARD_MESSAGE_IDS` and `GET_BOARD_MESSAGES` are still deduplicated rather than
+  kicked. The spec calls them a protocol violation.
+- `--msgboard.enabled`, off by default, still does not exist.
+
+
+---
+
+## 19. Round-11: reject the scalar, do not reduce it
+
+### 19.1 The bug
+
+`pow_scalar` reduced `nonce × difficulty_digest + block_hash` modulo the
+secp256k1 group order. The reference does not reduce. It hands the raw sum to
+`ScalarBaseMult` (`msgboard/pow_message.go:174-192`), and the binding refuses
+anything out of range rather than wrapping it:
+
+```text
+secp256k1_scalar_set_b32(&s, scalar, &overflow);
+if (overflow || secp256k1_scalar_is_zero(&s)) { ret = 0; }
+```
+
+(`ledgerwatch/secp256k1@v1.0.0/ext.h:115-117`; a sum needing more than 32 bytes
+hits the `len(scalar) > 32` panic at `scalar_mult_cgo.go:26`.)
+
+Reducing computes a challenge — and therefore a `PoW` hash, and therefore a
+verdict — for a message the reference refuses outright. The new spec states the
+rule explicitly for its own construction: *"Reject rather than reduce: must match
+Go's secp256k1 ScalarBaseMult behavior."* The rule is the same for the current
+one.
+
+### 19.2 Reachability
+
+Three inputs are refused, and an attacker can craft none of them:
+
+| case | probability | why it is out of reach |
+|---|---|---|
+| the 256-bit add carries | ≈ 2⁻⁶⁴ | needs a `block_hash` whose top 64 bits are all ones |
+| the sum lands in `[n, 2²⁵⁶)` | ≈ 2⁻¹²⁷ | a window about 2¹²⁹ wide |
+| the sum is zero | ≈ 2⁻²⁵⁶ | — |
+
+`nonce`, `work_multiplier` and `work_divisor` are attacker-chosen, but the
+`product` they control is under 2¹⁹²; only `block_hash` can push the sum past the
+boundary, and that has to name a real block. This is a conformance fix, not a
+live exploit — but a client split is a client split, and the cost of being right
+is one comparison.
+
+### 19.3 What changed
+
+`pow_scalar` returns the sum unreduced, or `None` outside `[1, n)`. The refusal
+now propagates instead of being papered over: `challenge` and `calculate_hash`
+return `Option`, and `to_checked` answers `InvalidWork`. Previously `challenge`
+returned all-zeros on failure, which was then hashed and difficulty-checked like
+any other value — so an unrepresentable scalar was rejected *probabilistically*
+rather than definitely.
+
+### 19.4 Tests
+
+The property test that pinned the old contract now pins the new one: half its
+2,000 iterations force the carry regime, and every case is checked against
+full-precision `U512` arithmetic for both the value and the accept/refuse
+verdict. The two cases the property test cannot reach — a sum in `[n, 2²⁵⁶)` at
+2⁻¹²⁷, and a zero sum — are constructed by hand in
+`test_pow_scalar_refuses_every_out_of_range_scalar`, together with `n-1` as the
+largest scalar that must still pass through unreduced.
+
+`test_live_board_message_still_verifies` pins a message taken off the live
+testnet board on 2026-08-19. Every other vector in the file is mined by this
+crate, so all of them would still agree with themselves if the construction
+drifted; that one was mined by the arcade's own client and accepted by the
+running fleet, which makes it the only case here that can catch reth drifting
+away from the network.
+
+Negative control: restoring the reduction fails exactly two tests.
+
+### 19.5 A client-side mismatch found in the same pass — not fixed here
+
+`@pulsechain/msgboard` (`packages/core/src/utils.ts:61`) encodes the challenge as
+`Uint8Array.from(challenge.getX().toArray())`. `bn.js`'s `toArray()` with no
+length returns the **minimal** representation, so an x-coordinate below 2²⁴⁸ —
+one attempt in 256 — yields 31 bytes. Reth (`pow.rs`) and the repo's own Rust
+grinder (`packages/pow-grinder/src/lib.rs:85`) both always use 32.
+
+So the TypeScript SDK hashes 31 bytes where the node hashes 32, computes a
+different work hash, and has the message rejected. It presents as an occasional
+unexplained rejection rather than a failure. The fix is `toArray('be', 32)`, in
+the msgboard repo rather than this one.

@@ -181,6 +181,7 @@ fn every_metric_is_instantiated_and_moves() {
             "msgboard.rejected_invalid_pow",
             "msgboard.rejected_other",
             "msgboard.rejected_oversized",
+            "msgboard.rejected_oversized_frame",
             "msgboard.requests_received",
             "msgboard.requests_sent",
             "msgboard.requests_suppressed",
@@ -320,4 +321,25 @@ fn every_metric_is_instantiated_and_moves() {
 
     board.release_pending(&[id]);
     assert_eq!(board.filter_wanted(&[id]).len(), 1, "a released id is wanted again");
+
+    // ── phase 7: the oversized-frame rejection is observable ─────────────────
+    //
+    // An inbound frame over `MAX_INBOUND_FRAME_SIZE` is dropped before it is
+    // decoded, so nothing else records it — this counter is the only signal
+    // that a peer is sending them. `handle_incoming` is private to the crate,
+    // so the wire behaviour is asserted in `protocol.rs`
+    // (`a_frame_one_byte_over_the_limit_is_rejected_and_reported`). What is
+    // left is the §3.1 property: the handle that path increments is registered,
+    // and its value reaches the recorder.
+    assert_eq!(
+        Snap::take(&snapshotter).counter("msgboard.rejected_oversized_frame"),
+        0,
+        "no oversized frame has been seen yet",
+    );
+    board.metrics().rejected_oversized_frame.increment(1);
+    assert_eq!(
+        Snap::take(&snapshotter).counter("msgboard.rejected_oversized_frame"),
+        1,
+        "an oversized inbound frame must be countable, not only loggable",
+    );
 }
