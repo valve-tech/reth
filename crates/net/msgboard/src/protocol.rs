@@ -55,6 +55,31 @@ const P2P_MSG_PACKET_LIMIT: usize = 100 * 1024;
 /// none can request, more than one frame's worth at a time.
 const MAX_IDS_PER_FRAME: usize = P2P_MSG_PACKET_LIMIT / MSG_ID_SIZE;
 
+/// Bytes a frame carries on top of the payload the packers measure: the opcode
+/// byte, plus an RLP list header that is at most four bytes at this size.
+///
+/// Eight is the figure `get_board_messages_chunks_large_responses` already
+/// asserts our own frames stay within, so the two bounds agree by construction.
+const FRAME_OVERHEAD_ALLOWANCE: usize = 8;
+
+/// Largest inbound frame we accept, opcode byte included. Anything larger is
+/// dropped undecoded and the peer is reported — see [`handle_incoming`].
+///
+/// The spec caps a `msg/1` packet at [`P2P_MSG_PACKET_LIMIT`], but that limit
+/// measures the payload, not the bytes on the wire. Our `BOARD_MESSAGES` packer
+/// flushes only once the *next* message would cross it, and the frame it then
+/// emits adds the RLP list header and the opcode on top. So reth legitimately
+/// sends frames a few bytes past 102_400, and a bare 102_400 inbound bound
+/// would have two reth nodes ban each other over their own largest legal
+/// frames.
+///
+/// The alternative — reserve the header in the packer so our frames fit 102_400
+/// exactly — reads cleaner against a strict peer, but it changes the frames we
+/// put on the wire to buy nothing: erigon-pulse applies no inbound size check at
+/// all, so no peer in the network is strict today. The allowance is 8 bytes on a
+/// 100 KiB bound, which does not weaken it.
+const MAX_INBOUND_FRAME_SIZE: usize = P2P_MSG_PACKET_LIMIT + FRAME_OVERHEAD_ALLOWANCE;
+
 /// Frames that may sit in a peer's outbound queue before the connection task
 /// stops producing and waits for the multiplexer to drain it.
 ///
@@ -446,6 +471,9 @@ fn reporter_as_deref(opt: Option<&Arc<dyn PeerReporter>>) -> Option<&dyn PeerRep
 
 /// Handle a single incoming raw frame from a peer.
 ///
+/// A frame over [`MAX_INBOUND_FRAME_SIZE`] is dropped undecoded and the sender
+/// is reported, whatever its opcode.
+///
 /// While the board is not ready (initial sync still in progress) all opcodes
 /// short-circuit — mirroring erigon-pulse `handleInboundMessage`'s `Started()`
 /// guard. Same behaviour when `cfg.gossip_disabled` is set: a read-only
@@ -466,6 +494,32 @@ async fn handle_incoming(
     peer_id: PeerId,
 ) -> Sent {
     if raw.is_empty() {
+        return Sent::Ok;
+    }
+
+    // Before the opcode is even read, so it covers every opcode and costs no
+    // allocation. Order matters: `MsgID::decode_list` sizes its `Vec` from the
+    // payload, so a 16 MiB frame becomes ~138_000 decoded IDs if this runs
+    // after it. 16 MiB is not hypothetical — eth-wire's `MAX_PAYLOAD_SIZE` is
+    // the only other inbound cap, and it is 160x the msg/1 limit.
+    if raw.len() > MAX_INBOUND_FRAME_SIZE {
+        tracing::debug!(
+            target: "msgboard",
+            ?peer_id,
+            bytes = raw.len(),
+            limit = MAX_INBOUND_FRAME_SIZE,
+            "oversized msgboard frame",
+        );
+        board.metrics().rejected_oversized_frame.increment(1);
+        if let Some(r) = reporter {
+            // The spec says disconnect. A satellite protocol has no disconnect
+            // lever short of ending the stream, which tears down the whole
+            // `RLPx` session including eth — `docs/msgboard-parity-gaps.md`
+            // §15.5 records why we don't. `report_bad_protocol` is the closest
+            // equivalent we have: `BadProtocol` weighs `i32::MIN`, so the peer
+            // is banned on the first offence.
+            r.report_bad_protocol(peer_id);
+        }
         return Sent::Ok;
     }
 
@@ -511,6 +565,12 @@ async fn handle_incoming(
             // exchange is unchanged against either client. It also makes this
             // the last outbound frame whose size the peer controls — see
             // `docs/msgboard-parity-gaps.md` §15.3.
+            //
+            // `MAX_INBOUND_FRAME_SIZE` now caps an announcement at
+            // `MAX_IDS_PER_FRAME` IDs, so `wanted` never spans two chunks and
+            // this loop runs once. It stays as the inner guard: the bound and
+            // the chunk size are separate constants, and only this keeps them
+            // from drifting apart silently.
             for (i, chunk) in wanted.chunks(MAX_IDS_PER_FRAME).enumerate() {
                 let mut buf = BytesMut::with_capacity(1 + chunk.len() * MSG_ID_SIZE);
                 buf.put_u8(GET_BOARD_MESSAGES);
@@ -565,6 +625,12 @@ async fn handle_incoming(
             // reaches either limit. A peer that does is either malfunctioning or
             // probing, and gets a truncated response rather than a penalty,
             // since neither client documents a bound it could have respected.
+            //
+            // The spec now documents one, and `MAX_INBOUND_FRAME_SIZE` enforces
+            // it before this arm runs: a request naming more than
+            // `MAX_IDS_PER_FRAME` distinct IDs is a frame over the packet
+            // limit, so the cap below is no longer reachable from the wire and
+            // the dedup is what still fires. Both stay — see §18.
             let mut seen = HashSet::with_capacity(ids.len().min(MAX_IDS_PER_FRAME));
             let mut requested = Vec::with_capacity(ids.len().min(MAX_IDS_PER_FRAME));
             for id in &ids {
@@ -900,17 +966,21 @@ mod tests {
         );
     }
 
-    /// A request larger than one frame's worth of IDs is truncated to
-    /// `MAX_IDS_PER_FRAME`, bounding the work a single frame can provoke.
+    /// A request for more than one frame's worth of distinct IDs is rejected,
+    /// not truncated.
     ///
-    /// No conforming peer reaches this: requests are built from one inbound
-    /// announcement, both clients announce in `MAX_IDS_PER_FRAME` chunks, and
-    /// `filter_wanted` returns a subset of that.
+    /// §14.3 capped the responder at `MAX_IDS_PER_FRAME` and deliberately did
+    /// not penalise, because no client documented a bound the sender could have
+    /// respected. The spec now documents one, and `MAX_INBOUND_FRAME_SIZE`
+    /// enforces it: 847 IDs is a 102,488-byte frame, so the request never
+    /// reaches the cap. The board is seeded past the cap so the old truncating
+    /// path would visibly serve 846 messages here.
     #[tokio::test]
-    async fn get_board_messages_caps_distinct_ids_at_one_frame() {
+    async fn get_board_messages_over_one_frame_of_ids_is_rejected_not_truncated() {
         let board = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
 
-        // Seed more distinct messages than the cap allows.
+        // Seed more distinct messages than one frame can name.
         let over = MAX_IDS_PER_FRAME + 50;
         let ids: Vec<MsgID> = (0..over)
             .map(|i| {
@@ -921,14 +991,15 @@ mod tests {
         assert_eq!(ids.len(), over);
 
         let payload: Vec<u8> = ids.iter().flat_map(|i| i.as_bytes().to_vec()).collect();
-        let (tx, mut rx) = channel();
-        handle_incoming(&board, None, &tx, frame(GET_BOARD_MESSAGES, &payload), peer()).await;
+        let raw = frame(GET_BOARD_MESSAGES, &payload);
+        assert!(raw.len() > MAX_INBOUND_FRAME_SIZE, "the request must be over the packet limit");
 
-        let served: usize = drain(&mut rx)
-            .iter()
-            .map(|f| decode_pow_msg_list(&f[1..]).expect("valid response").len())
-            .sum();
-        assert_eq!(served, MAX_IDS_PER_FRAME, "served exactly one frame's worth of IDs");
+        let (tx, mut rx) = channel();
+        handle_incoming(&board, Some(rep.as_ref()), &tx, raw, peer()).await;
+
+        assert!(drain(&mut rx).is_empty(), "nothing may be served from an oversized request");
+        assert_eq!(rep.bad_protocol(), 1, "the spec disconnects the sender");
+        assert_eq!(rep.bad_message(), 0);
     }
 
     /// The cap and dedup must not touch an ordinary exchange: a peer asking for
@@ -1225,6 +1296,134 @@ mod tests {
         handle_incoming(&board, None, &tx, frame(BOARD_MESSAGE_IDS, &[0u8; 5]), peer()).await;
         handle_incoming(&board, None, &tx, frame(GET_BOARD_MESSAGES, &[0u8; 5]), peer()).await;
         handle_incoming(&board, None, &tx, frame(BOARD_MESSAGES, &[0xFF, 0xFF]), peer()).await;
+    }
+
+    // ── inbound frame size ───────────────────────────────────────────────────
+    //
+    // The spec caps a msg/1 packet at 100 KiB and disconnects a peer that sends
+    // a larger one. Msgboard checked nothing: the only inbound cap was
+    // eth-wire's 16 MiB `MAX_PAYLOAD_SIZE`, 160x the limit, and a 16 MiB frame
+    // decodes to ~138_000 MsgIDs before anything else rejects it.
+
+    /// A config whose difficulty threshold is 1 for a ~100 KiB body, so a
+    /// message that size clears the `PoW` on the first nonce. `size_limit` is
+    /// raised to match: these tests are about the frame bound, not the body
+    /// bound.
+    fn frame_size_cfg() -> MsgboardConfig {
+        MsgboardConfig {
+            work_multiplier: 1,
+            work_divisor: 1_000_000_000,
+            size_limit: 256 * 1024,
+            ..easy_cfg()
+        }
+    }
+
+    /// Build a valid `BoardMessages` frame of exactly `target` bytes.
+    ///
+    /// The body length is solved for rather than guessed: one data byte moves
+    /// the encoded frame by one byte in this range, so the correction lands in
+    /// a couple of rounds.
+    fn board_messages_frame_of(target: usize) -> BytesMut {
+        let build = |len: usize| PoWMsg {
+            work_divisor: 1_000_000_000,
+            data: Bytes::from(vec![0x5A; len]),
+            ..pow_msg(1, &[])
+        };
+        let mut data_len = target - 200;
+        for _ in 0..8 {
+            let msg = build(data_len);
+            let encoded = encode_pow_msg_list(std::slice::from_ref(&msg));
+            let frame_len = 1 + encoded.len();
+            if frame_len == target {
+                assert!(
+                    msg.to_checked(10, 0).is_ok(),
+                    "the first nonce must clear a difficulty of 1",
+                );
+                return frame(BOARD_MESSAGES, &encoded);
+            }
+            data_len = (data_len as isize + target as isize - frame_len as isize) as usize;
+        }
+        panic!("no body length gives a {target}-byte frame");
+    }
+
+    /// The bound has to admit our own largest legal frame.
+    ///
+    /// The `BoardMessages` packer flushes before the *next* message would cross
+    /// `P2P_MSG_PACKET_LIMIT`, then adds the RLP list header and the opcode on
+    /// top — `get_board_messages_chunks_large_responses` pins that slack at 8
+    /// bytes. Enforcing a bare `P2P_MSG_PACKET_LIMIT` inbound would have two
+    /// reth nodes ban each other over frames they both emit by design.
+    #[test]
+    fn the_inbound_bound_admits_our_own_largest_frame() {
+        assert!(
+            MAX_INBOUND_FRAME_SIZE >= P2P_MSG_PACKET_LIMIT + 8,
+            "an inbound bound below our own outbound framing bans conforming reth peers",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_at_the_inbound_limit_is_accepted() {
+        let board = board_with_cfg(frame_size_cfg(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, mut rx) = channel();
+
+        let raw = board_messages_frame_of(MAX_INBOUND_FRAME_SIZE);
+        assert_eq!(raw.len(), MAX_INBOUND_FRAME_SIZE);
+        handle_incoming(&board, Some(rep.as_ref()), &tx, raw, peer()).await;
+
+        assert_eq!(board.all_message_ids().len(), 1, "a frame at the limit is handled normally");
+        assert!(drain(&mut rx).is_empty(), "BoardMessages draws no reply");
+        assert_eq!(rep.bad_protocol(), 0, "the limit is inclusive");
+        assert_eq!(rep.bad_message(), 0);
+    }
+
+    /// One byte over, and otherwise perfectly valid: without the size check the
+    /// board accepts the message, so this pins the bound rather than the
+    /// payload.
+    #[tokio::test]
+    async fn a_frame_one_byte_over_the_limit_is_rejected_and_reported() {
+        let board = board_with_cfg(frame_size_cfg(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, mut rx) = channel();
+
+        let raw = board_messages_frame_of(MAX_INBOUND_FRAME_SIZE + 1);
+        handle_incoming(&board, Some(rep.as_ref()), &tx, raw, peer()).await;
+
+        assert!(board.all_message_ids().is_empty(), "the payload must never be decoded");
+        assert!(drain(&mut rx).is_empty(), "an oversized frame draws no response");
+        assert_eq!(rep.bad_protocol(), 1, "the sender must be reported");
+        assert_eq!(rep.bad_message(), 0, "the frame is a protocol violation, not a bad message");
+    }
+
+    /// Size is judged before the payload is read, so well-formedness cannot
+    /// change the verdict.
+    ///
+    /// Two oversized frames: one whose ID list decodes and would otherwise draw
+    /// a response, one whose length is not a whole number of IDs and would
+    /// otherwise fail to decode. Both must take the same path.
+    #[tokio::test]
+    async fn oversize_is_decided_before_the_payload_is_decoded() {
+        let ids_over = MAX_INBOUND_FRAME_SIZE / MSG_ID_SIZE + 1;
+
+        for garbage in [false, true] {
+            let board = board_at(10);
+            let id = board.add_local_msg(mined(&[1], 10)).unwrap().msg_id();
+            let mut payload: Vec<u8> =
+                std::iter::repeat_n(id, ids_over).flat_map(|i| i.as_bytes().to_vec()).collect();
+            if garbage {
+                payload.push(0xFF);
+            }
+            let raw = frame(GET_BOARD_MESSAGES, &payload);
+            assert!(raw.len() > MAX_INBOUND_FRAME_SIZE, "the frame must be oversized");
+
+            let rep = Arc::new(RecordingReporter::default());
+            let (tx, mut rx) = channel();
+            handle_incoming(&board, Some(rep.as_ref()), &tx, raw, peer()).await;
+
+            assert!(drain(&mut rx).is_empty(), "garbage={garbage}: nothing may be served");
+            assert_eq!(rep.bad_protocol(), 1, "garbage={garbage}");
+            assert_eq!(rep.bad_message(), 0, "garbage={garbage}");
+        }
     }
 
     // ── BoardMessageIDs (inbound announcements) ──────────────────────────────
@@ -1901,53 +2100,41 @@ mod tests {
             .collect()
     }
 
-    /// A peer may announce more IDs in one frame than we will serve in one
-    /// response: `filter_wanted` returns a subset of an arbitrarily large
-    /// announcement, and the request built from it was emitted unchunked.
+    /// The largest announcement a peer may legally send is one frame's worth of
+    /// IDs, and the request we build from it must itself be a legal frame.
     ///
-    /// That frame is the last outbound frame whose size is set by the peer
-    /// rather than by us, and — since §14.3 — it is also lossy: a reth
-    /// responder honours at most `MAX_IDS_PER_FRAME` distinct IDs per request
-    /// and silently drops the rest.
+    /// §15.3 added the chunk loop because a peer could announce more than
+    /// `MAX_IDS_PER_FRAME` in a single frame, and a reth responder then
+    /// truncated the request and lost the overflow. `MAX_INBOUND_FRAME_SIZE`
+    /// now rejects that announcement before it is decoded — 847 IDs is 102,488
+    /// bytes — so the loop can no longer emit a second chunk. It stays as the
+    /// inner guard; what the wire can still reach is this case.
     #[tokio::test]
-    async fn requests_are_chunked_at_one_frame_of_ids() {
+    async fn a_full_frame_of_announced_ids_is_requested_in_one_legal_frame() {
         let board = board_at(10);
-        let over = MAX_IDS_PER_FRAME + 54;
-        let announced = wantable_ids(over);
+        let announced = wantable_ids(MAX_IDS_PER_FRAME);
+        let raw = frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&announced));
+        assert!(raw.len() <= MAX_INBOUND_FRAME_SIZE, "one frame's worth must be admissible");
 
         let wanted = board.filter_wanted(&announced);
-        assert_eq!(wanted.len(), over, "all must be wanted");
+        assert_eq!(wanted.len(), MAX_IDS_PER_FRAME, "all must be wanted");
         // `filter_wanted` claims every ID it returns, so this precondition
         // check would otherwise suppress the request the handler makes below.
         // Hand the claims back to leave the board as a first-time peer finds it.
         board.release_pending(&wanted);
 
         let (tx, mut rx) = channel();
-        handle_incoming(
-            &board,
-            None,
-            &tx,
-            frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&announced)),
-            peer(),
-        )
-        .await;
+        handle_incoming(&board, None, &tx, raw, peer()).await;
 
         let frames = drain(&mut rx);
-        assert_eq!(frames.len(), 2, "{over} wanted IDs must request as 846 + 54");
-
-        let mut requested = Vec::new();
-        for f in &frames {
-            assert_eq!(f[0], GET_BOARD_MESSAGES);
-            let ids = MsgID::decode_list(&f[1..]).expect("valid id list");
-            assert!(
-                ids.len() <= MAX_IDS_PER_FRAME,
-                "request frame carried {} IDs, over the {MAX_IDS_PER_FRAME} cap a responder honours",
-                ids.len(),
-            );
-            assert!(f.len() <= P2P_MSG_PACKET_LIMIT, "request frame exceeded the packet limit");
-            requested.extend(ids);
-        }
-        assert_eq!(requested, announced, "chunking must not drop or reorder any wanted ID");
+        assert_eq!(frames.len(), 1, "a legal announcement never needs a second request frame");
+        assert_eq!(frames[0][0], GET_BOARD_MESSAGES);
+        assert!(
+            frames[0].len() <= MAX_INBOUND_FRAME_SIZE,
+            "a legal announcement must not provoke a request a strict peer would ban",
+        );
+        let requested = MsgID::decode_list(&frames[0][1..]).expect("valid id list");
+        assert_eq!(requested, announced, "no wanted ID may be dropped or reordered");
     }
 
     /// Gossip means every peer announces every message. Only the first
@@ -2011,12 +2198,16 @@ mod tests {
         assert_eq!(MsgID::decode_list(&frames[0][1..]).expect("valid id list"), announced,);
     }
 
-    /// The reason chunking is a correctness fix and not just a size bound: an
-    /// over-sized request is *served* truncated, so an unchunked request loses
-    /// the overflow permanently. End-to-end against a real responder — the
-    /// §14.3 cap and the request path have to agree on the same frame size.
+    /// A board too large to announce in one frame still transfers in full.
+    ///
+    /// This case used to be driven by a single over-cap announcement frame,
+    /// because §12.9 held that a peer is not obliged to chunk. Since
+    /// `MAX_INBOUND_FRAME_SIZE` such a frame is rejected, so the exchange runs
+    /// the way the spec assumes every implementation runs it: chunked
+    /// announcements, one request per announcement, nothing lost across the
+    /// seam.
     #[tokio::test]
-    async fn every_announced_message_transfers_when_one_frame_announces_more_than_the_cap() {
+    async fn every_message_transfers_when_the_board_spans_several_announcement_frames() {
         let mut a = Node::at(10);
         let mut b = Node::at(10);
 
@@ -2034,32 +2225,22 @@ mod tests {
         }
         assert_eq!(a.board.status().2, total as u64);
 
-        // One announcement frame carrying every ID — more than `send_board_message_ids`
-        // would chunk into, which is exactly what a non-chunking peer may send.
-        let ids = a.board.all_message_ids();
-        handle_incoming(
-            &b.board,
-            Some(b.rep.as_ref()),
-            &b.tx,
-            frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&ids)),
-            peer(),
-        )
-        .await;
-
+        send_board_message_ids(&a.board, &a.tx, peer()).await;
+        assert_eq!(deliver(&mut a, &b).await.len(), 2, "A must announce in two frames");
         assert_eq!(deliver(&mut b, &a).await.len(), 2, "B must ask in two frames");
         deliver(&mut a, &b).await;
 
         assert_eq!(b.board.status().2, total as u64, "every announced message must transfer");
         assert_eq!(b.hashes(), a.hashes());
+        assert_eq!(b.rep.bad_protocol(), 0, "a chunked exchange costs no reputation");
+        assert_eq!(a.rep.bad_protocol(), 0);
     }
 
-    /// Announcements chunk at 846 IDs, and so now does the `GetBoardMessages`
+    /// Announcements chunk at 846 IDs, and so does the `GetBoardMessages`
     /// request built in response — see
-    /// `requests_are_chunked_at_one_frame_of_ids`. This test keeps the weaker
-    /// end-to-end property pinned: a request provoked by our *own* chunked
-    /// announcements stays inside the packet limit.
-    ///
-    /// See §12.9 — a peer is not obliged to chunk its announcements.
+    /// `a_full_frame_of_announced_ids_is_requested_in_one_legal_frame`. This
+    /// test keeps the weaker end-to-end property pinned: a request provoked by
+    /// our own chunked announcements stays inside the packet limit.
     #[tokio::test]
     async fn requests_provoked_by_our_own_announcements_stay_within_the_packet_limit() {
         let mut a = Node::at(10);

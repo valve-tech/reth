@@ -84,6 +84,14 @@ pub struct MsgboardMetrics {
     // ── protocol ─────────────────────────────────────────────────────────────
     /// Wire-malformed payloads (unparseable RLP, bad `MsgID` list length).
     pub bad_protocol: Counter,
+    /// Inbound frames dropped for exceeding `MAX_INBOUND_FRAME_SIZE`.
+    ///
+    /// The frame is discarded before it is decoded, so nothing else records it.
+    /// A conforming peer chunks at the packet limit and never reaches this, so
+    /// a non-zero value names a peer that is malfunctioning or probing. Watch it
+    /// after deploy: the only inbound cap before this counter existed was
+    /// eth-wire's 16 MiB `MAX_PAYLOAD_SIZE`, 160x the msg/1 limit.
+    pub rejected_oversized_frame: Counter,
     /// Payloads that parsed but carried messages failing validation.
     pub bad_message: Counter,
     /// Inbound `GetBoardMessages` frames whose ID list was deduplicated or
