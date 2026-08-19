@@ -1587,7 +1587,8 @@ divergences — but in this order, and not before the first step:
 
 1. **Get the reference.** The upstream Go (`pow_message.go` + the golden vector
    in `pow_message_test.go`), or the TypeScript at
-   `gitlab.com/pulsechaincom/msgboard`. Re-fetch the erigon-pulse remote first;
+   `gitlab.com/pulsechaincom/msgboard` — that repo exists and the team can reach
+   it; it is simply not readable from this environment. Re-fetch the erigon-pulse remote first;
    our checkout is 2.5 months stale and the algorithm may have landed since.
    Until this exists, write no PoW code.
 2. **Ask upstream the version question** in §17.4, and when mainnet switches.
@@ -1783,13 +1784,40 @@ Negative control: restoring the reduction fails exactly two tests.
 
 ### 19.5 A client-side mismatch found in the same pass — not fixed here
 
-`@pulsechain/msgboard` (`packages/core/src/utils.ts:61`) encodes the challenge as
-`Uint8Array.from(challenge.getX().toArray())`. `bn.js`'s `toArray()` with no
-length returns the **minimal** representation, so an x-coordinate below 2²⁴⁸ —
-one attempt in 256 — yields 31 bytes. Reth (`pow.rs`) and the repo's own Rust
-grinder (`packages/pow-grinder/src/lib.rs:85`) both always use 32.
+`bn.js`'s `toArray()` with no length argument returns the **minimal** byte
+representation, so an x-coordinate below 2²⁴⁸ — one attempt in 256 — encodes to
+31 bytes. The msgboard repo calls it that way in two places:
 
-So the TypeScript SDK hashes 31 bytes where the node hashes 32, computes a
-different work hash, and has the message rejected. It presents as an occasional
-unexplained rejection rather than a failure. The fix is `toArray('be', 32)`, in
-the msgboard repo rather than this one.
+| site | what it is |
+|---|---|
+| `packages/core/src/utils.ts:61` | `getChallenge`, used by `checkWork` — the TypeScript **verifier** |
+| `packages/core/src/utils.ts:115` | `createChallengeSearch`, the pure-JS incremental **grinder** |
+
+Reth (`pow.rs`) and the repo's own Rust grinder
+(`packages/pow-grinder/src/lib.rs:85`) both always use 32 bytes.
+
+Three details make this worse than a single wrong constant:
+
+- **The primary path is fine.** `doPoW` (`packages/sdk/src/index.ts:190`) tries
+  the native/WASM Rust grinder first, which encodes 32 bytes. The bug bites only
+  on the JS fallback it takes when that engine fails to load — and the fallback
+  carries a comment claiming it stays *"bit-identical to checkWork (the node's
+  verifier)"*. It is bit-identical to `checkWork`, because `checkWork` shares the
+  same bug; neither matches the node.
+- **Nothing local catches it.** The SDK's own verifier agrees with the SDK's own
+  grinder, so a message mined on the fallback path verifies clean in TypeScript
+  and is then rejected by the node. It presents as an unexplained submit failure.
+- **The parity test cannot see it.** `packages/sdk/src/grinder.test.ts` is exactly
+  the right shape — it asserts a Rust-grinder stamp passes TS `checkWork` — but it
+  mines one stamp for one fixed input. The two encodings differ only when the
+  x-coordinate has a leading zero byte, so the test is a coin flip that lands
+  right 255 times in 256 rather than a boundary check. A fix needs a test that
+  drives the leading-zero case deliberately, or asserts the encoded length
+  directly.
+
+No migration is implied: a message mined with a 31-byte challenge was always
+rejected, so none of them reached the board. Fixing makes strictly more messages
+valid.
+
+The fix is `toArray('be', 32)` at both sites, in the msgboard repo rather than
+this one.
