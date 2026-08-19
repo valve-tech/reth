@@ -12,9 +12,20 @@ file:line citation you can check.
 | Our implementation | reth fork, `msg/1`, running on PulseChain testnet v4 |
 | Spec | "PoW Message Board (Experimental, Opt-in)", § *msg/1 wire limits* |
 
-**Not in dispute:** PoW v2 matches. We reject a nonce unless `1 <= scalar < n`
-rather than reducing, per step 5, and we match `TestPoWGoldenVector`
-byte-for-byte. The duplicate-hash rule is unambiguous and we implement it.
+**Not in dispute:** step 5's *reject rather than reduce* rule. We apply it to
+the construction we run today: `pow_scalar` refuses a nonce unless
+`1 <= scalar < n` instead of reducing.
+
+> **Corrections before this goes upstream** — see
+> `docs/msgboard-parity-gaps.md` §20.
+>
+> - We do **not** implement the new PoW, and we cannot check `TestPoWGoldenVector`: that test does
+>   not exist in any ref of the reference checkout (§17.4).
+> - We do **not** implement the duplicate-hash kick, and should not. Erigon forwards
+>   `FilterMessageIDs` output into `GET_BOARD_MESSAGES` without deduplicating, so a conforming node
+>   bans erigon for a duplicate erigon did not originate (§20.5).
+> - Item 2 below overstates erigon's frame size. `MaxSizeMsgChunks` keeps only one message per
+>   group, so erigon emits about 8.3 KiB, not 102,404 B, and drops the rest (§20.6).
 
 ---
 

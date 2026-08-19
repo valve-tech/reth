@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_rlp::Encodable;
+use alloy_rlp::{length_of_length, Encodable};
 use bytes::BufMut;
 use futures::StreamExt;
 use reth_eth_wire::{
@@ -78,7 +78,60 @@ const FRAME_OVERHEAD_ALLOWANCE: usize = 8;
 /// put on the wire to buy nothing: erigon-pulse applies no inbound size check at
 /// all, so no peer in the network is strict today. The allowance is 8 bytes on a
 /// 100 KiB bound, which does not weaken it.
-const MAX_INBOUND_FRAME_SIZE: usize = P2P_MSG_PACKET_LIMIT + FRAME_OVERHEAD_ALLOWANCE;
+pub(crate) const MAX_INBOUND_FRAME_SIZE: usize = P2P_MSG_PACKET_LIMIT + FRAME_OVERHEAD_ALLOWANCE;
+
+/// Widest RLP encoding of a [`PoWMsg`](reth_msgboard_types::PoWMsg)'s
+/// fixed-width fields, `data` excluded.
+///
+/// `version` is one byte — `VERSION_V1` is 1, which RLP encodes as itself.
+/// `block_hash` and `category` are 32-byte strings, 33 bytes each. `nonce`,
+/// `work_multiplier` and `work_divisor` are `u64`s, 9 bytes each once the top
+/// byte is set. Taking every integer at its widest makes the derived ceiling
+/// hold for any message an operator's limit admits, not just a typical one.
+const MSG_FIXED_FIELDS_RLP_LEN: usize = 1 + 33 + 9 + 9 + 9 + 33;
+
+/// Bytes on the wire for a `BoardMessages` frame carrying exactly one message
+/// whose `data` field is `data_len` long: the opcode, the outer list header,
+/// the message's own list header, and the payload.
+///
+/// One message per frame is the case that matters. The packer flushes only
+/// once the *next* message would cross [`P2P_MSG_PACKET_LIMIT`], so a message
+/// larger than that target is never packed with anything else — it gets a
+/// frame to itself, and that frame is as large as the message.
+const fn lone_message_frame_len(data_len: usize) -> usize {
+    let data_rlp = length_of_length(data_len) + data_len;
+    let msg_payload = MSG_FIXED_FIELDS_RLP_LEN + data_rlp;
+    let msg_rlp = length_of_length(msg_payload) + msg_payload;
+    1 + length_of_length(msg_rlp) + msg_rlp
+}
+
+/// Largest `--msgboard.size-limit` that cannot make us emit a frame our own
+/// inbound bound rejects.
+///
+/// `size_limit` bounds the `data` field of every message we accept, and any
+/// message we accept we may later have to serve. Raise it past this figure and
+/// one `GetBoardMessages` for a single large message produces a frame over
+/// [`MAX_INBOUND_FRAME_SIZE`], which every reth peer drops undecoded while
+/// reporting us for a protocol violation — `BadProtocol` weighs `i32::MIN`, so
+/// that is a 12-hour ban from each of them. Erigon-pulse would neither request
+/// the message (`FilterMessageIDs` skips `id.Size() > cfg.MsgSizeLimit`,
+/// `msgboard/board.go:233`) nor object to the frame (its own inbound cap is
+/// `ProtocolMaxMsgSize` = 10 MiB), so the split is reth-against-reth and
+/// entirely self-inflicted. `msgboard.size-limit` is guarded at parse time in
+/// [`MsgboardArgs`](crate::MsgboardArgs) so it cannot be reached.
+///
+/// Solved rather than written down: the RLP header widths depend on the very
+/// length being solved for, and the answer moves the moment either
+/// [`P2P_MSG_PACKET_LIMIT`] or [`FRAME_OVERHEAD_ALLOWANCE`] does.
+/// `the_size_limit_ceiling_is_the_largest_body_that_fits_one_frame` checks the
+/// arithmetic against a real encoded message.
+pub(crate) const MAX_SAFE_SIZE_LIMIT: usize = {
+    let mut data_len = MAX_INBOUND_FRAME_SIZE;
+    while lone_message_frame_len(data_len) > MAX_INBOUND_FRAME_SIZE {
+        data_len -= 1;
+    }
+    data_len
+};
 
 /// Frames that may sit in a peer's outbound queue before the connection task
 /// stops producing and waits for the multiplexer to drain it.
@@ -1346,18 +1399,172 @@ mod tests {
         panic!("no body length gives a {target}-byte frame");
     }
 
+    /// A config that admits ~40 KiB bodies and keeps their difficulty in the
+    /// tens, so the packing tests spend their time on framing rather than on
+    /// mining. The ratio equals the board's own minimum, so nothing is
+    /// rejected as under-priced.
+    fn packing_cfg() -> MsgboardConfig {
+        MsgboardConfig {
+            work_multiplier: 100,
+            work_divisor: 1_000_000_000,
+            size_limit: 64 * 1024,
+            ..easy_cfg()
+        }
+    }
+
+    /// Mine a message under [`packing_cfg`] whose RLP length is exactly
+    /// `target` bytes.
+    ///
+    /// Solved rather than guessed: one data byte moves the encoded length by
+    /// one byte in this range, so the correction lands in a couple of rounds.
+    /// `fill` keeps sibling messages distinct, so the board does not collapse
+    /// two of them into one entry.
+    fn mined_with_rlp_len(target: usize, fill: u8, block: u64) -> PoWMsg {
+        let build = |data_len: usize, nonce: u64| PoWMsg {
+            version: VERSION_V1,
+            block_hash: block_hash_one(),
+            nonce,
+            work_multiplier: packing_cfg().work_multiplier,
+            work_divisor: packing_cfg().work_divisor,
+            category: category_hash(),
+            data: Bytes::from(vec![fill; data_len]),
+        };
+        let mut data_len = target - 110;
+        for _ in 0..8 {
+            let msg = (1u64..=1_000_000)
+                .find_map(|n| {
+                    let m = build(data_len, n);
+                    m.clone().to_checked(block, 0).is_ok().then_some(m)
+                })
+                .expect("no nonce clears the difficulty within 1M tries");
+            let len = msg.length();
+            if len == target {
+                return msg;
+            }
+            data_len = (data_len as isize + target as isize - len as isize) as usize;
+        }
+        panic!("no body length gives a {target}-byte message");
+    }
+
     /// The bound has to admit our own largest legal frame.
     ///
-    /// The `BoardMessages` packer flushes before the *next* message would cross
-    /// `P2P_MSG_PACKET_LIMIT`, then adds the RLP list header and the opcode on
-    /// top — `get_board_messages_chunks_large_responses` pins that slack at 8
-    /// bytes. Enforcing a bare `P2P_MSG_PACKET_LIMIT` inbound would have two
-    /// reth nodes ban each other over frames they both emit by design.
-    #[test]
-    fn the_inbound_bound_admits_our_own_largest_frame() {
+    /// The `BoardMessages` packer flushes only once the *next* message would
+    /// cross `P2P_MSG_PACKET_LIMIT`, so a chunk's payload reaches that figure
+    /// exactly, and the frame then adds the RLP list header and the opcode.
+    /// Enforcing a bare `P2P_MSG_PACKET_LIMIT` inbound would have two reth
+    /// nodes ban each other over frames they both emit by design.
+    ///
+    /// Erigon-pulse packs to the same rule (`MaxSizeMsgChunks`,
+    /// `msgboard/send.go:53-88`): it flushes when `groupSize+msgSize` would
+    /// cross `p2pMsgPacketLimit`, then prepends the list header to a payload
+    /// that has already reached the limit.
+    ///
+    /// This drives the real packer with real messages. The previous version
+    /// asserted `MAX_INBOUND_FRAME_SIZE >= P2P_MSG_PACKET_LIMIT + 8`, which
+    /// restates the definition two lines above the constant and could not
+    /// fail whatever the packer did.
+    #[tokio::test]
+    async fn the_inbound_bound_admits_our_own_largest_frame() {
+        let board = board_with_cfg(packing_cfg(), 10);
+
+        // Three messages whose RLP lengths sum to exactly one packet — the
+        // largest payload the packer can put in a single chunk.
+        let lens = [40_000usize, 30_000, 32_400];
+        assert_eq!(lens.iter().sum::<usize>(), P2P_MSG_PACKET_LIMIT, "the sum must be worst case");
+        let mut ids: Vec<MsgID> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                board.add_local_msg(mined_with_rlp_len(len, 0xA0 + i as u8, 10)).unwrap().msg_id()
+            })
+            .collect();
+
+        let (tx, mut rx) = channel();
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            peer(),
+        )
+        .await;
+
+        let frames = drain(&mut rx);
+        assert_eq!(frames.len(), 1, "a payload of exactly one packet is one chunk, not two");
+        let sole = &frames[0];
+        assert_eq!(
+            sole.len(),
+            1 + length_of_length(P2P_MSG_PACKET_LIMIT) + P2P_MSG_PACKET_LIMIT,
+            "opcode + list header + a full packet of payload",
+        );
         assert!(
-            MAX_INBOUND_FRAME_SIZE >= P2P_MSG_PACKET_LIMIT + 8,
-            "an inbound bound below our own outbound framing bans conforming reth peers",
+            sole.len() <= MAX_INBOUND_FRAME_SIZE,
+            "our own largest chunk is {} B, over the {MAX_INBOUND_FRAME_SIZE} B we admit inbound: \
+             two reth nodes would ban each other",
+            sole.len(),
+        );
+        assert_eq!(
+            decode_pow_msg_list(&sole[1..]).expect("the chunk decodes").len(),
+            3,
+            "nothing may be dropped to keep the frame small",
+        );
+
+        // One more message, and the packer must split rather than overshoot.
+        ids.push(board.add_local_msg(mined_with_rlp_len(9_000, 0xB0, 10)).unwrap().msg_id());
+        let (tx, mut rx) = channel();
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            peer(),
+        )
+        .await;
+
+        let frames = drain(&mut rx);
+        assert_eq!(frames.len(), 2, "past one packet the response must span two chunks");
+        let mut served = 0;
+        for f in &frames {
+            assert!(
+                f.len() <= MAX_INBOUND_FRAME_SIZE,
+                "chunk of {} B is over the {MAX_INBOUND_FRAME_SIZE} B inbound bound",
+                f.len(),
+            );
+            served += decode_pow_msg_list(&f[1..]).expect("each chunk decodes").len();
+        }
+        assert_eq!(served, 4, "every requested message is delivered exactly once");
+    }
+
+    /// [`MAX_SAFE_SIZE_LIMIT`] is solved from RLP header widths that depend on
+    /// the very length being solved for, so the arithmetic is checked against a
+    /// real encoded message rather than trusted.
+    ///
+    /// Both halves matter. Too high and the guard admits a `size_limit` that
+    /// gets us banned; too low and it refuses a configuration that is fine.
+    #[test]
+    fn the_size_limit_ceiling_is_the_largest_body_that_fits_one_frame() {
+        // Every integer at its widest, which is what `MSG_FIXED_FIELDS_RLP_LEN`
+        // assumes. A narrower message only makes the frame smaller.
+        let build = |data_len: usize| PoWMsg {
+            version: VERSION_V1,
+            block_hash: B256::repeat_byte(0xAB),
+            nonce: u64::MAX,
+            work_multiplier: u64::MAX,
+            work_divisor: u64::MAX,
+            category: B256::repeat_byte(0xCD),
+            data: Bytes::from(vec![0x5A; data_len]),
+        };
+        let frame_len =
+            |data_len: usize| 1 + encode_pow_msg_list(std::slice::from_ref(&build(data_len))).len();
+
+        assert_eq!(
+            frame_len(MAX_SAFE_SIZE_LIMIT),
+            MAX_INBOUND_FRAME_SIZE,
+            "a message at the ceiling must fill the inbound bound exactly",
+        );
+        assert!(
+            frame_len(MAX_SAFE_SIZE_LIMIT + 1) > MAX_INBOUND_FRAME_SIZE,
+            "one byte past the ceiling must not still fit — the guard would be too strict",
         );
     }
 

@@ -16,13 +16,17 @@
 //! ```text
 //! difficulty_digest = sha256(work_multiplier_be || work_divisor_be)[16..]  // last 16 bytes
 //!
-//! scalar = (nonce × difficulty_digest_as_bigint + block_hash_as_bigint) mod secp256k1_order
+//! scalar = nonce × difficulty_digest_as_bigint + block_hash_as_bigint
+//!          // computed over the integers, never reduced: the message is
+//!          // rejected outright unless 1 ≤ scalar < secp256k1_order
 //! (x, _y) = secp256k1_generator × scalar
 //! challenge = x                              // 32-byte big-endian x-coordinate
 //!
 //! hash = sha256(challenge || category || data)
 //!
 //! difficulty = (2^24 + data.len() × 10_000) × work_multiplier / work_divisor
+//!          // evaluated exactly; a true value above u64::MAX is rejected
+//!          // rather than wrapped — see `difficulty_checked`
 //! verify:  u256(hash) % difficulty == 0
 //! ```
 

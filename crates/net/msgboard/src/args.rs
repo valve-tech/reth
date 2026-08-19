@@ -5,6 +5,8 @@ use std::{path::PathBuf, time::Duration};
 use clap::Args;
 use reth_msgboard_types::MsgboardConfig;
 
+use crate::protocol::{MAX_INBOUND_FRAME_SIZE, MAX_SAFE_SIZE_LIMIT};
+
 /// Default DB flush interval. Mirrors `CommitEvery = 15s` in
 /// `private-erigon-pulse/msgboardcfg/config.go`.
 const DEFAULT_COMMIT_EVERY: &str = "15s";
@@ -12,6 +14,39 @@ const DEFAULT_COMMIT_EVERY: &str = "15s";
 /// Default periodic stats-log cadence. Mirrors `LogEvery = 30s` in
 /// `private-erigon-pulse/msgboardcfg/config.go`.
 const DEFAULT_LOG_EVERY: &str = "30s";
+
+/// Parse `--msgboard.size-limit`, refusing a value that would make us emit a
+/// `BoardMessages` frame every other reth node bans us for.
+///
+/// `size_limit` bounds the `data` field of every message the board accepts,
+/// and a message the board accepts is one it may later be asked to serve. The
+/// `BoardMessages` packer flushes only once the *next* message would cross the
+/// 100 KiB chunking target, so a message above that target travels alone in a
+/// frame as large as itself. Past [`MAX_SAFE_SIZE_LIMIT`] that frame exceeds
+/// [`MAX_INBOUND_FRAME_SIZE`], and a reth peer drops it undecoded and reports
+/// the sender for a protocol violation — a 12-hour ban, from every reth peer
+/// we serve.
+///
+/// Failing at parse time rather than at first send is the point: the send only
+/// happens once a message that large exists and someone asks for it, which can
+/// be days after the flag was set, and the operator sees peer bans rather than
+/// a bad flag.
+///
+/// This bounds nothing on the wire and rejects no message any peer sends. The
+/// default of 8 KiB is erigon-pulse's, three orders of magnitude below the
+/// ceiling, so no existing configuration changes.
+fn parse_size_limit(raw: &str) -> Result<usize, String> {
+    let limit: usize = raw.parse().map_err(|_| format!("`{raw}` is not a byte count"))?;
+    if limit > MAX_SAFE_SIZE_LIMIT {
+        return Err(format!(
+            "{limit} exceeds the {MAX_SAFE_SIZE_LIMIT}-byte ceiling: a message that size \
+             occupies a BoardMessages frame on its own, and the frame would be larger than \
+             the {MAX_INBOUND_FRAME_SIZE}-byte msg/1 packet every reth peer accepts, so \
+             serving it would get us banned"
+        ));
+    }
+    Ok(limit)
+}
 
 /// CLI arguments for the `msg/1` board.
 ///
@@ -29,7 +64,13 @@ pub struct MsgboardArgs {
     pub msgboard_work_divisor: u64,
 
     /// Maximum allowed byte length of a single message's data field.
-    #[arg(long = "msgboard.size-limit", default_value_t = 8192)]
+    ///
+    /// Capped at [`MAX_SAFE_SIZE_LIMIT`]; see [`parse_size_limit`].
+    #[arg(
+        long = "msgboard.size-limit",
+        default_value_t = 8192,
+        value_parser = parse_size_limit,
+    )]
     pub msgboard_size_limit: usize,
 
     /// Maximum number of messages retained in the board.
@@ -217,6 +258,48 @@ mod tests {
         assert_eq!(args.msgboard_commit_every, Duration::from_secs(7));
         assert_eq!(args.msgboard_log_every, Duration::from_secs(8));
         assert!(args.msgboard_gossip_disable);
+    }
+
+    /// `--msgboard.size-limit` is capped at the frame ceiling.
+    ///
+    /// The cap is a wire invariant, not taste: a message above it occupies a
+    /// `BoardMessages` frame on its own, and that frame is larger than the
+    /// `msg/1` packet every reth peer accepts, so the first peer that asks for
+    /// the message bans us. Erigon-pulse would not even request it
+    /// (`FilterMessageIDs` skips `id.Size() > cfg.MsgSizeLimit`), so the split
+    /// is reth against reth.
+    ///
+    /// Both directions are asserted. Refusing the ceiling itself would be a
+    /// guard that is simply too strict.
+    #[test]
+    fn size_limit_is_capped_at_the_frame_ceiling() {
+        let at = format!("--msgboard.size-limit={MAX_SAFE_SIZE_LIMIT}");
+        assert_eq!(
+            parse(&["reth", &at]).msgboard_size_limit,
+            MAX_SAFE_SIZE_LIMIT,
+            "the ceiling itself must be accepted",
+        );
+
+        let over = format!("--msgboard.size-limit={}", MAX_SAFE_SIZE_LIMIT + 1);
+        let Err(err) = CommandParser::<MsgboardArgs>::try_parse_from(["reth", &over]) else {
+            panic!("a size limit past the frame ceiling must not start the node");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("occupies a BoardMessages frame on its own"),
+            "the error must say why, not just that it is out of range: {err}",
+        );
+    }
+
+    /// The erigon-pulse default is three orders of magnitude below the ceiling,
+    /// so the guard changes no existing configuration. If this ever inverts,
+    /// the guard would refuse the default and the node would not start at all.
+    #[test]
+    fn the_default_size_limit_is_far_below_the_ceiling() {
+        assert!(
+            MsgboardArgs::default().msgboard_size_limit < MAX_SAFE_SIZE_LIMIT,
+            "the default must remain admissible",
+        );
     }
 
     /// The two duration flags take humantime, not a bare seconds count — `2m`
