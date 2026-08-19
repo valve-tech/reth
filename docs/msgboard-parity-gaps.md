@@ -1862,3 +1862,151 @@ valid.
 
 The fix is `toArray('be', 32)` at both sites, in the msgboard repo rather than
 this one.
+
+---
+
+## 20. Round-12: what of the new spec we can adopt without the network moving
+
+§17 asked whether the new spec is worth adopting. This round asks a narrower
+question: which of its normative elements can we ship **today** without our node
+rejecting a message the network accepts, or emitting one the network rejects.
+
+### 20.1 The ledger
+
+| # | Spec element | Status | Evidence |
+|---|---|---|---|
+| 1 | packet cap enforced on receive | **shipped** (§18) | `MAX_INBOUND_FRAME_SIZE` = 102,408, `protocol.rs:558` |
+| 2 | `MsgID` is 121 bytes | **shipped** | `MSG_ID_SIZE`, `msg_id.rs:21`; Go `messageIDSize`, `message_id.go:23` |
+| 3 | `BOARD_MESSAGES` chunked at 100 KiB | **shipped** | packer at `protocol.rs:718`; Go `MaxSizeMsgChunks`, `send.go:53` |
+| 4 | oversized packet costs the sender the connection | **shipped** (§18.3) | `report_bad_protocol`, weight `i32::MIN` |
+| 5 | duplicate IDs in `BOARD_MESSAGE_IDS` → kick | **blocked** | §20.2 |
+| 6 | duplicate IDs in `GET_BOARD_MESSAGES` → kick | **blocked** | §20.2 |
+| 7 | `--msgboard.enabled`, off by default | implementable, **not shipped** | §20.5 |
+| 8 | the six REST methods and the subscription | **shipped** | `rpc_api.rs:125-165` |
+| 9 | `D` as a bigint, target `2²⁵⁶ / D` | **blocked** | §17.4 — no peer computes it |
+| 10 | `payloadHash = sha256(category ‖ data)` | **blocked** | as above |
+| 11 | `scalarHash = sha256(ver ‖ blockHash ‖ payloadHash ‖ M ‖ Div ‖ nonce)` | **blocked** | as above |
+| 12 | reject a scalar outside `[1, n)` rather than reduce it | **shipped** (§19) | `pow_scalar`, `pow.rs` |
+| 13 | compressed point, `workHash = sha256(point)` | **blocked** | as above |
+| 14 | acceptance `workHash < 2²⁵⁶ / D` | **blocked** | as above |
+| 15 | `MsgSizeLimit` vs the packet limit (spec silent) | **shipped this round** | §20.3 |
+
+Items 9-11, 13 and 14 are the new `PoW`. They stand or fall together: a message
+is valid under one construction or the other, never both.
+
+### 20.2 Version-tagged coexistence does not work
+
+The obvious way to ship the new `PoW` early is to verify `version = 1` messages
+with the old construction and `version = 2` with the new, accept both, and emit
+only version 1 until the network moves. The spec makes this look available:
+`Message` carries a `version` field, and `scalarHash` binds it as a 1-byte
+value, so the two constructions could not collide.
+
+Three facts in the reference kill it.
+
+**The spec does not assign the new construction a version.** Every worked
+example in it says `"version": "0x1"`, and the `scalarHash` input is the message's
+own version byte, not a new one. Tagging the new construction `2` would be us
+inventing wire semantics upstream has not defined — the exact failure §17.6
+warns about, with the version field as the thing we get wrong.
+
+**Erigon refuses any version but 1, at the decode boundary, for the whole
+frame.** `Validate()` returns `ErrPoWMsgInvalidVersion` unless
+`Version == DefaultEncodingVersion` (`pow_message.go:97-100`), and
+`DecodeRLPMsgList` runs it over every element and fails the list on the first
+refusal (`pow_message.go:61-72`). The caller kicks:
+`return true, err // kick if we cannot parse their payload` (`fetch.go:267-271`).
+So one version-2 message in a `BOARD_MESSAGES` chunk does not cost us that
+message — it costs us the whole chunk, every honest version-1 message travelling
+with it, and the peer.
+
+**Nothing would ever reach the code anyway.** Erigon's announcement filter drops
+a version-2 `MsgID` before it is ever requested:
+`if id.Version() != DefaultEncodingVersion || ...` (`board.go:233`). A version-2
+message cannot cross the network, so a version-2 verifier would be an untested
+path with no reachable input, written against a spec with no reference
+implementation.
+
+Not implemented, and not worth revisiting until upstream says which version
+number the new construction carries.
+
+### 20.3 `--msgboard.size-limit` now has a ceiling
+
+`size_limit` bounds the `data` field of every message the board accepts, and a
+message the board accepts is one it may later be asked to serve. Both packers
+flush only once the *next* message would cross the 100 KiB chunking target, so a
+message above that target gets a frame to itself, as large as the message.
+
+Past a `data` length of **102,301 bytes** that frame exceeds
+`MAX_INBOUND_FRAME_SIZE`, and every reth peer drops it undecoded and reports the
+sender — `BadProtocol` weighs `i32::MIN`, so that is a 12-hour ban from each of
+them. Erigon-pulse would neither request the message (`board.go:233` skips
+`id.Size() > cfg.MsgSizeLimit`) nor object to the frame (its inbound cap is
+`ProtocolMaxMsgSize` = 10 MiB), so the split is reth against reth and entirely
+self-inflicted.
+
+`--msgboard.size-limit` is now rejected at parse time above that figure. The
+figure is solved in `MAX_SAFE_SIZE_LIMIT` rather than written down, because the
+RLP header widths depend on the length being solved for, and the answer moves
+with `P2P_MSG_PACKET_LIMIT` and `FRAME_OVERHEAD_ALLOWANCE`. The default is 8 KiB,
+so no existing configuration changes.
+
+This closes row 4 of `docs/msgboard-spec-feedback.md`: the spec does not say
+whether `MsgSizeLimit` must stay under the packet limit. On our side it must.
+
+### 20.4 The self-ban guard asserted a tautology
+
+`the_inbound_bound_admits_our_own_largest_frame` asserted
+`MAX_INBOUND_FRAME_SIZE >= P2P_MSG_PACKET_LIMIT + 8`. Two lines above it,
+`MAX_INBOUND_FRAME_SIZE` is *defined* as `P2P_MSG_PACKET_LIMIT + 8`. The test
+restated a definition and could not fail whatever the packer did.
+
+It now seeds the board with three real messages whose RLP lengths sum to exactly
+`P2P_MSG_PACKET_LIMIT` — the largest payload the packer can put in one chunk —
+drives a real `GetBoardMessages`, and asserts the emitted frame is 102,405 bytes
+and inside the inbound bound. A fourth message must then split the response
+rather than overshoot.
+
+Negative control: making the packer flush *after* pushing, so a chunk overshoots
+by a whole message, fails the new test and `get_board_messages_chunks_large_responses`.
+The retired assertion passes under that same mutation.
+
+### 20.5 Two things deliberately left alone
+
+**The duplicate-hash kick (rows 5 and 6).** Erigon forwards
+`FilterMessageIDs(mIDs)` straight into `GET_BOARD_MESSAGES` with no
+deduplication (`fetch.go:206-227`), and `FilterMessageIDs` tests each ID against
+the board, not against the IDs beside it (`board.go:214-246`) — its own comment
+acknowledges the duplicate case. So any peer that announces one ID twice in a
+frame makes erigon request it twice, and a spec-conforming node bans erigon for
+input erigon did not originate. §14.3 declined to penalise here because no client
+documented a bound; the spec documents one, and the reference still violates it.
+
+**`--msgboard.enabled`, off by default (row 7).** The flag is trivial. Landing it
+would silently stop the board on every fleet box at its next restart, until the
+units are edited. That is a deploy change, not a code change, and it belongs with
+one.
+
+### 20.6 A correction: erigon's chunker drops messages
+
+`docs/msgboard-spec-feedback.md` §2 says erigon packs a `BOARD_MESSAGES` payload
+up to 102,400 bytes and emits 102,404. It does not. `MaxSizeMsgChunks`
+(`send.go:53-71`) redeclares `var group` inside the loop and never reads the
+group back out of `all`, so `all[totalGroups-1] = group` overwrites each group
+with the single message just appended:
+
+```text
+30 messages of 8 KiB, run through the loop verbatim:
+group 0: 1 msg [11]   group 1: 1 msg [23]   group 2: 1 msg [29]
+in=30  out=3
+```
+
+Erigon therefore serves one message per chunk and drops the other 27. Two
+consequences. Its largest `BOARD_MESSAGES` frame is one message plus headers —
+about 8.3 KiB at the default `MsgSizeLimit`, not 102,404 — so reth's frames are
+the large ones on this network, and §20.3's ceiling is ours alone to enforce. And
+a bulk request to an erigon peer returns a fraction of what was asked for, which
+is worth knowing before reading anything into convergence timing.
+
+The packing *rule* is unchanged by the bug, and reth implements the rule: flush
+before the next message crosses the limit, then add the list header.
