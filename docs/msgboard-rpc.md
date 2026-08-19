@@ -24,7 +24,7 @@ Other tunables (defaults shown):
 |---|---|---|
 | `--msgboard.work-multiplier` | `10000` | Minimum accepted PoW multiplier |
 | `--msgboard.work-divisor` | `1000000` | Maximum accepted PoW divisor |
-| `--msgboard.size-limit` | `8192` | Max bytes of `data` per message |
+| `--msgboard.size-limit` | `8192` | Max bytes of `data` per message. Capped at `102301`: a larger message travels in a `BoardMessages` frame of its own, over the `msg/1` packet limit every reth peer enforces, so serving it earns a ban. The node refuses to start above the cap. |
 | `--msgboard.count-limit` | `10000` | Max live messages on the board |
 | `--msgboard.block-range` | `120` | Blocks before a message expires |
 | `--msgboard.stale-block-buffer` | `3` | Reject peer-announced messages within this many blocks of the lower bound |
