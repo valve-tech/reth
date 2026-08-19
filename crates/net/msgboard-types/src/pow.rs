@@ -173,13 +173,15 @@ impl PoWMsg {
     }
 
     /// Compute the SHA-256 `PoW` hash: `sha256(challenge ‖ category ‖ data)`.
-    pub fn calculate_hash(&self) -> B256 {
-        let challenge = self.challenge();
+    ///
+    /// `None` when the message has no valid challenge — see [`pow_scalar`](Self::pow_scalar).
+    pub fn calculate_hash(&self) -> Option<B256> {
+        let challenge = self.challenge()?;
         let mut h = Sha256::new();
         h.update(challenge);
         h.update(self.category.as_slice());
         h.update(&self.data);
-        B256::from_slice(&h.finalize())
+        Some(B256::from_slice(&h.finalize()))
     }
 
     /// Verify the `PoW` and return a [`CheckedPoWMsg`] on success.
@@ -200,7 +202,11 @@ impl PoWMsg {
             return Err(MsgboardError::InvalidWork);
         }
 
-        let hash = self.calculate_hash();
+        // No valid challenge means no valid `PoW`. The reference reaches the
+        // same verdict by refusing the scalar outright.
+        let Some(hash) = self.calculate_hash() else {
+            return Err(MsgboardError::InvalidWork);
+        };
         let hash_int = U256::from_be_slice(hash.as_slice());
         let diff_int = U256::from(difficulty);
 
@@ -225,39 +231,56 @@ impl PoWMsg {
         full[16..].try_into().expect("exactly 16 bytes")
     }
 
-    /// 32-byte x-coordinate of `G × scalar` where
-    /// `scalar = (nonce × difficulty_digest + block_hash) mod n`.
+    /// 32-byte x-coordinate of `G × scalar`, where the scalar is
+    /// `nonce × difficulty_digest + block_hash`.
     ///
-    /// Returns all-zeros only if the reduced scalar is zero (probability ≈ 2⁻²⁵⁶).
-    fn challenge(&self) -> [u8; 32] {
-        let Some(scalar_bytes) = self.pow_scalar() else { return [0u8; 32] };
+    /// `None` when that value is not a valid secp256k1 scalar — see
+    /// [`pow_scalar`](Self::pow_scalar).
+    fn challenge(&self) -> Option<[u8; 32]> {
+        let scalar_bytes = self.pow_scalar()?;
         // SecretKey is the scalar; PublicKey = G × scalar via the secp256k1 crate.
-        let Ok(sk) = secp256k1::SecretKey::from_slice(&scalar_bytes) else {
-            return [0u8; 32];
-        };
+        // `from_slice` enforces the same range rule a second time.
+        let sk = secp256k1::SecretKey::from_slice(&scalar_bytes).ok()?;
         let pk = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &sk);
         // Uncompressed: [0x04, x₀..x₃₁, y₀..y₃₁] — take the x coordinate.
         let s = pk.serialize_uncompressed();
-        s[1..33].try_into().expect("32 bytes")
+        Some(s[1..33].try_into().expect("32 bytes"))
     }
 
-    /// Compute `(nonce × difficulty_digest + block_hash) mod n` as a 32-byte
-    /// big-endian scalar. Returns `None` only when the result is zero.
+    /// The scalar `nonce × difficulty_digest + block_hash`, big-endian, or
+    /// `None` when that value is not a valid secp256k1 scalar.
     ///
-    /// ## Carry analysis
+    /// # Reject, do not reduce
     ///
-    /// - `nonce` fits in 64 bits; `difficulty_digest` is 128 bits.
-    /// - `product = nonce × digest < 2¹⁹²` — fits in U256 without overflow.
-    /// - `sum = product + block_hash` may overflow U256 (carry bit).
+    /// This deliberately does **not** take the sum modulo the group order.
+    /// Erigon hands the raw sum to `ScalarBaseMult`
+    /// (`msgboard/pow_message.go:174-192`), and the binding refuses anything
+    /// out of range instead of wrapping it:
     ///
-    /// When `carry = true`:
-    ///   `total = 2²⁵⁶ + sum_wrapped = n + nc + sum_wrapped`
-    ///   where `nc = 2²⁵⁶ − n` (≈ 2¹²⁸).
-    ///   `total mod n = (nc + sum_wrapped) mod n`
+    /// ```text
+    /// secp256k1_scalar_set_b32(&s, scalar, &overflow);
+    /// if (overflow || secp256k1_scalar_is_zero(&s)) { ret = 0; }
+    /// ```
     ///
-    ///   Adding `nc` (≈ 2¹²⁸) to `sum_wrapped` may overflow again (carry₂).
-    ///   If carry₂ = true, the wrapped value `adjusted < 2¹²⁸ ≪ n`, so
-    ///   `nc + adjusted` fits trivially without further reduction.
+    /// (`ledgerwatch/secp256k1@v1.0.0/ext.h:115-117`; a sum needing more than
+    /// 32 bytes hits the `len(scalar) > 32` panic in `scalar_mult_cgo.go:26`.)
+    /// Reducing instead would compute a challenge for a message the reference
+    /// refuses outright, so the two clients would disagree on its validity.
+    /// `specs/04-msgboard-pow-v2.md` states the rule for the new construction
+    /// too: *"Reject rather than reduce: must match Go's secp256k1
+    /// ScalarBaseMult behavior."*
+    ///
+    /// Three inputs are refused, none of them craftable:
+    ///
+    /// - **the add carries.** `product < 2¹⁹²`, so this needs a `block_hash` whose top 64 bits are
+    ///   all ones — about 2⁻⁶⁴ of blocks.
+    /// - **the sum lands in `[n, 2²⁵⁶)`.** That window is roughly 2¹²⁹ wide, so about 2⁻¹²⁷.
+    /// - **the sum is zero.**
+    ///
+    /// An attacker picks `nonce`, `work_multiplier` and `work_divisor` freely,
+    /// but `block_hash` has to name a real block, and none of these is
+    /// reachable by searching the fields they control. The rule earns its place
+    /// by conformance, not by being exploitable.
     fn pow_scalar(&self) -> Option<[u8; 32]> {
         let digest = self.difficulty_digest(); // 16 bytes
         let mut digest_padded = [0u8; 32];
@@ -272,28 +295,10 @@ impl PoWMsg {
         let product = nonce_u.wrapping_mul(digest_u);
         let (sum, carry) = product.overflowing_add(block_u);
 
-        let scalar_u = if carry {
-            // nc = 2²⁵⁶ − n (two's complement negation in U256 arithmetic).
-            let nc = n.wrapping_neg();
-            let (adjusted, carry2) = nc.overflowing_add(sum);
-            if carry2 {
-                // adjusted_wrapped = nc + sum − 2²⁵⁶ < 2¹²⁸ ≪ n → no subtraction needed.
-                nc.wrapping_add(adjusted)
-            } else if adjusted >= n {
-                adjusted - n
-            } else {
-                adjusted
-            }
-        } else if sum >= n {
-            sum - n
-        } else {
-            sum
-        };
-
-        if scalar_u == U256::ZERO {
+        if carry || sum == U256::ZERO || sum >= n {
             return None;
         }
-        Some(scalar_u.to_be_bytes())
+        Some(sum.to_be_bytes())
     }
 }
 
@@ -660,14 +665,16 @@ mod tests {
         }
     }
 
-    /// `pow_scalar` computes `(nonce × digest + block_hash) mod n` in U256, so
-    /// it has to handle the carry out of the 256-bit add by hand. Random inputs
-    /// never reach that code: `product < 2¹⁹²`, so a uniformly random
-    /// `block_hash` overflows the add with probability ≈ 2⁻⁶⁴. The carry branch
-    /// only runs for a near-maximal `block_hash` — which is precisely what a
-    /// peer probing for a client split would send, and getting it wrong yields a
-    /// different challenge, a different `PoW` hash, and a message erigon accepts
-    /// that reth rejects.
+    /// `pow_scalar` returns `nonce × digest + block_hash` unreduced, and refuses
+    /// the value outright when it falls outside `[1, n)` — the rule Go's
+    /// `ScalarBaseMult` binding enforces.
+    ///
+    /// Random inputs never reach the boundary: `product < 2¹⁹²`, so a uniformly
+    /// random `block_hash` overflows the add with probability ≈ 2⁻⁶⁴. Half the
+    /// iterations therefore force a near-maximal `block_hash` — precisely what a
+    /// peer probing for a client split would send. Getting this wrong yields a
+    /// different challenge, a different `PoW` hash, and a message one client
+    /// accepts that the other rejects.
     ///
     /// Both regimes are checked against full-precision U512 arithmetic, which is
     /// the definition Go's `math/big` reference computes.
@@ -719,7 +726,7 @@ mod tests {
             }
             msg.block_hash = B256::from(bh);
 
-            // Full-precision reference: no wraparound, no hand-rolled reduction.
+            // Full-precision reference: no wraparound, and no reduction either.
             let digest = msg.difficulty_digest();
             let mut digest_padded = [0u8; 64];
             digest_padded[48..].copy_from_slice(&digest);
@@ -735,20 +742,33 @@ mod tests {
                 carries += 1;
             }
 
-            let expected = sum % n_512;
-            let expected_bytes: [u8; 32] =
-                expected.to_be_bytes::<64>()[32..].try_into().expect("scalar fits in 32 bytes");
+            // The reference accepts the scalar only inside `[1, n)`. Anything
+            // else makes `ScalarBaseMult` refuse, so reth must refuse too.
+            let in_range = sum != U512::ZERO && sum < n_512;
 
             match msg.pow_scalar() {
-                Some(actual) => assert_eq!(
-                    actual, expected_bytes,
-                    "scalar mismatch at i={i}, nonce={}, mult={}, div={}, block_hash={}",
+                Some(actual) => {
+                    assert!(
+                        in_range,
+                        "pow_scalar accepted an out-of-range scalar at i={i}, \
+                         nonce={}, mult={}, div={}, block_hash={} — the reference \
+                         rejects it rather than reducing",
+                        msg.nonce, msg.work_multiplier, msg.work_divisor, msg.block_hash,
+                    );
+                    let expected: [u8; 32] = sum.to_be_bytes::<64>()[32..]
+                        .try_into()
+                        .expect("an in-range scalar fits in 32 bytes");
+                    assert_eq!(
+                        actual, expected,
+                        "scalar mismatch at i={i}, nonce={}, mult={}, div={}, block_hash={}",
+                        msg.nonce, msg.work_multiplier, msg.work_divisor, msg.block_hash,
+                    );
+                }
+                None => assert!(
+                    !in_range,
+                    "pow_scalar rejected a valid scalar at i={i}, nonce={}, \
+                     mult={}, div={}, block_hash={}",
                     msg.nonce, msg.work_multiplier, msg.work_divisor, msg.block_hash,
-                ),
-                None => assert_eq!(
-                    expected,
-                    U512::ZERO,
-                    "pow_scalar returned None for a non-zero scalar at i={i}",
                 ),
             }
             checked += 1;
@@ -760,32 +780,90 @@ mod tests {
         assert!(carries >= 500, "expected the forced-carry regime to fire, got {carries}");
     }
 
-    /// The carry branch's two inner cases (`carry2`, and `adjusted >= n`) are
-    /// unreachable for any message, and this pins the bound that makes them so.
+    /// The three refusal cases, driven directly rather than waited for.
     ///
-    /// After a carry, `sum_wrapped = product + block_hash − 2²⁵⁶ < 2¹⁹²`, because
-    /// `nonce < 2⁶⁴` and `digest < 2¹²⁸`. Adding `nc = 2²⁵⁶ − n ≈ 2¹²⁸` cannot
-    /// reach 2²⁵⁶ from below 2¹⁹², nor even reach `n`. Both branches are
-    /// therefore dead defensive code, not paths a test can drive — worth knowing
-    /// before anyone "simplifies" the bound they rest on.
+    /// The property test above forces the carry regime but cannot reach the
+    /// other two: a sum landing in `[n, 2²⁵⁶)` has probability ≈ 2⁻¹²⁷, and a
+    /// zero sum ≈ 2⁻²⁵⁶. Constructing them by hand is the only way to pin the
+    /// behaviour, so nobody restores the reduction and finds every test still
+    /// green.
     #[test]
-    fn test_pow_scalar_carry_cannot_overflow_a_second_time() {
-        use alloy_primitives::U512;
+    fn test_pow_scalar_refuses_every_out_of_range_scalar() {
+        // nonce = 0 would fail `validate` first, but `pow_scalar` is reached
+        // from `to_checked` on messages that only cleared the field checks, so
+        // drive it directly. digest is never zero, so nonce = 0 gives sum =
+        // block_hash; a zero block_hash then gives sum = 0.
+        let mut zero = make_msg(0, &[]);
+        zero.block_hash = B256::ZERO;
+        assert_eq!(zero.pow_scalar(), None, "a zero scalar must be refused, not multiplied");
 
-        let n_512 = U512::from_be_slice(&{
-            let mut buf = [0u8; 64];
-            buf[32..].copy_from_slice(&SECP256K1_ORDER);
-            buf
-        });
-        let nc = (U512::from(1u8) << 256) - n_512;
+        // sum == n exactly: nonce = 0 makes sum = block_hash, so set the hash
+        // to the group order. `n` itself is out of range — valid scalars stop
+        // one below it.
+        let mut at_order = make_msg(0, &[]);
+        at_order.block_hash = B256::from(SECP256K1_ORDER);
+        assert_eq!(at_order.pow_scalar(), None, "a scalar equal to n must be refused");
 
-        // The largest post-carry remainder any message can produce.
-        let max_sum_wrapped = (U512::from(1u8) << 192) - U512::from(1u8);
+        // sum just below n is the largest valid scalar.
+        let mut below = make_msg(0, &[]);
+        let n_minus_one = U256::from_be_slice(&SECP256K1_ORDER) - U256::from(1u8);
+        below.block_hash = B256::from(n_minus_one.to_be_bytes::<32>());
+        assert_eq!(
+            below.pow_scalar(),
+            Some(n_minus_one.to_be_bytes::<32>()),
+            "n-1 is in range and must pass through unreduced",
+        );
 
-        assert!(
-            nc + max_sum_wrapped < n_512,
-            "carry-branch result must stay below n, leaving carry2 and the \
-             `adjusted >= n` reduction unreachable",
+        // A carrying add: block_hash near 2²⁵⁶ with a product large enough to
+        // push past it. Reducing would have produced a small valid scalar here,
+        // which is exactly the divergence this refuses.
+        let mut carrying = make_msg(u64::MAX, &[]);
+        carrying.block_hash = B256::repeat_byte(0xFF);
+        assert_eq!(carrying.pow_scalar(), None, "a carrying add must be refused, not wrapped");
+
+        // And the refusal has to reach the verdict: no challenge, no hash, no
+        // acceptance.
+        assert_eq!(carrying.calculate_hash(), None);
+        assert!(matches!(
+            carrying.to_checked(1, 0),
+            Err(MsgboardError::InvalidWork) | Err(MsgboardError::InvalidDifficulty)
+        ));
+    }
+
+    /// A message taken off the live PulseChain testnet board (`direct-a-evm-943`,
+    /// 2026-08-19), pinned so the whole verification path stays wired to reality.
+    ///
+    /// The synthetic vectors above are mined by this crate, so they would still
+    /// agree with themselves if the construction drifted. This one was mined by
+    /// somebody else's client and accepted by the running fleet, which makes it
+    /// the only case here that can catch reth drifting away from the network.
+    #[test]
+    fn test_live_board_message_still_verifies() {
+        let msg = PoWMsg {
+            version: VERSION_V1,
+            block_hash: B256::from(hex_literal::hex!(
+                "3a2ca760216c5cb648c32aab73cbc1cdfdbcf02f77a4cd190995e3c46f3932b5"
+            )),
+            nonce: 0x2_ce3e,
+            work_multiplier: 0x2710,
+            work_divisor: 0xf_4240,
+            category: B256::from(hex_literal::hex!(
+                "6368617474657200000000000000000000000000000000000000000000000000"
+            )),
+            data: Bytes::from_static(b"Velit et tempor veniam cupidatat sint."),
+        };
+
+        msg.validate().expect("a live message must pass field validation");
+
+        let checked =
+            msg.to_checked(0x1_8009a1, 0).expect("a live message must pass PoW verification");
+
+        assert_eq!(
+            checked.hash,
+            B256::from(hex_literal::hex!(
+                "9cee9288b15680744308a5aad4f1d6f5c04a4e4313a8eeb4d573f40387b741bc"
+            )),
+            "recomputed PoW hash must match the hash the network assigned",
         );
     }
 
