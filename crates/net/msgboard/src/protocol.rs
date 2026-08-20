@@ -867,7 +867,7 @@ mod tests {
     use alloy_primitives::{Bytes, B256};
     use futures::poll;
     use reth_msgboard_types::{
-        encode_pow_msg_list, CheckedPoWMsg, MsgboardConfig, PoWMsg, VERSION_V1,
+        encode_pow_msg_list, CheckedPoWMsg, MsgboardConfig, PoWMsg, VERSION_V1, VERSION_V2,
     };
     use tokio::sync::mpsc::Receiver;
 
@@ -1707,8 +1707,10 @@ mod tests {
         let board = board_at(10);
         let (tx, mut rx) = channel();
         let real = checked(&[9], 10);
+        // Past the last construction we speak. `VERSION_V1 + 1` is v2, which is
+        // now requested rather than dropped.
         let bogus = MsgID::from_checked(
-            VERSION_V1 + 1,
+            VERSION_V2 + 1,
             &real.msg.block_hash,
             real.msg.data.len() as u64,
             real.msg.work_multiplier,
