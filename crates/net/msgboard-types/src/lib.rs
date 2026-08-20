@@ -28,12 +28,14 @@ pub mod msg_id;
 pub use msg_id::{MsgID, MSG_ID_SIZE};
 
 pub mod pow;
+pub mod pow_v2;
 pub use pow::{
     decode_pow_msg_list, decode_validated_pow_msg, encode_pow_msg_list, CheckedPoWMsg, PoWMsg,
     VERSION_V1,
 };
 
 pub mod protocol;
+pub use pow_v2::VERSION_V2;
 pub use protocol::{
     BOARD_MESSAGES, BOARD_MESSAGE_IDS, GET_BOARD_MESSAGES, PROTOCOL_LENGTH, PROTOCOL_NAME,
     PROTOCOL_VERSION,

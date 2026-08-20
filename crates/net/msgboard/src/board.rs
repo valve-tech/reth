@@ -20,7 +20,7 @@ use reth_libmdbx::Environment;
 use tokio::sync::broadcast;
 
 use reth_msgboard_types::{
-    CheckedPoWMsg, MsgID, MsgboardConfig, MsgboardError, PoWMsg, VERSION_V1,
+    CheckedPoWMsg, MsgID, MsgboardConfig, MsgboardError, PoWMsg, VERSION_V1, VERSION_V2,
 };
 
 use crate::{
@@ -289,7 +289,11 @@ impl MsgBoard {
                 // Mirrors erigon's `FilterMessageIDs`: drop announcements with a
                 // version we don't speak before requesting the body, instead of
                 // wasting an RTT and rejecting at decode time.
-                if id.version() != VERSION_V1 {
+                //
+                // Both constructions are spoken, so both are wanted. The board
+                // accepts either during the migration and the version byte, not
+                // the peer, decides which rules a message is judged by.
+                if id.version() != VERSION_V1 && id.version() != VERSION_V2 {
                     return false;
                 }
                 if index.has(&id.message_hash()) {
@@ -747,6 +751,17 @@ mod tests {
             }
         }
         panic!("no valid nonce found within 1M iterations");
+    }
+
+    /// Mine a `version = 2` message under [`easy_cfg`].
+    fn mined_v2(data: &[u8]) -> PoWMsg {
+        for n in 1u64..=1_000_000 {
+            let msg = PoWMsg { version: VERSION_V2, ..make_pow_msg(n, data) };
+            if msg.verify_v2().is_ok() {
+                return msg;
+            }
+        }
+        panic!("no valid v2 nonce found within 1M iterations");
     }
 
     /// Return a ready board pre-seeded with a known block hash at height `height`.
@@ -1230,5 +1245,41 @@ mod tests {
         // Board still holds the high-precedence message untouched.
         let (_, _, count, _, _, _) = board.status();
         assert_eq!(count, 1);
+    }
+
+    /// Both constructions live on one board at the same time.
+    ///
+    /// This is the whole migration design: the version byte, not the peer,
+    /// decides which rules a message is judged by. Clients move from v1 to v2
+    /// whenever they like and the board keeps serving both, so there is no
+    /// moment when everything has to switch at once.
+    #[test]
+    fn a_v1_and_a_v2_message_coexist_on_one_board() {
+        let board = board_with_block(100);
+
+        let v1 = make_pow_msg(find_nonce(&[0xA1]), &[0xA1]);
+        let v2 = mined_v2(&[0xA2]);
+        assert_eq!(v1.version, VERSION_V1);
+        assert_eq!(v2.version, VERSION_V2);
+
+        let checked_v1 = board.add_local_msg(v1).expect("v1 must still be accepted");
+        let checked_v2 = board.add_local_msg(v2).expect("v2 must be accepted");
+
+        let (_, _, count, ..) = board.status();
+        assert_eq!(count, 2, "both constructions occupy the board together");
+        assert_ne!(
+            checked_v1.hash, checked_v2.hash,
+            "the two constructions produce different hashes, so neither can shadow the other",
+        );
+
+        // And each is judged by its own rules: swapping the version byte alone
+        // invalidates a message, because the other construction reads the same
+        // fields differently.
+        let mut mislabelled = checked_v2.msg.clone();
+        mislabelled.version = VERSION_V1;
+        assert!(
+            mislabelled.to_checked(100, 0).is_err(),
+            "a v2 message relabelled v1 must fail — the constructions are not interchangeable",
+        );
     }
 }
