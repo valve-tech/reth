@@ -163,7 +163,7 @@ mod tests {
     /// The message both golden vectors are built from.
     fn vector_msg(nonce: u64, work_multiplier: u64, work_divisor: u64) -> PoWMsg {
         PoWMsg {
-            version: 1,
+            version: VERSION_V2,
             block_hash: B256::from(hex_literal::hex!(
                 "3a2ca760216c5cb648c32aab73cbc1cdfdbcf02f77a4cd190995e3c46f3932b5"
             )),
@@ -198,19 +198,19 @@ mod tests {
         assert_eq!(
             msg.scalar_hash_v2(),
             B256::from(hex_literal::hex!(
-                "3caed3ea9a5caa6e1e069d0126e4dc6698190aa3eec8ebcdab227d3e5b0fd18d"
+                "09aba0a15b2ccadd169a15a333047eab8ff06461e4c3644ef706e031b7b6cb5a"
             )),
             "scalarHash field order or widths differ from the spec",
         );
         assert_eq!(
             msg.challenge_v2().expect("scalar in range"),
-            hex_literal::hex!("035e55e474ae91c573e38855bba370f01d64a307fa9c834eda7b435ec9d24368b9"),
+            hex_literal::hex!("034318e87d35e7990efd2bc17af7b3ea4b68eb4f2a631a862b7a4ce5b78db80994"),
             "the point must be COMPRESSED — 33 bytes with a parity prefix",
         );
         assert_eq!(
             msg.work_hash_v2().expect("scalar in range"),
             B256::from(hex_literal::hex!(
-                "5ba003ccdb08503a19326a201834198a49e062d2f3f0e9506ff086eddb011dee"
+                "dd12f3cad108cb42ad99a9400711478930c2ba2c53e53b174674530bdfc23c93"
             )),
             "workHash = sha256(compressed point)",
         );
@@ -225,25 +225,31 @@ mod tests {
     /// Vector B — the same message mined against an easier target.
     #[test]
     fn golden_vector_b_verifies_when_mined() {
-        let msg = vector_msg(57_602, 1, 1_000);
+        let msg = vector_msg(1_035, 1, 1_000);
 
         assert_eq!(msg.difficulty_v2(), Some(U256::from(16_907u64)));
         assert_eq!(
             msg.scalar_hash_v2(),
             B256::from(hex_literal::hex!(
-                "bcff3c0ddc5d02b05e282566461d4f30f35ce90b3bfd36cde0c694dcb54a5e7d"
+                "348e5344a8eb52759dfa024bae215356bd89502161d7f560a21d9208fa188147"
             )),
         );
         assert_eq!(
             msg.challenge_v2().expect("scalar in range"),
-            hex_literal::hex!("030fbdcb58e555146c54a0863ebf038a0384d4bd90439d02b8d8d5f71096ca7a09"),
+            hex_literal::hex!("02d6567b6c5b520e59016afc79c8a8474c38df6783ba6d80be3e6489a80c51e95d"),
         );
 
-        let hash = msg.verify_v2().expect("vector B is mined and must verify");
+        // Through `to_checked`, not just `verify_v2` — the vector is a real v2
+        // message now, so the version byte must route it to the v2 rules by
+        // itself. A vector that only the v2 path can reach would not catch a
+        // dispatch that never fires.
+        let checked = msg.clone().to_checked(100, 0).expect("v2 dispatch must accept vector B");
+        let hash = checked.hash;
+        assert_eq!(hash, msg.verify_v2().expect("and agree with the direct call"));
         assert_eq!(
             hash,
             B256::from(hex_literal::hex!(
-                "00037212834e250723dc736508d445a0dbc01398040a980807641b4be2d1e361"
+                "000032ca8137d98480d4be2b3221f5f8d2e221d3a1a11ecf25627b7956b21137"
             )),
         );
     }
@@ -252,7 +258,7 @@ mod tests {
     /// doing work rather than the vector happening to pass.
     #[test]
     fn neighbouring_nonces_do_not_verify() {
-        for nonce in [57_601u64, 57_603] {
+        for nonce in [1_034u64, 1_036] {
             assert!(
                 vector_msg(nonce, 1, 1_000).verify_v2().is_err(),
                 "nonce {nonce} must not satisfy the target",
