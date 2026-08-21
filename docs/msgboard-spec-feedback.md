@@ -1,184 +1,262 @@
-# msg/1 wire limits — spec vs erigon-pulse
+# msgboard — findings from an independent msg/1 implementation
 
-**What this is:** four discrepancies between the *msg/1 wire limits* table in the
-msgboard spec and what erigon-pulse actually does. Every claim below is a
-file:line citation you can check.
+We built a `msg/1` implementation in a reth fork and run it on PulseChain
+testnet v4. It interoperates. Everything below was verified against
+erigon-pulse `v3.0.0-RC8` = `48cdb29e35`, package `msgboard/`, with file:line
+on both sides.
 
-**Sources compared**
-
-| | version |
-| --- | --- |
-| Reference implementation | erigon-pulse `v3.0.0-RC8` = `48cdb29e35`, package `msgboard/` |
-| Our implementation | reth fork, `msg/1`, running on PulseChain testnet v4 |
-| Spec | "PoW Message Board (Experimental, Opt-in)", § *msg/1 wire limits* |
-
-**Not in dispute:** step 5's *reject rather than reduce* rule. We apply it to
-the construction we run today: `pow_scalar` refuses a nonce unless
-`1 <= scalar < n` instead of reducing.
-
-> **Corrections before this goes upstream** — see
-> `docs/msgboard-parity-gaps.md` §20.
->
-> - We do **not** implement the new PoW, and we cannot check `TestPoWGoldenVector`: that test does
->   not exist in any ref of the reference checkout (§17.4).
-> - We do **not** implement the duplicate-hash kick, and should not. Erigon forwards
->   `FilterMessageIDs` output into `GET_BOARD_MESSAGES` without deduplicating, so a conforming node
->   bans erigon for a duplicate erigon did not originate (§20.5).
-> - Item 2 below overstates erigon's frame size. `MaxSizeMsgChunks` keeps only one message per
->   group, so erigon emits about 8.3 KiB, not 102,404 B, and drops the rest (§20.6).
+**What we run:** both constructions. We verify the current PoW as `version = 1`
+and the new PoW as `version = 2`, side by side on one board. See §2.
 
 ---
 
-## Summary
+## 1. `MaxSizeMsgChunks` drops messages
 
-| # | Spec says | Reference actually | Kind |
-| --- | --- | --- | --- |
-| 1 | `Maximum packet size 100 KiB (MaxMessageSize)` | `MaxMessageSize` is **10 MiB**; 100 KiB is a different, send-only constant | wrong value + wrong constant |
-| 2 | `BOARD_MESSAGES packing: encoded RLP list <= 100 KiB` | measures the RLP **payload** at 100 KiB, then adds the list header → emits up to **102,404 B** | wrong unit |
-| 3 | `Peers that send a larger packet are disconnected` | true, but at **10 MiB**; a 200 KiB frame is accepted | wrong threshold |
-| 4 | (silent) | `MsgSizeLimit` is operator-settable and can exceed the packet limit | undefined interaction |
-
----
-
-## 1. `MaxMessageSize` is 10 MiB
-
-```
-eth/protocols/eth/protocol.go:63   const maxMessageSize = 10 * 1024 * 1024
-eth/protocols/eth/protocol.go:64   const ProtocolMaxMsgSize = maxMessageSize
-```
-
-This is what the inbound path enforces for `msg/1`. The msgboard sidecar shares
-`runPeer` with the eth protocol, and that is the only size check on the path:
+This is the one we would most want to know about if it were ours.
 
 ```go
-// p2p/sentry/sentry_grpc_server.go:412
-if msg.Size > eth.ProtocolMaxMsgSize {
-    msg.Discard()
-    return p2p.NewPeerError(p2p.PeerErrorMessageSizeLimit, p2p.DiscSubprotocolError, ...)
+// msgboard/send.go:53-71
+for i := 0; i < len(msgs); i++ {
+    var group []*CheckedPoWMsg     // re-declared nil each iteration
+    ...
+    group = append(group, msg)     // so this is always a 1-element slice
+    groupSize += msgSize
+    all[totalGroups-1] = group     // and this overwrites the accumulated group
 }
 ```
 
-The 100 KiB figure is a different constant:
+`group` is redeclared inside the loop and the accumulated group is never read
+back out of `all`, so each write replaces the group with the single message just
+appended. We ran the loop verbatim twice, independently: **30 messages of 8 KiB
+in, 3 out.** Six messages of 30,000 bytes produce two frames of one message each.
+
+Every `BOARD_MESSAGES` frame the reference emits carries exactly one message, and
+the rest of the requested set is silently dropped. At the default `MsgSizeLimit`
+its largest frame is about 8.3 KiB, not ~100 KiB.
+
+Two consequences beyond the lost messages:
+
+- The wire-limits note *"honest implementations already chunk at 100 KiB, so this
+  is compatible with current senders"* currently holds **because of this bug**.
+- When it is fixed, frames jump from ~8 KiB to as much as ~102 KiB in one
+  release, and every strict inbound bound in the network is exercised for the
+  first time on that day.
+
+## 2. The new PoW construction — we shipped it, and had to decide four things the spec leaves open
+
+We now run the new construction in production, as **`version = 2`**. It verifies
+alongside the current one, so nothing on the network needed a flag day. Getting
+there meant making calls that belong in the spec. One of them is only safe if
+you agree with it.
+
+### 2.1 The version byte — we took 2, and we need you to confirm it
+
+`scalarHash` binds the version byte, but every worked example is
+`"version": "0x1"`. The spec defines a construction with no number to carry it.
+
+We assigned it **2**. That buys incremental migration: a version-1 message and a
+version-2 message coexist on one board, each verified by its own rules, and no
+operator has to switch at the same minute as everyone else.
+
+If you ship the new construction under version 1 instead, the two networks do
+not merely disagree — they kick each other:
+
+- We reject a version-1 message that fails the version-1 verifier as invalid
+  work, which is kickable.
+- You reject a version-2 message with `ErrPoWMsgInvalidVersion`
+  (`pow_message.go:97-100`), which fails the **whole frame** through
+  `DecodeRLPMsgList` (`:61-72`), and the caller kicks (`fetch.go:267-271`).
+
+**The ask:** confirm 2, or name the byte you want. This blocks everything below,
+because the version byte is the first byte into `scalarHash` — change it and
+every digest changes with it.
+
+### 2.2 Read literally, the PoW is free
+
+`D = ((2^24 + 10_000·dataLen)·M) / Div` is integer division over `M` and `Div`
+that the poster chooses. Set `M = 1`, `Div = 16777216`, `dataLen = 0`:
 
 ```
-msgboard/send.go:50   p2pMsgPacketLimit = 100 * 1024
+D      = 16777216 / 16777216 = 1
+target = 2^256 / 1           = 2^256
 ```
 
-`p2pMsgPacketLimit` appears only in `send.go`. It is a send-side chunking target
-and never runs on receive.
+Every 256-bit hash is below 2^256, so the first nonce wins. Push `Div` to
+16777217 and `D` is 0, and `2^256 / 0` is whatever the implementer's language
+does with it.
 
-## 2. The packing bound is on the payload, not the encoded list
+Step 1 tells the *poster* to query `msgboard_status` for the board's difficulty.
+Nothing tells the *verifier* to enforce it. The reference is safe because it
+gates on the operator's configured ratio, but that gate lives in the config, not
+in the spec — an implementer working from this document alone has no floor at
+all and accepts zero-work messages at line rate.
+
+We enforce a ratio floor and refuse `D = 0` at the decode boundary, before
+paying for the scalar multiplication. That floor is ours, and a third
+implementer cannot derive it from the text.
+
+**The ask:** state the receiver's rule normatively — the minimum acceptable
+`M/Div` (or minimum `D`), and whether a message below it is dropped or is
+kickable.
+
+### 2.3 The target does not fit in 256 bits
+
+At `D = 1` the target is exactly 2^256. An implementer who holds it in a 256-bit
+integer — the natural choice, since it is compared against a 256-bit hash —
+either overflows to zero and rejects everything, or wraps and accepts
+everything. The TypeScript in the spec is safe because BigInt is unbounded. Go
+and Rust are not safe by default.
+
+We compute the target in 512 bits. One sentence in the spec would settle it:
+compute the target in wider arithmetic, or test `workHash · D < 2^256` and never
+materialise the target. A floor on `D` (§2.2) also removes the case.
+
+### 2.4 What is the `hash` field now?
+
+Under the current construction the message hash is
+`sha256(challenge ‖ category ‖ data)`, which visibly commits to the body. Under
+the new one it is `sha256(compressedPoint)`, which commits to the body only
+through the scalar.
+
+That is still a sound identity — a different body gives a different
+`payloadHash`, a different scalar, a different point. But the REST data model
+documents `hash` with version-1 examples only, and that field fills the last 32
+bytes of the 121-byte `MsgID` that peers announce and request by. We read it as
+`hash = workHash`. Worth one line saying so.
+
+### 2.5 The out-of-range scalar needs a receiver rule too
+
+The spec is explicit that a poster must reject rather than reduce, and says why.
+It does not say what a *receiver* does with such a message.
+
+That matters more than the 2^-128 probability suggests. A receiver that reduces
+accepts messages a conforming receiver refuses, so the disagreement is silent
+and it is a conformance fork rather than a rounding error. It never happens by
+accident, so it only ever appears deliberately.
+
+**The ask:** invalid work (kickable), or malformed (drop)? We treat it as
+invalid work.
+
+### 2.6 The golden vector does not exist, so we built one
+
+`TestPoWGoldenVector` is cited as the normative worked example. It is not in the
+tree at `48cdb29e35` — `msgboard/pow_message_test.go` holds only
+`TestPoWMessageSuite`. We could not find a reference implementation of the new
+construction anywhere: not erigon-pulse at RC8, not the published npm packages,
+not the GitLab TypeScript repo, which has had no push in four months.
+
+So we generated one, from three independent readings of the spec text —
+JavaScript, Rust and Go — written so that a shared misreading would have to
+happen three times. There are two vectors: one pins every intermediate digest at
+a fixed nonce whether or not the work is sufficient, and one is actually mined.
+
+It is yours if you want it. **Caveat:** we computed it at `version = 2`, so
+§2.1 has to settle before the digests mean anything.
+
+### 2.7 Why the change is worth documenting
+
+The new construction closes two independent defects and the spec names neither.
+Writing them down stops a future implementer from optimising it back into the
+old shape.
+
+**The scalar was linear in the nonce.** `scalar(n+1) = scalar(n) + digest`, so
+`G·scalar(n+1) = G·scalar(n) + G·digest`, and `G·digest` is constant for a given
+`M`/`Div` pair. A poster advances the point with one addition, about 1 µs, where
+a verifier always pays a full scalar multiplication of 60 to 120 µs. The work
+costs 50 to 500 times less than the difficulty parameter claims.
+
+**The challenge never committed to the payload.** `category` and `data` entered
+only at the final hash, so one precomputed challenge sequence served every
+message in that block at that difficulty. For K messages the curve cost was
+O(N), not O(K·N) — the first message was cheap and every message after it was
+nearly free.
+
+They compound. The first defect makes the table cheap to build; the second makes
+it reusable forever. A SHA-256 scalar that commits to `payloadHash` kills both,
+which is why the fix is one line and not two.
+
+This also settles the transition question. Any period in which nodes accept both
+constructions is a period in which the weaker one governs. The value of an
+accept-both window is entirely in avoiding kicks, and none of it is in security.
+
+## 3. `MsgSizeLimit` above the packet limit bans conforming nodes
+
+`MsgSizeLimit` defaults to 8 KiB and is operator-settable
+(`msgboardcfg/config.go:18,38`; flag at `cmd/utils/flags.go:295`, reaching
+`cfg.MsgSizeLimit` at `:1705`). It is enforced per message
+(`board.go:388`, `:233`) with no relation to `p2pMsgPacketLimit`.
+
+Both packers give a message above the chunking target a frame to itself. So
+raising that one flag past ~100 KiB makes a node emit over-limit frames as
+ordinary traffic — not as an attack, and with no warning that the flag is bounded
+by anything.
+
+Against a receiver that enforces the wire-limits table, that is a permanent
+mutual ban between two nodes that each believe they are conforming. We have
+capped our own flag at 102,301 bytes, solved from the encoding rather than
+written down. **Worth saying in the spec that `MsgSizeLimit` must stay below the
+packet limit.**
+
+## 4. The packing bound: payload, or encoded list?
+
+The table bounds the *encoded RLP list* at 100 KiB. The reference measures the
+RLP **payload**:
 
 ```go
-// msgboard/send.go:53-88  MaxSizeMsgChunks
+// msgboard/send.go
 msgSize := msg.RLPSize()
-if totalGroups == 0 || groupSize+msgSize > p2pMsgPacketLimit {
-    ... start a new group ...
-}
-group  = append(group, msg)
+if totalGroups == 0 || groupSize+msgSize > p2pMsgPacketLimit { ...new group... }
 groupSize += msgSize
 ...
-chunk := EncodeRLPMsgList(toEncode)   // list header prepended HERE
+chunk := EncodeRLPMsgList(toEncode)   // list header prepended AFTER measuring
 ```
 
-The flush fires only when the *next* message would cross the limit, so
-`groupSize` reaches exactly 102,400. `EncodeRLPMsgList` then prepends a 4-byte
-list header at that length.
+The flush fires only when the *next* message would cross, so the payload reaches
+exactly 102,400 and the header adds four more. An implementer who bounds the
+encoded list at 102,400, as written, rejects a frame the reference intends to be
+legal.
 
-```
-payload      102,400 B   (what the loop measures)
-+ RLP header       4 B
-= encoded list 102,404 B   (what the spec bounds at 102,400)
-+ opcode           1 B
-= frame      102,405 B   (what goes on the wire)
-```
+This is latent today only because of §1. It becomes live the moment the packer is
+fixed. We allow 102,408 inbound — 100 KiB plus 8 — which absorbs the header, but
+that allowance is ours and a third party has no way to derive it from the spec.
 
-Not a defect in erigon — a mismatch between the spec's unit ("encoded RLP list")
-and the quantity the reference measures (the payload).
+**The ask:** name the unit precisely — RLP payload, encoded list, or frame
+including the opcode. (For calibration: erigon's own check reads `msg.Size`,
+which excludes the opcode — `p2p/transport.go:80`.)
 
-The ID path has no such gap: `RunWithIDChunks` (`msgboard/message_id.go:108`)
-uses `maxIDsPerChunk = 102400 / 121 = 846` and `FlattenMsgIDs`, a flat
-concatenation with no RLP wrapper. 846 x 121 = 102,366 B.
+## 5. Two smaller notes
 
-## 3. The disconnect threshold is 10 MiB
+**`MaxMessageSize` names nothing in the reference,** and the closest match is the
+wrong size. `grep -rn 'MaxMessageSize' --include='*.go'` finds one hit, in the
+consensus-layer libp2p config. The msg/1 receive path enforces
+`ProtocolMaxMsgSize` = **10 MiB** (`eth/protocols/eth/protocol.go:63-64`), via the
+only size check on the path (`p2p/sentry/sentry_grpc_server.go:412`). The 100 KiB
+figure is `p2pMsgPacketLimit` (`msgboard/send.go:50`), which appears only in
+`send.go` and never runs on receive. We read the table as normative and enforce
+100 KiB anyway — but the row as written sends an implementer to the wrong
+constant.
 
-The sentence is true against the constant in §1. A peer sending a 200 KiB
-`BOARD_MESSAGES` frame is not disconnected — it is accepted and decoded. Read
-next to the 100 KiB row, the sentence implies 100 KiB is enforced on receive.
+**The duplicate-hash kick has no safe implementation yet.** The reference has no
+duplicate check at all, and `AddRemoteMsgs` explicitly declines to penalise
+duplicates (`board.go:268`). We have not implemented it, because erigon forwards
+announced IDs into `GET_BOARD_MESSAGES` without deduplicating
+(`fetch.go:206-227`) — so a node honouring that line would ban erigon for input
+erigon relayed rather than originated. Worth fixing in the reference first, or
+the first implementer to enforce it partitions itself.
 
-## 4. `MsgSizeLimit` vs the packet limit is undefined
+## What we can supply
 
-```
-msgboard/msgboardcfg/config.go:38   MsgSizeLimit: 8 * 1024   // operator-settable
-```
+- **The golden vector for the new PoW** (§2.6) — two cases, every intermediate
+  digest pinned, cross-checked in three languages. Re-derivable at whatever
+  version byte you pick.
+- **A repro for §1** — the loop extracted, with the input and output counts.
+- **A cross-implementation corpus**: hex frames at the size boundary that both
+  nodes must accept or reject identically, once §4 fixes the unit.
+- **Our parity audit** against `v3.0.0-RC8`, file:line on both sides.
+- **A testnet report** on running version 1 and version 2 side by side, once
+  there is anything but us posting version 2.
 
-Both implementations give a single message its own frame when it exceeds the
-chunking target — the loop flushes only when the group is already non-empty. So
-raising `MsgSizeLimit` above ~100 KiB makes a node emit over-limit frames as a
-matter of course. The spec does not say whether that is permitted, or whether
-`MsgSizeLimit` must be bounded by the packet limit.
+Happy to file §1 as an issue instead if that is easier.
 
----
-
-## The one question that changes our code
-
-**On receive, which threshold is normative for `msg/1` — 100 KiB or
-`ProtocolMaxMsgSize`?**
-
-We read the table as normative and enforce 100 KiB inbound:
-
-```
-MAX_INBOUND_FRAME_SIZE = 100 KiB + 8 = 102,408 B
-```
-
-Above that we drop the frame before decode and drop the peer's reputation to the
-minimum, which disconnects it for 12 hours. The 8-byte allowance exists to absorb
-the header from §2, so we accept everything erigon emits at default settings —
-its true maximum is 102,405 B, leaving 3 bytes of margin.
-
-But that makes us ~100x stricter than the reference. It costs nothing today. It
-starts to matter the moment any node raises `MsgSizeLimit`: erigon peers would
-accept its frames and we would ban it.
-
-- If **100 KiB** is normative, the reference is more permissive than the spec.
-- If **10 MiB** is normative, we should relax our bound and row 1 needs rewording.
-
-## Suggested replacement table
-
-| Limit | Value |
-| --- | --- |
-| Maximum packet size, enforced on receive | 10 MiB (`ProtocolMaxMsgSize`, `eth/protocols/eth/protocol.go`) |
-| MsgID size | 121 bytes |
-| `BOARD_MESSAGES` packing (send) | RLP **payload** chunked at 100 KiB (`p2pMsgPacketLimit`); the list header is added after measuring, so an emitted frame may reach 100 KiB + header + opcode |
-| `BOARD_MESSAGE_IDS` packing (send) | `floor(100 KiB / 121)` = 846 IDs per frame, flat concatenation |
-| `MsgSizeLimit` | 8 KiB default; a message above the chunking target occupies a frame alone |
-
-For the sentence below the table: name which threshold disconnects.
-
-## Test vectors we can supply
-
-1. **Frame-framing boundary vectors.** `payload_len` → expected encoded frame
-   length across 102,396-102,401, where the RLP header width changes. These are
-   where two implementations silently disagree by a few bytes.
-2. **A worst-case packing test**, in Go and Rust. Messages sized so the payload
-   sum lands exactly on `p2pMsgPacketLimit`, asserting the emitted frame length.
-   Worth having: our own guard for this turned out to assert a tautology.
-3. **ID-frame vectors.** 845 / 846 / 847 IDs with expected byte lengths,
-   confirming a chunk is always a multiple of 121 and never splits a record.
-4. **A cross-implementation corpus.** Hex frames at the boundary that both nodes
-   must accept or reject identically — the wire-level analogue of
-   `TestPoWGoldenVector`.
-5. **Our parity audit** against `v3.0.0-RC8`, with file:line on both sides.
-
-## Reproducing the citations
-
-```bash
-git clone https://gitlab.com/pulsechaincom/erigon-pulse && cd erigon-pulse
-git checkout 48cdb29e35
-sed -n '60,65p'   eth/protocols/eth/protocol.go        # 10 MiB
-sed -n '410,416p' p2p/sentry/sentry_grpc_server.go     # the inbound check
-sed -n '48,88p'   msgboard/send.go                     # p2pMsgPacketLimit + packer
-sed -n '108,128p' msgboard/message_id.go               # ID chunking
-sed -n '36,40p'   msgboard/msgboardcfg/config.go       # MsgSizeLimit
-grep -rn 'p2pMsgPacketLimit' .                         # send.go only
-```
+**If you answer one thing, make it §2.1** — the version byte. Everything else we
+can work around; that one we cannot guess safely.
