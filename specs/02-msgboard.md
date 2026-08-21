@@ -4,6 +4,13 @@ This document specifies the MsgBoard feature — a decentralized message board p
 
 **Scope:** All msgboard-related changes. Reference implementation: `private-erigon-pulse` at tag `v3.0.0-RC8`.
 
+> **§4 (Proof of Work) describes the construction reth no longer runs.** It is
+> kept as an accurate record of erigon-pulse at RC8, which still computes it.
+> The algorithm reth implements is in `specs/04-msgboard-pow-v2.md`; it took the
+> same version byte, so a message valid under §4 is invalid on our nodes. See
+> `docs/msgboard-parity-gaps.md` §21. Everything else in this document — the
+> wire protocol, the data model, the board algorithm, the APIs — is current.
+
 ---
 
 ## Table of Contents
@@ -177,6 +184,9 @@ Where:
 - `WorkMultiplier / WorkDivisor` = difficulty ratio scaling factor
 
 ### 4.2 Hash Calculation
+
+> Superseded — see the note at the top of this document. `specs/04-msgboard-pow-v2.md`
+> §*PoW Requirements* has the construction reth runs.
 
 ```
 function calculateHash(msg):
