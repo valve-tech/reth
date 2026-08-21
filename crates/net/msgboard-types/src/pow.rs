@@ -39,7 +39,7 @@ use crate::{MsgID, MsgboardError};
 /// secp256k1 group order `n` in big-endian (32 bytes).
 ///
 /// `n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141`
-const SECP256K1_ORDER: [u8; 32] = [
+pub(crate) const SECP256K1_ORDER: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // FFFFFFFF FFFFFFFF
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, // FFFFFFFF FFFFFFFE
     0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, // BAAEDCE6 AF48A03B
@@ -91,7 +91,7 @@ pub struct CheckedPoWMsg {
 impl PoWMsg {
     /// Perform basic field-level validation (does **not** verify the `PoW`).
     pub fn validate(&self) -> Result<(), MsgboardError> {
-        if self.version != VERSION_V1 {
+        if self.version != VERSION_V1 && self.version != crate::pow_v2::VERSION_V2 {
             return Err(MsgboardError::InvalidVersion);
         }
         if self.block_hash == B256::ZERO {
@@ -103,11 +103,21 @@ impl PoWMsg {
         if self.work_multiplier == 0 || self.work_divisor == 0 {
             return Err(MsgboardError::InvalidDifficulty);
         }
-        // Reject the difficulty overflow here as well as in `to_checked`, so a
-        // crafted message dies at the decode boundary — before the secp256k1
-        // scalar multiplication the `PoW` check would otherwise pay for it, and
-        // early enough for the sender to earn a reputation penalty.
-        if self.difficulty_checked().is_none() {
+        // Reject an unrepresentable difficulty here as well as in `to_checked`,
+        // so a crafted message dies at the decode boundary — before the
+        // secp256k1 scalar multiplication the `PoW` check would otherwise pay
+        // for it, and early enough for the sender to earn a reputation penalty.
+        //
+        // v1 wraps its threshold in `u64` and the overflow was exploitable, so
+        // the check there is for representability. v2 computes `D` exactly and
+        // cannot wrap, so the only bad value is a zero threshold, which admits
+        // nothing rather than everything.
+        let difficulty_ok = if self.version == VERSION_V1 {
+            self.difficulty_checked().is_some()
+        } else {
+            self.difficulty_v2().is_some_and(|d| !d.is_zero())
+        };
+        if !difficulty_ok {
             return Err(MsgboardError::InvalidDifficulty);
         }
         if self.category == B256::ZERO && self.data.is_empty() {
@@ -197,6 +207,13 @@ impl PoWMsg {
         block_number: u64,
         timestamp: u64,
     ) -> Result<CheckedPoWMsg, MsgboardError> {
+        // v2 is a different construction end to end — see `crate::pow_v2`.
+        // Nothing below applies to it, so dispatch before any of it runs.
+        if self.version == crate::pow_v2::VERSION_V2 {
+            let hash = self.verify_v2()?;
+            return Ok(CheckedPoWMsg { msg: self, block_number, timestamp, hash });
+        }
+
         // Rejects both the zero threshold (a division by zero below) and the
         // overflow the wrap used to hide — see `difficulty_checked`.
         let Some(difficulty) = self.difficulty_checked() else {
@@ -436,9 +453,18 @@ mod tests {
     /// else is rejected at the decode boundary rather than being interpreted
     /// under v1 field semantics.
     #[test]
-    fn test_validate_rejects_non_v1_version() {
+    fn test_validate_rejects_versions_we_do_not_speak() {
         let mut msg = make_msg(1, &[1]);
-        msg.version = VERSION_V1 + 1;
+
+        // v1 and v2 are both spoken — the version byte selects the rules, it
+        // does not gate entry.
+        msg.version = VERSION_V1;
+        assert!(msg.validate().is_ok());
+        msg.version = crate::pow_v2::VERSION_V2;
+        assert!(msg.validate().is_ok(), "v2 is a construction we speak");
+
+        // Everything else is refused at the decode boundary.
+        msg.version = crate::pow_v2::VERSION_V2 + 1;
         assert!(matches!(msg.validate(), Err(MsgboardError::InvalidVersion)));
 
         msg.version = 0;
