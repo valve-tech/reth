@@ -5,8 +5,8 @@ testnet v4. It interoperates. Everything below was verified against
 erigon-pulse `v3.0.0-RC8` = `48cdb29e35`, package `msgboard/`, with file:line
 on both sides.
 
-**What we run:** both constructions. We verify the current PoW as `version = 1`
-and the new PoW as `version = 2`, side by side on one board. See §2.
+**What we run:** the new PoW, as `version = 1`, replacing the old one. We took
+the flag day. See §2.
 
 ---
 
@@ -42,34 +42,38 @@ Two consequences beyond the lost messages:
   release, and every strict inbound bound in the network is exercised for the
   first time on that day.
 
-## 2. The new PoW construction — we shipped it, and had to decide four things the spec leaves open
+## 2. The new PoW construction — we shipped it, and had to decide three things the spec leaves open
 
-We now run the new construction in production, as **`version = 2`**. It verifies
-alongside the current one, so nothing on the network needed a flag day. Getting
-there meant making calls that belong in the spec. One of them is only safe if
-you agree with it.
+We now run the new construction in production as **`version = 1`**, replacing
+the old one. Every board we run drained; every poster we run was upgraded in the
+same change. Getting there meant making calls that belong in the spec.
 
-### 2.1 The version byte — we took 2, and we need you to confirm it
+### 2.1 The version byte stays 1, and that makes this a flag day
 
-`scalarHash` binds the version byte, but every worked example is
-`"version": "0x1"`. The spec defines a construction with no number to carry it.
+`scalarHash` binds the version byte, and every worked example in the spec is
+`"version": "0x1"`. We read that as deliberate: the new construction *is*
+version 1, and the old one is gone.
 
-We assigned it **2**. That buys incremental migration: a version-1 message and a
-version-2 message coexist on one board, each verified by its own rules, and no
-operator has to switch at the same minute as everyone else.
+We tried the alternative first — ship the new construction as `version = 2`,
+verify both, and let clients move whenever they liked. We dropped it, for a
+reason worth stating rather than the convenience:
 
-If you ship the new construction under version 1 instead, the two networks do
-not merely disagree — they kick each other:
+**Any window in which both are accepted is a window in which the weaker one
+governs.** A board still taking version-1-old messages is exactly as spammable
+as it was before, so coexistence buys a smoother rollout and no security — and
+the security is the whole point of the change.
 
-- We reject a version-1 message that fails the version-1 verifier as invalid
-  work, which is kickable.
-- You reject a version-2 message with `ErrPoWMsgInvalidVersion`
-  (`pow_message.go:97-100`), which fails the **whole frame** through
-  `DecodeRLPMsgList` (`:61-72`), and the caller kicks (`fetch.go:267-271`).
+So this is a flag day, and it is worth the spec saying so out loud, next to the
+construction. An implementer who reads only the PoW section will not work out on
+their own that shipping it drains every board on the network and mutually bans
+every node that has not.
 
-**The ask:** confirm 2, or name the byte you want. This blocks everything below,
-because the version byte is the first byte into `scalarHash` — change it and
-every digest changes with it.
+**The ask:** confirm that version 1 is the new construction and the old one is
+retired — and if you can, name something an operator can target. A release tag,
+a block height, a date. Invalid work is kickable on both sides
+(`fetch.go:266-269`; our `add_remote_msgs` mirrors it), so whoever switches
+first is kicked by everyone who has not, and kicks them back. We will match
+whatever you pick.
 
 ### 2.2 Read literally, the PoW is free
 
@@ -145,13 +149,44 @@ tree at `48cdb29e35` — `msgboard/pow_message_test.go` holds only
 construction anywhere: not erigon-pulse at RC8, not the published npm packages,
 not the GitLab TypeScript repo, which has had no push in four months.
 
-So we generated one, from three independent readings of the spec text —
-JavaScript, Rust and Go — written so that a shared misreading would have to
-happen three times. There are two vectors: one pins every intermediate digest at
-a fixed nonce whether or not the work is sufficient, and one is actually mined.
+So we generated one, from independent readings of the spec text — JavaScript
+with a hand-rolled secp256k1, Rust, and Go — written so that a shared misreading
+would have to happen three times. There are two vectors: one pins every
+intermediate digest at a fixed nonce whether or not the work is sufficient, and
+one is actually mined.
 
-It is yours if you want it. **Caveat:** we computed it at `version = 2`, so
-§2.1 has to settle before the digests mean anything.
+Here it is. Both are at `version = 1`, which is the byte the spec's own examples
+use, so it should drop straight into `TestPoWGoldenVector` if you want it.
+
+```text
+VECTOR A — construction only, nonce fixed at 1, deliberately not mined
+  version 1
+  blockHash       0x3a2ca760216c5cb648c32aab73cbc1cdfdbcf02f77a4cd190995e3c46f3932b5
+  category        0x6368617474657200000000000000000000000000000000000000000000000000
+  data            "golden vector"  (13 bytes)
+  nonce 1 / workMultiplier 10000 / workDivisor 1000000
+  D               169072
+  target          0x0000633b2f5ccfab1c5e7b9a589ebb2c42f63035e122b764c1e8674d1cce1e2f
+  payloadHash     0xb66106e111b0e6cd08a49c7a37afa3259541bee8e465bef5e55f6cd7223d789a
+  scalarHash      0x3caed3ea9a5caa6e1e069d0126e4dc6698190aa3eec8ebcdab227d3e5b0fd18d
+  compressedPoint 0x035e55e474ae91c573e38855bba370f01d64a307fa9c834eda7b435ec9d24368b9
+  workHash        0x5ba003ccdb08503a19326a201834198a49e062d2f3f0e9506ff086eddb011dee
+  verifies        no  (workHash >= target — this vector is not mined)
+
+VECTOR B — the same message mined against an easier target
+  nonce 57602 / workMultiplier 1 / workDivisor 1000
+  D               16907
+  target          0x0003e052daeb075fbd9e751b0721b870c66a9125de8974ba1f0a577d0e110cac
+  scalarHash      0xbcff3c0ddc5d02b05e282566461d4f30f35ce90b3bfd36cde0c694dcb54a5e7d
+  compressedPoint 0x030fbdcb58e555146c54a0863ebf038a0384d4bd90439d02b8d8d5f71096ca7a09
+  workHash        0x00037212834e250723dc736508d445a0dbc01398040a980807641b4be2d1e361
+  verifies        yes;  nonces 57601 and 57603 do not
+```
+
+Vector A is the one that catches a misread of the byte layout: it pins four
+intermediates regardless of the verdict, so it cannot pass by luck the way a
+final-hash-only vector can. Vector B checks the threshold, and its neighbours
+check that the threshold is load-bearing.
 
 ### 2.7 Why the change is worth documenting
 
@@ -175,9 +210,10 @@ They compound. The first defect makes the table cheap to build; the second makes
 it reusable forever. A SHA-256 scalar that commits to `payloadHash` kills both,
 which is why the fix is one line and not two.
 
-This also settles the transition question. Any period in which nodes accept both
-constructions is a period in which the weaker one governs. The value of an
-accept-both window is entirely in avoiding kicks, and none of it is in security.
+This also settles the transition question, and it is why we did not take the
+version-2 route in §2.1. Any period in which nodes accept both constructions is
+a period in which the weaker one governs. The value of an accept-both window is
+entirely in avoiding kicks, and none of it is in security.
 
 ## 3. `MsgSizeLimit` above the packet limit bans conforming nodes
 
@@ -246,17 +282,18 @@ the first implementer to enforce it partitions itself.
 
 ## What we can supply
 
-- **The golden vector for the new PoW** (§2.6) — two cases, every intermediate
-  digest pinned, cross-checked in three languages. Re-derivable at whatever
-  version byte you pick.
+- **The golden vector for the new PoW** — printed in full in §2.6, two cases,
+  every intermediate digest pinned, cross-checked in three languages. Also the
+  generator, which is a dependency-free single file.
 - **A repro for §1** — the loop extracted, with the input and output counts.
 - **A cross-implementation corpus**: hex frames at the size boundary that both
   nodes must accept or reject identically, once §4 fixes the unit.
 - **Our parity audit** against `v3.0.0-RC8`, file:line on both sides.
-- **A testnet report** on running version 1 and version 2 side by side, once
-  there is anything but us posting version 2.
+- **A testnet report** on running the new construction — we are on it now, so we
+  will know before you do whether anything about it bites in production.
 
 Happy to file §1 as an issue instead if that is easier.
 
-**If you answer one thing, make it §2.1** — the version byte. Everything else we
-can work around; that one we cannot guess safely.
+**If you answer one thing, make it §2.2** — the missing floor on `D`. The version
+byte we have now read the same way you wrote it; a receiver with no minimum
+difficulty is a network anyone can fill for free.

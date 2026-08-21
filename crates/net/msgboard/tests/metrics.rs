@@ -39,8 +39,6 @@ use reth_msgboard_types::{MsgboardConfig, PoWMsg, VERSION_V1};
 /// `work_multiplier`/`work_divisor` whose exact difficulty exceeds `u64::MAX`.
 /// Erigon's `uint64` arithmetic wraps these to a trivially cheap threshold;
 /// reth rejects them. See `docs/msgboard-parity-gaps.md` §14.1.
-const OVERFLOW_MULTIPLIER: u64 = 1_014_806_211_241_672_337;
-const OVERFLOW_DIVISOR: u64 = 16;
 
 const fn block_hash_one() -> B256 {
     B256::repeat_byte(0x01)
@@ -240,25 +238,25 @@ fn every_metric_is_instantiated_and_moves() {
     let oversized = PoWMsg { data: Bytes::from(vec![0u8; 9 * 1024]), ..base };
 
     let weak = PoWMsg { work_divisor: 2_000_000, ..base.clone() };
-    let overflow = PoWMsg {
-        work_multiplier: OVERFLOW_MULTIPLIER,
-        work_divisor: OVERFLOW_DIVISOR,
-        ..base.clone()
-    };
+    // A zero divisor clears the minimum-work gate — `M × cfg.divisor >=
+    // cfg.multiplier × 0` holds for every `M` — and then leaves `D` undefined.
+    // It is the only input that still reaches `to_checked` with no usable
+    // difficulty, so it is what separates the two rejection counters.
+    let no_difficulty = PoWMsg { work_divisor: 0, ..base.clone() };
     let bad_work = bad_pow(&[7], 10);
     let unknown_block = PoWMsg { block_hash: B256::repeat_byte(0xEE), ..base.clone() };
 
     let (added, kickable) = board.add_remote_msgs(vec![
         oversized,
         weak,
-        overflow,
+        no_difficulty,
         bad_work,
         unknown_block,
         base.clone(),
         base, // duplicate of the one just accepted
     ]);
     assert_eq!(added, 1, "only the well-formed message is accepted");
-    assert_eq!(kickable, 4, "oversized, weak, overflow and bad-pow are all penalised");
+    assert_eq!(kickable, 4, "oversized, weak, no-difficulty and bad-pow are all penalised");
 
     let snap = Snap::take(&snapshotter);
     assert_eq!(snap.counter("msgboard.accepted_remote"), 1);
@@ -267,7 +265,7 @@ fn every_metric_is_instantiated_and_moves() {
     assert_eq!(
         snap.counter("msgboard.rejected_invalid_difficulty"),
         1,
-        "the difficulty overflow must be counted separately from ordinary bad PoW",
+        "an undefined difficulty must be counted separately from ordinary bad PoW",
     );
     assert_eq!(snap.counter("msgboard.rejected_invalid_pow"), 1);
     assert_eq!(snap.counter("msgboard.skipped_unknown_block"), 1);

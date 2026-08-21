@@ -343,17 +343,28 @@ Pick one scheme per application and document it for your peers. The node only kn
 **Required to construct a valid `addMessage` call.** Conceptually:
 
 ```
-difficulty       = (2^24 + len(data) × 10_000) × workMultiplier / workDivisor
-diff_digest      = sha256(workMultiplier_be8 ‖ workDivisor_be8)[16:]   // last 16 bytes
-scalar           = (nonce × u128(diff_digest) + u256(blockHash)) mod secp256k1_order
-challenge        = x_coordinate(G × scalar)                            // 32-byte x of secp256k1 point
-hash             = sha256(challenge ‖ category ‖ data)
-valid            = u256_be(hash) % difficulty == 0   // modular check, NOT leading zeros
+D                = (2^24 + len(data) × 10_000) × workMultiplier / workDivisor
+target           = 2^256 / D                       // exact; D = 1 gives exactly 2^256
+payloadHash      = sha256(category ‖ data)
+scalarHash       = sha256(version_be1 ‖ blockHash ‖ payloadHash
+                          ‖ workMultiplier_be8 ‖ workDivisor_be8 ‖ nonce_be8)
+scalar           = u256_be(scalarHash)             // REJECT unless 1 <= scalar < n
+point            = G × scalar
+hash             = sha256(compress(point))         // 33 bytes, 0x02/0x03 ‖ x
+valid            = u256_be(hash) < target          // threshold, NOT leading zeros
 ```
 
-Mining loop on the client: pick `(workMultiplier, workDivisor)`, fetch a recent `blockHash`, then iterate `nonce = 1, 2, …` recomputing `hash` until the `% difficulty == 0` condition holds.
+Mining loop on the client: pick `(workMultiplier, workDivisor)`, fetch a recent `blockHash`, then iterate `nonce = 1, 2, …` recomputing `hash` until it falls below the target.
 
-Reference implementation: `crates/net/msgboard-types/src/pow.rs` — `PoWMsg::calculate_hash` and `PoWMsg::to_checked` are the exact functions the node runs to verify.
+Three details clients get wrong:
+
+- **The point is compressed.** 33 bytes with a parity prefix, not the bare 32-byte x-coordinate.
+- **An out-of-range scalar is rejected, not reduced.** Take the next nonce. Reducing produces a hash the node will not agree with. (It happens with probability about 2⁻¹²⁸, so you will not see it in testing — implement it anyway.)
+- **`version` is hashed.** Change the version byte and the work is void.
+
+**This replaced a different algorithm under the same version byte.** A message mined with `sha256(challenge ‖ category ‖ data)` and `hash % D == 0` does not verify any more. See `docs/msgboard-parity-gaps.md` §21.
+
+Reference implementation: `crates/net/msgboard-types/src/pow.rs` — `PoWMsg::calculate_hash` and `PoWMsg::to_checked` are the exact functions the node runs to verify. `mod golden_vector` in the same file pins a worked example, and `scripts/msgboard-pow-vector.js` regenerates it from the spec text alone.
 
 ---
 
@@ -366,9 +377,9 @@ Reference implementation: `crates/net/msgboard-types/src/pow.rs` — `PoWMsg::ca
 | `powmsg: invalid version` | `-32602` | `version != 1` |
 | `powmsg: invalid block hash` | `-32602` | Zero hash |
 | `powmsg: invalid nonce` | `-32602` | `nonce == 0` |
-| `powmsg: invalid difficulty` | `-32602` | `workMultiplier == 0` or `workDivisor == 0` |
+| `powmsg: invalid difficulty` | `-32602` | `workMultiplier == 0`, `workDivisor == 0`, or `D` floors to 0 |
 | `powmsg: invalid data` | `-32602` | Both `category` and `data` empty |
-| `powmsg: invalid work` | `-32602` | PoW does not satisfy `hash % difficulty == 0` |
+| `powmsg: invalid work` | `-32602` | `hash >= target`, or the scalar fell outside `[1, n)` |
 | `msgboard: message too large` | `-32000` | `len(data) > size-limit` |
 | `msgboard: message work too easy` | `-32000` | Ratio below node's minimum |
 | `msgboard: message block too old` | `-32000` | `blockHash` is unknown / outside the live window |

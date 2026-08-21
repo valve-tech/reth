@@ -20,7 +20,7 @@ use reth_libmdbx::Environment;
 use tokio::sync::broadcast;
 
 use reth_msgboard_types::{
-    CheckedPoWMsg, MsgID, MsgboardConfig, MsgboardError, PoWMsg, VERSION_V1, VERSION_V2,
+    CheckedPoWMsg, MsgID, MsgboardConfig, MsgboardError, PoWMsg, VERSION_V1,
 };
 
 use crate::{
@@ -290,10 +290,7 @@ impl MsgBoard {
                 // version we don't speak before requesting the body, instead of
                 // wasting an RTT and rejecting at decode time.
                 //
-                // Both constructions are spoken, so both are wanted. The board
-                // accepts either during the migration and the version byte, not
-                // the peer, decides which rules a message is judged by.
-                if id.version() != VERSION_V1 && id.version() != VERSION_V2 {
+                if id.version() != VERSION_V1 {
                     return false;
                 }
                 if index.has(&id.message_hash()) {
@@ -424,9 +421,9 @@ impl MsgBoard {
             let checked = match msg.to_checked(block_number, timestamp) {
                 Ok(checked) => checked,
                 Err(err) => {
-                    // Split by reason: `InvalidDifficulty` is the §14.1
-                    // overflow, where reth and erigon genuinely disagree, and
-                    // must not be lumped in with ordinary bad `PoW`.
+                    // Split by reason: `InvalidDifficulty` means the message
+                    // declares no usable threshold at all, which is a malformed
+                    // parameter rather than a failed mining attempt.
                     match err {
                         MsgboardError::InvalidDifficulty => {
                             self.metrics.rejected_invalid_difficulty.increment(1)
@@ -476,6 +473,14 @@ impl MsgBoard {
         if !self.is_ready() {
             return Err(MsgboardError::NotReady);
         }
+
+        // The remote path validates on decode (`decode_pow_msg_list`); the local
+        // path had no equivalent, so a message the peers would kick us for
+        // relaying could still enter the board through the RPC. The version byte
+        // makes that concrete: it is hashed into the scalar, so a message mined
+        // at the wrong version has genuine work behind it and passes
+        // `to_checked` on its own terms.
+        msg.validate()?;
 
         if !self.cfg.is_size_acceptable(msg.data.len()) {
             return Err(MsgboardError::MessageTooLarge);
@@ -753,17 +758,6 @@ mod tests {
         panic!("no valid nonce found within 1M iterations");
     }
 
-    /// Mine a `version = 2` message under [`easy_cfg`].
-    fn mined_v2(data: &[u8]) -> PoWMsg {
-        for n in 1u64..=1_000_000 {
-            let msg = PoWMsg { version: VERSION_V2, ..make_pow_msg(n, data) };
-            if msg.verify_v2().is_ok() {
-                return msg;
-            }
-        }
-        panic!("no valid v2 nonce found within 1M iterations");
-    }
-
     /// Return a ready board pre-seeded with a known block hash at height `height`.
     fn board_with_block(height: u64) -> MsgBoard {
         let board = MsgBoard::new(easy_cfg());
@@ -818,7 +812,11 @@ mod tests {
             })
             .collect();
         for msg in &spam {
-            assert_eq!(msg.difficulty_checked(), None, "exact threshold exceeds u64::MAX");
+            let d = msg.difficulty().expect("well-formed parameters");
+            assert!(
+                d > alloy_primitives::U256::from(u64::MAX),
+                "the exact threshold is ~2^80 — the old code wrapped it to 1",
+            );
             assert!(
                 board.config().is_work_acceptable(msg.work_multiplier, msg.work_divisor),
                 "the minimum-work gate is not what rejects these",
@@ -1247,39 +1245,34 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    /// Both constructions live on one board at the same time.
+    /// Version 1 is the only version the board will take.
     ///
-    /// This is the whole migration design: the version byte, not the peer,
-    /// decides which rules a message is judged by. Clients move from v1 to v2
-    /// whenever they like and the board keeps serving both, so there is no
-    /// moment when everything has to switch at once.
+    /// This replaced a test asserting that two constructions coexisted. They no
+    /// longer do: the new algorithm took the same version byte, so there is
+    /// nothing to tell an old message from a new one and no dual-accept path to
+    /// build. Anything but 1 is refused outright.
     #[test]
-    fn a_v1_and_a_v2_message_coexist_on_one_board() {
+    fn only_version_one_is_accepted() {
         let board = board_with_block(100);
 
-        let v1 = make_pow_msg(find_nonce(&[0xA1]), &[0xA1]);
-        let v2 = mined_v2(&[0xA2]);
-        assert_eq!(v1.version, VERSION_V1);
-        assert_eq!(v2.version, VERSION_V2);
+        let good = make_pow_msg(find_nonce(&[0xA1]), &[0xA1]);
+        assert_eq!(good.version, VERSION_V1);
+        board.add_local_msg(good.clone()).expect("version 1 must be accepted");
 
-        let checked_v1 = board.add_local_msg(v1).expect("v1 must still be accepted");
-        let checked_v2 = board.add_local_msg(v2).expect("v2 must be accepted");
+        for bad in [0u8, 2, 3] {
+            let mut msg = good.clone();
+            msg.version = bad;
+            assert!(
+                matches!(board.add_local_msg(msg), Err(MsgboardError::InvalidVersion)),
+                "version {bad} must be refused",
+            );
+        }
 
-        let (_, _, count, ..) = board.status();
-        assert_eq!(count, 2, "both constructions occupy the board together");
-        assert_ne!(
-            checked_v1.hash, checked_v2.hash,
-            "the two constructions produce different hashes, so neither can shadow the other",
-        );
-
-        // And each is judged by its own rules: swapping the version byte alone
-        // invalidates a message, because the other construction reads the same
-        // fields differently.
-        let mut mislabelled = checked_v2.msg.clone();
-        mislabelled.version = VERSION_V1;
-        assert!(
-            mislabelled.to_checked(100, 0).is_err(),
-            "a v2 message relabelled v1 must fail — the constructions are not interchangeable",
-        );
+        // The version byte is hashed into the scalar, so relabelling a valid
+        // message breaks its work even when the new label is one we speak.
+        // That is what makes the byte load-bearing rather than decorative.
+        let mut relabelled = good.clone();
+        relabelled.version = 2;
+        assert!(relabelled.verify().is_err());
     }
 }

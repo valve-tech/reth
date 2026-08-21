@@ -83,7 +83,7 @@ pub(crate) const MAX_INBOUND_FRAME_SIZE: usize = P2P_MSG_PACKET_LIMIT + FRAME_OV
 /// Widest RLP encoding of a [`PoWMsg`](reth_msgboard_types::PoWMsg)'s
 /// fixed-width fields, `data` excluded.
 ///
-/// `version` is one byte — `VERSION_V1` is 1, which RLP encodes as itself.
+/// `version` is one byte — [`VERSION_V1`] is 1, which RLP encodes as itself.
 /// `block_hash` and `category` are 32-byte strings, 33 bytes each. `nonce`,
 /// `work_multiplier` and `work_divisor` are `u64`s, 9 bytes each once the top
 /// byte is set. Taking every integer at its widest makes the derived ceiling
@@ -867,7 +867,7 @@ mod tests {
     use alloy_primitives::{Bytes, B256};
     use futures::poll;
     use reth_msgboard_types::{
-        encode_pow_msg_list, CheckedPoWMsg, MsgboardConfig, PoWMsg, VERSION_V1, VERSION_V2,
+        encode_pow_msg_list, CheckedPoWMsg, MsgboardConfig, PoWMsg, VERSION_V1,
     };
     use tokio::sync::mpsc::Receiver;
 
@@ -1707,10 +1707,9 @@ mod tests {
         let board = board_at(10);
         let (tx, mut rx) = channel();
         let real = checked(&[9], 10);
-        // Past the last construction we speak. `VERSION_V1 + 1` is v2, which is
-        // now requested rather than dropped.
+        // Version 1 is the only construction, so anything else is dropped.
         let bogus = MsgID::from_checked(
-            VERSION_V2 + 1,
+            VERSION_V1 + 1,
             &real.msg.block_hash,
             real.msg.data.len() as u64,
             real.msg.work_multiplier,

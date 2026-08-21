@@ -1883,16 +1883,18 @@ rejecting a message the network accepts, or emitting one the network rejects.
 | 6 | duplicate IDs in `GET_BOARD_MESSAGES` → kick | **blocked** | §20.2 |
 | 7 | `--msgboard.enabled`, off by default | implementable, **not shipped** | §20.5 |
 | 8 | the six REST methods and the subscription | **shipped** | `rpc_api.rs:125-165` |
-| 9 | `D` as a bigint, target `2²⁵⁶ / D` | **blocked** | §17.4 — no peer computes it |
-| 10 | `payloadHash = sha256(category ‖ data)` | **blocked** | as above |
-| 11 | `scalarHash = sha256(ver ‖ blockHash ‖ payloadHash ‖ M ‖ Div ‖ nonce)` | **blocked** | as above |
-| 12 | reject a scalar outside `[1, n)` rather than reduce it | **shipped** (§19) | `pow_scalar`, `pow.rs` |
-| 13 | compressed point, `workHash = sha256(point)` | **blocked** | as above |
-| 14 | acceptance `workHash < 2²⁵⁶ / D` | **blocked** | as above |
+| 9 | `D` as a bigint, target `2²⁵⁶ / D` | **shipped** (§21) | `difficulty`/`target`, `pow.rs` |
+| 10 | `payloadHash = sha256(category ‖ data)` | **shipped** (§21) | `payload_hash`, `pow.rs` |
+| 11 | `scalarHash = sha256(ver ‖ blockHash ‖ payloadHash ‖ M ‖ Div ‖ nonce)` | **shipped** (§21) | `scalar_hash`, `pow.rs` |
+| 12 | reject a scalar outside `[1, n)` rather than reduce it | **shipped** (§19, §21) | `challenge`, `pow.rs` |
+| 13 | compressed point, `workHash = sha256(point)` | **shipped** (§21) | `challenge`/`calculate_hash`, `pow.rs` |
+| 14 | acceptance `workHash < 2²⁵⁶ / D` | **shipped** (§21) | `verify`, `pow.rs` |
 | 15 | `MsgSizeLimit` vs the packet limit (spec silent) | **shipped this round** | §20.3 |
 
 Items 9-11, 13 and 14 are the new `PoW`. They stand or fall together: a message
-is valid under one construction or the other, never both.
+is valid under one construction or the other, never both. They shipped in §21,
+as a flag day — the table row above is the state after that decision, and §20.2
+below records the coexistence design that was tried first and then dropped.
 
 ### 20.2 Version-tagged coexistence does not work
 
@@ -2010,3 +2012,124 @@ is worth knowing before reading anything into convergence timing.
 
 The packing *rule* is unchanged by the bug, and reth implements the rule: flush
 before the next message crosses the limit, then add the list header.
+
+---
+
+## 21. Round-13: the new construction takes version 1, and the old one is gone
+
+§20 shipped the parts of the new spec the network already accepted and left the
+`PoW` itself blocked. §17.7 recorded why: nothing anywhere implements the new
+construction, so adopting it means becoming the reference. This round does that.
+
+**Decision: the new construction is `version = 1`.** It replaces the old one
+outright. There is no `version = 2`, no dual-accept path, and no migration
+window.
+
+### 21.1 Why not version 2
+
+A previous round shipped the new construction as `version = 2` alongside the old
+one, on the reasoning that the version byte could carry both and clients could
+move whenever they liked. That is the wrong shape for this network, for one
+reason that outweighs the convenience:
+
+**Any window in which both are accepted is a window in which the weaker one
+governs.** The old construction costs an attacker 50-500× less than its
+difficulty parameter claims, and lets one precomputed table mine unlimited
+messages in a block (§17.2). A board that still accepts it is exactly as
+spammable as it was before. Coexistence buys a smoother client rollout and no
+security at all — and the security is the entire reason for the change.
+
+Two smaller reasons point the same way. The spec never assigns the new
+construction a number; every worked example in it is `"version": "0x1"`, and
+`scalarHash` hashes that byte. Picking 2 ourselves means every digest we publish
+is wrong for anyone who follows the spec literally. And we are the only operator,
+so the coordination problem a version byte solves does not exist here.
+
+### 21.2 What the flag day costs
+
+Nothing on any board survives. Every message currently held was mined under the
+old rules, and `verify` refuses all of them. Boards drain to empty on restart:
+`load_from_db` re-checks each message against the current rules and pushes the
+failures onto `discarded` for the next flush to delete.
+
+Every poster must be upgraded before it can post again. There is no partial
+state — a poster running the old algorithm produces messages that no node will
+accept, and it will not be told why beyond `InvalidWork`.
+
+Peers that have not upgraded are kicked, and kick back. `add_remote_msgs` counts
+a failed `PoW` as kickable, so the two sides ban each other on the first
+exchange. On a single-operator network that is a restart; it would not be on a
+larger one.
+
+### 21.3 What changed in the code
+
+`pow_v2.rs` is gone; its contents are `pow.rs`, without the `_v2` suffixes. The
+old construction — `difficulty_digest`, `pow_scalar`, the uncompressed
+x-coordinate challenge, the `hash mod D == 0` test, and the `u64` difficulty with
+its overflow guard — is deleted rather than deprecated. `difficulty` now returns
+`Option<U256>` and `target` returns `Option<U512>`; the widening is not
+decorative, because `D = 1` puts the target at exactly 2²⁵⁶.
+
+Two tests carry the decision:
+
+- `test_a_message_mined_under_the_old_construction_is_now_worthless` pins a real message taken off
+  the live testnet board on 2026-08-19 and asserts it no longer verifies. It was
+  mined by somebody else's client and accepted by the running fleet, so it is the
+  only case in the suite that can catch a partial revert toward the old
+  algorithm. It replaces a test that asserted the opposite.
+- `only_version_one_is_accepted` replaces the coexistence test. It also checks
+  that relabelling a valid message to `version = 2` breaks its work, which is
+  what makes the version byte load-bearing rather than decorative.
+
+### 21.4 The golden vector
+
+The spec cites `TestPoWGoldenVector` as the normative worked example. It does not
+exist at `48cdb29e35`; `msgboard/pow_message_test.go` holds only
+`TestPoWMessageSuite`. Ours is `mod golden_vector` in `pow.rs`, generated by
+`scripts/msgboard-pow-vector.js` — an independent transcription of the spec text
+with a hand-rolled secp256k1, so agreement between the two is agreement between
+two readings of the spec rather than a call into the same library twice.
+
+```text
+VECTOR A — construction only, nonce fixed at 1, deliberately not mined
+  version 1 / blockHash 0x3a2ca760…32b5 / category 0x63686174…0000 ("chatter")
+  data "golden vector" (13 bytes) / M 10000 / Div 1000000 / D 169072
+  payloadHash     0xb66106e111b0e6cd08a49c7a37afa3259541bee8e465bef5e55f6cd7223d789a
+  scalarHash      0x3caed3ea9a5caa6e1e069d0126e4dc6698190aa3eec8ebcdab227d3e5b0fd18d
+  compressedPoint 0x035e55e474ae91c573e38855bba370f01d64a307fa9c834eda7b435ec9d24368b9
+  workHash        0x5ba003ccdb08503a19326a201834198a49e062d2f3f0e9506ff086eddb011dee
+
+VECTOR B — the same message mined against an easier target
+  nonce 57602 / M 1 / Div 1000 / D 16907
+  scalarHash      0xbcff3c0ddc5d02b05e282566461d4f30f35ce90b3bfd36cde0c694dcb54a5e7d
+  compressedPoint 0x030fbdcb58e555146c54a0863ebf038a0384d4bd90439d02b8d8d5f71096ca7a09
+  workHash        0x00037212834e250723dc736508d445a0dbc01398040a980807641b4be2d1e361
+```
+
+Vector A pins the byte layout regardless of whether the work is sufficient — a
+vector that only checks the final verdict can pass by luck; four intermediates
+cannot. Vector B is mined, and nonces 57601 and 57603 are asserted to fail, so
+the threshold is load-bearing.
+
+### 21.5 A gap this surfaced: local submissions were never field-validated
+
+`add_local_msg` went straight to `to_checked` and never called `validate`. The
+remote path validates on decode (`decode_pow_msg_list`), so the asymmetry only
+ever mattered for RPC submissions — but it meant a message the peers would kick
+us for relaying could still enter our own board.
+
+The version byte makes it concrete rather than theoretical. It is hashed into the
+scalar, so a message mined at `version = 0` has genuine work behind it and passes
+`to_checked` on its own terms; only `validate` refuses it. `add_local_msg` now
+calls `validate` first.
+
+### 21.6 What this does not settle
+
+The spec still gives the poster's obligations and never the receiver's, and that
+leaves `D` unbounded below: `M = 1`, `Div = 2²⁴`, empty body gives `D = 1`, a
+target of 2²⁵⁶, and a first-nonce win. What stops it here is the operator's
+minimum-work gate (`is_work_acceptable`), which is ours and not in the spec. An
+implementer working from the document alone has no floor at all.
+
+`a_difficulty_of_one_admits_every_hash` pins that case so the exemption stays
+visible. Raised upstream as §2.2 of `docs/msgboard-spec-feedback.md`.
