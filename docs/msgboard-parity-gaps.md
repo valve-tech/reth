@@ -1879,8 +1879,8 @@ rejecting a message the network accepts, or emitting one the network rejects.
 | 2 | `MsgID` is 121 bytes | **shipped** | `MSG_ID_SIZE`, `msg_id.rs:21`; Go `messageIDSize`, `message_id.go:23` |
 | 3 | `BOARD_MESSAGES` chunked at 100 KiB | **shipped** | packer at `protocol.rs:718`; Go `MaxSizeMsgChunks`, `send.go:53` |
 | 4 | oversized packet costs the sender the connection | **shipped** (§18.3) | `report_bad_protocol`, weight `i32::MIN` |
-| 5 | duplicate IDs in `BOARD_MESSAGE_IDS` → kick | **blocked** | §20.2 |
-| 6 | duplicate IDs in `GET_BOARD_MESSAGES` → kick | **blocked** | §20.2 |
+| 5 | duplicate IDs in `BOARD_MESSAGE_IDS` → kick | **blocked** | §20.5 |
+| 6 | duplicate IDs in `GET_BOARD_MESSAGES` → kick | **blocked** | §20.5 |
 | 7 | `--msgboard.enabled`, off by default | implementable, **not shipped** | §20.5 |
 | 8 | the six REST methods and the subscription | **shipped** | `rpc_api.rs:125-165` |
 | 9 | `D` as a bigint, target `2²⁵⁶ / D` | **shipped** (§21) | `difficulty`/`target`, `pow.rs` |
@@ -1929,8 +1929,13 @@ message cannot cross the network, so a version-2 verifier would be an untested
 path with no reachable input, written against a spec with no reference
 implementation.
 
-Not implemented, and not worth revisiting until upstream says which version
-number the new construction carries.
+**Superseded by §21.** This section was written to argue against shipping the new
+construction as `version = 2`, and it shipped that way anyway before being
+reversed. Its three facts are now the argument *for* what we did: the spec does
+not assign the new construction a version because it does not need one — the new
+construction is version 1, and the old one is gone. Read on for the fourth
+reason, which is the one that actually decided it: coexistence means the weaker
+construction governs for the whole window.
 
 ### 20.3 `--msgboard.size-limit` now has a ceiling
 
