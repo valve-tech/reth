@@ -581,6 +581,45 @@ mod tests {
         assert_eq!(got.block_number, 10);
     }
 
+    /// The notification method must be `msgboard_subscription`.
+    ///
+    /// The typed `subscribe_unbounded` helper above matches on subscription id
+    /// and never looks at the method name, so it passes either way — and it did
+    /// pass for the whole time the name was wrong. This reads the raw frame.
+    ///
+    /// The spec's worked example names `msgboard_subscription`, jsonrpsee
+    /// defaults it to the subscribe method's own name, and the failure is
+    /// silent: the subscription opens, carries traffic, and a client filtering
+    /// on the documented name sees an empty board.
+    #[tokio::test]
+    async fn subscription_notifications_use_the_method_name_the_spec_documents() {
+        let board = ready_board(10);
+        let m = module(Arc::clone(&board));
+
+        let (_resp, mut stream) = m
+            .raw_json_request(
+                r#"{"jsonrpc":"2.0","id":1,"method":"msgboard_subscribe","params":["newMessages"]}"#,
+                4,
+            )
+            .await
+            .expect("subscribe must be accepted");
+
+        board.add_local_msg(mined(&[7], category(0xCA), 10)).unwrap();
+
+        let raw = stream.recv().await.expect("subscription yielded nothing");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw.get()).expect("notification must be JSON");
+
+        assert_eq!(
+            parsed["method"], "msgboard_subscription",
+            "notification method must match the spec, not the subscribe method name",
+        );
+        // The id's wire form is the harness's own (a bare number here, a hex
+        // string from the real server), so only its presence is asserted.
+        assert!(!parsed["params"]["subscription"].is_null());
+        assert!(parsed["params"]["result"]["hash"].is_string());
+    }
+
     #[tokio::test]
     async fn subscribe_category_filter_suppresses_other_categories() {
         let board = ready_board(10);

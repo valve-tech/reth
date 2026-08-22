@@ -2308,3 +2308,41 @@ A prediction worth checking rather than assuming: if peer bans are the cause,
 they expire 12 hours after each box's restart and gossip returns on its own,
 with no deploy. If it does not return by then, the ban theory is wrong and the
 next thing to read is the new `msgboard_peer_sessions` gauge from §22.
+
+---
+
+## 24. Round-16: the subscription notification carried the wrong method name
+
+`msgboard_subscribe` works end to end — verified live on `direct-a-evm-943`,
+where a held subscription delivered real arcade and provecash messages as they
+were posted. But the notification frames named the wrong method:
+
+```
+emitted:  {"jsonrpc":"2.0","method":"msgboard_subscribe",    "params":{...}}
+spec:     {"jsonrpc":"2.0","method":"msgboard_subscription", "params":{...}}
+```
+
+jsonrpsee defaults a subscription's notification name to the subscribe method's
+own name; the `name = "subscribe" => "subscription"` form overrides it. Nothing
+in the crate said which was intended, so the default stood.
+
+This is a silent failure, which is what makes it worth a section. The
+subscription opens, the id comes back, frames flow, and every count on the
+server looks healthy. A client that filters on the documented name — as our own
+`docs/msgboard-rpc.md:285` tells it to, in shipped example code — simply sees an
+empty board forever.
+
+### 24.1 Why the tests did not catch it
+
+`subscribe_emits_newly_accepted_messages` and the category-filter test both use
+jsonrpsee's typed `subscribe_unbounded` helper, which correlates on subscription
+id and never inspects the method name. They passed for the whole time the name
+was wrong, and would pass again if it regressed.
+
+`subscription_notifications_use_the_method_name_the_spec_documents` reads the
+raw frame through `raw_json_request` instead. Reverting the `=>` fails it.
+
+The general lesson is the one §22 hit from the other side: a test that consumes
+its own output through the same abstraction that produced it cannot see a
+contract break. The typed helper and the server agreed with each other and both
+disagreed with the spec.

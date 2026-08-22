@@ -157,8 +157,14 @@ pub trait MsgboardApi {
     /// JSON-RPC shape `["newMessages", filter?]`. Pass an optional
     /// [`NewMessagesFilter`] as the second parameter to restrict notifications
     /// to a single category.
+    /// The notification method is `msgboard_subscription`, **not**
+    /// `msgboard_subscribe`. jsonrpsee defaults the notification name to the
+    /// subscribe method's name; the `=>` form overrides it. The spec's worked
+    /// example is explicit, and a client filtering on the documented name sees
+    /// nothing at all if this drifts — the subscription still opens and still
+    /// carries traffic, so the failure looks like a silent board.
     #[subscription(
-        name = "subscribe",
+        name = "subscribe" => "subscription",
         unsubscribe = "unsubscribe",
         item = MsgboardMsg
     )]
