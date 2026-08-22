@@ -2053,9 +2053,14 @@ so the coordination problem a version byte solves does not exist here.
 ### 21.2 What the flag day costs
 
 Nothing on any board survives. Every message currently held was mined under the
-old rules, and `verify` refuses all of them. Boards drain to empty on restart:
-`load_from_db` re-checks each message against the current rules and pushes the
-failures onto `discarded` for the next flush to delete.
+old rules, and `verify` refuses all of them.
+
+**Correction (§23).** This section first claimed boards drain on restart because
+`load_from_db` re-checks each message against the current rules. That was wrong
+when written. `load_from_db` checked the size limit and the work *ratio* and
+never re-verified the `PoW`, and `db_load_all` only RLP-decodes — so old-
+construction messages came straight back onto the board at startup and were
+announced to peers as valid. Fixed in §23.
 
 Every poster must be upgraded before it can post again. There is no partial
 state — a poster running the old algorithm produces messages that no node will
@@ -2225,3 +2230,81 @@ The number that would settle it is `accepted_remote` **before** the roll. If
 Prometheus retains it and it was already zero, inbound gossip never worked and
 this is not a regression at all — which points the investigation at peering and
 capability negotiation rather than at anything the roll changed.
+
+
+---
+
+## 23. Round-15: the flag day did not drain the boards
+
+`load_from_db` re-inserted every stored message that satisfied the size limit
+and the work ratio, and never re-verified the `PoW` (`board.rs:151-161`;
+`db_load_all` only RLP-decodes). §21.2 claimed the opposite. The claim was never
+true, and the flag day is exactly the condition that makes it matter.
+
+So at the roll each box reloaded a board full of old-construction messages,
+announced them to its peers as valid, and served the bodies on request. Every
+body a conforming peer rejects earns us one `BadMessage` hit **from that peer**.
+At reth's defaults that is `16 × REPUTATION_UNIT` against a `50 × REPUTATION_UNIT`
+threshold, so the fourth message we serve gets us banned — and the ban is global
+and lasts 12 hours (`peers/config.rs:200`). It costs `eth/68` block sync, not
+just msgboard.
+
+A rules change is precisely when a stored row stops meaning what it meant when
+it was written. Trusting the row is what turned a construction change into a
+mutual partition.
+
+### 23.1 The fix
+
+`load_from_db` now re-verifies, and requires the recomputed work hash to equal
+the hash the row carries:
+
+```rust
+let valid = self.cfg.is_size_acceptable(arc.msg.data.len()) &&
+    self.cfg.is_work_acceptable(arc.msg.work_multiplier, arc.msg.work_divisor) &&
+    arc.msg.verify().is_ok_and(|hash| hash == arc.hash);
+```
+
+Failures already went to `discarded`, so the next flush deletes them from MDBX
+and the board self-cleans across one restart.
+
+The cost is one scalar multiplication per stored row, paid once at startup —
+under a second for a full `count_limit` board, against a partition measured in
+hours.
+
+`a_stored_message_that_no_longer_verifies_is_not_reloaded` writes two rows
+straight through `db_flush` (which verifies nothing, by design), one sound and
+one whose recorded hash does not match its own work, and asserts only the sound
+one loads. Dropping the `verify` clause fails it.
+
+### 23.2 What the fleet metrics actually said
+
+The runbook that opened this
+(`monorepo/deploy/rpc/runbooks/msgboard-gossip-investigation.md`) reports gossip
+as dead fleet-wide and reads `expired 31` on chain 369 as evidence of a
+regression. §22.3 already noted that `expired` cannot support that inference.
+Prometheus keeps 365 days of `reth_msgboard_*` (scraped since 2026-08-03), and
+it separates two problems the runbook treats as one:
+
+| host | `accepted_remote`, 30d peak | last increase |
+|---|---|---|
+| direct-a-evm-369 | **0** | never |
+| direct-b-evm-369 | **0** | never |
+| indexer | **0** | never |
+| direct-a-evm-943 | 453 | 2026-08-21 16:56Z |
+| direct-b-evm-943 | 573 | 2026-08-21 16:56Z |
+| direct-a-evm-1 | 6 | 2026-08-21 18:56Z |
+| direct-b-evm-1 | 2016 | 2026-08-21 18:56Z |
+
+**Chain 369 never received a single message**, across the whole retained window.
+That is not a regression and the roll did not cause it; it belongs with the
+peering question in the runbook's sub-problem A.
+
+**Chains 943 and 1 were receiving until the roll and stopped at it.** `direct-b-evm-1`
+alone took 2016 messages in the preceding week. Both chains stopped at their own
+restart and have not resumed since — which is the regression, and §23 is its
+most likely mechanism.
+
+A prediction worth checking rather than assuming: if peer bans are the cause,
+they expire 12 hours after each box's restart and gossip returns on its own,
+with no deploy. If it does not return by then, the ban theory is wrong and the
+next thing to read is the new `msgboard_peer_sessions` gauge from §22.

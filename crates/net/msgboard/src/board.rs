@@ -153,8 +153,22 @@ impl MsgBoard {
             let arc = Arc::new(msg);
             // Reject rows that no longer satisfy the live config. They land in
             // `discarded` so the next flush deletes them from MDBX.
+            //
+            // The `PoW` is re-verified, not trusted. A row on disk was valid
+            // under the rules in force when it was written, and those rules can
+            // change under it — §21 changed the construction outright. Without
+            // this check a construction change leaves the board serving
+            // messages no conforming peer can accept, and every one we serve
+            // earns us a `BadMessage` hit from that peer. Four is a 12-hour
+            // ban, and the ban is global: it costs block sync, not just
+            // msgboard.
+            //
+            // The cost is one scalar multiplication per stored message, paid
+            // once at startup — under a second for a full `count_limit` board,
+            // against a partition that lasts hours.
             let valid = self.cfg.is_size_acceptable(arc.msg.data.len()) &&
-                self.cfg.is_work_acceptable(arc.msg.work_multiplier, arc.msg.work_divisor);
+                self.cfg.is_work_acceptable(arc.msg.work_multiplier, arc.msg.work_divisor) &&
+                arc.msg.verify().is_ok_and(|hash| hash == arc.hash);
             if !valid {
                 let mut state = self.state.lock();
                 state.discarded.push(arc);
@@ -1274,5 +1288,45 @@ mod tests {
         let mut relabelled = good.clone();
         relabelled.version = 2;
         assert!(relabelled.verify().is_err());
+    }
+
+    /// A stored message whose `PoW` no longer verifies must not come back onto
+    /// the board at startup.
+    ///
+    /// A row on disk was valid under the rules in force when it was written,
+    /// and §21 changed those rules outright. Before this check `load_from_db`
+    /// re-inserted such rows unexamined, so a construction change left the
+    /// board announcing and serving messages no conforming peer could accept —
+    /// and each one served earns a `BadMessage` hit from that peer, four of
+    /// which is a 12-hour ban on *all* protocols, block sync included.
+    ///
+    /// The stale row here carries a hash that does not match its own work,
+    /// which is what a rules change looks like from the loader's side.
+    #[test]
+    fn a_stored_message_that_no_longer_verifies_is_not_reloaded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = crate::db::open_msgboard_db(dir.path()).expect("open db");
+
+        let good = {
+            let msg = make_pow_msg(find_nonce(&[0xB1]), &[0xB1]);
+            let hash = msg.verify().expect("mined");
+            CheckedPoWMsg { msg, block_number: 100, timestamp: 0, hash }
+        };
+        // Same fields, but the recorded hash is not the one this construction
+        // produces — indistinguishable, on disk, from a row written under rules
+        // that have since changed.
+        let stale = CheckedPoWMsg { hash: B256::repeat_byte(0xEE), ..good.clone() };
+
+        crate::db::db_flush(&env, std::slice::from_ref(&good), &[]).expect("write good");
+        crate::db::db_flush(&env, std::slice::from_ref(&stale), &[]).expect("write stale");
+
+        let board = MsgBoard::with_db(easy_cfg(), env);
+        board.set_ready();
+        board.set_head(100, block_hash_one());
+        let loaded = board.load_from_db().expect("load");
+
+        assert_eq!(loaded, 1, "only the message that still verifies may load");
+        assert!(board.get_message(&good.hash).is_some(), "the valid one survives");
+        assert!(board.get_message(&stale.hash).is_none(), "the stale one must not");
     }
 }
