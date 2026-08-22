@@ -2198,6 +2198,16 @@ reading would report a healthy network with no peer attached.
 them three different ways, then asserts `opened == closed == 3` and the gauge
 back at 0. Deleting the `Drop` body fails it.
 
+It lives in its own integration test (`tests/session_gauge.rs`) rather than
+beside the code, and the reason is worth recording because it will catch the
+next person: **metric handles bind to whichever recorder was live when they were
+built.** As a unit test it passed alone and failed in the full suite — 144 other
+tests had already constructed `MsgboardMetrics` against the default recorder, so
+the snapshot came back empty and the assertion read `None`, not a wrong number.
+`metrics::with_local_recorder` does not help, because the binding happens at
+construction rather than at emission. The test needs a process where the
+recorder is installed first, which only an integration test can guarantee.
+
 ### 22.3 A caution about `expired`
 
 The runbook reads `expired 31` on both chain-369 boxes as proof that inbound
