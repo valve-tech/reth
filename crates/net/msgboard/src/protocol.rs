@@ -313,13 +313,20 @@ impl ConnectionHandler for MsgboardConnectionHandler {
 /// A gauge that is incremented and decremented by hand drifts upward the first
 /// time a path returns early, and a drifting "peers connected" reading is worse
 /// than none — it is the number an operator trusts when nothing else is moving.
+/// `Drop` is what makes the decrement unconditional: early returns and a panic
+/// inside the spawned connection task all pay it.
+///
+/// Public so `tests/session_gauge.rs` can assert that contract. That test needs
+/// a process where the recorder is installed before any [`MsgboardMetrics`] is
+/// built, which a unit test in this crate cannot have.
 #[derive(Debug)]
-struct SessionGuard {
+pub struct SessionGuard {
     metrics: MsgboardMetrics,
 }
 
 impl SessionGuard {
-    fn new(metrics: MsgboardMetrics) -> Self {
+    /// Open a session: raise the gauge and count the open.
+    pub fn new(metrics: MsgboardMetrics) -> Self {
         metrics.peer_sessions.increment(1.0);
         metrics.peer_sessions_opened.increment(1);
         Self { metrics }
@@ -884,84 +891,6 @@ where
 
     fn report_bad_protocol(&self, peer_id: PeerId) {
         self.network.reputation_change(peer_id, ReputationChangeKind::BadProtocol);
-    }
-}
-
-#[cfg(test)]
-mod session_gauge {
-    use super::*;
-    use crate::metrics::MsgboardMetrics;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-
-    /// The live-session gauge must return to zero on every exit path, including
-    /// the ones that never reach the end of `run_connection`.
-    ///
-    /// A hand-incremented gauge drifts upward the first time a path returns
-    /// early, and this is the number an operator reads when nothing else is
-    /// moving — a stuck non-zero "peers connected" would report a healthy
-    /// network while no peer is attached at all. The guard is what makes the
-    /// decrement unconditional; this asserts it stays that way.
-    ///
-    /// Three sessions are opened and closed three different ways, then read
-    /// once. `snapshot()` drains, so a read per assertion would report deltas
-    /// rather than the running value — the paired counters carry the real
-    /// weight here: `closed` short of `opened` means a `Drop` did not run.
-    ///
-    /// Installs its own recorder, so it must be the only test in this binary
-    /// that does. The integration suite in `tests/metrics.rs` runs in a
-    /// separate process and installs its own.
-    #[test]
-    fn the_gauge_returns_to_zero_on_every_exit_path() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        recorder.install().expect("no other recorder installed in this test binary");
-
-        let metrics = MsgboardMetrics::default();
-
-        // 1. Falls off the end.
-        {
-            let _session = SessionGuard::new(metrics.clone());
-        }
-
-        // 2. Returns early.
-        fn bails(metrics: MsgboardMetrics) -> bool {
-            let _session = SessionGuard::new(metrics);
-            return false;
-            #[allow(unreachable_code)]
-            true
-        }
-        assert!(!bails(metrics.clone()));
-
-        // 3. Panics. The connection task is spawned, so a panic there is contained and would
-        //    otherwise leak a count for the life of the process.
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _session = SessionGuard::new(metrics);
-            panic!("session died mid-frame");
-        }));
-        assert!(caught.is_err(), "the panic must actually have happened");
-
-        let snap = snapshotter.snapshot().into_vec();
-        let read = |name: &str| {
-            snap.iter().find_map(|(key, _, _, value)| {
-                (key.key().name() == name).then(|| match value {
-                    DebugValue::Gauge(g) => g.into_inner(),
-                    DebugValue::Counter(c) => *c as f64,
-                    other => panic!("{name} is {other:?}"),
-                })
-            })
-        };
-
-        assert_eq!(read("msgboard.peer_sessions_opened"), Some(3.0));
-        assert_eq!(
-            read("msgboard.peer_sessions_closed"),
-            Some(3.0),
-            "every session must close, including the early return and the panic",
-        );
-        assert_eq!(
-            read("msgboard.peer_sessions"),
-            Some(0.0),
-            "three sessions opened and three closed must leave the gauge where it started",
-        );
     }
 }
 
