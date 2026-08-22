@@ -2138,3 +2138,80 @@ implementer working from the document alone has no floor at all.
 
 `a_difficulty_of_one_admits_every_hash` pins that case so the exemption stays
 visible. Raised upstream as §2.2 of `docs/msgboard-spec-feedback.md`.
+
+---
+
+## 22. Round-14: no metric could tell "nobody is talking" from "nobody can"
+
+The fleet runbook
+(`monorepo/deploy/rpc/runbooks/msgboard-gossip-investigation.md`, 2026-08-21)
+reports `announcements_received = 0` on all seven boxes while
+`announcements_sent` is 26 and 34. Nothing arrives from any peer.
+
+Its most useful line is not a symptom, it is an absence:
+
+> Note there is **no metric for connected `msg/1` peers**. Adding one is
+> probably the single highest-value change for diagnosing this class of fault.
+
+That is correct, and the gap is worse than it looks. Every counter on the
+receive path — `announcements_received`, `bodies_received`, `accepted_remote`,
+every `rejected_*` — reads zero in two completely different worlds:
+
+- peers negotiate `msg/1` and send us nothing, or send us things we reject;
+- no connected peer speaks `msg/1` at all, so the receive path is never reached.
+
+The fixes have nothing in common, and no combination of the existing metrics
+separates them. The `bad_message 0 / bad_protocol 0` pair is the tell that it is
+the second — we are not rejecting anything, because nothing arrives — but that
+is an inference from two zeros, which is exactly the kind of reasoning that
+produced the "wrong algorithm" false alarm the runbook opens by retracting.
+
+### 22.1 What was added
+
+| metric | type | reads |
+|---|---|---|
+| `msgboard_peer_sessions` | gauge | peers with a live `msg/1` session right now |
+| `msgboard_peer_sessions_opened` | counter | sessions opened since start |
+| `msgboard_peer_sessions_closed` | counter | sessions closed since start |
+| `msgboard_peer_unsupported` | counter | peers that connected without the capability |
+
+Read them together:
+
+- **gauge 0, `peer_unsupported` climbing** — we have peers, none run a board. Nothing is broken in reth; the question is who else runs msgboard.
+- **gauge 0, `opened` high** — peers negotiate and then drop the subprotocol. Look for disconnect reasons.
+- **gauge > 0, `announcements_received` 0** — sessions are live and silent. Now the receive path is worth reading.
+
+`peer_unsupported` is expected to be large. The capability is opt-in, so most of
+the network will never negotiate it; the counter exists to separate "no msgboard
+peers" from "no peers", which the eth peer count alone cannot do.
+
+### 22.2 The gauge is guarded, not hand-counted
+
+`SessionGuard` raises the gauge on construction and lowers it on `Drop`, so
+every exit from `run_connection` pays the decrement — including early returns and
+a panic inside the spawned connection task. A gauge incremented and decremented
+by hand drifts upward the first time a path returns early, and this is precisely
+the number an operator trusts when nothing else is moving. A stuck non-zero
+reading would report a healthy network with no peer attached.
+
+`the_gauge_returns_to_zero_on_every_exit_path` opens three sessions and closes
+them three different ways, then asserts `opened == closed == 3` and the gauge
+back at 0. Deleting the `Drop` body fails it.
+
+### 22.3 A caution about `expired`
+
+The runbook reads `expired 31` on both chain-369 boxes as proof that inbound
+gossip used to work, and therefore that this is a regression from the
+2026-08-21 roll.
+
+That inference does not hold. `expired` counts every message whose anchor block
+left the live window, with no regard for where the message came from
+(`board.rs:243-250`) — a message posted through `msgboard_addMessage` expires
+exactly like one received from a peer. The boxes carry `accepted_local` 6 and 7
+for a handful of probe and arcade posts, so a locally-fed board would produce
+the same 31.
+
+The number that would settle it is `accepted_remote` **before** the roll. If
+Prometheus retains it and it was already zero, inbound gossip never worked and
+this is not a regression at all — which points the investigation at peering and
+capability negotiation rather than at anything the roll changed.
