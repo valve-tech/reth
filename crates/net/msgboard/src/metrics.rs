@@ -81,6 +81,31 @@ pub struct MsgboardMetrics {
     /// Messages dropped because their anchor block left the live window.
     pub expired: Counter,
 
+    // ── peer sessions ────────────────────────────────────────────────────────
+    /// Peers with a live `msg/1` session right now.
+    ///
+    /// **Read this first when no gossip is arriving.** Every other counter on
+    /// the receive path reads zero both when nobody is talking to us and when
+    /// nobody *can*, and the two have completely different fixes. Zero here
+    /// means no connected peer negotiated the capability, so the receive path
+    /// was never reached and the message-level counters are silent by
+    /// construction rather than by rejection.
+    pub peer_sessions: Gauge,
+    /// `msg/1` sessions opened since start.
+    ///
+    /// Read against [`peer_sessions`](Self::peer_sessions): a high count with a
+    /// gauge near zero means peers negotiate the capability and then drop it,
+    /// which is a different fault from never negotiating it at all.
+    pub peer_sessions_opened: Counter,
+    /// `msg/1` sessions closed since start.
+    pub peer_sessions_closed: Counter,
+    /// Peers that connected but do not speak `msg/1`.
+    ///
+    /// Expected to be large: the capability is opt-in and most of the network
+    /// does not run it. It is here to separate "we have no msgboard peers" from
+    /// "we have no peers", which the eth peer count alone cannot do.
+    pub peer_unsupported: Counter,
+
     // ── protocol ─────────────────────────────────────────────────────────────
     /// Wire-malformed payloads (unparseable RLP, bad `MsgID` list length).
     pub bad_protocol: Counter,
