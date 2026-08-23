@@ -2346,3 +2346,96 @@ The general lesson is the one §22 hit from the other side: a test that consumes
 its own output through the same abstraction that produced it cannot see a
 contract break. The typed helper and the server agreed with each other and both
 disagreed with the spec.
+
+---
+
+## 25. Round-17: the gauge answered it, and it inverted the diagnosis
+
+`v2.5.1-pulse-4` is deployed fleet-wide. The metrics §22 added resolve the
+gossip question in one read, and they contradict both of the stories told
+earlier in this document.
+
+```
+                     peer_sessions   opened/hr   peer_unsupported   accepted_local/hr
+direct-a-evm-369           1            83            7,900               0
+direct-b-evm-369           0           186           14,411               0
+direct-a-evm-943           0             0           11,177             127
+direct-b-evm-943           0             0           12,698             139
+direct-a-evm-1             0             0           13,268               0
+direct-b-evm-1             0             0           27,112               0
+```
+
+### 25.1 Two different faults, neither the one that was assumed
+
+**Chain 943 (testnet v4) has no `msg/1` peers at all.** Not one session has
+opened since the roll. Its nodes see 51,000-59,000 peer connections an hour and
+every one of them lacks the capability. This is where all the real traffic is —
+127 and 139 accepted local posts an hour — and it has nowhere to go.
+
+**Chain 369 (mainnet) is the only chain that has `msg/1` peers.** Sessions open
+at 83-186 an hour. They are short-lived, but that is ordinary churn rather than a
+msgboard fault: the same boxes open 49,000-59,000 eth connections an hour, so
+`msg/1` sessions track the general churn at about 0.3% of it — the share of
+mainnet peers that run a board. Both 369 boards are empty, so we announce
+nothing and there is nothing for a peer to request.
+
+**Chain 1 has none, correctly.** Msgboard is a PulseChain protocol.
+
+### 25.2 Corrections to earlier rounds
+
+Two claims in this document were wrong, and the gauge is what showed it.
+
+**§23.2 said chain 369 "never received a single message" and treated that as the
+fault.** The zero was real, but the reading was backwards: 369 is the only chain
+with msgboard peers at all. Its boards are empty because nothing is posted to
+them, not because it cannot gossip.
+
+**§23 proposed peer bans as the mechanism for 943 and chain 1 falling silent at
+the roll, and predicted recovery when the 12-hour window expired.** That did not
+happen. More than 24 hours passed with no recovery, and chain 1's peer count
+returned to 130 while its gossip stayed at zero. Peers returning without gossip
+returning falsifies it. The §23 fix — re-verifying stored messages on load — is
+still correct and still worth having, but it was not the cause of the silence.
+
+Both errors have the same shape: reading a zero as evidence of a specific
+mechanism when the metric could not distinguish that mechanism from any other.
+That is what §22 was written to stop, and it took deploying it to stop it.
+
+### 25.3 The actionable finding: our own replicas are not peered
+
+On 943 the entire msgboard network is our two boxes. They are not connected to
+each other. The only TCP link between them is lighthouse on `:9300`; reth's
+`:30303` has no session, and neither node's command line carries
+`--trusted-peers`.
+
+So the two replicas hold divergent boards by construction, which is precisely
+the customer-visible symptom the fleet runbook opens with: a client writes to
+one replica through eRPC, reads from the other, and sees nothing.
+
+Static peering fixes it outright, because on testnet there is no third party to
+depend on:
+
+```
+direct-a-evm-943  116.202.173.179:30303
+  enode://c6b52cf99ec0bdecec6b1ca58c42c59358c7f9aabe0369aca5c73d51c5efdfb0
+         1aeeec069aa52b0a70386682a0cc6fd5c0c8c3714ce5100011c0df2b311a43b2
+
+direct-b-evm-943  157.90.179.40:30303
+  enode://8d094139bc456c134f5d397bd5320dd40faecf6d6f586a57ce2141147599ce7f
+         6f4365e10114856aa7c467ed995db84e55ced6a598d137377a2693f1b1ad5e64
+```
+
+That is a deploy change in the monorepo, not a reth change. Nothing in reth
+needs to move for it.
+
+### 25.4 What the metrics will say when it works
+
+`peer_sessions` goes to 1 on each 943 box and stays there — a trusted peer is
+reconnected rather than churned. `announcements_sent` starts tracking
+`accepted_local`, which has been pinned at zero against 127/hr. Then
+`announcements_received`, `requests_sent` and `accepted_remote` move on the
+opposite box, and `msg_count` converges between the two.
+
+If `peer_sessions` reaches 1 and `accepted_remote` stays at zero, the fault is
+downstream of the session and §22's read order says the receive path is finally
+worth reading.
