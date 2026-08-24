@@ -97,10 +97,15 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          # --release --bin reth mirrors what rpc-cargo-rebuild runs on the box,
-          # so the published artifact is the same thing the fleet would have
-          # compiled for itself.
-          cargo build --release --bin reth --target "$TARGET"
+          # Mirror what rpc-cargo-rebuild compiles on the firehose boxes: the
+          # v2.3-era feature set with --no-default-features. v2.4.0 moved `jit`
+          # (revmc -> llvm-sys) and `gmp` into bin/reth's DEFAULT features, so a
+          # default `cargo build` needs LLVM + GMP that neither these runners nor
+          # the boxes carry. The boxes build with exactly this set, and the JIT
+          # stays off at runtime regardless, so this IS the fleet binary.
+          cargo build --release --bin reth --target "$TARGET" \
+            --no-default-features \
+            --features "jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
 
       - name: Package
         env:
