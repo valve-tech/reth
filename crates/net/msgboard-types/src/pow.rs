@@ -979,6 +979,77 @@ mod golden_vector {
 mod upstream_golden_vector {
     use super::*;
 
+    /// Our exact `D` and erigon's saturating `u64` agree everywhere a message
+    /// can exist.
+    ///
+    /// erigon-pulse computes the full 192-bit product and returns
+    /// `math.MaxUint64` only when the quotient would not fit a `u64`
+    /// (`msgboard/pow_message.go:132-154`, `pulse-v3.4.4`). We compute the same
+    /// quotient in `U256` and never saturate, so the two can only differ in that
+    /// one regime.
+    ///
+    /// They differ harmlessly there. Saturating **raises** the threshold rather
+    /// than lowering it — `MaxUint64` is the largest `D` expressible, so
+    /// erigon's target becomes `2^256 / 2^64 = 2^192` while ours is smaller
+    /// still. Clearing either needs about 2^64 scalar multiplications, so no
+    /// message reaches the disagreement, and the direction is the safe one:
+    /// wherever the two differ, erigon is the more permissive and we reject a
+    /// superset of what it rejects.
+    ///
+    /// This is worth pinning because the same expression in plain `u64` used to
+    /// **wrap**, which made `D` small and the work free (§14.1). Saturation is
+    /// the opposite failure and is not exploitable — but the two are one
+    /// careless edit apart.
+    #[test]
+    fn saturating_and_exact_difficulty_agree_wherever_a_message_can_exist() {
+        /// erigon's `difficulty`, transcribed.
+        fn erigon_difficulty(size: u64, multiplier: u64, divisor: u64) -> u64 {
+            let base = (1u128 << 24) + u128::from(size) * 10_000;
+            let product = base * u128::from(multiplier);
+            let quotient = product / u128::from(divisor);
+            u64::try_from(quotient).unwrap_or(u64::MAX)
+        }
+
+        let mut msg = PoWMsg {
+            version: VERSION_V1,
+            block_hash: B256::repeat_byte(1),
+            nonce: 1,
+            work_multiplier: 1,
+            work_divisor: 1,
+            category: B256::repeat_byte(2),
+            data: Bytes::from_static(b"x"),
+        };
+
+        // Ordinary parameters: identical, no saturation anywhere.
+        for (m, d) in [(1u64, 1u64), (10_000, 1_000_000), (1, 1_000), (u32::MAX as u64, 7)] {
+            msg.work_multiplier = m;
+            msg.work_divisor = d;
+            let exact = msg.difficulty().expect("nonzero divisor");
+            let erigon = erigon_difficulty(msg.size(), m, d);
+            assert_eq!(exact, U256::from(erigon), "M={m} Div={d} must agree exactly");
+        }
+
+        // The saturating regime. erigon clamps to MaxUint64; we do not.
+        msg.work_multiplier = 1 << 60;
+        msg.work_divisor = 1;
+        let exact = msg.difficulty().expect("nonzero divisor");
+        assert_eq!(erigon_difficulty(msg.size(), 1 << 60, 1), u64::MAX, "erigon saturates here");
+        assert!(exact > U256::from(u64::MAX), "we keep the exact value");
+
+        // And the divergence is unreachable: erigon's own target in that regime
+        // is 2^256 / 2^64, which needs about 2^64 attempts to clear. Ours is
+        // tighter still, so we reject a superset — never the other way round.
+        let erigon_target = (U512::from(1u8) << 256) / u512_from_u256(U256::from(u64::MAX));
+        assert!(
+            msg.target().expect("nonzero D") < erigon_target,
+            "wherever the two differ, we must be the stricter one",
+        );
+        assert!(
+            erigon_target < (U512::from(1u8) << 193),
+            "and erigon's own threshold there is already out of reach",
+        );
+    }
+
     /// The upstream golden vector, `TestPoWGoldenVector` in erigon-pulse at
     /// `pulse-v3.4.4` (`msgboard/pow_message_test.go:256`).
     ///
