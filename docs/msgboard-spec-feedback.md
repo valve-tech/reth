@@ -5,8 +5,13 @@ testnet v4. It interoperates. Everything below was verified against
 erigon-pulse `v3.0.0-RC8` = `48cdb29e35`, package `msgboard/`, with file:line
 on both sides.
 
-**What we run:** the new PoW, as `version = 1`, replacing the old one. We took
-the flag day. See §2.
+**What we run:** the new PoW, as `version = 1`. We match `pulse-v3.4.4`
+byte for byte, including its golden vector.
+
+**Most of this document is now answered.** It was written against
+`v3.0.0-RC8`. `pulse-v3.4.4` ships the new construction at version 1, fixes the
+chunker, names the packing unit, and adds the golden vector — see §2.6 and §4.
+What remains open is §2.2.
 
 ---
 
@@ -141,52 +146,16 @@ accident, so it only ever appears deliberately.
 **The ask:** invalid work (kickable), or malformed (drop)? We treat it as
 invalid work.
 
-### 2.6 The golden vector does not exist, so we built one
+### 2.6 The golden vector — found, and we match it
 
-`TestPoWGoldenVector` is cited as the normative worked example. It is not in the
-tree at `48cdb29e35` — `msgboard/pow_message_test.go` holds only
-`TestPoWMessageSuite`. We could not find a reference implementation of the new
-construction anywhere: not erigon-pulse at RC8, not the published npm packages,
-not the GitLab TypeScript repo, which has had no push in four months.
+Withdrawn. `TestPoWGoldenVector` is absent at `v3.0.0-RC8`, which is the tree
+this document was written against, and present at `pulse-v3.4.4`
+(`msgboard/pow_message_test.go:256`). We ran your vector through our
+implementation and reproduce every intermediate byte for byte — `payloadHash`,
+`scalarHash`, the compressed point, `workHash`, `D`, and the target.
 
-So we generated one, from independent readings of the spec text — JavaScript
-with a hand-rolled secp256k1, Rust, and Go — written so that a shared misreading
-would have to happen three times. There are two vectors: one pins every
-intermediate digest at a fixed nonce whether or not the work is sufficient, and
-one is actually mined.
-
-Here it is. Both are at `version = 1`, which is the byte the spec's own examples
-use, so it should drop straight into `TestPoWGoldenVector` if you want it.
-
-```text
-VECTOR A — construction only, nonce fixed at 1, deliberately not mined
-  version 1
-  blockHash       0x3a2ca760216c5cb648c32aab73cbc1cdfdbcf02f77a4cd190995e3c46f3932b5
-  category        0x6368617474657200000000000000000000000000000000000000000000000000
-  data            "golden vector"  (13 bytes)
-  nonce 1 / workMultiplier 10000 / workDivisor 1000000
-  D               169072
-  target          0x0000633b2f5ccfab1c5e7b9a589ebb2c42f63035e122b764c1e8674d1cce1e2f
-  payloadHash     0xb66106e111b0e6cd08a49c7a37afa3259541bee8e465bef5e55f6cd7223d789a
-  scalarHash      0x3caed3ea9a5caa6e1e069d0126e4dc6698190aa3eec8ebcdab227d3e5b0fd18d
-  compressedPoint 0x035e55e474ae91c573e38855bba370f01d64a307fa9c834eda7b435ec9d24368b9
-  workHash        0x5ba003ccdb08503a19326a201834198a49e062d2f3f0e9506ff086eddb011dee
-  verifies        no  (workHash >= target — this vector is not mined)
-
-VECTOR B — the same message mined against an easier target
-  nonce 57602 / workMultiplier 1 / workDivisor 1000
-  D               16907
-  target          0x0003e052daeb075fbd9e751b0721b870c66a9125de8974ba1f0a577d0e110cac
-  scalarHash      0xbcff3c0ddc5d02b05e282566461d4f30f35ce90b3bfd36cde0c694dcb54a5e7d
-  compressedPoint 0x030fbdcb58e555146c54a0863ebf038a0384d4bd90439d02b8d8d5f71096ca7a09
-  workHash        0x00037212834e250723dc736508d445a0dbc01398040a980807641b4be2d1e361
-  verifies        yes;  nonces 57601 and 57603 do not
-```
-
-Vector A is the one that catches a misread of the byte layout: it pins four
-intermediates regardless of the verdict, so it cannot pass by luck the way a
-final-hash-only vector can. Vector B checks the threshold, and its neighbours
-check that the threshold is load-bearing.
+That settles interoperability far better than anything we could have asked for,
+and most of the questions above with it.
 
 ### 2.7 Why the change is worth documenting
 
@@ -256,9 +225,18 @@ This is latent today only because of §1. It becomes live the moment the packer 
 fixed. We allow 102,408 inbound — 100 KiB plus 8 — which absorbs the header, but
 that allowance is ours and a third party has no way to derive it from the spec.
 
-**The ask:** name the unit precisely — RLP payload, encoded list, or frame
-including the opcode. (For calibration: erigon's own check reads `msg.Size`,
-which excludes the opcode — `p2p/transport.go:80`.)
+**Answered at `pulse-v3.4.4`, and we were on the wrong side of it.**
+`MaxSizeMsgChunks` now flushes on `rlp.ListSize(content+enc) > MaxMessageSize`
+(`msgboard/send.go:67`) — the encoded list — and the same release disconnects a
+peer whose inbound frame exceeds it. The chunker bug in §1 is fixed there too.
+
+We bounded the payload and added the list header afterwards, so our largest
+chunk encoded to 102_404 and every upgraded peer would have dropped the
+connection. Fixed on our side; we now bound the same quantity you do.
+
+Worth putting the unit in the spec text rather than leaving it to the code — it
+is the one place where a plausible misreading costs a disconnect rather than a
+rejected message.
 
 ## 5. Two smaller notes
 

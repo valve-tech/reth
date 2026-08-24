@@ -65,19 +65,21 @@ const FRAME_OVERHEAD_ALLOWANCE: usize = 8;
 /// Largest inbound frame we accept, opcode byte included. Anything larger is
 /// dropped undecoded and the peer is reported — see [`handle_incoming`].
 ///
-/// The spec caps a `msg/1` packet at [`P2P_MSG_PACKET_LIMIT`], but that limit
-/// measures the payload, not the bytes on the wire. Our `BOARD_MESSAGES` packer
-/// flushes only once the *next* message would cross it, and the frame it then
-/// emits adds the RLP list header and the opcode on top. So reth legitimately
-/// sends frames a few bytes past 102_400, and a bare 102_400 inbound bound
-/// would have two reth nodes ban each other over their own largest legal
-/// frames.
+/// The spec caps a `msg/1` packet at [`P2P_MSG_PACKET_LIMIT`] without naming the
+/// unit. erigon-pulse settled it at `pulse-v3.4.4`: the packer bounds
+/// `rlp.ListSize(content+enc)` — the encoded list — and the same release began
+/// disconnecting peers whose inbound frame exceeds it.
 ///
-/// The alternative — reserve the header in the packer so our frames fit 102_400
-/// exactly — reads cleaner against a strict peer, but it changes the frames we
-/// put on the wire to buy nothing: erigon-pulse applies no inbound size check at
-/// all, so no peer in the network is strict today. The allowance is 8 bytes on a
-/// 100 KiB bound, which does not weaken it.
+/// Our packer now bounds the same quantity, so the frames we emit fit 102_400
+/// and this allowance is never needed for our own traffic. It stays because the
+/// opcode byte still rides outside the list on the wire, and refusing a frame
+/// that is legal by one plausible reading of the spec costs more than accepting
+/// eight bytes we will not send.
+///
+/// An earlier revision argued the opposite — that reserving the header in the
+/// packer bought nothing because no peer was strict. That was true of
+/// `v3.0.0-RC8` and false from `pulse-v3.4.4` on, which is a disconnect from
+/// every upgraded peer.
 pub(crate) const MAX_INBOUND_FRAME_SIZE: usize = P2P_MSG_PACKET_LIMIT + FRAME_OVERHEAD_ALLOWANCE;
 
 /// Widest RLP encoding of a [`PoWMsg`](reth_msgboard_types::PoWMsg)'s
@@ -98,6 +100,20 @@ const MSG_FIXED_FIELDS_RLP_LEN: usize = 1 + 33 + 9 + 9 + 9 + 33;
 /// once the *next* message would cross [`P2P_MSG_PACKET_LIMIT`], so a message
 /// larger than that target is never packed with anything else — it gets a
 /// frame to itself, and that frame is as large as the message.
+/// Encoded length of an RLP list whose payload is `payload_len` bytes — the
+/// payload plus its own header.
+///
+/// The packing bound is on this, not on the payload. erigon-pulse settled the
+/// unit at `pulse-v3.4.4`: `MaxSizeMsgChunks` flushes on
+/// `rlp.ListSize(content+enc) > MaxMessageSize` (`msgboard/send.go:67`), and the
+/// same release began disconnecting peers whose inbound frame exceeds
+/// `MaxMessageSize`. Bounding the payload instead lets the header push the
+/// encoded list four bytes past the cap, which is a disconnect and a penalty
+/// from every conforming peer.
+const fn encoded_list_len(payload_len: usize) -> usize {
+    length_of_length(payload_len) + payload_len
+}
+
 const fn lone_message_frame_len(data_len: usize) -> usize {
     let data_rlp = length_of_length(data_len) + data_len;
     let msg_payload = MSG_FIXED_FIELDS_RLP_LEN + data_rlp;
@@ -755,7 +771,9 @@ async fn handle_incoming(
             let mut chunk_size = 0usize;
             for msg in &msgs {
                 let msg_size = msg.length();
-                if !chunk.is_empty() && chunk_size + msg_size > P2P_MSG_PACKET_LIMIT {
+                if !chunk.is_empty() &&
+                    encoded_list_len(chunk_size + msg_size) > P2P_MSG_PACKET_LIMIT
+                {
                     let encoded_chunk = encode_pow_msg_list(&chunk);
                     let mut buf = BytesMut::with_capacity(1 + encoded_chunk.len());
                     buf.put_u8(BOARD_MESSAGES);
@@ -1499,6 +1517,59 @@ mod tests {
     /// cross `p2pMsgPacketLimit`, then prepends the list header to a payload
     /// that has already reached the limit.
     ///
+    /// A payload of exactly one packet must split, because its encoded list
+    /// does not fit one packet.
+    ///
+    /// This is the discriminating case. Until `pulse-v3.4.4` the packer bounded
+    /// the payload, so these three went out as a single 102_404-byte list — four
+    /// bytes past what an upgraded erigon peer accepts before it disconnects and
+    /// penalises. The sibling test below uses 102_396 and is one chunk under
+    /// either rule, so it cannot catch a regression here.
+    #[tokio::test]
+    async fn a_payload_of_exactly_one_packet_splits_because_the_list_header_does_not_fit() {
+        let board = board_with_cfg(packing_cfg(), 10);
+
+        let lens = [40_000usize, 30_000, 32_400];
+        assert_eq!(lens.iter().sum::<usize>(), P2P_MSG_PACKET_LIMIT);
+        assert!(
+            encoded_list_len(P2P_MSG_PACKET_LIMIT) > P2P_MSG_PACKET_LIMIT,
+            "the premise: this payload cannot be encoded within one packet",
+        );
+
+        let ids: Vec<MsgID> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                board.add_local_msg(mined_with_rlp_len(len, 0xC0 + i as u8, 10)).unwrap().msg_id()
+            })
+            .collect();
+
+        let (tx, mut rx) = channel();
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            peer(),
+        )
+        .await;
+
+        let frames = drain(&mut rx);
+        assert_eq!(frames.len(), 2, "the packer must split rather than emit an over-limit list");
+
+        let mut served = 0;
+        for f in &frames {
+            assert_eq!(f[0], BOARD_MESSAGES);
+            assert!(
+                f.len() - 1 <= P2P_MSG_PACKET_LIMIT,
+                "encoded list of {} B is over the limit every conforming peer enforces",
+                f.len() - 1,
+            );
+            served += decode_pow_msg_list(&f[1..]).expect("each chunk decodes").len();
+        }
+        assert_eq!(served, 3, "splitting must not drop a message");
+    }
+
     /// This drives the real packer with real messages. The previous version
     /// asserted `MAX_INBOUND_FRAME_SIZE >= P2P_MSG_PACKET_LIMIT + 8`, which
     /// restates the definition two lines above the constant and could not
@@ -1507,10 +1578,16 @@ mod tests {
     async fn the_inbound_bound_admits_our_own_largest_frame() {
         let board = board_with_cfg(packing_cfg(), 10);
 
-        // Three messages whose RLP lengths sum to exactly one packet — the
-        // largest payload the packer can put in a single chunk.
-        let lens = [40_000usize, 30_000, 32_400];
-        assert_eq!(lens.iter().sum::<usize>(), P2P_MSG_PACKET_LIMIT, "the sum must be worst case");
+        // Three messages whose RLP lengths sum to the largest payload that
+        // still encodes within one packet once the list header is counted.
+        //
+        // That is four bytes short of `P2P_MSG_PACKET_LIMIT`, not equal to it.
+        // An earlier revision used the full limit here and asserted the three
+        // went in one chunk — which is the behaviour `pulse-v3.4.4` peers
+        // disconnect us for, since the encoded list came to 102_404.
+        let lens = [40_000usize, 30_000, 32_396];
+        let payload = lens.iter().sum::<usize>();
+        assert_eq!(encoded_list_len(payload), P2P_MSG_PACKET_LIMIT, "the sum must be worst case");
         let mut ids: Vec<MsgID> = lens
             .iter()
             .enumerate()
@@ -1534,8 +1611,13 @@ mod tests {
         let sole = &frames[0];
         assert_eq!(
             sole.len(),
-            1 + length_of_length(P2P_MSG_PACKET_LIMIT) + P2P_MSG_PACKET_LIMIT,
-            "opcode + list header + a full packet of payload",
+            1 + P2P_MSG_PACKET_LIMIT,
+            "opcode plus an encoded list that exactly fills one packet",
+        );
+        assert_eq!(
+            sole.len() - 1,
+            P2P_MSG_PACKET_LIMIT,
+            "the list itself must not exceed the limit — peers disconnect above it",
         );
         assert!(
             sole.len() <= MAX_INBOUND_FRAME_SIZE,
@@ -1950,6 +2032,45 @@ mod tests {
     /// Responses are split into ~100 KiB packets. Each message here carries a
     /// 4 KiB payload, so 64 of them exceed the limit and must span >1 frame,
     /// with every frame independently decodable.
+    /// The packing bound is on the encoded list, and the two units differ by
+    /// enough to matter.
+    ///
+    /// A chunk whose *payload* exactly fills the packet limit encodes to four
+    /// bytes past it, because the RLP list header rides on top. erigon-pulse
+    /// bounds the encoded list and, from `pulse-v3.4.4`, disconnects a peer that
+    /// exceeds it — so those four bytes cost the connection and a penalty from
+    /// every upgraded peer.
+    ///
+    /// `get_board_messages_chunks_large_responses` below drives the real packer,
+    /// but its messages do not pack tightly enough to land on the boundary, so
+    /// it passes under either bound. This is the test that pins the difference.
+    #[test]
+    fn the_packing_bound_is_on_the_encoded_list_not_the_payload() {
+        assert!(
+            encoded_list_len(P2P_MSG_PACKET_LIMIT) > P2P_MSG_PACKET_LIMIT,
+            "a payload-sized bound overflows once the list header is added",
+        );
+        assert_eq!(
+            encoded_list_len(P2P_MSG_PACKET_LIMIT) - P2P_MSG_PACKET_LIMIT,
+            4,
+            "and it overflows by the header width, not by a rounding error",
+        );
+
+        // The largest payload that still fits once its own header is counted.
+        let widest = (1..=P2P_MSG_PACKET_LIMIT)
+            .rev()
+            .find(|&p| encoded_list_len(p) <= P2P_MSG_PACKET_LIMIT)
+            .expect("some payload fits");
+        assert_eq!(encoded_list_len(widest), P2P_MSG_PACKET_LIMIT);
+        assert_eq!(widest, P2P_MSG_PACKET_LIMIT - 4);
+
+        // Monotone, so the packer's flush test is a valid stopping rule.
+        for payload in [1usize, 55, 56, 255, 256, 65_535, 65_536, widest] {
+            assert!(encoded_list_len(payload) > payload);
+            assert!(encoded_list_len(payload + 1) >= encoded_list_len(payload));
+        }
+    }
+
     #[tokio::test]
     async fn get_board_messages_chunks_large_responses() {
         let board = board_at(10);
@@ -1983,15 +2104,16 @@ mod tests {
         let mut total = 0;
         for f in &frames {
             assert_eq!(f[0], BOARD_MESSAGES);
-            // Tight, because MAX_QUEUED_OUTGOING_FRAMES x this is the per-peer
-            // memory bound in §15.1. The chunker flushes *before* pushing a
-            // message that would exceed the limit, so a frame is one packet
-            // plus the RLP list header and the opcode byte — it does not
-            // overshoot by a whole message.
+            // The RLP list, opcode excluded, must fit the packet limit exactly.
+            // erigon-pulse bounds this same quantity and disconnects a peer that
+            // exceeds it (`msgboard/send.go:67`, `pulse-v3.4.4`), so a frame one
+            // byte over costs the connection and a penalty from every upgraded
+            // peer. Asserting on `f.len() - 1` rather than `f.len()` is the
+            // whole point: the opcode rides outside the list.
             assert!(
-                f.len() <= P2P_MSG_PACKET_LIMIT + 8,
-                "frame of {} B exceeds one packet; the per-peer memory bound assumes it does not",
-                f.len(),
+                f.len() - 1 <= P2P_MSG_PACKET_LIMIT,
+                "encoded list of {} B exceeds the packet limit; every conforming peer disconnects",
+                f.len() - 1,
             );
             total += decode_pow_msg_list(&f[1..]).expect("each chunk decodes independently").len();
         }

@@ -975,3 +975,70 @@ mod golden_vector {
         assert!(msg.verify().is_ok(), "every hash is below 2^256");
     }
 }
+#[cfg(test)]
+mod upstream_golden_vector {
+    use super::*;
+
+    /// The upstream golden vector, `TestPoWGoldenVector` in erigon-pulse at
+    /// `pulse-v3.4.4` (`msgboard/pow_message_test.go:256`).
+    ///
+    /// This is the artefact `specs/04-msgboard-pow-v2.md` cites under
+    /// *Reference Implementations*. Earlier rounds recorded it as missing —
+    /// it is absent at `v3.0.0-RC8`, which is the tree those rounds read, and
+    /// present at `pulse-v3.4.4`. Ours was generated independently; this
+    /// asserts the two agree, which is what makes us interoperable rather than
+    /// merely self-consistent.
+    #[test]
+    fn we_reproduce_the_upstream_golden_vector() {
+        let msg = PoWMsg {
+            version: 1,
+            block_hash: B256::from(hex_literal::hex!(
+                "2222222222222222222222222222222222222222222222222222222222222222"
+            )),
+            nonce: 44,
+            work_multiplier: 1,
+            work_divisor: 1_000_000,
+            category: B256::from(hex_literal::hex!(
+                "1111111111111111111111111111111111111111111111111111111111111111"
+            )),
+            data: Bytes::from_static(b"golden"),
+        };
+
+        assert_eq!(
+            msg.payload_hash(),
+            B256::from(hex_literal::hex!(
+                "2e0ef2bdf57f87bed3bba450118d7e9353af23a432d4d266e188a1ba97984166"
+            )),
+        );
+        assert_eq!(
+            msg.scalar_hash(),
+            B256::from(hex_literal::hex!(
+                "80a78c97a0c6fb125f111743e7b741008fa75e13dc1bb7c2b9112f2a41996f0d"
+            )),
+        );
+        assert_eq!(
+            msg.challenge().expect("scalar in range"),
+            hex_literal::hex!("03f7fa35a9e98a3dcfa07049278de28c35fb688a9e95c8a83e0c391d441f67200e"),
+        );
+        assert_eq!(
+            msg.calculate_hash().expect("scalar in range"),
+            B256::from(hex_literal::hex!(
+                "05af3628ff0ca1b329d012d76b57fc5976ef8ef8df6c3f6e8c6cd4df1e30a922"
+            )),
+        );
+        assert_eq!(msg.difficulty(), Some(U256::from(16u64)));
+        assert_eq!(
+            msg.target(),
+            Some(
+                U512::from_str_radix(
+                    "1000000000000000000000000000000000000000000000000000000000000000",
+                    16
+                )
+                .unwrap()
+            ),
+        );
+
+        let checked = msg.clone().to_checked(0, 0).expect("upstream vector must verify");
+        assert_eq!(checked.hash, msg.calculate_hash().unwrap());
+    }
+}
