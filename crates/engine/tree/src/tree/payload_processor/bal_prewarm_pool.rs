@@ -7,7 +7,7 @@ use reth_provider::{
 };
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread::JoinHandle,
@@ -34,6 +34,7 @@ enum PrewarmMsg {
         build: Arc<BuildProviderFn>,
         caches: ExecutionCache,
         txpool_snapshot: Option<TxPoolPrewarmCacheSnapshot>,
+        cancelled: Arc<AtomicBool>,
     },
     /// Warm one target into the held provider's cache. Ignored if no provider is held.
     Warm(PrewarmTarget),
@@ -72,20 +73,27 @@ impl BalPrewarmPool {
     }
 
     /// Begins a block: hands every worker the provider builder and shared cache so each opens its
-    /// own read txn over the parent state. Pair with [`end_block`](Self::end_block).
+    /// own read txn over the parent state. The returned handle ends the block when finished or
+    /// dropped.
     pub fn begin_block(
         &self,
         build: Arc<BuildProviderFn>,
         caches: ExecutionCache,
         txpool_snapshot: Option<TxPoolPrewarmCacheSnapshot>,
-    ) {
+        cancelled: Arc<AtomicBool>,
+    ) -> BalPrewarmBlock<'_> {
+        let mut started = true;
         for worker in &self.workers {
-            let _ = worker.send(PrewarmMsg::BeginBlock {
-                build: build.clone(),
-                caches: caches.clone(),
-                txpool_snapshot: txpool_snapshot.clone(),
-            });
+            started &= worker
+                .send(PrewarmMsg::BeginBlock {
+                    build: build.clone(),
+                    caches: caches.clone(),
+                    txpool_snapshot: txpool_snapshot.clone(),
+                    cancelled: cancelled.clone(),
+                })
+                .is_ok();
         }
+        BalPrewarmBlock { pool: self, cancelled, started, finished: false }
     }
 
     /// Fire-and-forget: warm an account (basic account + bytecode) and its storage slots.
@@ -93,7 +101,7 @@ impl BalPrewarmPool {
     /// The slots are dispatched in `WARM_BATCH_SIZE` chunks that are distributed independently,
     /// so a single account with a large read-set does not serialize onto one worker;
     /// [`end_block`](Self::end_block) waits for the slowest queue.
-    pub fn warm_account(&self, addr: Address, slots: impl IntoIterator<Item = StorageKey>) {
+    fn warm_account(&self, addr: Address, slots: impl IntoIterator<Item = StorageKey>) {
         let mut slots = slots.into_iter();
         let mut batch: Box<[StorageKey]> = slots.by_ref().take(WARM_BATCH_SIZE).collect();
         self.send_warm(PrewarmTarget::Account(addr, batch));
@@ -111,21 +119,57 @@ impl BalPrewarmPool {
     /// requests queued ahead of this message.
     ///
     /// Blocks until all workers processed the end block message.
-    pub fn end_block(&self) {
+    fn end_block(&self) -> bool {
         let (tx, rx) = oneshot::channel();
         let tx = Arc::new(SendOnDrop { sender: Some(tx) });
 
+        let mut sent = true;
         for worker in &self.workers {
-            let _ = worker.send(PrewarmMsg::EndBlock(tx.clone()));
+            sent &= worker.send(PrewarmMsg::EndBlock(tx.clone())).is_ok();
         }
 
         drop(tx);
-        rx.blocking_recv().expect("BAL prewarm pool dropped without signaling completion");
+        sent && rx.blocking_recv().is_ok()
     }
 
     fn send_warm(&self, target: PrewarmTarget) {
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let _ = self.workers[i].send(PrewarmMsg::Warm(target));
+    }
+}
+
+/// A BAL prewarm generation that closes every worker's provider when dropped.
+///
+/// Keeping the end marker in a guard prevents panics or early returns in the dispatcher from
+/// leaving read transactions pinned or mixing a later block with the current generation.
+#[derive(Debug)]
+pub struct BalPrewarmBlock<'a> {
+    pool: &'a BalPrewarmPool,
+    cancelled: Arc<AtomicBool>,
+    started: bool,
+    finished: bool,
+}
+
+impl BalPrewarmBlock<'_> {
+    /// Queues an account read and its storage slots in this generation.
+    pub fn warm_account(&self, addr: Address, slots: impl IntoIterator<Item = StorageKey>) {
+        self.pool.warm_account(addr, slots);
+    }
+
+    /// Ends this generation and returns whether every worker processed its end marker.
+    pub fn finish(mut self) -> bool {
+        self.finished = true;
+        let ended = self.pool.end_block();
+        self.started && ended
+    }
+}
+
+impl Drop for BalPrewarmBlock<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancelled.store(true, Ordering::Relaxed);
+            let _ = self.pool.end_block();
+        }
     }
 }
 
@@ -162,23 +206,37 @@ fn prewarm_loop(rx: crossbeam_channel::Receiver<PrewarmMsg>) {
     // The provider (and its MDBX read txn) held for the current block, between `BeginBlock` and
     // `EndBlock`. `None` while idle, so no read txn is pinned across the inter-block gap.
     let mut provider: Option<CachedStateProvider<StateProviderBox>> = None;
+    let mut cancelled: Option<Arc<AtomicBool>> = None;
 
     // Blocks when idle; the channel disconnects (and the loop ends) when the pool is dropped.
     while let Ok(msg) = rx.recv() {
         match msg {
-            PrewarmMsg::BeginBlock { build, caches, txpool_snapshot } => {
-                provider = match (build)() {
-                    Ok(inner) => Some(
-                        CachedStateProvider::new_prewarm(inner, caches)
-                            .with_txpool_snapshot(txpool_snapshot),
-                    ),
-                    Err(err) => {
-                        trace!(target: "engine::tree::bal_prewarm_pool", %err, "failed to build provider");
-                        None
+            PrewarmMsg::BeginBlock {
+                build,
+                caches,
+                txpool_snapshot,
+                cancelled: block_cancelled,
+            } => {
+                provider = if block_cancelled.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    match (build)() {
+                        Ok(inner) => Some(
+                            CachedStateProvider::new_prewarm(inner, caches)
+                                .with_txpool_snapshot(txpool_snapshot),
+                        ),
+                        Err(err) => {
+                            trace!(target: "engine::tree::bal_prewarm_pool", %err, "failed to build provider");
+                            None
+                        }
                     }
                 };
+                cancelled = Some(block_cancelled);
             }
             PrewarmMsg::Warm(target) => {
+                if cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    continue
+                }
                 let Some(provider) = provider.as_ref() else { continue };
                 match target {
                     PrewarmTarget::Account(addr, slots) => {
@@ -201,6 +259,7 @@ fn prewarm_loop(rx: crossbeam_channel::Receiver<PrewarmMsg>) {
             }
             PrewarmMsg::EndBlock(end_tx) => {
                 provider = None;
+                cancelled = None;
                 drop(end_tx);
             }
         }
@@ -215,5 +274,42 @@ impl Drop for SendOnDrop {
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::Address;
+    use reth_execution_cache::CachedStatus;
+    use reth_provider::test_utils::MockEthProvider;
+    use std::{convert::Infallible, time::Duration};
+
+    #[test]
+    fn cancellation_discards_queued_warm_reads() {
+        let pool = BalPrewarmPool::new(1);
+        let caches = ExecutionCache::new(1_000);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let address = Address::repeat_byte(0x11);
+        let (build_started_tx, build_started_rx) = crossbeam_channel::bounded(1);
+        let (release_build_tx, release_build_rx) = crossbeam_channel::bounded(0);
+        let provider = MockEthProvider::default();
+        provider.enable_database_provider();
+        let build = Arc::new(move || {
+            let _ = build_started_tx.send(());
+            let _ = release_build_rx.recv();
+            Ok(Box::new(provider.clone()) as StateProviderBox)
+        });
+
+        let block = pool.begin_block(build, caches.clone(), None, Arc::clone(&cancelled));
+        build_started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        block.warm_account(address, []);
+        cancelled.store(true, Ordering::Relaxed);
+        release_build_tx.send(()).unwrap();
+
+        assert!(block.finish());
+        let status =
+            caches.get_or_try_insert_account_with(address, || Ok::<_, Infallible>(None)).unwrap();
+        assert_eq!(status, CachedStatus::NotCached(None));
     }
 }
