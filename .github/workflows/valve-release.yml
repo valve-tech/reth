@@ -121,7 +121,11 @@ jobs:
           # Silicon), so a broken build can't ship silently.
           "$BIN" --version || { echo "::error::reth --version failed"; exit 1; }
           tar -czf "dist/reth-${TAG}-${TARGET}.tar.gz" -C "target/${TARGET}/release" reth
-          cd dist && sha256sum "reth-${TAG}-${TARGET}.tar.gz" > "reth-${TAG}-${TARGET}.tar.gz.sha256"
+          # sha256sum is GNU-only; the macos-14 runner has `shasum -a 256`. Both
+          # emit the same "<hash>  <file>" format, so the combined SHA256SUMS
+          # stays uniform and `sha256sum -c`-verifiable.
+          if command -v sha256sum >/dev/null 2>&1; then SHA256="sha256sum"; else SHA256="shasum -a 256"; fi
+          cd dist && $SHA256 "reth-${TAG}-${TARGET}.tar.gz" > "reth-${TAG}-${TARGET}.tar.gz.sha256"
           ls -la
 
       - uses: actions/upload-artifact@v4
