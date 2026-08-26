@@ -967,7 +967,7 @@ where
         });
 
         if let Some(valid_block_tx) = valid_block_tx {
-            let _ = valid_block_tx.send(());
+            valid_block_tx.notify_valid();
         }
 
         // Firehose live-path: all post-execution validations have passed — flush the block
