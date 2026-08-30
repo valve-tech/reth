@@ -12,6 +12,7 @@ use alloy_rpc_client::RpcClient;
 use derive_more::Deref;
 use reth_chainspec::{ChainSpec, ChainSpecProvider};
 use reth_evm_ethereum::EthEvmConfig;
+use reth_metrics::{metrics, metrics::Gauge, Metrics};
 use reth_network_api::noop::NoopNetwork;
 use reth_node_api::{FullNodeComponents, FullNodeTypes};
 use reth_rpc_convert::{RpcConvert, RpcConverter};
@@ -36,6 +37,14 @@ use reth_transaction_pool::{
 use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 
 const DEFAULT_BROADCAST_CAPACITY: usize = 2000;
+
+/// How often the blocking IO semaphore's free capacity is sampled.
+///
+/// Sampled rather than written on every acquire because a permit is released by dropping an
+/// opaque [`OwnedSemaphorePermit`](tokio::sync::OwnedSemaphorePermit), which gives no release
+/// hook to update a gauge from. 5s is well under a typical scrape interval, so a scrape never
+/// reads a value it has already seen.
+const BLOCKING_IO_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Helper type alias for [`RpcConverter`] with components from the given [`FullNodeComponents`].
 pub type EthRpcConverterFor<N, NetworkT = Ethereum> = RpcConverter<
@@ -337,6 +346,25 @@ where
             BatchTxProcessor::new(components.pool().clone(), max_batch_size);
         task_spawner.spawn_critical_task("tx-batcher", processor);
 
+        let blocking_io_request_semaphore = Arc::new(Semaphore::new(max_blocking_io_requests));
+        {
+            // Capacity is emitted alongside the free count so a dashboard can express saturation
+            // without knowing what `--rpc.max-blocking-io-requests` was set to on this node.
+            let metrics = BlockingIoMetrics::default();
+            let semaphore = blocking_io_request_semaphore.clone();
+            task_spawner.spawn_task(async move {
+                let mut interval = tokio::time::interval(BLOCKING_IO_SAMPLE_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    // Capacity is re-set on every tick, not once at construction. A value written
+                    // before the metrics recorder is installed goes nowhere, and this node already
+                    // loses its `executor.spawn` task counters that way.
+                    metrics.capacity.set(max_blocking_io_requests as f64);
+                    metrics.available_permits.set(semaphore.available_permits() as f64);
+                }
+            });
+        }
+
         Self {
             components,
             signers,
@@ -352,7 +380,7 @@ where
             blocking_task_pool,
             fee_history_cache,
             blocking_task_guard: BlockingTaskGuard::new(proof_permits),
-            blocking_io_request_semaphore: Arc::new(Semaphore::new(max_blocking_io_requests)),
+            blocking_io_request_semaphore,
             raw_tx_sender,
             raw_tx_forwarder,
             converter,
@@ -567,6 +595,22 @@ where
     pub const fn force_blob_sidecar_upcasting(&self) -> bool {
         self.force_blob_sidecar_upcasting
     }
+}
+
+/// Saturation of the blocking IO request semaphore, which bounds how many `eth_call`,
+/// `eth_simulateV1` and `call_many` requests execute concurrently.
+///
+/// A node whose `available_permits` sits near zero is rejecting nothing, but every further request
+/// of those three kinds waits for a permit before it takes a blocking thread. That is the healthy
+/// order — the queue forms on the reactor rather than on the blocking pool — so this gauge reading
+/// low is back-pressure working, not an incident.
+#[derive(Metrics)]
+#[metrics(scope = "rpc.blocking_io")]
+struct BlockingIoMetrics {
+    /// Permits currently free on the blocking IO semaphore.
+    available_permits: Gauge,
+    /// Total permits the semaphore was built with (`--rpc.max-blocking-io-requests`).
+    capacity: Gauge,
 }
 
 #[cfg(test)]
