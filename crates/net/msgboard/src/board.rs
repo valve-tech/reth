@@ -169,10 +169,10 @@ impl MsgBoard {
     /// Duplicate hashes already present in the index follow the same path.
     pub fn load_from_db(&self) -> eyre::Result<u64> {
         let Some(ref env) = self.db else { return Ok(0) };
-        let (msgs, bad) = db::db_load_all(env)?;
-        if bad > 0 {
-            tracing::warn!(target: "msgboard", bad, "skipped invalid messages during DB load");
-        }
+        // `db_load_all` reports the skipped rows itself, with the decode error,
+        // the row's RLP shape and an ERROR when the whole table fails. Repeating
+        // the bare count here only buried that line under a vaguer one.
+        let (msgs, _bad) = db::db_load_all(env)?;
 
         let mut loaded = 0u64;
         let mut dropped_invalid = 0u64;
