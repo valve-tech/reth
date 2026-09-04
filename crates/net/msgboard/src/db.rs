@@ -19,6 +19,16 @@ const TEBIBYTE: usize = GIBIBYTE * 1024;
 /// on-disk layout is interchangeable between implementations.
 const TABLE_NAME: &str = "BoardMessage";
 
+/// Top-level RLP elements in a stored [`CheckedPoWMsg`]: `msg`, `block_number`,
+/// `timestamp`, `hash`.
+///
+/// Erigon dropped `Timestamp` from its `CheckedPoWMsg` at `78fbcffb8b`
+/// (`msgboard/pow_message.go:57-64`), so an erigon-written row holds three.
+/// Neither side decodes the other's records, and the count is what tells the
+/// two apart in a log. It is a diagnostic, not a version field: nothing reads
+/// it to decide how to parse a row.
+const EXPECTED_RLP_ELEMENTS: usize = 4;
+
 /// MDBX page size. Matches `PageSize = 16 KiB` in erigon-pulse `msgboard/util.go`.
 const PAGE_SIZE_BYTES: usize = 16 * KIBIBYTE;
 
@@ -107,33 +117,102 @@ pub(crate) fn open_env_with_map_size(path: &Path, map_size: usize) -> eyre::Resu
 }
 
 /// Load all messages from the database.
+///
+/// Returns the messages that decoded and a count of the rows that did not.
+/// A row that fails is skipped, not deleted — erigon's `dbLoadMsgs` deletes it
+/// instead (`msgboard/db.go:32-44`), and keeping the bytes leaves an operator
+/// something to inspect after a wholesale failure.
+///
+/// Undecodable rows are logged here rather than at the call site, because only
+/// this function still holds the bytes that explain them.
 pub fn db_load_all(env: &Environment) -> eyre::Result<(Vec<CheckedPoWMsg>, u64)> {
     let tx = env.begin_ro_txn()?;
     let db = tx.open_db(Some(TABLE_NAME))?;
     let cursor = tx.cursor(db.dbi())?;
 
     let mut msgs = Vec::new();
-    let mut bad = 0u64;
+    let mut rows = 0u64;
+    let mut read_failures = 0u64;
+    let mut decode_failures = 0u64;
+    let mut first_decode_error: Option<String> = None;
+    // Top-level RLP element count of the failed rows, and whether every failed
+    // row agrees on it. One repeated count is a writer with a different record
+    // shape; a spread of counts is damage.
+    let mut failed_elements: Option<usize> = None;
+    let mut elements_agree = true;
 
-    let iter = cursor.iter_slices();
-    for item in iter {
-        let (_, value) = match item {
-            Ok((k, v)) => (k, v),
-            Err(_) => {
-                bad += 1;
+    for item in cursor.iter_slices() {
+        rows += 1;
+        let (key, value) = match item {
+            Ok(kv) => kv,
+            Err(err) => {
+                read_failures += 1;
+                tracing::debug!(target: "msgboard", %err, "msgboard DB row could not be read");
                 continue;
             }
         };
 
         match CheckedPoWMsg::decode(&mut &*value) {
             Ok(checked) => msgs.push(checked),
-            Err(_) => {
-                bad += 1;
+            Err(err) => {
+                decode_failures += 1;
+                let elements = rlp_top_level_element_count(&value);
+                if decode_failures == 1 {
+                    failed_elements = elements;
+                } else if failed_elements != elements {
+                    elements_agree = false;
+                }
+                if first_decode_error.is_none() {
+                    first_decode_error = Some(err.to_string());
+                }
+                tracing::debug!(
+                    target: "msgboard",
+                    key = %alloy_primitives::hex::encode(&key),
+                    %err,
+                    ?elements,
+                    bytes = value.len(),
+                    "msgboard DB row does not decode as a CheckedPoWMsg",
+                );
             }
         }
     }
 
-    Ok((msgs, bad))
+    if decode_failures > 0 {
+        let shape = elements_agree.then_some(failed_elements).flatten();
+        if decode_failure_is_wholesale(rows, decode_failures) {
+            tracing::error!(
+                target: "msgboard",
+                rows,
+                decode_failures,
+                elements = ?shape,
+                expected_elements = EXPECTED_RLP_ELEMENTS,
+                error = ?first_decode_error,
+                "most msgboard DB rows do not decode; the board starts nearly empty. \
+                 A row that holds a different number of RLP elements than expected was \
+                 written by another msgboard implementation or an older reth, not corrupted",
+            );
+        } else {
+            tracing::warn!(
+                target: "msgboard",
+                rows,
+                decode_failures,
+                elements = ?shape,
+                expected_elements = EXPECTED_RLP_ELEMENTS,
+                error = ?first_decode_error,
+                "some msgboard DB rows do not decode and are skipped",
+            );
+        }
+    }
+    if read_failures > 0 {
+        tracing::warn!(
+            target: "msgboard",
+            rows,
+            read_failures,
+            "some msgboard DB rows could not be read from MDBX",
+        );
+    }
+
+    Ok((msgs, read_failures + decode_failures))
 }
 
 /// Batch flush: write the given messages and delete discarded ones.
@@ -176,6 +255,44 @@ pub fn db_flush<M: Borrow<CheckedPoWMsg>>(
     Ok(bytes_written)
 }
 
+/// Decide whether the decode failures are wholesale rather than scattered.
+///
+/// The threshold is half the rows examined. Scattered corruption cannot reach
+/// it: MDBX damage takes out pages, so it costs a run of neighbouring rows, not
+/// every other row in the table. At half or above the cause is systematic — a
+/// foreign or older writer produced these records — and the board comes back
+/// nearly empty. There is no minimum row count, because a one-row database
+/// whose only row fails is total loss too, and the operator has to hear about
+/// it either way.
+const fn decode_failure_is_wholesale(rows: u64, decode_failures: u64) -> bool {
+    decode_failures > 0 && decode_failures * 2 >= rows
+}
+
+/// Count the top-level elements of an RLP list without decoding them.
+///
+/// Returns `None` when the bytes are not one well-formed list, which is what a
+/// truncated or corrupt row looks like. A `Some(n)` with `n` other than
+/// [`EXPECTED_RLP_ELEMENTS`] means the row is intact RLP of the wrong shape —
+/// the signature of a foreign writer.
+///
+/// The walk only reads headers, so a row that declares a huge payload costs a
+/// bounds check rather than an allocation.
+fn rlp_top_level_element_count(value: &[u8]) -> Option<usize> {
+    let mut buf = value;
+    let header = alloy_rlp::Header::decode(&mut buf).ok()?;
+    if !header.list {
+        return None;
+    }
+    let mut body = buf.get(..header.payload_length)?;
+    let mut elements = 0usize;
+    while !body.is_empty() {
+        let item = alloy_rlp::Header::decode(&mut body).ok()?;
+        body = body.get(item.payload_length..)?;
+        elements += 1;
+    }
+    Some(elements)
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::Bytes;
@@ -201,6 +318,20 @@ mod tests {
             timestamp: 1_700_000_000,
             hash: B256::from(hash),
         }
+    }
+
+    /// Encode `msg` the way erigon does at `78fbcffb8b`: the body, the block
+    /// number and the work hash, with no `timestamp` between the last two.
+    fn three_element_row(msg: &CheckedPoWMsg) -> Vec<u8> {
+        let mut body = Vec::new();
+        msg.msg.encode(&mut body);
+        msg.block_number.encode(&mut body);
+        msg.hash.encode(&mut body);
+
+        let mut out = Vec::new();
+        alloy_rlp::Header { list: true, payload_length: body.len() }.encode(&mut out);
+        out.extend_from_slice(&body);
+        out
     }
 
     #[test]
@@ -316,6 +447,95 @@ mod tests {
         assert_eq!(bad, 2, "both undecodable rows should be counted");
         assert_eq!(loaded.len(), 1, "the good message should still load");
         assert_eq!(loaded[0].hash, good.hash);
+    }
+
+    /// A healthy database has one shape and no failures. This is the control
+    /// for the two foreign-writer tests below: without it, a helper that always
+    /// reported the wrong element count would still look correct.
+    #[test]
+    fn a_healthy_row_holds_the_expected_element_count() {
+        let mut encoded = Vec::new();
+        sample_msg(1).encode(&mut encoded);
+        assert_eq!(rlp_top_level_element_count(&encoded), Some(EXPECTED_RLP_ELEMENTS));
+
+        let dir = TempDir::new().expect("tempdir");
+        let env = open_msgboard_db(dir.path()).expect("open");
+        db_flush(&env, &[sample_msg(1), sample_msg(2)], &[]).expect("flush");
+
+        let (loaded, bad) = db_load_all(&env).expect("load");
+        assert_eq!(bad, 0);
+        assert_eq!(loaded.len(), 2);
+    }
+
+    /// Erigon dropped `Timestamp` from `CheckedPoWMsg` at `78fbcffb8b`
+    /// (`msgboard/pow_message.go:57-64`), so its rows hold three top-level
+    /// elements against reth's four. Reth cannot decode them, and the element
+    /// count is the only thing that separates "a different writer produced
+    /// this" from "these bytes are damaged".
+    #[test]
+    fn a_three_element_row_is_undecodable_but_names_its_shape() {
+        let row = three_element_row(&sample_msg(7));
+
+        assert!(
+            CheckedPoWMsg::decode(&mut &*row).is_err(),
+            "a three-element record must not decode as reth's four-element one",
+        );
+        assert_eq!(rlp_top_level_element_count(&row), Some(3));
+
+        let dir = TempDir::new().expect("tempdir");
+        let env = open_msgboard_db(dir.path()).expect("open");
+        {
+            let tx = env.begin_rw_txn().expect("rw txn");
+            let db = tx.open_db(Some(TABLE_NAME)).expect("open table");
+            tx.put(db.dbi(), B256::from([0x07u8; 32]).as_slice(), &row, WriteFlags::empty())
+                .expect("put foreign row");
+            tx.commit().expect("commit");
+        }
+
+        let (loaded, bad) = db_load_all(&env).expect("load");
+        assert!(loaded.is_empty(), "nothing decodes, so the board starts empty");
+        assert_eq!(bad, 1);
+        // Every row failed, so the loader escalates instead of warning once.
+        assert!(decode_failure_is_wholesale(1, 1));
+    }
+
+    /// A truncated row cannot report an element count, which is what tells it
+    /// apart from a foreign writer's intact-but-differently-shaped record.
+    #[test]
+    fn a_truncated_row_reports_no_element_count() {
+        let mut encoded = Vec::new();
+        sample_msg(3).encode(&mut encoded);
+        let truncated = &encoded[..encoded.len() / 2];
+
+        assert_eq!(rlp_top_level_element_count(truncated), None);
+        assert_eq!(rlp_top_level_element_count(b"not rlp"), None);
+
+        let dir = TempDir::new().expect("tempdir");
+        let env = open_msgboard_db(dir.path()).expect("open");
+        let good = sample_msg(1);
+        db_flush(&env, std::slice::from_ref(&good), &[]).expect("flush");
+        {
+            let tx = env.begin_rw_txn().expect("rw txn");
+            let db = tx.open_db(Some(TABLE_NAME)).expect("open table");
+            tx.put(db.dbi(), B256::from([0xCCu8; 32]).as_slice(), truncated, WriteFlags::empty())
+                .expect("put truncated");
+            tx.commit().expect("commit");
+        }
+
+        let (loaded, bad) = db_load_all(&env).expect("load");
+        assert_eq!(bad, 1);
+        assert_eq!(loaded.len(), 1, "the healthy row survives one damaged neighbour");
+    }
+
+    /// The escalation rule decides whether an operator sees an error or a
+    /// warning, so it is pinned at its boundary rather than left to the log.
+    #[test]
+    fn the_escalation_rule_triggers_at_half_the_rows() {
+        assert!(!decode_failure_is_wholesale(100, 0), "a clean load says nothing");
+        assert!(!decode_failure_is_wholesale(100, 49), "under half stays a warning");
+        assert!(decode_failure_is_wholesale(100, 50), "half escalates");
+        assert!(decode_failure_is_wholesale(100, 100), "total loss escalates");
+        assert!(decode_failure_is_wholesale(1, 1), "a one-row total loss escalates");
     }
 
     #[test]

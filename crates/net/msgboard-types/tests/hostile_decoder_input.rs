@@ -286,8 +286,9 @@ fn every_prefix_of_a_valid_frame_is_refused_or_decodes_cleanly() {
 /// is a single-byte string where a list must be, and `0xFF` is a list header
 /// declaring `u64::MAX`. Both are refused, at every size up to a full frame.
 ///
-/// `0xC0` is excluded because it is the empty list, which is legal — see
-/// `trailing_bytes_after_a_complete_value_are_ignored`.
+/// `0xC0` is excluded because a single `0xC0` is the empty list, which is
+/// legal, and this loop starts at one byte. Longer runs of it are refused as
+/// trailing bytes — see `trailing_bytes_after_a_complete_value_are_refused`.
 #[test]
 fn uniform_fill_buffers_are_refused_at_every_size_up_to_a_full_frame() {
     for fill in [0x00u8, 0xFF, 0x80, 0xF8] {
@@ -309,39 +310,38 @@ fn uniform_fill_buffers_are_refused_at_every_size_up_to_a_full_frame() {
     assert!(decode_validated_pow_msg(&[]).is_err());
 }
 
-/// Both decoders stop at the end of the first complete RLP value and ignore
-/// whatever follows it, so a peer can append arbitrary bytes to a valid frame
-/// and still have it accepted.
+/// Both decoders refuse bytes that follow the end of a complete RLP value, so
+/// one message set has exactly one valid encoding.
 ///
-/// This is a divergence from the Go reference: `rlp.DecodeBytes` — which
-/// erigon-pulse's `DecodeRLPMsgList` and `PoWMsgFromRLP` both use — returns
-/// `errMoreThanOneValue` for trailing data. Nothing here is a memory hazard:
-/// the trailing bytes are never read, and `MAX_INBOUND_FRAME_SIZE` still bounds
-/// what a peer can send. The consequence is malleability — several distinct
-/// frames carry one message set — which matters wherever a caller keys on the
-/// bytes rather than on the decoded fields. The board keys on the `PoW` hash,
-/// which is computed from fields, so nothing downstream is affected today.
+/// Erigon's live decoders refuse the same way. `PoWMsgFromRLP` — the RPC
+/// submission path, reached from `GrpcServer.AddMessage` — calls
+/// `rlp.DecodeBytes`, which returns `ErrMoreThanOneValue` when the stream has
+/// bytes left. `DecodeRLPWireMsgList`, the `BOARD_MESSAGES` decoder at
+/// `78fbcffb8b`, calls it too and says why: "`DecodeBytes` is required so
+/// trailing RLP data is rejected". Only the dead `DecodeRLPMsgList` is lenient,
+/// and nothing in erigon still calls it.
 ///
-/// Pinned rather than fixed: tightening it changes what reth accepts on the
-/// wire, which belongs in its own change.
+/// The hazard is malleability, not memory: the trailing bytes are never read,
+/// and `MAX_INBOUND_FRAME_SIZE` bounds what a peer can send either way. Without
+/// the check one message set has unboundedly many valid frames, which matters
+/// wherever a caller keys on the bytes rather than on the decoded fields.
 #[test]
-fn trailing_bytes_after_a_complete_value_are_ignored() {
+fn trailing_bytes_after_a_complete_value_are_refused() {
     let mut list = encode_pow_msg_list(&[minimal_msg(1)]);
-    let clean = decode_pow_msg_list(&list).expect("the frame decodes");
+    decode_pow_msg_list(&list).expect("the clean frame decodes");
     list.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-    assert_eq!(decode_pow_msg_list(&list).expect("trailing bytes are ignored"), clean);
+    assert!(matches!(decode_pow_msg_list(&list), Err(MsgboardError::TrailingBytes)));
 
     let mut single = encode_single_msg(&minimal_msg(1));
+    decode_validated_pow_msg(&single).expect("the clean message decodes");
     single.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-    assert_eq!(
-        decode_validated_pow_msg(&single).expect("trailing bytes are ignored"),
-        minimal_msg(1),
-    );
+    assert!(matches!(decode_validated_pow_msg(&single), Err(MsgboardError::TrailingBytes)));
 
-    // The degenerate case: an empty list followed by anything at all.
-    let mut padded = vec![0xC0u8];
-    padded.resize(MAX_INBOUND_FRAME_SIZE, 0xC0);
-    assert!(decode_pow_msg_list(&padded).expect("an empty list decodes").is_empty());
+    // The degenerate case: an empty list followed by anything at all. A bare
+    // `0xC0` is still a legal empty list; a frame full of them is not one.
+    assert!(decode_pow_msg_list(&[0xC0]).expect("a bare empty list decodes").is_empty());
+    let padded = vec![0xC0u8; MAX_INBOUND_FRAME_SIZE];
+    assert!(matches!(decode_pow_msg_list(&padded), Err(MsgboardError::TrailingBytes)));
 }
 
 // ── decode_validated_pow_msg ─────────────────────────────────────────────────

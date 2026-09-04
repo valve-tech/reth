@@ -312,9 +312,25 @@ impl CheckedPoWMsg {
 /// Each decoded message is field-validated on the spot — mirrors erigon's
 /// `DecodeRLPMsgList` calling `Validate()` per element. Callers downstream
 /// (`MsgBoard::add_remote_msgs` etc.) can therefore trust the input.
+///
+/// Bytes after the end of the list are refused. Erigon's `DecodeRLPMsgList`
+/// itself is lenient here — it calls `rlp.Decode` over a `bytes.Reader`, which
+/// stops at the first complete value — but at `78fbcffb8b` that function has no
+/// callers left. The live `BOARD_MESSAGES` decoder is `DecodeRLPWireMsgList`,
+/// which calls `rlp.DecodeBytes` and carries the comment "`DecodeBytes` is
+/// required so trailing RLP data is rejected". Reth still serves
+/// `BOARD_MESSAGES` through this function, so it owes the strict reading.
+///
+/// Trailing bytes are malleability, not a memory hazard: one message set would
+/// otherwise have unboundedly many valid frames, and a caller that keys on the
+/// frame bytes rather than on the decoded fields would treat them as distinct.
 pub fn decode_pow_msg_list(payload: &[u8]) -> Result<Vec<PoWMsg>, MsgboardError> {
     use alloy_rlp::Decodable;
-    let msgs = Vec::<PoWMsg>::decode(&mut &*payload).map_err(MsgboardError::Rlp)?;
+    let mut buf = payload;
+    let msgs = Vec::<PoWMsg>::decode(&mut buf).map_err(MsgboardError::Rlp)?;
+    if !buf.is_empty() {
+        return Err(MsgboardError::TrailingBytes);
+    }
     for m in &msgs {
         m.validate()?;
     }
@@ -326,9 +342,19 @@ pub fn decode_pow_msg_list(payload: &[u8]) -> Result<Vec<PoWMsg>, MsgboardError>
 /// Used by the JSON-RPC `msgboard_addMessage` handler. Mirrors erigon-pulse's
 /// `PoWMsgFromRLP` (decode + `Validate`) so the validation step lives at the
 /// decode boundary, not inside the board's hot path.
+///
+/// Bytes after the end of the message are refused, because `PoWMsgFromRLP`
+/// refuses them: it calls `rlp.DecodeBytes`, which returns `ErrMoreThanOneValue`
+/// when the stream has anything left. Erigon reaches it from
+/// `GrpcServer.AddMessage`, the same submission path reth reaches it from, so
+/// the strict reading applies to an RPC client too, not only to a peer.
 pub fn decode_validated_pow_msg(payload: &[u8]) -> Result<PoWMsg, MsgboardError> {
     use alloy_rlp::Decodable;
-    let msg = PoWMsg::decode(&mut &*payload).map_err(MsgboardError::Rlp)?;
+    let mut buf = payload;
+    let msg = PoWMsg::decode(&mut buf).map_err(MsgboardError::Rlp)?;
+    if !buf.is_empty() {
+        return Err(MsgboardError::TrailingBytes);
+    }
     msg.validate()?;
     Ok(msg)
 }
