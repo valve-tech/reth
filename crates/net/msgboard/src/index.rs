@@ -12,16 +12,18 @@
 //!                               && newMsg.ratio < msgs[i].ratio))
 //! ```
 //!
-//! The ratio term is guarded by block equality, so the comparator is a strict
-//! `(block, ratio)` lexicographic order. Reth matches it exactly, so
-//! `evict_oldest` removes the **same** message under the **same** input
-//! sequence as erigon, preserving wire-observable parity when the board sits
-//! at its count limit.
+//! Erigon added the block-equality guard on the ratio term in `pulse-v3.4.4`
+//! (`78fbcffb8b`). With it the comparator is a strict `(block, ratio)`
+//! lexicographic order; without it the ratio term stands alone in the `OR`,
+//! the comparator is non-monotonic, and the resulting order depends on the
+//! insertion sequence.
 //!
-//! Erigon added that guard in `pulse-v3.4.4` (`78fbcffb8b`). Before it the
-//! ratio term stood alone in the `OR` and the comparator was non-monotonic,
-//! which made the resulting order depend on insertion sequence. See
-//! [`erigon_insert_pos`] for what adopting the guard moves.
+//! Reth implements both and selects between them with
+//! [`MsgboardConfig::pulse_v344`](reth_msgboard_types::MsgboardConfig), so
+//! `evict_oldest` removes the **same** message under the **same** input
+//! sequence as the peers this node is actually talking to. Eviction order is
+//! wire-observable at the count limit, so this is not a local preference. See
+//! [`erigon_insert_pos`].
 //!
 //! Because the predicate is non-monotonic, the resulting order depends on
 //! *how* the position is found, not just on the comparator: any binary search
@@ -47,9 +49,21 @@ pub struct MsgIndex {
     categories: HashMap<B256, HashMap<B256, Arc<CheckedPoWMsg>>>,
     /// Sum of all message `data` field lengths in bytes.
     total_size: u64,
+    /// Selects the insert comparator. See [`erigon_insert_pos`].
+    ///
+    /// `false` is the comparator every deployed peer runs. Defaulting to it
+    /// means a board built without going through [`MsgBoard`](crate::MsgBoard)
+    /// — every test that calls `MsgIndex::default` — keeps the shipped
+    /// ordering rather than silently opting into the new one.
+    pulse_v344: bool,
 }
 
 impl MsgIndex {
+    /// Build an index whose comparator matches the selected behaviour set.
+    pub fn with_behaviour(pulse_v344: bool) -> Self {
+        Self { pulse_v344, ..Self::default() }
+    }
+
     /// Insert a message. Returns `false` if the message is already present.
     pub fn insert(&mut self, msg: Arc<CheckedPoWMsg>) -> bool {
         if self.by_hash.contains_key(&msg.hash) {
@@ -61,6 +75,7 @@ impl MsgIndex {
             msg.block_number,
             msg.msg.work_multiplier,
             msg.msg.work_divisor,
+            self.pulse_v344,
         );
         self.total_size += msg.msg.data.len() as u64;
         self.msgs.insert(pos, Arc::clone(&msg));
@@ -165,12 +180,16 @@ impl MsgIndex {
     /// a lower and an upper index and returns the contiguous slice between
     /// them, commenting "assuming msgs are sorted by block number".
     ///
-    /// Since `pulse-v3.4.4` guarded the insert comparator that assumption
-    /// holds, so the seeked slice and a per-message filter now agree on any
-    /// range that matches something. One divergence survives: when *no*
-    /// message satisfies a bound, erigon's seek never fires, the index keeps
-    /// its initial value, and the filter fails open — a query whose range
-    /// matches nothing returns the whole board.
+    /// That assumption holds only under `pulse-v3.4.4`'s guarded comparator,
+    /// which sorts the board by block. There the seeked slice and a
+    /// per-message filter agree on any range that matches something. Below it
+    /// the board is unsorted and erigon returns out-of-range messages that
+    /// happen to sit between its bounds.
+    ///
+    /// One divergence survives either way: when *no* message satisfies a
+    /// bound, erigon's seek never fires, the index keeps its initial value,
+    /// and the filter fails open — a query whose range matches nothing returns
+    /// the whole board.
     ///
     /// Reth filters per message, deliberately. Reproducing erigon here would
     /// mean handing an operator the entire board when they asked for a range
@@ -215,7 +234,7 @@ impl MsgIndex {
 }
 
 /// Insert position for a message, matching erigon-pulse's `MsgIndex.Insert`
-/// (`msgboard/message_index.go:149` at `pulse-v3.4.4`).
+/// (`msgboard/message_index.go:149`).
 ///
 /// Erigon does two things, in order: a fast path that appends when the new
 /// message already sorts at or after the tail, then a **linear scan** from
@@ -224,31 +243,38 @@ impl MsgIndex {
 /// divergence to justify rather than a free win, and the board is bounded by
 /// `count_limit` anyway.
 ///
-/// The comparator orders by block number first and compares the work ratio
-/// only within one block. `pulse-v3.4.4` added that block-equality guard; the
-/// release before it left the ratio term standing alone in the `OR`, which
-/// made the comparator non-monotonic — the order then depended on the
-/// insertion sequence, not just on the set of messages. Adopting the guard
-/// moves 74.6% of board orders and 39.4% of `msgs[0]` values (the entry
-/// `evict_oldest` drops) across the corpus in
-/// `insert_order_matches_erigon_insert_over_200k_sequences`.
+/// `pulse_v344` selects which comparator. The two disagree on 74.6% of board
+/// orders and 39.4% of `msgs[0]` values — the entry `evict_oldest` drops —
+/// across the corpus in `insert_order_matches_erigon_insert_over_200k_sequences`.
+/// Eviction order is wire-observable: two nodes fed the same messages must
+/// drop the same one or they gossip different boards. So this is not a local
+/// preference, and it has to flip with the rest of the behaviour set rather
+/// than ahead of it.
 ///
 /// The fast path is not merely an optimisation. It appends on a ratio equal to
 /// the tail's, where the scan's strict `<` would have found an earlier
-/// position, so removing it changes the result.
+/// position, so removing it changes the result. Both comparators share it,
+/// differing only in how they compare two ratios.
 fn erigon_insert_pos(
     msgs: &[Arc<CheckedPoWMsg>],
     new_block: u64,
     new_mult: u64,
     new_div: u64,
+    pulse_v344: bool,
 ) -> usize {
     let Some(last) = msgs.last() else { return 0 };
 
-    if new_block > last.block_number ||
-        (new_block == last.block_number &&
-            cmp_ratio(new_mult, new_div, last.msg.work_multiplier, last.msg.work_divisor)
-                .is_ge())
-    {
+    let sorts_at_or_after_tail = if pulse_v344 {
+        new_block > last.block_number ||
+            (new_block == last.block_number &&
+                cmp_ratio(new_mult, new_div, last.msg.work_multiplier, last.msg.work_divisor)
+                    .is_ge())
+    } else {
+        let new_ratio = ratio_f64(new_mult, new_div);
+        new_block > last.block_number ||
+            (new_block == last.block_number && new_ratio >= last.msg.difficulty_ratio())
+    };
+    if sorts_at_or_after_tail {
         return msgs.len();
     }
 
@@ -259,14 +285,31 @@ fn erigon_insert_pos(
     // absent from the ordered list if the position were ever missed. Appending
     // is the safe reading of that unreachable branch — reth must not silently
     // drop a message it reported as accepted.
-    msgs.iter()
-        .position(|m| {
+    let pos = if pulse_v344 {
+        msgs.iter().position(|m| {
             new_block < m.block_number ||
                 (new_block == m.block_number &&
                     cmp_ratio(new_mult, new_div, m.msg.work_multiplier, m.msg.work_divisor)
                         .is_lt())
         })
-        .unwrap_or(msgs.len())
+    } else {
+        // The ratio term stands alone in the `OR`, so the comparator is not a
+        // total order and the resulting sequence depends on insertion order.
+        // `pulse-v3.4.4` guarded it; every peer below that release did not.
+        let new_ratio = ratio_f64(new_mult, new_div);
+        msgs.iter().position(|m| new_block < m.block_number || new_ratio < m.msg.difficulty_ratio())
+    };
+    pos.unwrap_or(msgs.len())
+}
+
+/// The work ratio as `f64`, which is how erigon computed it below
+/// `pulse-v3.4.4`.
+///
+/// Kept for the legacy comparator only. `f64` stops separating ratios above
+/// 2^53, so the value is not usable for ordering in general — but reproducing
+/// the deployed order means reproducing its arithmetic too.
+fn ratio_f64(mult: u64, div: u64) -> f64 {
+    mult as f64 / div as f64
 }
 
 /// Compare the work ratios `a/b` and `c/d` exactly, as erigon's `cmpRatio`
@@ -585,23 +628,27 @@ mod tests {
     #[test]
     fn insert_position_respects_the_block_equality_guard() {
         // Pre-seed: [(5, 0.10), (10, 0.10)] — same ratio, increasing block.
-        let mut idx = MsgIndex::default();
-        idx.insert(fake_checked(5, 100_000, 1_000_000, 0xA0));
-        idx.insert(fake_checked(10, 100_000, 1_000_000, 0xA1));
+        // Then insert (10, 0.05), a lower ratio from the later block. This is
+        // the shape the guard changes.
+        let build = |pulse_v344: bool| {
+            let mut idx = MsgIndex::with_behaviour(pulse_v344);
+            idx.insert(fake_checked(5, 100_000, 1_000_000, 0xA0));
+            idx.insert(fake_checked(10, 100_000, 1_000_000, 0xA1));
+            idx.insert(fake_checked(10, 50_000, 1_000_000, 0xB0));
+            idx.all_msgs().iter().map(|m| m.hash[0]).collect::<Vec<u8>>()
+        };
 
-        // Insert (10, 0.05). The scan skips i=0: block 10 is not below block 5,
-        // and the ratios are not compared across different blocks. At i=1 the
-        // blocks match and 0.05 < 0.10, so the message lands at index 1.
-        let new_msg = fake_checked(10, 50_000, 1_000_000, 0xB0);
-        idx.insert(Arc::clone(&new_msg));
+        // Guarded: the scan skips i=0, because ratios are not compared across
+        // different blocks. At i=1 the blocks match and 0.05 < 0.10, so the
+        // message lands at index 1 and the block-5 message stays the eviction
+        // target.
+        assert_eq!(build(true), vec![0xA0, 0xB0, 0xA1], "guarded comparator");
 
-        let order: Vec<u8> = idx.all_msgs().iter().map(|m| m.hash[0]).collect();
-        assert_eq!(order, vec![0xA0, 0xB0, 0xA1], "must match erigon's guarded comparator");
-
-        // The eviction target stays the block-5 message. Under the unguarded
-        // comparator it was the message just inserted, which sent erigon down
-        // its self-displacement `BoardOverflow` branch at `count_limit` = 1.
-        assert_eq!(idx.all_msgs()[0].hash[0], 0xA0, "eviction target must match erigon's");
+        // Unguarded: the ratio term stands alone, so 0.05 < 0.10 fires at i=0
+        // and the new message lands at the front — becoming the entry
+        // `evict_oldest` drops, which at `count_limit` = 1 sends erigon down
+        // its self-displacement `BoardOverflow` branch.
+        assert_eq!(build(false), vec![0xB0, 0xA0, 0xA1], "unguarded comparator");
     }
 
     /// Differential test against erigon's real `MsgIndex.Insert`, run in Go.
@@ -707,8 +754,15 @@ mod tests {
     /// `mult` per message.
     #[test]
     fn insert_order_matches_erigon_insert_over_200k_sequences() {
-        /// Digest produced by erigon's `MsgIndex.Insert` at `pulse-v3.4.4`, run in Go 1.23.
-        const ERIGON_INSERT_DIGEST: u64 = 7673666368459825830;
+        /// Digest from erigon's `MsgIndex.Insert` at `pulse-v3.4.4`, run in Go 1.23.
+        const GUARDED_DIGEST: u64 = 7673666368459825830;
+        /// Digest from the same routine one release earlier, before the guard.
+        ///
+        /// This is what every deployed peer produces, and what reth produced
+        /// before the behaviour set became selectable. Both are pinned because
+        /// the flag has to reproduce each of them exactly — a node with the
+        /// flag off must gossip the same board as the network it is on.
+        const LEGACY_DIGEST: u64 = 14248539691690691664;
 
         /// xorshift64 — must match the Go generator bit for bit.
         struct Rng(u64);
@@ -728,38 +782,46 @@ mod tests {
         const MULTS: [u64; 5] = [10_000, 50_000, 100_000, 200_000, 500_000];
         const DIV: u64 = 1_000_000;
 
-        let mut rng = Rng(0xDEAD_BEEF);
-        let mut digest: u64 = 14695981039346656037; // FNV-1a offset basis
-        let mix = |byte: u8, d: &mut u64| {
-            *d ^= u64::from(byte);
-            *d = d.wrapping_mul(1099511628211); // FNV-1a prime
+        let corpus_digest = |pulse_v344: bool| {
+            let mut rng = Rng(0xDEAD_BEEF);
+            let mut digest: u64 = 14695981039346656037; // FNV-1a offset basis
+            let mix = |byte: u8, d: &mut u64| {
+                *d ^= u64::from(byte);
+                *d = d.wrapping_mul(1099511628211); // FNV-1a prime
+            };
+
+            for _ in 0..200_000 {
+                let n = 3 + (rng.next() % 12) as usize;
+                let mut seq = Vec::with_capacity(n);
+                for id in 0..n {
+                    let block = BLOCKS[(rng.next() % BLOCKS.len() as u64) as usize];
+                    let mult = MULTS[(rng.next() % MULTS.len() as u64) as usize];
+                    seq.push((block, mult, id as u8));
+                }
+
+                let mut idx = MsgIndex::with_behaviour(pulse_v344);
+                for (block, mult, id) in seq {
+                    idx.insert(fake_checked(block, mult, DIV, id));
+                }
+
+                // Hash the resulting order; the hash byte carries the message id.
+                for msg in idx.all_msgs() {
+                    mix(msg.hash[0], &mut digest);
+                }
+                mix(255, &mut digest); // sequence separator
+            }
+            digest
         };
 
-        for _ in 0..200_000 {
-            let n = 3 + (rng.next() % 12) as usize;
-            let mut seq = Vec::with_capacity(n);
-            for id in 0..n {
-                let block = BLOCKS[(rng.next() % BLOCKS.len() as u64) as usize];
-                let mult = MULTS[(rng.next() % MULTS.len() as u64) as usize];
-                seq.push((block, mult, id as u8));
-            }
-
-            let mut idx = MsgIndex::default();
-            for (block, mult, id) in seq {
-                idx.insert(fake_checked(block, mult, DIV, id));
-            }
-
-            // Hash the resulting order; the hash byte carries the message id.
-            for msg in idx.all_msgs() {
-                mix(msg.hash[0], &mut digest);
-            }
-            mix(255, &mut digest); // sequence separator
-        }
-
         assert_eq!(
-            digest, ERIGON_INSERT_DIGEST,
-            "board ordering diverged from erigon's MsgIndex.Insert at pulse-v3.4.4; \
-             the pre-guard comparator produces 14248539691690691664",
+            corpus_digest(true),
+            GUARDED_DIGEST,
+            "board ordering diverged from erigon's MsgIndex.Insert at pulse-v3.4.4",
+        );
+        assert_eq!(
+            corpus_digest(false),
+            LEGACY_DIGEST,
+            "the flag-off path must still reproduce the deployed ordering",
         );
     }
 
@@ -796,22 +858,21 @@ mod tests {
             (8, R20, 8),
         ];
 
-        let mut idx = MsgIndex::default();
-        for (block, mult, id) in seq {
-            idx.insert(fake_checked(block, mult, DIV, 0xA0 + id));
-        }
+        let order = |pulse_v344: bool| {
+            let mut idx = MsgIndex::with_behaviour(pulse_v344);
+            for (block, mult, id) in seq {
+                idx.insert(fake_checked(block, mult, DIV, 0xA0 + id));
+            }
+            idx.all_msgs().iter().map(|m| m.hash[0] - 0xA0).collect::<Vec<u8>>()
+        };
 
-        let order: Vec<u8> = idx.all_msgs().iter().map(|m| m.hash[0] - 0xA0).collect();
-        assert_eq!(
-            order,
-            vec![0, 4, 5, 2, 3, 7, 8, 6, 1],
-            "insert order must match erigon's fast-path-then-linear-scan Insert",
-        );
-        assert_eq!(
-            idx.all_msgs()[0].hash[0] - 0xA0,
-            0,
-            "eviction target (msgs[0]) must match erigon's",
-        );
+        let guarded = order(true);
+        assert_eq!(guarded, vec![0, 4, 5, 2, 3, 7, 8, 6, 1], "guarded comparator");
+        assert_eq!(guarded[0], 0, "eviction target under the guarded comparator");
+
+        let legacy = order(false);
+        assert_eq!(legacy, vec![7, 8, 6, 5, 4, 3, 0, 2, 1], "unguarded comparator");
+        assert_eq!(legacy[0], 7, "eviction target under the unguarded comparator");
     }
 
     /// Pins the surviving half of the divergence from erigon's `MsgIndex.Msgs`
@@ -833,28 +894,42 @@ mod tests {
         const R50: u64 = 500_000; // ratio 0.50
         const DIV: u64 = 1_000_000;
 
-        let mut idx = MsgIndex::default();
-        for (block, mult, id) in [(2u64, R10, 0u8), (2, R50, 1), (5, R50, 2), (5, R10, 3)] {
-            idx.insert(fake_checked(block, mult, DIV, 0xA0 + id));
-        }
+        let build = |pulse_v344: bool| {
+            let mut idx = MsgIndex::with_behaviour(pulse_v344);
+            for (block, mult, id) in [(2u64, R10, 0u8), (2, R50, 1), (5, R50, 2), (5, R10, 3)] {
+                idx.insert(fake_checked(block, mult, DIV, 0xA0 + id));
+            }
+            idx
+        };
         let blocks = |msgs: &[Arc<CheckedPoWMsg>]| -> Vec<u64> {
             msgs.iter().map(|m| m.block_number).collect()
         };
-        assert_eq!(blocks(idx.all_msgs()), vec![2, 2, 5, 5], "the guard sorts the board by block");
 
-        // Erigon seeks leftIdx=2, rightIdx=4 and returns blocks [5, 5]. Reth
-        // agrees. Before the guard the board was [2, 5, 2, 5] and erigon
-        // returned [5, 2, 5] — the block-2 message rode along between bounds.
+        // Guarded: the board is block-sorted, so erigon's "assuming msgs are
+        // sorted by block number" holds and its seeked slice agrees with a
+        // per-message filter on any range that matches something.
+        let idx = build(true);
+        assert_eq!(blocks(idx.all_msgs()), vec![2, 2, 5, 5], "the guard sorts by block");
+        // Erigon seeks leftIdx=2, rightIdx=4 and returns blocks [5, 5].
         assert_eq!(blocks(&idx.all_msgs_filtered(Some(5), Some(8))), vec![5, 5]);
-
-        // A range that matches nothing at the lower end still agrees, because
-        // the backward seek for `to` does fire.
+        // A range matching nothing at the lower end still agrees, because the
+        // backward seek for `to` does fire.
         assert!(idx.all_msgs_filtered(Some(3), Some(4)).is_empty());
 
-        // The divergence that survives: no message satisfies `from`, erigon's
-        // forward seek never fires, and it returns the whole board — blocks
-        // [2, 2, 5, 5] — where reth returns nothing.
+        // Unguarded: the board is not block-sorted, so erigon returns
+        // out-of-range messages that happen to sit between its two bounds. It
+        // seeks leftIdx=1, rightIdx=4 and returns blocks [5, 2, 5]; reth
+        // filters per message and returns [5, 5]. That half of the divergence
+        // exists only below `pulse-v3.4.4`.
+        let legacy = build(false);
+        assert_eq!(blocks(legacy.all_msgs()), vec![2, 5, 2, 5], "no guard, no block order");
+        assert_eq!(blocks(&legacy.all_msgs_filtered(Some(5), Some(8))), vec![5, 5]);
+
+        // The surviving divergence, under both: no message satisfies `from`,
+        // erigon's forward seek never fires, and it returns the whole board
+        // where reth returns nothing.
         assert!(idx.all_msgs_filtered(Some(10), Some(20)).is_empty());
+        assert!(legacy.all_msgs_filtered(Some(10), Some(20)).is_empty());
 
         // The category-filtered path is *not* divergent: erigon's
         // `CategoryMsgs` skips per message, like reth.

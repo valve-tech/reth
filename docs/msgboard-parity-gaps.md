@@ -719,10 +719,12 @@ OR-comparator did not produce a block-sorted vec (§11). It had two consequences
    count`). A query whose range matches nothing returns **the entire board**.
 
 **Erigon guarded the comparator in `pulse-v3.4.4` (`78fbcffb8b`), and reth
-followed. The board is block-sorted on both sides now, so consequence 1 is
-gone** — the seeked slice and a per-message filter agree on any range that
-matches something. Consequence 2 survives untouched: the fail-open depends on
-the seek not firing, not on the ordering.
+implements both comparators behind `MsgboardConfig::pulse_v344` (§26). Under
+the guard the board is block-sorted, so consequence 1 is gone** — the seeked
+slice and a per-message filter agree on any range that matches something.
+Below the guard, which is the default and what every deployed peer runs,
+consequence 1 stands as written. Consequence 2 survives either way: the
+fail-open depends on the seek not firing, not on the ordering.
 
 Worked case — board holding blocks 1, 2, 3, queried `from=10 to=20`: erigon
 returns all three messages, reth returns none. That is still true.
@@ -2487,7 +2489,20 @@ predicate now reproduces the linear scan exactly — verified, same digest over
 the 200k corpus. Reth keeps the scan because erigon scans, not because a search
 is unsafe.
 
-### 26.3 Measured impact of adopting it
+### 26.3 It is selectable, not adopted
+
+Eviction order is wire-observable — two nodes fed the same messages must drop
+the same one, or they gossip different boards. `78fbcffb8b` lives on one
+unmerged, untagged branch and nowhere else in the repository, so no deployed
+peer runs the guarded comparator. Adopting it outright would have moved this
+node away from every peer it talks to.
+
+Both comparators therefore ship, selected by
+`MsgboardConfig::pulse_v344` — the same flag that selects the wire format,
+because the network moves once. Off is the deployed ordering. The differential
+test pins **both** digests, so neither path can drift.
+
+### 26.4 Measured impact of the guard
 
 Both comparators run in Go over the same 200k-sequence corpus:
 
@@ -2504,7 +2519,7 @@ difference is provenance: this digest comes from erigon's current `Insert`
 compiled and run, and the generator was validated by reproducing the previous
 digest from the previous comparator before the new one was trusted.
 
-### 26.4 Method, since the last two rounds got this wrong
+### 26.5 Method, since the last two rounds got this wrong
 
 The generator in `index.rs`'s differential test was run in Go against **both**
 comparators. The old one reproduced the committed constant exactly. Only then
@@ -2512,7 +2527,7 @@ was the new constant taken. Every hand-written expected order in the index
 tests was re-derived by running erigon's `Insert` over that specific sequence,
 not adjusted by hand until the test passed.
 
-### 26.5 Consequence: §13.4 is half retired
+### 26.6 Consequence: §13.4 is half retired, under the guard
 
 A block-sorted board makes erigon's "assuming msgs are sorted by block number"
 true. Its seeked slice and reth's per-message filter now agree on any range
@@ -2520,7 +2535,7 @@ that matches something, so the "out-of-range messages ride along" half of
 §13.4 is gone. The fail-open half survives, because it depends on the seek not
 firing rather than on the ordering. §13.4 is updated in place.
 
-### 26.6 Still open, and larger than this section
+### 26.7 Still open, and larger than this section
 
 `78fbcffb8b` also changed the wire format: `WirePoWMsg` carries a claimed hash
 on `BOARD_MESSAGES`, and `GET_BOARD_MESSAGES` carries 32-byte hashes instead of
