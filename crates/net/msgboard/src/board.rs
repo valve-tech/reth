@@ -121,7 +121,7 @@ impl MsgBoard {
     fn build(cfg: MsgboardConfig, db: Option<Environment>) -> Self {
         let (new_msg_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let state = BoardState {
-            index: MsgIndex::default(),
+            index: MsgIndex::with_behaviour(cfg.pulse_v344),
             block_filter: BlockFilter::new(cfg.block_range),
             discarded: Vec::new(),
             dirty: HashSet::new(),
@@ -1143,6 +1143,57 @@ mod tests {
 
         let (_, _, count, _, _, _) = board.status();
         assert_eq!(count, 1);
+    }
+
+    /// The board must hand its behaviour set to the index.
+    ///
+    /// Without this the flag gates the wire format while eviction quietly
+    /// keeps the other ordering — and eviction order is the half that is
+    /// wire-observable, so the node would gossip a board its peers disagree
+    /// with while appearing to speak their protocol.
+    #[test]
+    fn the_board_gives_the_index_its_behaviour_set() {
+        fn mined(block_hash: B256, mult: u64, data: &[u8]) -> PoWMsg {
+            let base = PoWMsg {
+                version: VERSION_V1,
+                block_hash,
+                nonce: 0,
+                work_multiplier: mult,
+                work_divisor: 1_000_000,
+                category: category_hash(),
+                data: Bytes::copy_from_slice(data),
+            };
+            for n in 1u64..=1_000_000 {
+                let mut msg = base.clone();
+                msg.nonce = n;
+                if msg.clone().to_checked(0, 0).is_ok() {
+                    return msg;
+                }
+            }
+            panic!("no valid nonce found within 1M iterations");
+        }
+
+        // Two blocks, and a later-block message whose ratio is the lowest.
+        // The unguarded comparator compares that ratio across blocks and sorts
+        // it to the front; the guarded one does not.
+        let low = block_hash_one();
+        let high = B256::from([0x02u8; 32]);
+
+        let front_of_board = |pulse_v344: bool| {
+            let board = MsgBoard::new(MsgboardConfig { pulse_v344, ..easy_cfg() });
+            board.set_ready();
+            board.set_head(5, low);
+            board.set_head(10, high);
+
+            board.add_local_msg(mined(low, 3, b"a")).expect("block 5, highest ratio");
+            board.add_local_msg(mined(high, 3, b"b")).expect("block 10, highest ratio");
+            board.add_local_msg(mined(high, 1, b"c")).expect("block 10, lowest ratio");
+
+            board.all_messages()[0].msg.data.to_vec()
+        };
+
+        assert_eq!(front_of_board(true), b"a", "guarded: the earliest block sorts first");
+        assert_eq!(front_of_board(false), b"c", "unguarded: the lowest ratio sorts first");
     }
 
     #[test]

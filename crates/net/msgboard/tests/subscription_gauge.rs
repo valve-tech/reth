@@ -35,8 +35,8 @@ fn the_gauge_returns_to_zero_on_every_exit_path() {
         let _subscription = SubscriptionGuard::new(metrics.clone());
     }
 
-    // 2. Returns early. The subscribe loop breaks out of `tokio::select!` on a
-    //    closed sink, a serialisation failure and a send failure alike.
+    // 2. Returns early. The subscribe loop breaks out of `tokio::select!` on a closed sink, a
+    //    serialisation failure and a send failure alike.
     fn bails(metrics: MsgboardMetrics) -> bool {
         let _subscription = SubscriptionGuard::new(metrics);
         return false;
@@ -45,8 +45,8 @@ fn the_gauge_returns_to_zero_on_every_exit_path() {
     }
     assert!(!bails(metrics.clone()));
 
-    // 3. Panics. The subscription runs in a spawned task, so a panic there is
-    //    contained and would otherwise leak a count for the life of the process.
+    // 3. Panics. The subscription runs in a spawned task, so a panic there is contained and would
+    //    otherwise leak a count for the life of the process.
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _subscription = SubscriptionGuard::new(metrics);
         panic!("subscription died mid-notification");
