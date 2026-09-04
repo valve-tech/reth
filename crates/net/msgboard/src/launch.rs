@@ -23,7 +23,7 @@ use reth_msgboard_types::MsgboardConfig;
 use reth_network::{protocol::IntoRlpxSubProtocol, NetworkProtocols};
 use reth_network_api::{NetworkInfo, Peers, PeersInfo};
 use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives};
-use reth_rpc_builder::TransportRpcModules;
+use reth_rpc_builder::{RethRpcModule, TransportRpcModules};
 use reth_storage_api::{BlockNumReader, NodePrimitivesProvider};
 use tokio::{sync::broadcast::error::RecvError, time::sleep};
 
@@ -128,7 +128,11 @@ impl MsgboardLauncher {
         board.spawn_log_task(self.args.msgboard_log_every);
 
         let rpc = MsgboardApi::new(Arc::clone(&board));
-        modules.merge_configured(rpc.into_rpc())?;
+        // `merge_configured` would install the namespace on every enabled
+        // transport whatever `--http.api` says. That is how `msgboard_addMessage`
+        // — a write method — reached an unauthenticated port under a config whose
+        // `--http.api "eth,net,web3"` reads like it excludes everything else.
+        install_msgboard_rpc(modules, rpc)?;
 
         let reporter = Arc::new(NetworkPeerReporter::new(network.clone()));
         let handler = MsgboardProtocolHandler::new(Arc::clone(&board)).with_reporter(reporter);
@@ -234,9 +238,86 @@ impl MsgboardLauncher {
     }
 }
 
+/// The namespace an operator names in `--http.api`, `--ws.api` or `--ipc.api`
+/// to expose the msgboard methods.
+///
+/// [`RethRpcModule`] has no msgboard variant, so this rides its `Other`
+/// catch-all. That is enough for the allowlist check and keeps the change out
+/// of the shared RPC types.
+pub const MSGBOARD_RPC_NAMESPACE: &str = "msgboard";
+
+/// The [`RethRpcModule`] the msgboard methods register under.
+fn msgboard_rpc_module() -> RethRpcModule {
+    RethRpcModule::Other(MSGBOARD_RPC_NAMESPACE.to_string())
+}
+
+/// Install the msgboard methods on every transport whose namespace allowlist
+/// names [`MSGBOARD_RPC_NAMESPACE`], and on no other.
+fn install_msgboard_rpc(modules: &mut TransportRpcModules, api: MsgboardApi) -> eyre::Result<()> {
+    modules.merge_if_module_configured(msgboard_rpc_module(), api.into_rpc())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use reth_rpc_builder::{RpcModuleSelection, TransportRpcModuleConfig};
+
     use super::*;
+
+    /// A transport whose allowlist does not name msgboard must not carry it.
+    ///
+    /// `merge_if_module_configured` gates every transport on exactly this
+    /// predicate, so this is the decision the install turns on.
+    #[test]
+    fn a_transport_that_does_not_name_msgboard_does_not_get_it() {
+        let config = TransportRpcModuleConfig::default()
+            .with_http([RethRpcModule::Eth])
+            .with_ipc([RethRpcModule::Eth]);
+
+        assert!(!config.contains_http(&msgboard_rpc_module()));
+        assert!(!config.contains_ipc(&msgboard_rpc_module()));
+    }
+
+    /// Naming the namespace is what turns it on, on that transport alone.
+    #[test]
+    fn naming_msgboard_enables_it_on_that_transport_only() {
+        let config = TransportRpcModuleConfig::default()
+            .with_http([RethRpcModule::Eth, msgboard_rpc_module()])
+            .with_ipc([RethRpcModule::Eth]);
+
+        assert!(config.contains_http(&msgboard_rpc_module()));
+        assert!(!config.contains_ipc(&msgboard_rpc_module()));
+    }
+
+    /// The exact `--http.api` string `etc/docker-compose.yml` ships, on
+    /// `--http.addr 0.0.0.0` with 8545 published.
+    ///
+    /// It reads like a three-namespace restriction and is one. Before the
+    /// install honoured it, that published port answered
+    /// `msgboard_addMessage` — a write method — with no authentication.
+    #[test]
+    fn the_shipped_docker_compose_allowlist_excludes_msgboard() {
+        let selection: RpcModuleSelection =
+            "eth,net,web3".parse().expect("the compose --http.api value must parse");
+        let config = TransportRpcModuleConfig::default().with_http(selection);
+
+        assert!(!config.contains_http(&msgboard_rpc_module()));
+        assert!(config.contains_http(&RethRpcModule::Eth));
+    }
+
+    /// `--http.api "msgboard"` has to parse into the module the install
+    /// registers under, or the flag silently does nothing.
+    #[test]
+    fn the_namespace_string_parses_to_the_module_we_register_under() {
+        let parsed: RethRpcModule =
+            MSGBOARD_RPC_NAMESPACE.parse().expect("namespace must parse as a module");
+        assert_eq!(parsed, msgboard_rpc_module());
+
+        let selection: RpcModuleSelection =
+            "eth,msgboard".parse().expect("operators must be able to name it");
+        let config = TransportRpcModuleConfig::default().with_http(selection);
+        assert!(config.contains_http(&msgboard_rpc_module()));
+    }
 
     fn launcher_with_db_dir(db_dir: Option<&str>) -> MsgboardLauncher {
         MsgboardLauncher::new(MsgboardArgs {
