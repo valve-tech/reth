@@ -21,7 +21,7 @@ use reth_libmdbx::Environment;
 use tokio::sync::broadcast;
 
 use reth_msgboard_types::{
-    CheckedPoWMsg, MsgID, MsgboardConfig, MsgboardError, PoWMsg, VERSION_V1,
+    CheckedPoWMsg, MsgID, MsgboardConfig, MsgboardError, PoWMsg, WirePoWMsg, VERSION_V1,
 };
 
 use crate::{
@@ -410,6 +410,24 @@ impl MsgBoard {
             .collect()
     }
 
+    /// Fetch the messages named by these work hashes, each paired with the hash
+    /// it is held under.
+    ///
+    /// Used to respond to a `GetBoardMessages` packet under the
+    /// `pulse-v3.4.4` behaviour set, where the request names 32-byte hashes and
+    /// the reply carries the hash alongside each body. Mirrors erigon's
+    /// `GetMessage(ctx, h)` loop (`msgboard/fetch.go:256-266`): a hash we do
+    /// not hold is skipped, not reported.
+    pub fn get_wire_messages_for_hashes(&self, hashes: &[B256]) -> Vec<WirePoWMsg> {
+        let state = self.state.lock();
+        hashes
+            .iter()
+            .filter_map(|hash| {
+                state.index.get(hash).map(|m| WirePoWMsg::new(m.msg.clone(), m.hash))
+            })
+            .collect()
+    }
+
     /// Add `PoWMsg`s received from a remote peer.
     ///
     /// Inputs **must** already be field-validated — wire-side messages are
@@ -436,6 +454,41 @@ impl MsgBoard {
     /// `cfg.NoGossip`). Returns `(0, 0)` — read-only observers must not
     /// penalise peers for participating in gossip the operator opted out of.
     pub fn add_remote_msgs(&self, msgs: Vec<PoWMsg>) -> (usize, usize) {
+        // `B256::ZERO` is erigon's absent-claim sentinel (`addMsgLocked`'s
+        // `claimedHash != (common.Hash{})` guards), and a real work hash is
+        // never zero.
+        self.add_remote(msgs.into_iter().map(|msg| (msg, B256::ZERO)))
+    }
+
+    /// Add messages delivered with the hash their sender claims for them.
+    ///
+    /// The `pulse-v3.4.4` entry point. Same rules as
+    /// [`add_remote_msgs`](Self::add_remote_msgs), plus the two checks the
+    /// claim buys — see [`add_remote`](Self::add_remote). Mirrors erigon's
+    /// `AddRemoteWireMsgs` (`msgboard/board.go:271-292`).
+    pub fn add_remote_wire_msgs(&self, msgs: Vec<WirePoWMsg>) -> (usize, usize) {
+        self.add_remote(msgs.into_iter().map(|m| (m.msg, m.hash)))
+    }
+
+    /// The shared body of both remote-ingest entry points.
+    ///
+    /// Each message arrives with the hash its sender claims for it, or
+    /// [`B256::ZERO`] when the wire format carries no claim. A claim is used
+    /// twice, straddling the expensive step, exactly as erigon's `addMsgLocked`
+    /// uses it (`msgboard/board.go:402-462`):
+    ///
+    ///  - **Before** `to_checked`, as an index probe. A message we already hold is then free to
+    ///    re-receive. Without the claim nothing can look a delivery up first: the index key is
+    ///    `sha256(challenge ‖ category ‖ data)` and `challenge` *is* the elliptic curve point, so
+    ///    learning which message arrived costs the secp256k1 scalar multiplication we are trying to
+    ///    avoid. Gossip re-delivers constantly, so this is the common case, not the corner one.
+    ///  - **After** `to_checked`, against the recomputed hash. The claim is never trusted; a
+    ///    mismatch is kickable, because a peer that mislabels a body is either broken or probing.
+    ///
+    /// With no claim both checks are skipped and the duplicate is caught later,
+    /// by `insert_checked` returning `MessageExists` — same outcome, paid for
+    /// with a verification.
+    fn add_remote(&self, msgs: impl IntoIterator<Item = (PoWMsg, B256)>) -> (usize, usize) {
         if self.cfg.gossip_disabled {
             return (0, 0);
         }
@@ -446,7 +499,7 @@ impl MsgBoard {
         let timestamp = unix_timestamp();
         let mut added = 0;
         let mut kickable = 0;
-        for msg in msgs {
+        for (msg, claimed) in msgs {
             if !self.cfg.is_size_acceptable(msg.data.len()) {
                 self.metrics.rejected_oversized.increment(1);
                 kickable += 1;
@@ -470,6 +523,13 @@ impl MsgBoard {
                 continue
             };
 
+            // Ordered as erigon orders it: after the block lookup, before the
+            // scalar multiplication.
+            if !claimed.is_zero() && self.state.lock().index.has(&claimed) {
+                self.metrics.skipped_duplicate.increment(1);
+                continue;
+            }
+
             let checked = match msg.to_checked(block_number, timestamp) {
                 Ok(checked) => checked,
                 Err(err) => {
@@ -489,6 +549,14 @@ impl MsgBoard {
                     continue;
                 }
             };
+            if !claimed.is_zero() && checked.hash != claimed {
+                // Counted under `rejected_other` rather than its own gauge: a
+                // conforming peer never sends one, so the interesting signal is
+                // the `BadMessage` hit the caller raises, not the rate.
+                self.metrics.rejected_other.increment(1);
+                kickable += 1;
+                continue;
+            }
             match self.insert_checked(checked) {
                 Ok(_) => {
                     self.metrics.accepted_remote.increment(1);
@@ -847,6 +915,7 @@ mod tests {
             block_range: 120,
             stale_block_buffer: 3,
             gossip_disabled: false,
+            pulse_v344: false,
         }
     }
 
