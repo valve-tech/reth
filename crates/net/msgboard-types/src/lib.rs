@@ -7,8 +7,8 @@
 //! | Opcode | Name               | Payload                          |
 //! |--------|--------------------|----------------------------------|
 //! | 0x00   | `BoardMessageIDs`  | Flat concatenated [`MsgID`]s     |
-//! | 0x01   | `GetBoardMessages` | Flat concatenated [`MsgID`]s     |
-//! | 0x02   | `BoardMessages`    | RLP list of [`PoWMsg`]s          |
+//! | 0x01   | `GetBoardMessages` | Flat concatenated message hashes |
+//! | 0x02   | `BoardMessages`    | RLP list of [`WirePoWMsg`]s      |
 //!
 //! See [`protocol`] for opcode constants and capability metadata.
 
@@ -32,6 +32,15 @@ pub use pow::{
     decode_pow_msg_list, decode_validated_pow_msg, encode_pow_msg_list, CheckedPoWMsg, PoWMsg,
     VERSION_V1,
 };
+
+pub mod hashes;
+pub use hashes::{
+    check_unique_hashes, decode_msg_hash_list, encode_msg_hash_list, MAX_GET_BOARD_MESSAGES,
+    MSG_HASH_SIZE,
+};
+
+pub mod wire;
+pub use wire::{decode_wire_pow_msg_list, encode_wire_pow_msg_list, WirePoWMsg};
 
 pub mod protocol;
 pub use protocol::{
@@ -101,6 +110,30 @@ pub enum MsgboardError {
     /// A [`MsgID`] list payload is not a whole multiple of [`MSG_ID_SIZE`].
     #[error("MsgID list length is not a multiple of MSG_ID_SIZE")]
     MalformedIdList,
+
+    /// A message-hash list payload is not a whole multiple of [`MSG_HASH_SIZE`].
+    #[error("message hash list length is not a multiple of MSG_HASH_SIZE")]
+    MalformedHashList,
+
+    /// A `GetBoardMessages` frame names the same hash twice.
+    #[error("msgboard: duplicate message hashes")]
+    DuplicateHashes,
+
+    /// A `GetBoardMessages` frame names more than [`MAX_GET_BOARD_MESSAGES`] hashes.
+    #[error("msgboard: GetBoardMessages exceeds the hash cap")]
+    GetTooManyHashes,
+
+    /// A `BoardMessages` element carries a zero claimed hash.
+    #[error("msgboard: missing claimed message hash")]
+    MissingClaimedHash,
+
+    /// A delivered message's recomputed work hash is not the one claimed for it.
+    #[error("msgboard: claimed hash does not match computed hash")]
+    ClaimedHashMismatch,
+
+    /// A payload carries bytes after the end of its RLP value.
+    #[error("msgboard: trailing bytes after RLP value")]
+    TrailingBytes,
 
     /// RLP decoding error.
     #[error("RLP decode error: {0}")]
