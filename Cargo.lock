@@ -9351,6 +9351,7 @@ dependencies = [
  "parking_lot",
  "reth-chain-state",
  "reth-eth-wire",
+ "reth-execution-types",
  "reth-fs-util",
  "reth-libmdbx",
  "reth-metrics",

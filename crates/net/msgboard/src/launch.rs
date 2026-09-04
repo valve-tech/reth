@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use reth_chain_state::CanonStateSubscriptions;
+use reth_chain_state::{CanonStateNotifications, CanonStateSubscriptions};
 use reth_msgboard_types::MsgboardConfig;
 use reth_network::{protocol::IntoRlpxSubProtocol, NetworkProtocols};
 use reth_network_api::{NetworkInfo, Peers, PeersInfo};
@@ -191,26 +191,10 @@ impl MsgboardLauncher {
             }
         });
 
-        let mut rx = provider.subscribe_to_canonical_state();
-        let board_for_canon = Arc::clone(&board);
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(notification) => {
-                        let tip = notification.tip();
-                        board_for_canon.set_head(tip.number(), tip.hash());
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        tracing::warn!(
-                            target: "msgboard",
-                            lagged = n,
-                            "canonical-state stream lagged; head update may have skipped blocks",
-                        );
-                    }
-                    Err(RecvError::Closed) => break,
-                }
-            }
-        });
+        tokio::spawn(drive_canonical_head(
+            Arc::clone(&board),
+            provider.subscribe_to_canonical_state(),
+        ));
     }
 
     /// Final flush on shutdown — call after `wait_for_node_exit().await`.
@@ -238,6 +222,39 @@ impl MsgboardLauncher {
     }
 }
 
+/// Push each canonical tip into [`MsgBoard::set_head`].
+///
+/// The block-window prune-and-expiry pipeline advances only from here. If this
+/// loop stops, the board keeps serving messages anchored to a chain it no
+/// longer follows and rejects every message anchored to a block it has not
+/// seen — both silently, because nothing else reads the chain.
+///
+/// Split out of [`MsgboardLauncher::install_post_launch_tasks`] so a test can
+/// drive it with a real notification stream. Inside the `spawn` closure it was
+/// reachable only from a running node.
+async fn drive_canonical_head<N>(board: Arc<MsgBoard>, mut rx: CanonStateNotifications<N>)
+where
+    N: NodePrimitives,
+    N::BlockHeader: AlloyBlockHeader,
+{
+    loop {
+        match rx.recv().await {
+            Ok(notification) => {
+                let tip = notification.tip();
+                board.set_head(tip.number(), tip.hash());
+            }
+            Err(RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    target: "msgboard",
+                    lagged = n,
+                    "canonical-state stream lagged; head update may have skipped blocks",
+                );
+            }
+            Err(RecvError::Closed) => break,
+        }
+    }
+}
+
 /// The namespace an operator names in `--http.api`, `--ws.api` or `--ipc.api`
 /// to expose the msgboard methods.
 ///
@@ -260,9 +277,53 @@ fn install_msgboard_rpc(modules: &mut TransportRpcModules, api: MsgboardApi) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use alloy_primitives::B256;
+    use reth_chain_state::{test_utils::TestBlockBuilder, CanonStateNotification};
+    use reth_execution_types::Chain;
+    use reth_msgboard_types::MsgboardConfig;
     use reth_rpc_builder::{RpcModuleSelection, TransportRpcModuleConfig};
 
     use super::*;
+
+    /// A canonical commit must reach [`MsgBoard::set_head`].
+    ///
+    /// Nothing else advances the block window, so if this wiring breaks the
+    /// board keeps serving messages anchored to a chain it no longer follows
+    /// and rejects every message anchored to a block it has not seen. Both
+    /// failures are silent, which is why the loop is worth a gate rather than
+    /// a reading.
+    #[tokio::test]
+    async fn a_canonical_commit_advances_the_board_head() {
+        const HEIGHT: u64 = 4_242;
+
+        let board = Arc::new(MsgBoard::new(MsgboardConfig::default()));
+        assert_eq!(board.status().1, 0, "a fresh board has no head");
+
+        let (tx, rx) = tokio::sync::broadcast::channel::<CanonStateNotification>(4);
+        tokio::spawn(drive_canonical_head(Arc::clone(&board), rx));
+
+        let mut builder = TestBlockBuilder::eth();
+        let executed = builder.get_executed_block_with_number(HEIGHT, B256::ZERO);
+        let block = executed.recovered_block().clone();
+        // The execution outcome and trie data are irrelevant here — only the
+        // tip's number and hash reach `set_head`.
+        let chain = Arc::new(Chain::new([block], Default::default(), BTreeMap::new()));
+
+        tx.send(CanonStateNotification::Commit { new: chain }).expect("receiver is live");
+
+        // The driver runs on its own task, so give it a turn to observe.
+        for _ in 0..100 {
+            if board.status().1 == HEIGHT {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let (_, head, ..) = board.status();
+        assert_eq!(head, HEIGHT, "the commit must advance the board head");
+    }
 
     /// A transport whose allowlist does not name msgboard must not carry it.
     ///
