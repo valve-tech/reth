@@ -8,15 +8,20 @@
 //! ```text
 //! if new sorts at or after the tail -> append
 //! else pos = first i where (newMsg.block_number < msgs[i].block_number
-//!                           || newMsg.difficulty_ratio < msgs[i].difficulty_ratio)
+//!                           || (newMsg.block_number == msgs[i].block_number
+//!                               && newMsg.ratio < msgs[i].ratio))
 //! ```
 //!
-//! That OR-comparator is not a true total order — under mixed
-//! `(block, ratio)` distributions it can place a new message at an earlier
-//! index than a strict `(block, ratio)` lexicographic sort would. Reth
-//! matches this exactly so `evict_oldest` removes the **same** message under
-//! the **same** input sequence as erigon, preserving wire-observable parity
-//! when the board is at its count limit.
+//! The ratio term is guarded by block equality, so the comparator is a strict
+//! `(block, ratio)` lexicographic order. Reth matches it exactly, so
+//! `evict_oldest` removes the **same** message under the **same** input
+//! sequence as erigon, preserving wire-observable parity when the board sits
+//! at its count limit.
+//!
+//! Erigon added that guard in `pulse-v3.4.4` (`78fbcffb8b`). Before it the
+//! ratio term stood alone in the `OR` and the comparator was non-monotonic,
+//! which made the resulting order depend on insertion sequence. See
+//! [`erigon_insert_pos`] for what adopting the guard moves.
 //!
 //! Because the predicate is non-monotonic, the resulting order depends on
 //! *how* the position is found, not just on the comparator: any binary search
@@ -26,7 +31,7 @@
 //! message already sorts at or after the tail. [`erigon_insert_pos`] ports
 //! that, so no binary search may be substituted for it.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use alloy_primitives::B256;
 use reth_msgboard_types::CheckedPoWMsg;
@@ -51,7 +56,12 @@ impl MsgIndex {
             return false;
         }
 
-        let pos = erigon_insert_pos(&self.msgs, msg.block_number, msg.msg.difficulty_ratio());
+        let pos = erigon_insert_pos(
+            &self.msgs,
+            msg.block_number,
+            msg.msg.work_multiplier,
+            msg.msg.work_divisor,
+        );
         self.total_size += msg.msg.data.len() as u64;
         self.msgs.insert(pos, Arc::clone(&msg));
         self.by_hash.insert(msg.hash, Arc::clone(&msg));
@@ -153,13 +163,14 @@ impl MsgIndex {
     /// **Accepted divergence from erigon — see `docs/msgboard-parity-gaps.md`
     /// §13.4.** Erigon's `MsgIndex.Msgs` does not filter per message. It seeks
     /// a lower and an upper index and returns the contiguous slice between
-    /// them, commenting "assuming msgs are sorted by block number" — which the
-    /// OR-comparator does not guarantee. So erigon includes out-of-range
-    /// messages that happen to sit between the bounds, and when *no* message
-    /// satisfies a bound its seek leaves the index at its initial value and the
-    /// filter fails open: a query whose range matches nothing returns the whole
-    /// board. Over randomised boards, 68% of range-filtered queries differ, and
-    /// on 30% reth returns empty where erigon returns a non-empty slice.
+    /// them, commenting "assuming msgs are sorted by block number".
+    ///
+    /// Since `pulse-v3.4.4` guarded the insert comparator that assumption
+    /// holds, so the seeked slice and a per-message filter now agree on any
+    /// range that matches something. One divergence survives: when *no*
+    /// message satisfies a bound, erigon's seek never fires, the index keeps
+    /// its initial value, and the filter fails open — a query whose range
+    /// matches nothing returns the whole board.
     ///
     /// Reth filters per message, deliberately. Reproducing erigon here would
     /// mean handing an operator the entire board when they asked for a range
@@ -171,7 +182,7 @@ impl MsgIndex {
     ///
     /// [`category_msgs_filtered`](Self::category_msgs_filtered) is **not**
     /// divergent — erigon's `CategoryMsgs` skips per message, like reth.
-    /// `all_msgs_filtered_filters_per_message_where_erigon_slices` pins both.
+    /// `all_msgs_filtered_diverges_only_when_erigons_seek_fails_open` pins both.
     pub fn all_msgs_filtered(
         &self,
         from_block: Option<u64>,
@@ -203,27 +214,40 @@ impl MsgIndex {
     }
 }
 
-/// Insert position for a message with `(new_block, new_ratio)`, matching
-/// erigon-pulse's `MsgIndex.Insert` (`msgboard/message_index.go`).
+/// Insert position for a message, matching erigon-pulse's `MsgIndex.Insert`
+/// (`msgboard/message_index.go:149` at `pulse-v3.4.4`).
 ///
 /// Erigon does two things, in order: a fast path that appends when the new
 /// message already sorts at or after the tail, then a **linear scan** from
-/// index 0 for the first entry the OR-comparator says the new message sorts
-/// below. Neither is a binary search, and neither may be replaced by one:
-/// the comparator is non-monotonic (see the module docs), so a binary search
-/// probes only a subset of indices and can stop past the first match.
-/// Replaying identical insert sequences, substituting Go's `sort.Search`
-/// reorders 80–100% of boards and changes `msgs[0]` — the message
-/// `evict_oldest` drops — on 10–45% of them, depending on board depth.
+/// index 0 for the first entry the comparator says the new message sorts
+/// below. Keep the scan. Erigon still scans, so a binary search is a
+/// divergence to justify rather than a free win, and the board is bounded by
+/// `count_limit` anyway.
 ///
-/// The fast path is not merely an optimisation. It appends on
-/// `new_ratio >= last_ratio` at the same block, where the scan's strict `<`
-/// would have found an earlier position, so removing it changes the result.
-fn erigon_insert_pos(msgs: &[Arc<CheckedPoWMsg>], new_block: u64, new_ratio: f64) -> usize {
+/// The comparator orders by block number first and compares the work ratio
+/// only within one block. `pulse-v3.4.4` added that block-equality guard; the
+/// release before it left the ratio term standing alone in the `OR`, which
+/// made the comparator non-monotonic — the order then depended on the
+/// insertion sequence, not just on the set of messages. Adopting the guard
+/// moves 74.6% of board orders and 39.4% of `msgs[0]` values (the entry
+/// `evict_oldest` drops) across the corpus in
+/// `insert_order_matches_erigon_insert_over_200k_sequences`.
+///
+/// The fast path is not merely an optimisation. It appends on a ratio equal to
+/// the tail's, where the scan's strict `<` would have found an earlier
+/// position, so removing it changes the result.
+fn erigon_insert_pos(
+    msgs: &[Arc<CheckedPoWMsg>],
+    new_block: u64,
+    new_mult: u64,
+    new_div: u64,
+) -> usize {
     let Some(last) = msgs.last() else { return 0 };
 
     if new_block > last.block_number ||
-        (new_block == last.block_number && new_ratio >= last.msg.difficulty_ratio())
+        (new_block == last.block_number &&
+            cmp_ratio(new_mult, new_div, last.msg.work_multiplier, last.msg.work_divisor)
+                .is_ge())
     {
         return msgs.len();
     }
@@ -236,8 +260,33 @@ fn erigon_insert_pos(msgs: &[Arc<CheckedPoWMsg>], new_block: u64, new_ratio: f64
     // is the safe reading of that unreachable branch — reth must not silently
     // drop a message it reported as accepted.
     msgs.iter()
-        .position(|m| new_block < m.block_number || new_ratio < m.msg.difficulty_ratio())
+        .position(|m| {
+            new_block < m.block_number ||
+                (new_block == m.block_number &&
+                    cmp_ratio(new_mult, new_div, m.msg.work_multiplier, m.msg.work_divisor)
+                        .is_lt())
+        })
         .unwrap_or(msgs.len())
+}
+
+/// Compare the work ratios `a/b` and `c/d` exactly, as erigon's `cmpRatio`
+/// (`msgboard/pow_message.go:234`) does.
+///
+/// Cross-multiplication in `u128` cannot overflow for `u64` inputs, so this
+/// agrees with erigon's `bits.Mul64` pair on every input.
+/// [`PoWMsg::difficulty_ratio`](reth_msgboard_types::PoWMsg::difficulty_ratio)
+/// returns `f64` and stops separating ratios above 2^53, which is why board
+/// ordering does not use it.
+const fn cmp_ratio(a: u64, b: u64, c: u64, d: u64) -> Ordering {
+    let left = (a as u128) * (d as u128);
+    let right = (b as u128) * (c as u128);
+    if left < right {
+        Ordering::Less
+    } else if left > right {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
 }
 
 #[cfg(test)]
@@ -521,34 +570,38 @@ mod tests {
         assert_eq!(got.hash, msg.hash);
     }
 
-    /// Locks the erigon-matching insert comparator against mixed
-    /// `(block, ratio)` distributions where reth's previous strict-lex
-    /// comparator placed the new message **after** the OR-comparator's
-    /// position. Hand-built `CheckedPoWMsg`s are used so the test can pin
-    /// arbitrary `(block, ratio)` pairs without burning CPU mining valid
-    /// PoW for each combination.
+    /// Locks the block-equality guard in the insert comparator.
+    ///
+    /// This is the case the guard changes. Erigon's pre-`pulse-v3.4.4` scan
+    /// tested `new_ratio < msgs[i].ratio` on its own, so a lower-ratio message
+    /// from a *later* block sorted ahead of an earlier block and landed at
+    /// index 0. The guarded predicate compares ratios only inside one block,
+    /// so the message sorts after every earlier block instead.
+    ///
+    /// Hand-built `CheckedPoWMsg`s pin arbitrary `(block, ratio)` pairs
+    /// without mining valid `PoW` for each combination. The expected order
+    /// comes from running erigon's `MsgIndex.Insert` at `78fbcffb8b` over this
+    /// sequence in Go.
     #[test]
-    fn insert_position_matches_erigon_or_comparator() {
+    fn insert_position_respects_the_block_equality_guard() {
         // Pre-seed: [(5, 0.10), (10, 0.10)] — same ratio, increasing block.
         let mut idx = MsgIndex::default();
         idx.insert(fake_checked(5, 100_000, 1_000_000, 0xA0));
         idx.insert(fake_checked(10, 100_000, 1_000_000, 0xA1));
 
-        // Insert (10, 0.05). erigon's scan predicate on i=0:
-        //   10 < 5 (F) || 0.05 < 0.10 (T) → returns 0.
-        // So the new message lands at index 0 and `msgs[0]` after insert is the
-        // freshly-inserted one. Eviction would remove the just-inserted msg
-        // → reth must hit the BoardOverflow self-displacement path here for
-        // count_limit=1, matching erigon.
+        // Insert (10, 0.05). The scan skips i=0: block 10 is not below block 5,
+        // and the ratios are not compared across different blocks. At i=1 the
+        // blocks match and 0.05 < 0.10, so the message lands at index 1.
         let new_msg = fake_checked(10, 50_000, 1_000_000, 0xB0);
         idx.insert(Arc::clone(&new_msg));
 
-        // After insert: msgs[0] is the lowest-precedence entry.
-        assert_eq!(
-            idx.all_msgs()[0].hash,
-            new_msg.hash,
-            "erigon's OR-comparator places the new lower-ratio same-block msg at index 0",
-        );
+        let order: Vec<u8> = idx.all_msgs().iter().map(|m| m.hash[0]).collect();
+        assert_eq!(order, vec![0xA0, 0xB0, 0xA1], "must match erigon's guarded comparator");
+
+        // The eviction target stays the block-5 message. Under the unguarded
+        // comparator it was the message just inserted, which sent erigon down
+        // its self-displacement `BoardOverflow` branch at `count_limit` = 1.
+        assert_eq!(idx.all_msgs()[0].hash[0], 0xA0, "eviction target must match erigon's");
     }
 
     /// Differential test against erigon's real `MsgIndex.Insert`, run in Go.
@@ -560,11 +613,18 @@ mod tests {
     /// identical to erigon's across the whole corpus — not just on the
     /// hand-picked cases above.
     ///
-    /// The digest is deliberately sensitive: substituting Go's `sort.Search`
-    /// for erigon's linear scan yields `11128719865354962318`, and Rust's
-    /// `slice::partition_point` yields `1127759515664285576`. Any future change
-    /// to the insert position, the comparator, or `difficulty_ratio` will move
-    /// it.
+    /// The digest tracks `pulse-v3.4.4` (`78fbcffb8b`), whose comparator guards
+    /// the ratio term with block equality. The unguarded comparator that came
+    /// before it yields `14248539691690691664` over this same corpus; the two
+    /// disagree on 74.6% of board orders and on 39.4% of `msgs[0]` values —
+    /// the entry `evict_oldest` drops. Any change to the insert position, the
+    /// comparator, or the ratio comparison moves the digest.
+    ///
+    /// The guarded comparator is monotonic, so a binary search over the same
+    /// predicate now reproduces the scan exactly: Go's `sort.Search` yields
+    /// this digest, not a different one. That was **not** true of the
+    /// unguarded comparator, under which a search reordered most boards. The
+    /// scan stays because erigon scans, not because a search is unsafe.
     ///
     /// The Go body below is `msgboard/message_index.go`'s `Insert` verbatim,
     /// with only the duplicate/`addToMap` handling elided — the corpus never
@@ -573,20 +633,37 @@ mod tests {
     /// ```text
     /// package main
     ///
-    /// import "fmt"
+    /// import (
+    ///     "fmt"
+    ///     "math/bits"
+    /// )
     ///
-    /// type M struct { block uint64; ratio float64; id uint8 }
+    /// type M struct { block, mult, div uint64; id uint8 }
     /// type R struct{ s uint64 }
     /// func (r *R) next() uint64 { x:=r.s; x^=x<<13; x^=x>>7; x^=x<<17; r.s=x; return x }
+    ///
+    /// func cmpRatio(a, b, c, d uint64) int {
+    ///     hi1, lo1 := bits.Mul64(a, d)
+    ///     hi2, lo2 := bits.Mul64(b, c)
+    ///     switch {
+    ///     case hi1 < hi2 || (hi1 == hi2 && lo1 < lo2): return -1
+    ///     case hi1 > hi2 || (hi1 == hi2 && lo1 > lo2): return 1
+    ///     default: return 0
+    ///     }
+    /// }
     ///
     /// func erigonInsert(msgs []M, newMsg M) []M {
     ///     if len(msgs) == 0 { return append(msgs, newMsg) }
     ///     last := msgs[len(msgs)-1]
-    ///     if newMsg.block > last.block || (newMsg.block == last.block && newMsg.ratio >= last.ratio) {
+    ///     if newMsg.block > last.block ||
+    ///         (newMsg.block == last.block &&
+    ///          cmpRatio(newMsg.mult, newMsg.div, last.mult, last.div) >= 0) {
     ///         return append(msgs, newMsg)
     ///     }
     ///     for i, msg := range msgs {
-    ///         if newMsg.block < msg.block || newMsg.ratio < msg.ratio {
+    ///         if newMsg.block < msg.block ||
+    ///             (newMsg.block == msg.block &&
+    ///              cmpRatio(newMsg.mult, newMsg.div, msg.mult, msg.div) < 0) {
     ///             out := make([]M, 0, len(msgs)+1)
     ///             out = append(out, msgs[:i]...)
     ///             out = append(out, newMsg)
@@ -599,7 +676,8 @@ mod tests {
     ///
     /// func main() {
     ///     blocks := []uint64{1,2,3,5,8,10,15,20}
-    ///     ratios := []float64{0.01,0.05,0.10,0.20,0.50}
+    ///     mults := []uint64{10_000,50_000,100_000,200_000,500_000}
+    ///     const div = uint64(1_000_000)
     ///     rng := &R{0xDEADBEEF}
     ///     var h uint64 = 14695981039346656037
     ///     mix := func(b byte) { h ^= uint64(b); h *= 1099511628211 }
@@ -608,8 +686,8 @@ mod tests {
     ///         seq := make([]M, 0, n)
     ///         for id := 0; id < n; id++ {
     ///             b := blocks[rng.next()%uint64(len(blocks))]
-    ///             r := ratios[rng.next()%uint64(len(ratios))]
-    ///             seq = append(seq, M{b, r, uint8(id)})
+    ///             m := mults[rng.next()%uint64(len(mults))]
+    ///             seq = append(seq, M{b, m, div, uint8(id)})
     ///         }
     ///         board := make([]M, 0, n)
     ///         for _, m := range seq { board = erigonInsert(board, m) }
@@ -625,13 +703,12 @@ mod tests {
     /// empty.
     ///
     /// The Rust side below must mirror that generator exactly: same xorshift
-    /// seed and update, same draw order (`n`, then `block` then `ratio` per
-    /// message), and ratios expressed as `mult / 1_000_000` so the f64 values
-    /// are bit-identical to Go's decimal literals.
+    /// seed and update, and the same draw order — `n`, then `block` then
+    /// `mult` per message.
     #[test]
     fn insert_order_matches_erigon_insert_over_200k_sequences() {
-        /// Digest produced by erigon's `MsgIndex.Insert` running in Go 1.23.
-        const ERIGON_INSERT_DIGEST: u64 = 14248539691690691664;
+        /// Digest produced by erigon's `MsgIndex.Insert` at `pulse-v3.4.4`, run in Go 1.23.
+        const ERIGON_INSERT_DIGEST: u64 = 7673666368459825830;
 
         /// xorshift64 — must match the Go generator bit for bit.
         struct Rng(u64);
@@ -681,26 +758,23 @@ mod tests {
 
         assert_eq!(
             digest, ERIGON_INSERT_DIGEST,
-            "board ordering diverged from erigon's MsgIndex.Insert; \
-             a sort.Search port produces 11128719865354962318 and \
-             partition_point produces 1127759515664285576",
+            "board ordering diverged from erigon's MsgIndex.Insert at pulse-v3.4.4; \
+             the pre-guard comparator produces 14248539691690691664",
         );
     }
 
     /// Regression test for substituting any binary search for erigon's scan.
     ///
-    /// Two- and three-element boards can't separate the candidates — they all
-    /// probe the same indices — so the test above passes under erigon's scan,
-    /// under Go's `sort.Search`, and under Rust's `partition_point` alike.
-    /// Separating them needs a board deep enough for the probe sequences to
-    /// diverge, which is ≥5 entries.
+    /// The expected order below is what erigon's `MsgIndex.Insert` at
+    /// `78fbcffb8b` produces, computed by running erigon's Go source over this
+    /// sequence. A deep board is used because short ones cannot separate
+    /// candidate insert positions.
     ///
-    /// The expected order below is what erigon's `MsgIndex.Insert` produces,
-    /// computed by running erigon's Go source over this sequence. A
-    /// `sort.Search` port yields `[7, 6, 5, 3, 8, 1, 0, 4, 2]` and
-    /// `partition_point` yields `[6, 5, 3, 7, 8, 1, 0, 4, 2]` — the latter also
-    /// puts a **different message at index 0**, and so evicts a different
-    /// message than erigon once the board hits `count_limit`.
+    /// The guarded comparator sorts the board by block number, so this order
+    /// is also what a plain `(block, ratio)` lexicographic sort gives. That
+    /// agreement is the point: it is the evidence the comparator became a
+    /// total order, and it is what makes the digest test's `sort.Search`
+    /// equivalence hold.
     #[test]
     fn insert_position_matches_erigon_on_deep_board() {
         const R50: u64 = 500_000; // ratio 0.50
@@ -730,28 +804,31 @@ mod tests {
         let order: Vec<u8> = idx.all_msgs().iter().map(|m| m.hash[0] - 0xA0).collect();
         assert_eq!(
             order,
-            vec![7, 8, 6, 5, 4, 3, 0, 2, 1],
+            vec![0, 4, 5, 2, 3, 7, 8, 6, 1],
             "insert order must match erigon's fast-path-then-linear-scan Insert",
         );
         assert_eq!(
             idx.all_msgs()[0].hash[0] - 0xA0,
-            7,
+            0,
             "eviction target (msgs[0]) must match erigon's",
         );
     }
 
-    /// Pins the accepted divergence from erigon's `MsgIndex.Msgs` documented on
-    /// [`MsgIndex::all_msgs_filtered`] and in `docs/msgboard-parity-gaps.md`
-    /// §13.4: reth filters per message where erigon returns the contiguous
-    /// slice between two seeked bounds.
+    /// Pins the surviving half of the divergence from erigon's `MsgIndex.Msgs`
+    /// documented on [`MsgIndex::all_msgs_filtered`] and in
+    /// `docs/msgboard-parity-gaps.md` §13.4.
     ///
-    /// Both halves of the divergence are asserted, with erigon's answers taken
-    /// from running its `Msgs` over the same board in Go. The board here is
-    /// deliberately *not* block-sorted — `[2, 5, 2, 5]` — which is the
-    /// precondition erigon's "assuming msgs are sorted by block number"
-    /// comment gets wrong, and without which neither half reproduces.
+    /// The guarded comparator sorts the board by block number, so erigon's
+    /// "assuming msgs are sorted by block number" is now true and its seeked
+    /// slice agrees with reth's per-message filter on any range that matches
+    /// something. What survives is the fail-open: when no message satisfies
+    /// `from`, erigon's forward seek never fires, `leftIdx` stays 0, and it
+    /// returns the whole board where reth returns nothing.
+    ///
+    /// Erigon's answers below come from running its `Msgs` (`78fbcffb8b`,
+    /// `msgboard/message_index.go:65`) over this board in Go.
     #[test]
-    fn all_msgs_filtered_filters_per_message_where_erigon_slices() {
+    fn all_msgs_filtered_diverges_only_when_erigons_seek_fails_open() {
         const R10: u64 = 100_000; // ratio 0.10
         const R50: u64 = 500_000; // ratio 0.50
         const DIV: u64 = 1_000_000;
@@ -763,14 +840,20 @@ mod tests {
         let blocks = |msgs: &[Arc<CheckedPoWMsg>]| -> Vec<u64> {
             msgs.iter().map(|m| m.block_number).collect()
         };
-        assert_eq!(blocks(idx.all_msgs()), vec![2, 5, 2, 5], "board must not be block-sorted");
+        assert_eq!(blocks(idx.all_msgs()), vec![2, 2, 5, 5], "the guard sorts the board by block");
 
-        // Erigon seeks leftIdx=1, rightIdx=4 and returns blocks [5, 2, 5] —
-        // the block-2 message rides along because it sits between the bounds.
+        // Erigon seeks leftIdx=2, rightIdx=4 and returns blocks [5, 5]. Reth
+        // agrees. Before the guard the board was [2, 5, 2, 5] and erigon
+        // returned [5, 2, 5] — the block-2 message rode along between bounds.
         assert_eq!(blocks(&idx.all_msgs_filtered(Some(5), Some(8))), vec![5, 5]);
 
-        // No message satisfies `from`, so erigon's seek never fires, leftIdx
-        // stays 0, and it returns the whole board: blocks [2, 5, 2, 5].
+        // A range that matches nothing at the lower end still agrees, because
+        // the backward seek for `to` does fire.
+        assert!(idx.all_msgs_filtered(Some(3), Some(4)).is_empty());
+
+        // The divergence that survives: no message satisfies `from`, erigon's
+        // forward seek never fires, and it returns the whole board — blocks
+        // [2, 2, 5, 5] — where reth returns nothing.
         assert!(idx.all_msgs_filtered(Some(10), Some(20)).is_empty());
 
         // The category-filtered path is *not* divergent: erigon's
