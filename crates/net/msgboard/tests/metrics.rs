@@ -39,7 +39,6 @@ use reth_msgboard_types::{MsgboardConfig, PoWMsg, VERSION_V1};
 /// `work_multiplier`/`work_divisor` whose exact difficulty exceeds `u64::MAX`.
 /// Erigon's `uint64` arithmetic wraps these to a trivially cheap threshold;
 /// reth rejects them. See `docs/msgboard-parity-gaps.md` §14.1.
-
 const fn block_hash_one() -> B256 {
     B256::repeat_byte(0x01)
 }
@@ -184,6 +183,7 @@ fn every_metric_is_instantiated_and_moves() {
             "msgboard.rejected_other",
             "msgboard.rejected_oversized",
             "msgboard.rejected_oversized_frame",
+            "msgboard.rejected_unsolicited",
             "msgboard.requests_received",
             "msgboard.requests_sent",
             "msgboard.requests_suppressed",
@@ -193,6 +193,7 @@ fn every_metric_is_instantiated_and_moves() {
             "msgboard.skipped_board_overflow",
             "msgboard.skipped_duplicate",
             "msgboard.skipped_unknown_block",
+            "msgboard.wants_refused",
             "msgboard.write_to_db_bytes",
             "msgboard.write_to_db_duration_seconds",
         ],

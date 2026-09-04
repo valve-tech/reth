@@ -147,4 +147,18 @@ pub struct MsgboardMetrics {
     pub bodies_served: Counter,
     /// Individual messages received in `BoardMessages` payloads.
     pub bodies_received: Counter,
+    /// Delivered messages dropped before `PoW` verification because the peer
+    /// held no reservation for them.
+    ///
+    /// A peer racing another peer's answer, or answering a request we withdrew,
+    /// shows up here in ones and twos. A peer flooding bodies nobody asked for
+    /// shows up in thousands: each one used to cost a secp256k1 scalar
+    /// multiplication on the connection task.
+    pub rejected_unsolicited: Counter,
+    /// Announced IDs we wanted but did not request, because this peer already
+    /// owes us `MAX_WANT_PER_PEER` messages.
+    ///
+    /// Stays at zero against a conforming peer, which cannot announce more than
+    /// one frame's worth at a time.
+    pub wants_refused: Counter,
 }
