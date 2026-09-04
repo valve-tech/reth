@@ -271,7 +271,7 @@ impl MsgBoard {
     }
 
     /// Returns a reference to the configuration.
-    pub fn config(&self) -> &MsgboardConfig {
+    pub const fn config(&self) -> &MsgboardConfig {
         &self.cfg
     }
 
@@ -424,8 +424,8 @@ impl MsgBoard {
     ///
     ///  - `accepted` — number of messages newly inserted into the board.
     ///  - `kickable` — number of messages rejected for *non-circumstantial* reasons (oversized
-    ///    payload, undersized work, invalid PoW). Mirrors erigon-pulse `AddRemoteMsgs` returning a
-    ///    non-nil error → caller sets `kickPeer=true`.
+    ///    payload, undersized work, invalid `PoW`). Mirrors erigon-pulse `AddRemoteMsgs` returning
+    ///    a non-nil error → caller sets `kickPeer=true`.
     ///
     /// Circumstantial rejections (`MessageExists`, `BoardOverflow`,
     /// `BlockTooOld`) do **not** contribute to `kickable`,
@@ -837,7 +837,7 @@ mod tests {
         B256::from(b)
     }
 
-    /// Config with easy PoW so tests can mine valid messages quickly.
+    /// Config with easy `PoW` so tests can mine valid messages quickly.
     fn easy_cfg() -> MsgboardConfig {
         MsgboardConfig {
             work_multiplier: 1,
@@ -1428,7 +1428,7 @@ mod tests {
         // The version byte is hashed into the scalar, so relabelling a valid
         // message breaks its work even when the new label is one we speak.
         // That is what makes the byte load-bearing rather than decorative.
-        let mut relabelled = good.clone();
+        let mut relabelled = good;
         relabelled.version = 2;
         assert!(relabelled.verify().is_err());
     }
