@@ -319,6 +319,90 @@ mod tests {
         assert!(config.contains_http(&msgboard_rpc_module()));
     }
 
+    /// Drive the install itself and report which transports came away with
+    /// msgboard methods on them.
+    ///
+    /// The four tests above assert on [`TransportRpcModuleConfig`], which is
+    /// reth's own type — they pass whether the install honours the allowlist
+    /// or ignores it. Only this helper runs `install_msgboard_rpc` and looks
+    /// at what it registered.
+    fn install_and_report(config: TransportRpcModuleConfig) -> (bool, bool, bool) {
+        let board = Arc::new(MsgBoard::new(MsgboardConfig::default()));
+        let mut modules = TransportRpcModules::default()
+            .with_config(config)
+            .with_http(jsonrpsee::RpcModule::new(()))
+            .with_ws(jsonrpsee::RpcModule::new(()))
+            .with_ipc(jsonrpsee::RpcModule::new(()));
+
+        install_msgboard_rpc(&mut modules, MsgboardApi::new(board)).expect("install must succeed");
+
+        let carries = |m: Option<jsonrpsee::Methods>| {
+            m.is_some_and(|methods| methods.method_names().any(|n| n.starts_with("msgboard_")))
+        };
+        let named = |n: &str| n.starts_with("msgboard_");
+        (
+            carries(modules.http_methods(named)),
+            carries(modules.ws_methods(named)),
+            carries(modules.ipc_methods(named)),
+        )
+    }
+
+    /// The install must put the methods only where the allowlist names them.
+    ///
+    /// This is the regression the audit found. The install used
+    /// `merge_configured`, which merges into every enabled transport and
+    /// consults no allowlist, so the namespace rode onto transports that
+    /// never asked for it. Swap `merge_if_module_configured` back for
+    /// `merge_configured` and this test fails; the four above do not.
+    #[test]
+    fn the_install_puts_msgboard_only_on_the_transport_that_names_it() {
+        let (http, ws, ipc) = install_and_report(
+            TransportRpcModuleConfig::default()
+                .with_http([RethRpcModule::Eth, msgboard_rpc_module()])
+                .with_ws([RethRpcModule::Eth])
+                .with_ipc([RethRpcModule::Eth]),
+        );
+
+        assert!(http, "http named msgboard, so it must carry the methods");
+        assert!(!ws, "ws did not name msgboard");
+        assert!(!ipc, "ipc did not name msgboard");
+    }
+
+    /// The shipped compose file must not answer msgboard on its published port.
+    ///
+    /// `etc/docker-compose.yml` runs `--http.api "eth,net,web3"` on
+    /// `--http.addr 0.0.0.0` with 8545 published. Before the fix that port
+    /// answered `msgboard_addMessage`, a write method, with no
+    /// authentication. This drives the install with that exact string.
+    #[test]
+    fn the_shipped_docker_compose_port_does_not_answer_msgboard() {
+        let selection: RpcModuleSelection =
+            "eth,net,web3".parse().expect("the compose --http.api value must parse");
+        let (http, _, _) =
+            install_and_report(TransportRpcModuleConfig::default().with_http(selection));
+
+        assert!(!http, "the published port must not carry a msgboard write method");
+    }
+
+    /// An operator who names the namespace gets it, on every transport that
+    /// names it.
+    ///
+    /// The counterpart to the test above: the allowlist must not be so strict
+    /// that naming `msgboard` fails to turn it on.
+    #[test]
+    fn naming_the_namespace_on_two_transports_installs_it_on_both() {
+        let (http, ws, ipc) = install_and_report(
+            TransportRpcModuleConfig::default()
+                .with_http([msgboard_rpc_module()])
+                .with_ws([msgboard_rpc_module()])
+                .with_ipc([RethRpcModule::Eth]),
+        );
+
+        assert!(http, "http named msgboard");
+        assert!(ws, "ws named msgboard");
+        assert!(!ipc, "ipc did not, and IPC is on by default");
+    }
+
     fn launcher_with_db_dir(db_dir: Option<&str>) -> MsgboardLauncher {
         MsgboardLauncher::new(MsgboardArgs {
             msgboard_db_dir: db_dir.map(PathBuf::from),

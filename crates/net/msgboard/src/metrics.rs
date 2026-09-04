@@ -99,6 +99,22 @@ pub struct MsgboardMetrics {
     pub peer_sessions_opened: Counter,
     /// `msg/1` sessions closed since start.
     pub peer_sessions_closed: Counter,
+    /// Live `msgboard_subscribe` subscriptions across every RPC connection.
+    ///
+    /// jsonrpsee already bounds these per connection, so this is not a cap —
+    /// it is the reading that was missing. A subscription task that outlives
+    /// its sink raises this and never lowers it, and without the gauge that
+    /// leak is invisible until the per-connection cap starts refusing clients
+    /// for no reason an operator can see.
+    pub rpc_subscriptions: Gauge,
+    /// Subscriptions accepted since start.
+    ///
+    /// Read against [`rpc_subscriptions`](Self::rpc_subscriptions): a high
+    /// count with a gauge near zero means clients subscribe and leave, which
+    /// is a different fault from clients that subscribe and hang.
+    pub rpc_subscriptions_opened: Counter,
+    /// Subscriptions ended since start.
+    pub rpc_subscriptions_closed: Counter,
     /// Peers that connected but do not speak `msg/1`.
     ///
     /// Expected to be large: the capability is opt-in and most of the network

@@ -18,6 +18,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
     board::MsgBoard,
+    metrics::MsgboardMetrics,
     rpc_api::{
         ContentFilter, MsgboardApiServer, MsgboardMsg, MsgboardStatus, NewMessagesFilter,
         CONTENT_DEFAULT_LIMIT, CONTENT_MAX_LIMIT,
@@ -27,6 +28,33 @@ use crate::{
 /// Subscription kind discriminator. Matches erigon-pulse's
 /// `msgboard_subscribe(["newMessages", filter?])` shape.
 const SUBSCRIPTION_KIND_NEW_MESSAGES: &str = "newMessages";
+
+/// Holds the live-subscription gauge up for as long as a subscription runs.
+///
+/// A guard rather than a pair of calls around the loop, because the loop has
+/// four exits — a closed sink, an exhausted stream, a serialisation failure and
+/// a send failure — and a panic in the spawned task is a fifth. `Drop` covers
+/// all five; a decrement written after the loop covers four.
+#[derive(Debug)]
+pub struct SubscriptionGuard {
+    metrics: MsgboardMetrics,
+}
+
+impl SubscriptionGuard {
+    /// Open a subscription: raise the gauge and count the open.
+    pub fn new(metrics: MsgboardMetrics) -> Self {
+        metrics.rpc_subscriptions.increment(1.0);
+        metrics.rpc_subscriptions_opened.increment(1);
+        Self { metrics }
+    }
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        self.metrics.rpc_subscriptions.decrement(1.0);
+        self.metrics.rpc_subscriptions_closed.increment(1);
+    }
+}
 
 /// `msgboard_*` API implementation.
 #[derive(Debug, Clone)]
@@ -125,8 +153,13 @@ impl MsgboardApiServer for MsgboardApi {
         let category_filter = filter.and_then(|f| f.category);
         let sink = pending.accept().await?;
         let board = Arc::clone(&self.board);
+        // Taken after `accept`, so a rejected subscription never counts.
+        let subscription = SubscriptionGuard::new(self.board.metrics());
 
         tokio::spawn(async move {
+            // Moved into the task so the gauge falls when the task ends,
+            // however it ends.
+            let _subscription = subscription;
             let rx = board.subscribe();
             // `ready(result.ok())` is Unpin (unlike `async move` blocks),
             // which lets the FilterMap stream work inside `tokio::select!`.
