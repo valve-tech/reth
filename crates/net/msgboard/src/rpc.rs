@@ -18,7 +18,10 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
     board::MsgBoard,
-    rpc_api::{ContentFilter, MsgboardApiServer, MsgboardMsg, MsgboardStatus, NewMessagesFilter},
+    rpc_api::{
+        ContentFilter, MsgboardApiServer, MsgboardMsg, MsgboardStatus, NewMessagesFilter,
+        CONTENT_DEFAULT_LIMIT, CONTENT_MAX_LIMIT,
+    },
 };
 
 /// Subscription kind discriminator. Matches erigon-pulse's
@@ -61,14 +64,31 @@ impl MsgboardApiServer for MsgboardApi {
         filter: Option<ContentFilter>,
     ) -> RpcResult<HashMap<String, Vec<MsgboardMsg>>> {
         let filter = filter.unwrap_or_default();
+        let limit = filter.limit.unwrap_or(CONTENT_DEFAULT_LIMIT);
+        if limit > CONTENT_MAX_LIMIT {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                format!("limit {limit} exceeds the maximum of {CONTENT_MAX_LIMIT}"),
+                None::<()>,
+            ));
+        }
+        let offset = filter.offset.unwrap_or(0);
+
+        // The board hands back `Arc`s, so its lock covers pointer copies only.
+        // Everything expensive happens below and outside the lock: `to_rpc_msg`
+        // deep-copies each `data` field, and serde hex-expands it on the way
+        // out. `limit` is what bounds both — a `spawn_blocking` here would
+        // cover only the loop, not the serialisation jsonrpsee runs after the
+        // handler returns.
         let msgs = match filter.category {
             Some(cat) => {
                 self.board.category_msgs_filtered(&cat, filter.from_block, filter.to_block)
             }
             None => self.board.all_msgs_filtered(filter.from_block, filter.to_block),
         };
+
         let mut grouped: HashMap<String, Vec<MsgboardMsg>> = HashMap::new();
-        for m in &msgs {
+        for m in msgs.iter().skip(offset).take(limit) {
             let rpc = to_rpc_msg(m);
             // Lowercase 0x-hex matches alloy's Display impl and erigon-pulse output.
             let key = rpc.category.to_string();
@@ -203,6 +223,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::rpc_api::{CONTENT_DEFAULT_LIMIT, CONTENT_MAX_LIMIT};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -259,6 +280,50 @@ mod tests {
 
     fn module(board: Arc<MsgBoard>) -> RpcModule<MsgboardApi> {
         MsgboardApi::new(board).into_rpc()
+    }
+
+    /// Config whose `PoW` difficulty `D` is exactly 1 for a `data` field of
+    /// `data_len` bytes, so nonce 1 always verifies.
+    ///
+    /// `D = (2^24 + 10_000 × data_len) × M / Div`, so `M = 1` paired with
+    /// `Div = 2^24 + 10_000 × data_len` gives 1, and every hash clears the
+    /// target. Mining against [`easy_cfg`] instead costs about a hundred
+    /// secp256k1 multiplications per message, which is minutes for the
+    /// thousand-message boards below.
+    fn trivial_pow_cfg(data_len: usize) -> MsgboardConfig {
+        MsgboardConfig {
+            work_multiplier: 1,
+            work_divisor: (1 << 24) + 10_000 * data_len as u64,
+            ..easy_cfg()
+        }
+    }
+
+    /// Ready board holding `count` messages of `data_len` bytes, all in one
+    /// category at block 10. Each message carries its index in the first eight
+    /// bytes so no two hash alike.
+    fn filled_board(count: usize, data_len: usize) -> Arc<MsgBoard> {
+        assert!(data_len >= 8, "the index needs eight bytes to make messages unique");
+        let cfg = trivial_pow_cfg(data_len);
+        let board = Arc::new(MsgBoard::new(cfg.clone()));
+        board.set_ready();
+        board.set_head(10, block_hash_one());
+
+        for i in 0..count {
+            let mut data = vec![0u8; data_len];
+            data[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            board
+                .add_local_msg(PoWMsg {
+                    version: VERSION_V1,
+                    block_hash: block_hash_one(),
+                    nonce: 1,
+                    work_multiplier: cfg.work_multiplier,
+                    work_divisor: cfg.work_divisor,
+                    category: category(0xAA),
+                    data: Bytes::from(data),
+                })
+                .unwrap();
+        }
+        board
     }
 
     /// RLP-encode a `PoWMsg` the way a client submits it to `addMessage`.
@@ -642,6 +707,257 @@ mod tests {
             sub.next::<MsgboardMsg>().await.expect("subscription yielded nothing").unwrap();
         assert_eq!(got.hash, wanted.hash, "filtered-out category leaked through");
         assert_eq!(got.category, category(0xBB));
+    }
+
+    // ── content paging ───────────────────────────────────────────────────────
+
+    /// A no-argument call is the shape erigon clients use, and it used to
+    /// return the whole board — a deep copy of every `data` field plus serde's
+    /// hex expansion, both alive at once. The cap has to bite on exactly that
+    /// call, not only on one that names a limit.
+    #[tokio::test]
+    async fn content_without_a_limit_stops_at_the_default_page_size() {
+        let m = module(filled_board(CONTENT_DEFAULT_LIMIT + 8, 8));
+
+        let v: Value = m.call("msgboard_content", rpc_params_none()).await.unwrap();
+        assert_eq!(total_msgs(&v), CONTENT_DEFAULT_LIMIT);
+    }
+
+    /// A board smaller than the cap comes back whole, so the cap does not
+    /// change the answer an ordinary node gives.
+    #[tokio::test]
+    async fn content_returns_a_small_board_whole() {
+        let board = ready_board(10);
+        for i in 0..5u8 {
+            board.add_local_msg(mined(&[i], category(0xAA), 10)).unwrap();
+        }
+        let m = module(board);
+
+        let v: Value = m.call("msgboard_content", rpc_params_none()).await.unwrap();
+        assert_eq!(total_msgs(&v), 5);
+    }
+
+    #[tokio::test]
+    async fn content_rejects_a_limit_above_the_maximum() {
+        let m = module(ready_board(10));
+        let code =
+            call_err_code(&m, "msgboard_content", vec![json!({"limit": CONTENT_MAX_LIMIT + 1})])
+                .await;
+        assert_eq!(code, -32602);
+    }
+
+    #[tokio::test]
+    async fn content_accepts_a_limit_at_the_maximum() {
+        let m = module(ready_board(10));
+        let v: Value =
+            m.call("msgboard_content", vec![json!({"limit": CONTENT_MAX_LIMIT})]).await.unwrap();
+        assert!(v.as_object().unwrap().is_empty());
+    }
+
+    /// Paging must walk the board exactly once. Asserting only "no duplicates"
+    /// would pass on an unordered source, so this pins the concatenated pages
+    /// against board precedence order.
+    #[tokio::test]
+    async fn content_pages_walk_the_board_once_in_precedence_order() {
+        let board = ready_board(10);
+        for i in 0..10u8 {
+            board.add_local_msg(mined(&[i], category(0xAA), 10)).unwrap();
+        }
+        let expected: Vec<B256> = board.all_messages().iter().map(|m| m.hash).collect();
+        let m = module(board);
+        let key = category(0xAA).to_string();
+
+        let mut walked: Vec<B256> = Vec::new();
+        for offset in [0, 4, 8] {
+            let v: Value = m
+                .call("msgboard_content", vec![json!({"limit": 4, "offset": offset})])
+                .await
+                .unwrap();
+            let Some(page) = v.get(&key) else { continue };
+            walked.extend(
+                page.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|msg| serde_json::from_value::<B256>(msg["hash"].clone()).unwrap()),
+            );
+        }
+
+        assert_eq!(walked, expected, "paging must cover the board once, in precedence order");
+    }
+
+    /// The limit counts messages, not categories: a page may hold part of one
+    /// category, and the categories together must not exceed it.
+    #[tokio::test]
+    async fn content_limit_counts_messages_across_every_category() {
+        let board = ready_board(10);
+        board.add_local_msg(mined(&[1], category(0xAA), 10)).unwrap();
+        board.add_local_msg(mined(&[2], category(0xBB), 10)).unwrap();
+        board.add_local_msg(mined(&[3], category(0xCC), 10)).unwrap();
+        let m = module(board);
+
+        let v: Value = m.call("msgboard_content", vec![json!({"limit": 2})]).await.unwrap();
+        assert_eq!(total_msgs(&v), 2);
+    }
+
+    /// The category path is separate code over the same board, so it needs its
+    /// own proof that the page bound applies.
+    #[tokio::test]
+    async fn content_limit_applies_to_a_category_filtered_query() {
+        let board = ready_board(10);
+        for i in 0..5u8 {
+            board.add_local_msg(mined(&[i], category(0xAA), 10)).unwrap();
+        }
+        let m = module(board);
+
+        let v: Value = m
+            .call("msgboard_content", vec![json!({"category": category(0xAA), "limit": 2})])
+            .await
+            .unwrap();
+        assert_eq!(total_msgs(&v), 2);
+    }
+
+    /// An offset past the end is the normal end of a walk, not an error — a
+    /// client paging a board that shrank under it must not see a failure.
+    #[tokio::test]
+    async fn content_offset_past_the_end_returns_an_empty_map() {
+        let board = ready_board(10);
+        board.add_local_msg(mined(&[1], category(0xAA), 10)).unwrap();
+        let m = module(board);
+
+        let v: Value = m.call("msgboard_content", vec![json!({"offset": 99})]).await.unwrap();
+        assert!(v.as_object().unwrap().is_empty());
+    }
+
+    /// Paging composes with the block-range filter: `offset` counts messages
+    /// that survived the range, not messages on the board.
+    #[tokio::test]
+    async fn content_paging_applies_after_the_block_range_filter() {
+        let board = ready_board(10);
+        for i in 0..6u8 {
+            board.add_local_msg(mined(&[i], category(0xAA), 10)).unwrap();
+        }
+        let m = module(board);
+
+        let out_of_range: Value =
+            m.call("msgboard_content", vec![json!({"fromBlock": 11, "limit": 3})]).await.unwrap();
+        assert!(out_of_range.as_object().unwrap().is_empty());
+
+        let in_range: Value =
+            m.call("msgboard_content", vec![json!({"toBlock": 10, "limit": 3})]).await.unwrap();
+        assert_eq!(total_msgs(&in_range), 3);
+    }
+
+    // ── subscribe: the server's own cap ──────────────────────────────────────
+
+    /// `msgboard_subscribe` spawns a task per subscriber, which looked
+    /// unbounded. It is not: jsonrpsee caps concurrent subscriptions per
+    /// connection, and reth feeds that cap from
+    /// `--rpc.max-subscriptions-per-connection` (default 1024) alongside
+    /// `--rpc.max-connections` (default 500). `msgboard_subscribe` inherits the
+    /// same bound as `eth_subscribe`, so the board adds no cap of its own.
+    ///
+    /// This drives a real server over a socket because the in-process
+    /// `RpcModule` harness carries no server config and enforces nothing.
+    #[tokio::test]
+    async fn subscribe_is_bounded_by_the_jsonrpsee_per_connection_cap() {
+        use jsonrpsee::{
+            core::client::SubscriptionClientT,
+            rpc_params,
+            server::{ServerBuilder, ServerConfig},
+            ws_client::WsClientBuilder,
+        };
+
+        let config = ServerConfig::builder().max_subscriptions_per_connection(2).build();
+        let server = ServerBuilder::default()
+            .set_config(config)
+            .build("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = server.local_addr().expect("bound address");
+        let handle = server.start(module(ready_board(10)));
+
+        let client =
+            WsClientBuilder::default().build(format!("ws://{addr}")).await.expect("ws connect");
+
+        let mut open = Vec::new();
+        for i in 0..2 {
+            open.push(
+                client
+                    .subscribe::<MsgboardMsg, _>(
+                        "msgboard_subscribe",
+                        rpc_params!["newMessages"],
+                        "msgboard_unsubscribe",
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("subscription {i} is within the cap: {err}")),
+            );
+        }
+
+        let over_cap = client
+            .subscribe::<MsgboardMsg, _>(
+                "msgboard_subscribe",
+                rpc_params!["newMessages"],
+                "msgboard_unsubscribe",
+            )
+            .await;
+        assert!(over_cap.is_err(), "the server must refuse a subscription past its cap");
+
+        drop(open);
+        handle.stop().expect("server still running");
+    }
+
+    // ── measurement ──────────────────────────────────────────────────────────
+
+    /// Records what `msgboard_content` costs on a full default board, with and
+    /// without the page cap. It backs the figures quoted on
+    /// [`CONTENT_DEFAULT_LIMIT`]; rerun it if the cap or the wire shape moves.
+    ///
+    /// Ignored by default: it holds 10,000 × 8 KiB of messages and the uncapped
+    /// leg builds a response twice that size, which runs well past nextest's
+    /// slow-test timeout. Run it on its own with
+    /// `cargo nextest run -p reth-msgboard --run-ignored ignored-only \
+    ///  -E 'test(measure_content)' --no-capture`.
+    #[ignore]
+    #[tokio::test]
+    async fn measure_content_on_a_full_board() {
+        let cfg = trivial_pow_cfg(8 * 1024);
+        let board = filled_board(cfg.count_limit, cfg.size_limit);
+
+        // The uncapped leg runs the work the handler used to do — every message
+        // through `to_rpc_msg`, then grouped, then serialised — without going
+        // through jsonrpsee, so the cost is attributable to the response and not
+        // to the transport.
+        let t = std::time::Instant::now();
+        let all = board.all_msgs_filtered(None, None);
+        let mut grouped: HashMap<String, Vec<MsgboardMsg>> = HashMap::new();
+        for m in &all {
+            let rpc = to_rpc_msg(m);
+            grouped.entry(rpc.category.to_string()).or_default().push(rpc);
+        }
+        let uncapped = serde_json::to_string(&grouped).unwrap();
+        println!(
+            "uncapped: {} messages -> {} bytes of JSON in {:?} ({} bytes of raw data)",
+            all.len(),
+            uncapped.len(),
+            t.elapsed(),
+            cfg.count_limit * cfg.size_limit,
+        );
+        drop((grouped, uncapped));
+
+        let m = module(Arc::clone(&board));
+        let t = std::time::Instant::now();
+        let v: Value = m.call("msgboard_content", rpc_params_none()).await.unwrap();
+        println!(
+            "capped:   {} messages -> {} bytes of JSON in {:?}",
+            total_msgs(&v),
+            serde_json::to_string(&v).unwrap().len(),
+            t.elapsed(),
+        );
+    }
+
+    /// Total messages across every category in a `msgboard_content` response.
+    fn total_msgs(v: &Value) -> usize {
+        v.as_object().unwrap().values().map(|a| a.as_array().unwrap().len()).sum()
     }
 
     /// `jsonrpsee` needs a concrete type for a no-params call; `Vec<Value>`

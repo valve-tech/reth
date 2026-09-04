@@ -83,6 +83,9 @@ pub struct MsgboardStatus {
 }
 
 /// Optional filter for `msgboard_content`.
+///
+/// Every field is optional and the whole filter may be omitted, so the
+/// erigon-compatible no-argument call keeps working.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentFilter {
@@ -95,6 +98,14 @@ pub struct ContentFilter {
     /// Maximum block number (inclusive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_block: Option<u64>,
+    /// Maximum number of messages in the response, counted across every
+    /// category it holds. Defaults to [`CONTENT_DEFAULT_LIMIT`]. A value above
+    /// [`CONTENT_MAX_LIMIT`] is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Number of messages to skip before the page starts. Defaults to `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
 }
 
 /// Optional filter for `msgboard_subscribe`. Only one option for now.
@@ -135,6 +146,26 @@ pub trait MsgboardApi {
     /// list of messages in that category, matching erigon-pulse's JSON-RPC
     /// shape. If a `category` filter is supplied, the map contains at most
     /// one entry; if no messages match, the map is empty.
+    ///
+    /// # Paging
+    ///
+    /// A response holds at most `limit` messages, defaulting to
+    /// [`CONTENT_DEFAULT_LIMIT`]. **A call that names no limit is truncated on
+    /// a larger board.** This diverges from erigon-pulse, which returns the
+    /// whole board however big it is; see [`CONTENT_DEFAULT_LIMIT`] for the
+    /// measured cost of doing that.
+    ///
+    /// `offset` skips messages before the page starts. Both apply to the flat
+    /// message list in board precedence order — ascending block number, then
+    /// ascending difficulty ratio — *before* the messages are grouped by
+    /// category. Grouping preserves that relative order inside each category,
+    /// so a client that raises `offset` by `limit` each call walks the board
+    /// once, in order, with no gaps and no repeats.
+    ///
+    /// A response holding exactly `limit` messages may be truncated. That is
+    /// the only truncation signal: the result shape is fixed by erigon parity,
+    /// so there is nowhere to put a cursor. Page until a response comes back
+    /// short.
     #[method(name = "content")]
     async fn msgboard_content(
         &self,
@@ -174,6 +205,32 @@ pub trait MsgboardApi {
         filter: Option<NewMessagesFilter>,
     ) -> jsonrpsee::core::SubscriptionResult;
 }
+
+/// Messages [`MsgboardApiServer::msgboard_content`] returns when the caller
+/// names no `limit`.
+///
+/// The board holds up to `count_limit` messages whose `data` runs to
+/// `size_limit` bytes each — 10,000 × 8 KiB by default. Serialising all of
+/// them deep-copies every `data` field and then hex-expands it, so the copy and
+/// the JSON are alive together.
+///
+/// Measured on a full default board: the uncapped response is 167,340,072 bytes
+/// of JSON built from 81,920,000 bytes of `data`, and building plus serialising
+/// it takes about 11 s on one runtime worker. That lands 0.26% under the
+/// 160 MiB `--rpc.max-response-size` default, so a board a little fuller pays
+/// the whole cost and jsonrpsee then refuses to send the result. At this cap
+/// the same board answers in 16,734,072 bytes.
+/// `measure_content_on_a_full_board` reproduces both figures.
+///
+/// Capping the page turns that into an answer a client can use, and paging
+/// gets the rest.
+pub const CONTENT_DEFAULT_LIMIT: usize = 1_000;
+
+/// Largest `limit` [`MsgboardApiServer::msgboard_content`] accepts.
+///
+/// An explicit request for more is refused rather than clamped: a clamped page
+/// is short but looks complete, and the caller cannot tell.
+pub const CONTENT_MAX_LIMIT: usize = 5_000;
 
 #[cfg(test)]
 mod wire_shape_tests {
