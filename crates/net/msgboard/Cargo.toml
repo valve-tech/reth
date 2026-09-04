@@ -47,6 +47,10 @@ tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# `ws-client` drives a real jsonrpsee server over a socket, which is the only
+# way to observe the server's per-connection subscription cap; the in-process
+# `RpcModule` harness has no server config to enforce it with.
+jsonrpsee = { workspace = true, features = ["ws-client"] }
 metrics-util = { workspace = true, features = ["debugging"] }
 serde_json = { workspace = true, features = ["std"] }
 tempfile = { workspace = true }
