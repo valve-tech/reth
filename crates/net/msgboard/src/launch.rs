@@ -7,7 +7,7 @@
 //! notifications, and flush a final time on shutdown.
 //!
 //! The helper is node-agnostic — both [`PulsechainNode`] and `EthereumNode`
-//! can drive it, so the same binary can serve PulseChain and Ethereum chain
+//! can drive it, so the same binary can serve `PulseChain` and Ethereum chain
 //! IDs from one msgboard implementation.
 //!
 //! [`PulsechainNode`]: https://docs.rs/reth-pulsechain-node
@@ -180,7 +180,7 @@ impl MsgboardLauncher {
         }
 
         let board_for_watcher = Arc::clone(&board);
-        let net_for_watcher = network.clone();
+        let net_for_watcher = network;
         tokio::spawn(async move {
             loop {
                 sleep(SYNC_WATCHER_INTERVAL).await;

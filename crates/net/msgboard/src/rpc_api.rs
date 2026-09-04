@@ -1,6 +1,6 @@
 //! `msgboard` RPC interface.
 //!
-//! Exposes the PulseChain `msg/1` board over JSON-RPC. All methods are
+//! Exposes the `PulseChain` `msg/1` board over JSON-RPC. All methods are
 //! prefixed with `msgboard_` and the subscription fires on every new
 //! accepted message.
 
@@ -33,7 +33,7 @@ pub struct MsgboardMsg {
     /// Block number corresponding to `block_hash`.
     #[serde(with = "alloy_serde::quantity")]
     pub block_number: u64,
-    /// PoW nonce found during mining.
+    /// `PoW` nonce found during mining.
     #[serde(with = "alloy_serde::quantity")]
     pub nonce: u64,
     /// Work multiplier used in the difficulty calculation.
@@ -48,7 +48,7 @@ pub struct MsgboardMsg {
     pub category: B256,
     /// Arbitrary message body.
     pub data: Bytes,
-    /// SHA-256 PoW hash that identifies this message.
+    /// SHA-256 `PoW` hash that identifies this message.
     pub hash: B256,
 }
 
@@ -172,7 +172,7 @@ pub trait MsgboardApi {
         filter: Option<ContentFilter>,
     ) -> RpcResult<HashMap<String, Vec<MsgboardMsg>>>;
 
-    /// Look up a single message by its SHA-256 PoW hash.
+    /// Look up a single message by its SHA-256 `PoW` hash.
     #[method(name = "getMessage")]
     async fn msgboard_get_message(&self, hash: B256) -> RpcResult<Option<MsgboardMsg>>;
 

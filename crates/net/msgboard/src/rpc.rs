@@ -36,7 +36,7 @@ pub struct MsgboardApi {
 
 impl MsgboardApi {
     /// Create a new instance backed by the given shared board.
-    pub fn new(board: Arc<MsgBoard>) -> Self {
+    pub const fn new(board: Arc<MsgBoard>) -> Self {
         Self { board }
     }
 }
@@ -137,11 +137,10 @@ impl MsgboardApiServer for MsgboardApi {
                     _ = sink.closed() => break,
                     maybe_msg = stream.next() => {
                         let Some(checked) = maybe_msg else { break };
-                        if let Some(want) = category_filter.as_ref() {
-                            if &checked.msg.category != want {
+                        if let Some(want) = category_filter.as_ref()
+                            && &checked.msg.category != want {
                                 continue;
                             }
-                        }
                         let rpc_msg = to_rpc_msg(&checked);
                         let msg = match SubscriptionMessage::new(
                             sink.method_name(),
@@ -172,7 +171,7 @@ impl MsgboardApiServer for MsgboardApi {
 
 /// Map a [`MsgboardError`] to a JSON-RPC error with a code matching erigon-pulse.
 ///
-/// `powmsg:` errors → `-32602` (InvalidParams, matching Go's `rpc.InvalidParamsError`).
+/// `powmsg:` errors → `-32602` (`InvalidParams`, matching Go's `rpc.InvalidParamsError`).
 /// `msgboard:` errors → `-32000` (default error code, matching Go's `defaultErrorCode`).
 fn msgboard_error_to_rpc(err: MsgboardError) -> ErrorObjectOwned {
     let code = match &err {

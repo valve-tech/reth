@@ -15,7 +15,7 @@ const GIBIBYTE: usize = MEBIBYTE * 1024;
 const TEBIBYTE: usize = GIBIBYTE * 1024;
 
 /// MDBX named-table holding RLP-encoded `CheckedPoWMsg` values keyed by SHA-256
-/// PoW hash. Mirrors `kv.BoardMessage = "BoardMessage"` in erigon-pulse so the
+/// `PoW` hash. Mirrors `kv.BoardMessage = "BoardMessage"` in erigon-pulse so the
 /// on-disk layout is interchangeable between implementations.
 const TABLE_NAME: &str = "BoardMessage";
 

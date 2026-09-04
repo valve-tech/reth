@@ -151,8 +151,8 @@ impl MsgIndex {
     ) -> Vec<Arc<CheckedPoWMsg>> {
         self.category_msgs(category)
             .filter(|m| {
-                from_block.map_or(true, |f| m.block_number >= f) &&
-                    to_block.map_or(true, |t| m.block_number <= t)
+                from_block.is_none_or(|f| m.block_number >= f) &&
+                    to_block.is_none_or(|t| m.block_number <= t)
             })
             .cloned()
             .collect()
@@ -191,8 +191,8 @@ impl MsgIndex {
         self.msgs
             .iter()
             .filter(|m| {
-                from_block.map_or(true, |f| m.block_number >= f) &&
-                    to_block.map_or(true, |t| m.block_number <= t)
+                from_block.is_none_or(|f| m.block_number >= f) &&
+                    to_block.is_none_or(|t| m.block_number <= t)
             })
             .cloned()
             .collect()
