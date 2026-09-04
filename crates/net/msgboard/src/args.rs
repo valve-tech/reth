@@ -5,7 +5,7 @@ use std::{path::PathBuf, time::Duration};
 use clap::Args;
 use reth_msgboard_types::MsgboardConfig;
 
-use crate::protocol::{MAX_INBOUND_FRAME_SIZE, MAX_SAFE_SIZE_LIMIT};
+use crate::protocol::{MAX_SAFE_SIZE_LIMIT, P2P_MSG_PACKET_LIMIT};
 
 /// Default DB flush interval. Mirrors `CommitEvery = 15s` in
 /// `private-erigon-pulse/msgboardcfg/config.go`.
@@ -16,16 +16,16 @@ const DEFAULT_COMMIT_EVERY: &str = "15s";
 const DEFAULT_LOG_EVERY: &str = "30s";
 
 /// Parse `--msgboard.size-limit`, refusing a value that would make us emit a
-/// `BoardMessages` frame every other reth node bans us for.
+/// `BoardMessages` packet our peers ban us for.
 ///
 /// `size_limit` bounds the `data` field of every message the board accepts,
 /// and a message the board accepts is one it may later be asked to serve. The
 /// `BoardMessages` packer flushes only once the *next* message would cross the
-/// 100 KiB chunking target, so a message above that target travels alone in a
-/// frame as large as itself. Past [`MAX_SAFE_SIZE_LIMIT`] that frame exceeds
-/// [`MAX_INBOUND_FRAME_SIZE`], and a reth peer drops it undecoded and reports
-/// the sender for a protocol violation — a 12-hour ban, from every reth peer
-/// we serve.
+/// 100 KiB packet limit, so a message above that limit travels alone in a
+/// packet as large as itself. Past [`MAX_SAFE_SIZE_LIMIT`] that packet exceeds
+/// [`P2P_MSG_PACKET_LIMIT`]: a reth peer drops it undecoded and reports the
+/// sender for a protocol violation — a 12-hour ban — and an erigon-pulse peer
+/// disconnects outright.
 ///
 /// Failing at parse time rather than at first send is the point: the send only
 /// happens once a message that large exists and someone asks for it, which can
@@ -34,14 +34,15 @@ const DEFAULT_LOG_EVERY: &str = "30s";
 ///
 /// This bounds nothing on the wire and rejects no message any peer sends. The
 /// default of 8 KiB is erigon-pulse's, three orders of magnitude below the
-/// ceiling, so no existing configuration changes.
+/// ceiling, so no existing configuration changes. Erigon guards the same value
+/// the same way at startup (`validateMsgSizeLimit`, `msgboard/util.go:17-23`).
 fn parse_size_limit(raw: &str) -> Result<usize, String> {
     let limit: usize = raw.parse().map_err(|_| format!("`{raw}` is not a byte count"))?;
     if limit > MAX_SAFE_SIZE_LIMIT {
         return Err(format!(
             "{limit} exceeds the {MAX_SAFE_SIZE_LIMIT}-byte ceiling: a message that size \
              occupies a BoardMessages frame on its own, and the frame would be larger than \
-             the {MAX_INBOUND_FRAME_SIZE}-byte msg/1 packet every reth peer accepts, so \
+             the {P2P_MSG_PACKET_LIMIT}-byte msg/1 packet every conforming peer accepts, so \
              serving it would get us banned"
         ));
     }
@@ -121,6 +122,25 @@ pub struct MsgboardArgs {
     /// read-only observability nodes.
     #[arg(long = "msgboard.gossip-disable", default_value_t = false)]
     pub msgboard_gossip_disable: bool,
+
+    /// Match the erigon-pulse `pulse-v3.4.4` behaviour set instead of the one
+    /// before it.
+    ///
+    /// Erigon changed observable behaviour at commit `78fbcffb8b` and left
+    /// `ProtocolVersion` at `1`, so the capability handshake cannot tell the
+    /// two apart: an old node and a new node negotiate `msg/1` and then refuse
+    /// each other's frames. Set this on the day the network moves, not before.
+    ///
+    /// Off, the node is byte-identical to the behaviour before that commit.
+    /// On, it speaks the newer one: `GetBoardMessages` carries 32-byte message
+    /// hashes rather than 121-byte `MsgID` records, and `BoardMessages`
+    /// carries each message paired with the hash its sender claims for it.
+    ///
+    /// The switch is named for the release rather than for the wire because
+    /// the wire is not all that moved: the same commit changed the board's
+    /// eviction order, which peers observe just as directly.
+    #[arg(long = "msgboard.pulse-v344", default_value_t = false)]
+    pub msgboard_pulse_v344: bool,
 }
 
 impl Default for MsgboardArgs {
@@ -136,6 +156,7 @@ impl Default for MsgboardArgs {
             msgboard_commit_every: Duration::from_secs(15),
             msgboard_log_every: Duration::from_secs(30),
             msgboard_gossip_disable: false,
+            msgboard_pulse_v344: false,
         }
     }
 }
@@ -151,6 +172,7 @@ impl MsgboardArgs {
             block_range: self.msgboard_block_range,
             stale_block_buffer: self.msgboard_stale_block_buffer,
             gossip_disabled: self.msgboard_gossip_disable,
+            pulse_v344: self.msgboard_pulse_v344,
         }
     }
 }
@@ -198,6 +220,10 @@ mod tests {
         assert_eq!(args.msgboard_commit_every, Duration::from_secs(15), "erigon CommitEvery");
         assert_eq!(args.msgboard_log_every, Duration::from_secs(30), "erigon LogEvery");
         assert!(!args.msgboard_gossip_disable, "gossip is on by default");
+        assert!(
+            !args.msgboard_pulse_v344,
+            "the newer erigon behaviour set is opt-in: peers still speak the older one",
+        );
         assert_eq!(args.msgboard_db_dir, None, "db dir defaults to <datadir>/msgboard");
     }
 
@@ -217,6 +243,7 @@ mod tests {
             msgboard_commit_every: Duration::from_secs(77),
             msgboard_log_every: Duration::from_secs(88),
             msgboard_gossip_disable: true,
+            msgboard_pulse_v344: true,
         };
 
         let cfg = args.into_config();
@@ -227,6 +254,7 @@ mod tests {
         assert_eq!(cfg.block_range, 55);
         assert_eq!(cfg.stale_block_buffer, 66);
         assert!(cfg.gossip_disabled);
+        assert!(cfg.pulse_v344);
     }
 
     /// Flag names are an operator-facing contract (`docs/msgboard-parity-gaps.md`
@@ -246,6 +274,7 @@ mod tests {
             "--msgboard.commit-every=7s",
             "--msgboard.log-every=8s",
             "--msgboard.gossip-disable",
+            "--msgboard.pulse-v344",
         ]);
 
         assert_eq!(args.msgboard_work_multiplier, 1);
@@ -258,16 +287,15 @@ mod tests {
         assert_eq!(args.msgboard_commit_every, Duration::from_secs(7));
         assert_eq!(args.msgboard_log_every, Duration::from_secs(8));
         assert!(args.msgboard_gossip_disable);
+        assert!(args.msgboard_pulse_v344);
     }
 
-    /// `--msgboard.size-limit` is capped at the frame ceiling.
+    /// `--msgboard.size-limit` is capped at the packet ceiling.
     ///
     /// The cap is a wire invariant, not taste: a message above it occupies a
-    /// `BoardMessages` frame on its own, and that frame is larger than the
-    /// `msg/1` packet every reth peer accepts, so the first peer that asks for
-    /// the message bans us. Erigon-pulse would not even request it
-    /// (`FilterMessageIDs` skips `id.Size() > cfg.MsgSizeLimit`), so the split
-    /// is reth against reth.
+    /// `BoardMessages` packet on its own, and that packet is larger than the
+    /// `msg/1` limit every conforming peer enforces, so the first peer that
+    /// asks for the message bans us.
     ///
     /// Both directions are asserted. Refusing the ceiling itself would be a
     /// guard that is simply too strict.

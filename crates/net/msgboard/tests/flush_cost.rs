@@ -112,6 +112,7 @@ fn flushing_an_unchanged_board_costs_almost_nothing() {
         block_range: 120,
         stale_block_buffer: 3,
         gossip_disabled: false,
+        pulse_v344: false,
     };
     let board = MsgBoard::with_db(cfg, env);
     board.set_ready();

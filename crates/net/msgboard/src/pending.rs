@@ -157,14 +157,17 @@ impl Default for PendingRequests {
 /// instance lives in each connection task, so the peer half of erigon's key is
 /// the instance itself and only the hash is stored.
 ///
-/// Reth cannot yet match a delivered message to its reservation, because it
-/// takes a scalar multiplication to learn which message arrived — the index key
-/// is `sha256(challenge ‖ category ‖ data)` and `challenge` *is* the curve
-/// point. Erigon closed that gap by putting the sender's claimed hash on the
-/// wire (`WirePoWMsg`). Until reth speaks that format,
-/// [`take_any`](Self::take_any) spends the oldest live reservation instead of
-/// the matching one, which bounds the work exactly and identifies it only
-/// approximately.
+/// Which reservation a delivery spends depends on the behaviour set the node
+/// is running, because that is what decides whether the delivery says which
+/// message it is:
+///
+///  - [`take`](Self::take) spends the reservation for a named hash, mirroring erigon's `Take(peer,
+///    hash, now)`. It needs the claimed hash `WirePoWMsg` carries, so it is reachable only with
+///    `--msgboard.pulse-v344`.
+///  - [`take_any`](Self::take_any) spends the oldest live reservation instead. Without a claimed
+///    hash nothing identifies a delivery before verification — the index key is `sha256(challenge ‖
+///    category ‖ data)` and `challenge` *is* the curve point — so the count is exact and the
+///    identity is not.
 #[derive(Debug)]
 pub(crate) struct WantList {
     /// Reserved hashes in reservation order. Every entry shares one TTL, so
@@ -240,6 +243,24 @@ impl WantList {
             }
         }
         false
+    }
+
+    /// Spend the reservation for `hash`, authorising one `PoW` verification.
+    ///
+    /// Returns `false` when this peer does not owe us that hash, which is the
+    /// signal to drop the message unverified. Mirrors erigon's
+    /// `Take(peer, hash, now)` (`msgboard/want_list.go`, `pulse-v3.4.4`): the
+    /// delivery names itself, so an unsolicited message in the middle of a
+    /// frame does not spend the reservation standing behind it.
+    ///
+    /// The queue entry is left in place and skipped when it surfaces, keeping
+    /// this O(1) — the same bookkeeping [`release`](Self::release) uses. A
+    /// spent reservation is not restored if the message then fails validation,
+    /// matching erigon: the peer is penalised, and another peer may already
+    /// hold its own reservation for the same message.
+    pub(crate) fn take(&mut self, hash: B256, now: Instant) -> bool {
+        self.prune(now);
+        self.live.remove(&hash)
     }
 
     /// Number of live reservations, for tests.
@@ -419,6 +440,44 @@ mod tests {
         assert_eq!(wants.len(), 1);
         assert!(wants.take_any(now), "the surviving reservation still pays for one");
         assert!(!wants.take_any(now), "the released one does not");
+    }
+
+    /// A delivery that names itself spends its own reservation, not the oldest
+    /// one. Erigon keys the want list by `(peer, hash)` and takes by hash, so a
+    /// late answer to an earlier request stays authorised.
+    #[test]
+    fn taking_by_hash_spends_only_that_hash() {
+        let mut wants = WantList::default();
+        let now = Instant::now();
+
+        wants.reserve(hash(1), now);
+        wants.reserve(hash(2), now);
+
+        assert!(wants.take(hash(2), now), "the message that arrived is paid for");
+        assert!(!wants.take(hash(2), now), "and only once");
+        assert_eq!(wants.len(), 1);
+        assert!(wants.take(hash(1), now), "the older reservation survived");
+    }
+
+    #[test]
+    fn taking_a_hash_we_never_reserved_authorises_nothing() {
+        let mut wants = WantList::default();
+        let now = Instant::now();
+        wants.reserve(hash(1), now);
+
+        assert!(!wants.take(hash(9), now), "an unrequested message is not authorised");
+        assert_eq!(wants.len(), 1, "and it does not consume someone else's reservation");
+    }
+
+    #[test]
+    fn a_reservation_taken_by_hash_stops_authorising_once_it_expires() {
+        let ttl = Duration::from_secs(15);
+        let mut wants = WantList::new(ttl, MAX_WANT_PER_PEER);
+        let now = Instant::now();
+
+        wants.reserve(hash(1), now);
+        assert!(!wants.take(hash(1), now + ttl), "a late answer buys nothing");
+        assert_eq!(wants.len(), 0);
     }
 
     /// Released entries stay in the queue and are skipped when they surface, so
