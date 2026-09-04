@@ -169,13 +169,23 @@ impl MsgboardApiServer for MsgboardApi {
     }
 }
 
-/// Map a [`MsgboardError`] to a JSON-RPC error with a code matching erigon-pulse.
+/// Map a [`MsgboardError`] to a JSON-RPC error code.
 ///
-/// `powmsg:` errors → `-32602` (`InvalidParams`, matching Go's `rpc.InvalidParamsError`).
-/// `msgboard:` errors → `-32000` (default error code, matching Go's `defaultErrorCode`).
+/// Board-level rejections follow erigon: its RPC layer classifies them by a
+/// literal string prefix, `powmsg:` giving `InvalidParams` and everything else
+/// the default code (`rpc/jsonrpc/msgboard_api.go:87`).
+///
+/// **Decode failures deliberately diverge.** Erigon never classifies them at
+/// all. `GrpcServer.AddMessage` returns a decode error as a transport error
+/// (`msgboard/msgboard_grpc_server.go`), so `MsgBoardAPIImpl.AddMessage`
+/// returns at its `if err != nil` and the prefix check below it never runs —
+/// a malformed payload gets the generic code by omission rather than by
+/// decision. Reth reports every failure of one `decode_validated_pow_msg` call
+/// as `InvalidParams`, because a caller cannot be told that a truncated
+/// payload is a bad parameter while a padded one is a server fault.
 fn msgboard_error_to_rpc(err: MsgboardError) -> ErrorObjectOwned {
     let code = match &err {
-        // powmsg: decode + validation errors → InvalidParams
+        // Malformed input from the caller → InvalidParams.
         MsgboardError::InvalidVersion |
         MsgboardError::InvalidBlockHash |
         MsgboardError::InvalidNonce |
@@ -183,8 +193,10 @@ fn msgboard_error_to_rpc(err: MsgboardError) -> ErrorObjectOwned {
         MsgboardError::InvalidData |
         MsgboardError::InvalidWork |
         MsgboardError::Rlp(_) |
-        MsgboardError::MalformedIdList => -32602,
-        // msgboard: board-level errors → default
+        MsgboardError::TrailingBytes |
+        MsgboardError::MalformedIdList |
+        MsgboardError::MalformedHashList => -32602,
+        // Board-level rejections → default.
         _ => -32000,
     };
     ErrorObjectOwned::owned(code, err.to_string(), None::<()>)
@@ -380,8 +392,10 @@ mod tests {
         assert!(board.get_message(&hash).is_some(), "message should be on the board");
     }
 
-    /// Decode/validation failures map to `-32602` (`InvalidParams`), matching
-    /// erigon's `rpc.InvalidParamsError` for `powmsg:` errors.
+    /// Decode and validation failures map to `-32602` (`InvalidParams`).
+    ///
+    /// This is the documented divergence from erigon, which returns a decode
+    /// error before its own classifier runs. See `msgboard_error_to_rpc`.
     #[tokio::test]
     async fn add_message_rejects_undecodable_rlp_with_invalid_params() {
         let m = module(ready_board(10));
@@ -396,6 +410,27 @@ mod tests {
         let bad = pow_msg(0, &[1], category(0xCA));
         let code = call_err_code(&m, "msgboard_addMessage", vec![json!(rlp_hex(&bad))]).await;
         assert_eq!(code, -32602);
+    }
+
+    /// Both ways one `decode_validated_pow_msg` call can fail report the same
+    /// code. A caller must not be told that a truncated payload is a bad
+    /// parameter while a padded one is a server fault.
+    #[tokio::test]
+    async fn every_decode_failure_reports_the_same_code() {
+        let m = module(ready_board(10));
+        let good = pow_msg(1, &[1], category(0xCA));
+
+        // Truncated: the value ends before the payload does.
+        let hex = rlp_hex(&good);
+        let truncated = &hex[..hex.len() - 4];
+        let truncated_code = call_err_code(&m, "msgboard_addMessage", vec![json!(truncated)]).await;
+
+        // Padded: a complete value with bytes after it.
+        let padded = format!("{hex}c0");
+        let padded_code = call_err_code(&m, "msgboard_addMessage", vec![json!(padded)]).await;
+
+        assert_eq!(truncated_code, -32602, "a truncated payload is a bad parameter");
+        assert_eq!(padded_code, truncated_code, "so is a padded one");
     }
 
     /// Board-level rejections map to `-32000`, matching erigon's
