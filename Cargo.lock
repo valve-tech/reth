@@ -9375,6 +9375,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "hex-literal",
+ "proptest",
  "secp256k1 0.30.0",
  "serde",
  "sha2 0.10.9",

@@ -58,6 +58,7 @@ pub struct MsgboardConfig {
     ///  - skips the bulk-announce on every peer connection,
     ///  - does not forward newly accepted messages to peers,
     ///  - skips inbound `BoardMessageIDs` requests.
+    ///
     /// Locally-submitted messages via JSON-RPC continue to work.
     /// Default: `false`.
     pub gossip_disabled: bool,

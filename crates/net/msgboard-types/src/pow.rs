@@ -377,12 +377,7 @@ mod tests {
 
     /// Brute-force search for a valid nonce (≤ 1 M iterations).
     fn find_nonce(data: &[u8]) -> Option<u64> {
-        for n in 1u64..=1_000_000 {
-            if make_msg(n, data).to_checked(0, 0).is_ok() {
-                return Some(n);
-            }
-        }
-        None
+        (1u64..=1_000_000).find(|n| make_msg(*n, data).to_checked(0, 0).is_ok())
     }
 
     #[test]
@@ -540,8 +535,7 @@ mod tests {
     #[test]
     fn test_rlp_round_trip_single() {
         let n = find_nonce(&[42u8]).expect("nonce found");
-        let msg = make_msg(n, &[42u8]);
-        let checked = msg.clone().to_checked(100, 999).expect("valid");
+        let checked = make_msg(n, &[42u8]).to_checked(100, 999).expect("valid");
 
         use alloy_rlp::{Decodable, Encodable};
         let mut enc = Vec::new();
@@ -672,7 +666,7 @@ mod tests {
         }
     }
 
-    /// A message taken off the live PulseChain testnet board (`direct-a-evm-943`,
+    /// A message taken off the live `PulseChain` testnet board (`direct-a-evm-943`,
     /// 2026-08-19), mined under the construction this replaced.
     ///
     /// It is pinned here as a negative control. The golden vectors are mined by
@@ -724,7 +718,7 @@ mod tests {
     /// used here as a regression guard for RLP wire-format compatibility.
     ///
     /// The test only asserts the fields that the Go test checks (`block_hash`); we
-    /// additionally verify block_number and that the nested PoWMsg round-trips correctly.
+    /// additionally verify `block_number` and that the nested `PoWMsg` round-trips correctly.
     #[test]
     fn test_hardcoded_checked_msg_compatibility() {
         // From msgboard/pow_message_test.go TestEncodeAndDecode.

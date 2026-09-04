@@ -28,6 +28,7 @@ serde = { workspace = true, features = ["derive"], optional = true }
 
 [dev-dependencies]
 hex-literal = "0.4"
+proptest.workspace = true
 
 [features]
 default = ["std"]
