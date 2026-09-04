@@ -1,6 +1,6 @@
 //! MDBX persistent storage for msgboard messages.
 
-use std::path::Path;
+use std::{borrow::Borrow, path::Path};
 
 use alloy_primitives::B256;
 use alloy_rlp::{Decodable, Encodable};
@@ -42,13 +42,31 @@ const MERGE_THRESHOLD_16DOT16_PERCENT: u64 = 3 * 8192;
 /// Geometry mirrors `private-erigon-pulse/msgboard/util.go` so a reth-built
 /// msgboard env opens cleanly under erigon and vice versa.
 pub fn open_msgboard_db(path: &Path) -> eyre::Result<Environment> {
+    let env = open_env(path, TEBIBYTE)?;
+
+    {
+        let tx = env.begin_rw_txn()?;
+        tx.create_db(Some(TABLE_NAME), DatabaseFlags::empty())?;
+        tx.commit()?;
+    }
+
+    Ok(env)
+}
+
+/// Open the environment itself, without the named table.
+///
+/// `map_size` is a parameter only so tests can shrink it; every production
+/// caller passes erigon's 1 TiB.
+fn open_env(path: &Path, map_size: usize) -> eyre::Result<Environment> {
     reth_fs_util::create_dir_all(path)?;
 
     let env = Environment::builder()
         .set_max_dbs(1)
         .set_geometry(Geometry {
-            size: Some(0..TEBIBYTE),
-            growth_step: Some(GROWTH_STEP_BYTES),
+            size: Some(0..map_size),
+            // Scaled down with the map, so a small test map still has several
+            // growth steps inside it.
+            growth_step: Some(GROWTH_STEP_BYTES.min(map_size as isize / 4)),
             shrink_threshold: Some(0),
             page_size: Some(PageSize::Set(PAGE_SIZE_BYTES)),
         })
@@ -62,12 +80,29 @@ pub fn open_msgboard_db(path: &Path) -> eyre::Result<Environment> {
         .write_map()
         .open(path)?;
 
-    {
-        let tx = env.begin_rw_txn()?;
-        tx.create_db(Some(TABLE_NAME), DatabaseFlags::empty())?;
-        tx.commit()?;
-    }
+    Ok(env)
+}
 
+/// An environment with no `BoardMessage` table.
+///
+/// Every [`db_flush`] against it fails at `open_db`, which lets a test drive
+/// the board's flush-failure path without corrupting anything.
+#[cfg(test)]
+pub(crate) fn open_env_without_table(path: &Path) -> eyre::Result<Environment> {
+    open_env(path, TEBIBYTE)
+}
+
+/// An environment whose map holds at most `map_size` bytes.
+///
+/// A transaction that needs more than the map has left fails, and a smaller one
+/// still commits. That makes flush failure *recoverable* in a test: shrink the
+/// write set and the next flush succeeds.
+#[cfg(test)]
+pub(crate) fn open_env_with_map_size(path: &Path, map_size: usize) -> eyre::Result<Environment> {
+    let env = open_env(path, map_size)?;
+    let tx = env.begin_rw_txn()?;
+    tx.create_db(Some(TABLE_NAME), DatabaseFlags::empty())?;
+    tx.commit()?;
     Ok(env)
 }
 
@@ -101,10 +136,23 @@ pub fn db_load_all(env: &Environment) -> eyre::Result<(Vec<CheckedPoWMsg>, u64)>
     Ok((msgs, bad))
 }
 
-/// Batch flush: write current messages and delete discarded ones.
-pub fn db_flush(
+/// Batch flush: write the given messages and delete discarded ones.
+///
+/// `current` is generic over `Borrow<CheckedPoWMsg>` so a caller holding
+/// `Arc<CheckedPoWMsg>` can pass its slice straight through, instead of copying
+/// a whole struct per message into a `Vec<CheckedPoWMsg>` for the call.
+///
+/// Deletions run before writes, and the order is load-bearing. A hash can
+/// appear in both slices: a message is discarded when it leaves the index, and
+/// a peer can re-send the same message and get it re-inserted before the next
+/// flush. Deleting first leaves that row present, which is what the board
+/// holds. The reverse order would drop a message the board still serves.
+///
+/// The whole batch is one MDBX transaction, so a failure leaves every row as
+/// it was.
+pub fn db_flush<M: Borrow<CheckedPoWMsg>>(
     env: &Environment,
-    current: &[CheckedPoWMsg],
+    current: &[M],
     discarded_hashes: &[B256],
 ) -> eyre::Result<u64> {
     let tx = env.begin_rw_txn()?;
@@ -117,6 +165,7 @@ pub fn db_flush(
 
     let mut rlp_buf = Vec::new();
     for msg in current {
+        let msg = msg.borrow();
         rlp_buf.clear();
         msg.encode(&mut rlp_buf);
         tx.put(db.dbi(), msg.hash.as_slice(), &rlp_buf, WriteFlags::empty())?;
@@ -279,7 +328,7 @@ mod tests {
         db_flush(&env, &[m1.clone(), m2.clone()], &[]).expect("flush");
 
         // Drop m1, keep m2.
-        db_flush(&env, &[m2.clone()], &[m1.hash]).expect("flush2");
+        db_flush(&env, std::slice::from_ref(&m2), &[m1.hash]).expect("flush2");
 
         let (loaded, bad) = db_load_all(&env).expect("load");
         assert_eq!(bad, 0);
