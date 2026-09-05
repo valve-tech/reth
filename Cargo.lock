@@ -10280,6 +10280,7 @@ dependencies = [
  "http",
  "jsonrpsee",
  "metrics",
+ "metrics-util",
  "pin-project",
  "reqwest",
  "reth-chain-state",
