@@ -1262,15 +1262,6 @@ Msgboard:
 
           When set, the node still **receives** announcements and full messages from peers and serves `GetBoardMessages` requests, but it does **not** announce its own message IDs (neither the bulk announce on peer connect nor per-message announces as new messages are accepted). Useful for read-only observability nodes.
 
-      --msgboard.pulse-v344
-          Match the erigon-pulse `pulse-v3.4.4` behaviour set instead of the one before it.
-
-          Erigon changed observable behaviour at commit `78fbcffb8b` and left `ProtocolVersion` at `1`, so the capability handshake cannot tell the two apart: an old node and a new node negotiate `msg/1` and then refuse each other's frames. Set this on the day the network moves, not before.
-
-          Off, the node is byte-identical to the behaviour before that commit. On, it speaks the newer one: `GetBoardMessages` carries 32-byte message hashes rather than 121-byte `MsgID` records, and `BoardMessages` carries each message paired with the hash its sender claims for it.
-
-          The switch is named for the release rather than for the wire because the wire is not all that moved: the same commit changed the board's eviction order, which peers observe just as directly.
-
 Logging:
       --log.stdout.format <FORMAT>
           The format to use for logs written to stdout
