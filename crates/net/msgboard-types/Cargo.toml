@@ -40,4 +40,8 @@ std = [
     "thiserror/std",
     "serde?/std",
 ]
-serde = ["dep:serde", "alloy-primitives/serde"]
+serde = [
+    "dep:serde",
+    "alloy-primitives/serde",
+    "secp256k1/serde",
+]
