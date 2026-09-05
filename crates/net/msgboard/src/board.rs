@@ -1151,6 +1151,81 @@ mod tests {
     /// keeps the other ordering — and eviction order is the half that is
     /// wire-observable, so the node would gossip a board its peers disagree
     /// with while appearing to speak their protocol.
+    /// The flush must not run on a runtime worker.
+    ///
+    /// `flush_to_db` is fully synchronous: it opens an MDBX write transaction,
+    /// writes every dirty row, and fsyncs on commit. Run directly inside the
+    /// async task it would hold a worker thread for the whole transaction, and
+    /// every task sharing that thread stops.
+    ///
+    /// Asserted as **liveness, not duration**. The runtime gets exactly one
+    /// worker. A write transaction is held open before the flush fires, so
+    /// `begin_rw_txn` spins on `Error::Busy` with a blocking 250 ms sleep —
+    /// real contention through the production path, no test hook in the flush.
+    /// If that spinning sits on the worker, nothing else on the runtime can
+    /// run; the probe task below never completes and the channel times out.
+    ///
+    /// The test body stays **off** the runtime, on the plain `#[test]` thread,
+    /// so a regression fails on the timeout instead of hanging the suite —
+    /// which is what would happen if the assertion were itself a runtime task
+    /// waiting on a blocked worker.
+    ///
+    /// The five-second bound is a liveness ceiling, not a budget. A healthy
+    /// runtime clears it in well under a second; a regression sits on the
+    /// worker until the timeout expires, so pass and fail are an order of
+    /// magnitude apart rather than a few percent. **If this ever flakes, do
+    /// not raise the ceiling** — a machine that cannot schedule a
+    /// `spawn_blocking` thread inside five seconds is not the failure this
+    /// guards against, and lifting the number is how a real regression gets
+    /// mistaken for one.
+    #[test]
+    fn the_flush_does_not_occupy_a_runtime_worker() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = crate::db::open_msgboard_db(dir.path()).expect("open db");
+        // A second handle to the same environment. `Environment` is an `Arc`
+        // internally, so both share one writer lock.
+        let blocker = env.clone();
+
+        let board = Arc::new(MsgBoard::with_db(easy_cfg(), env));
+        board.set_ready();
+        board.set_head(1, block_hash_one());
+        let nonce = find_nonce(&[7]);
+        board.add_local_msg(make_pow_msg(nonce, &[7])).expect("valid message");
+
+        // Take the writer slot. Every flush now blocks until this is dropped.
+        let held = blocker.begin_rw_txn().expect("hold the writer lock");
+
+        let _flush =
+            rt.block_on(async { board.spawn_flush_task(std::time::Duration::from_millis(10)) });
+
+        // Give the interval room to elapse so the flush is genuinely blocked
+        // before the probe goes in. This sleep is on the test thread, not the
+        // runtime, so it cannot itself starve.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            let _ = probe_tx.send(());
+        });
+
+        let progressed = probe_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+
+        drop(held);
+        rt.shutdown_timeout(std::time::Duration::from_secs(5));
+
+        assert!(
+            progressed,
+            "a blocked flush held the only runtime worker; \
+             `spawn_flush_task` must hand `flush_to_db` to `spawn_blocking`",
+        );
+    }
+
     #[test]
     fn the_board_gives_the_index_its_behaviour_set() {
         fn mined(block_hash: B256, mult: u64, data: &[u8]) -> PoWMsg {
