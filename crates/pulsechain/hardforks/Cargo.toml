@@ -27,4 +27,6 @@ std = [
     "reth-chainspec/std",
     "reth-ethereum-forks/std",
     "alloy-primitives/std",
+    "alloy-eips/std",
+    "reth-network-peers/std",
 ]
