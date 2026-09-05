@@ -14,7 +14,9 @@ static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 use std::sync::Arc;
 
 use clap::Parser;
-use reth::{cli::Cli, FirehoseExecutorBuilder, PulsechainFirehoseExecutorBuilder};
+use reth::{
+    cli::Cli, FirehoseExecutorBuilder, MsgboardNetworkBuilder, PulsechainFirehoseExecutorBuilder,
+};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_msgboard::{args::MsgboardArgs, MsgboardLauncher};
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
@@ -161,12 +163,13 @@ fn run_ethereum_node() -> eyre::Result<()> {
                 let handle = builder
                     .with_types::<EthereumNode>()
                     .with_components(
-                        EthereumNode::components().executor(FirehoseExecutorBuilder::default()),
+                        EthereumNode::components()
+                            .executor(FirehoseExecutorBuilder::default())
+                            .network(MsgboardNetworkBuilder::new(launcher.clone())),
                     )
                     .with_add_ons(EthereumAddOns::default())
                     .extend_rpc_modules(move |ctx| {
-                        let datadir = ctx.config().datadir().data_dir().to_path_buf();
-                        launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
+                        launcher_for_rpc.install_rpc(ctx.modules)?;
                         Ok(())
                     })
                     .install_exex("firehose", |ctx| async move {
@@ -188,11 +191,13 @@ fn run_ethereum_node() -> eyre::Result<()> {
                 let launcher_for_rpc = launcher.clone();
                 let handle = builder
                     .with_types::<EthereumNode>()
-                    .with_components(EthereumNode::components())
+                    .with_components(
+                        EthereumNode::components()
+                            .network(MsgboardNetworkBuilder::new(launcher.clone())),
+                    )
                     .with_add_ons(EthereumAddOns::default())
                     .extend_rpc_modules(move |ctx| {
-                        let datadir = ctx.config().datadir().data_dir().to_path_buf();
-                        launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
+                        launcher_for_rpc.install_rpc(ctx.modules)?;
                         Ok(())
                     })
                     .launch()
@@ -276,12 +281,12 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                 .with_types::<PulsechainNode>()
                 .with_components(
                     PulsechainNode::components()
-                        .executor(PulsechainFirehoseExecutorBuilder::default()),
+                        .executor(PulsechainFirehoseExecutorBuilder::default())
+                        .network(MsgboardNetworkBuilder::new(launcher.clone())),
                 )
                 .with_add_ons(EthereumAddOns::default())
                 .extend_rpc_modules(move |ctx| {
-                    let datadir = ctx.config().datadir().data_dir().to_path_buf();
-                    launcher_for_rpc.install(ctx.modules, ctx.network().clone(), datadir)?;
+                    launcher_for_rpc.install_rpc(ctx.modules)?;
 
                     // Replace eth_estimateGas with a version that adds a 20% margin.
                     let eth_api = ctx.registry.eth_api().clone();
