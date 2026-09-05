@@ -121,7 +121,7 @@ impl MsgBoard {
     fn build(cfg: MsgboardConfig, db: Option<Environment>) -> Self {
         let (new_msg_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let state = BoardState {
-            index: MsgIndex::with_behaviour(cfg.pulse_v344),
+            index: MsgIndex::default(),
             block_filter: BlockFilter::new(cfg.block_range),
             discarded: Vec::new(),
             dirty: HashSet::new(),
@@ -915,7 +915,6 @@ mod tests {
             block_range: 120,
             stale_block_buffer: 3,
             gossip_disabled: false,
-            pulse_v344: false,
         }
     }
 
@@ -1201,8 +1200,11 @@ mod tests {
         // Take the writer slot. Every flush now blocks until this is dropped.
         let held = blocker.begin_rw_txn().expect("hold the writer lock");
 
-        let _flush =
-            rt.block_on(async { board.spawn_flush_task(std::time::Duration::from_millis(10)) });
+        // `block_on` only supplies the runtime context `spawn_flush_task` needs;
+        // the handle it returns is not awaited here, because the point is to
+        // leave the flush running while the probe goes in.
+        let _guard = rt.enter();
+        let _flush = board.spawn_flush_task(std::time::Duration::from_millis(10));
 
         // Give the interval room to elapse so the flush is genuinely blocked
         // before the probe goes in. This sleep is on the test thread, not the
@@ -1227,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn the_board_gives_the_index_its_behaviour_set() {
+    fn the_board_orders_by_ratio_only_within_a_block() {
         fn mined(block_hash: B256, mult: u64, data: &[u8]) -> PoWMsg {
             let base = PoWMsg {
                 version: VERSION_V1,
@@ -1249,13 +1251,13 @@ mod tests {
         }
 
         // Two blocks, and a later-block message whose ratio is the lowest.
-        // The unguarded comparator compares that ratio across blocks and sorts
-        // it to the front; the guarded one does not.
+        // Comparing that ratio across blocks would sort it to the front. The
+        // comparator guards on block equality, so it does not.
         let low = block_hash_one();
         let high = B256::from([0x02u8; 32]);
 
-        let front_of_board = |pulse_v344: bool| {
-            let board = MsgBoard::new(MsgboardConfig { pulse_v344, ..easy_cfg() });
+        let front_of_board = || {
+            let board = MsgBoard::new(easy_cfg());
             board.set_ready();
             board.set_head(5, low);
             board.set_head(10, high);
@@ -1267,8 +1269,11 @@ mod tests {
             board.all_messages()[0].msg.data.to_vec()
         };
 
-        assert_eq!(front_of_board(true), b"a", "guarded: the earliest block sorts first");
-        assert_eq!(front_of_board(false), b"c", "unguarded: the lowest ratio sorts first");
+        assert_eq!(
+            front_of_board(),
+            b"a",
+            "ratios are only compared within a block, so the earliest block sorts first",
+        );
     }
 
     #[test]

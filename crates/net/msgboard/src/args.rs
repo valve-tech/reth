@@ -122,25 +122,6 @@ pub struct MsgboardArgs {
     /// read-only observability nodes.
     #[arg(long = "msgboard.gossip-disable", default_value_t = false)]
     pub msgboard_gossip_disable: bool,
-
-    /// Match the erigon-pulse `pulse-v3.4.4` behaviour set instead of the one
-    /// before it.
-    ///
-    /// Erigon changed observable behaviour at commit `78fbcffb8b` and left
-    /// `ProtocolVersion` at `1`, so the capability handshake cannot tell the
-    /// two apart: an old node and a new node negotiate `msg/1` and then refuse
-    /// each other's frames. Set this on the day the network moves, not before.
-    ///
-    /// Off, the node is byte-identical to the behaviour before that commit.
-    /// On, it speaks the newer one: `GetBoardMessages` carries 32-byte message
-    /// hashes rather than 121-byte `MsgID` records, and `BoardMessages`
-    /// carries each message paired with the hash its sender claims for it.
-    ///
-    /// The switch is named for the release rather than for the wire because
-    /// the wire is not all that moved: the same commit changed the board's
-    /// eviction order, which peers observe just as directly.
-    #[arg(long = "msgboard.pulse-v344", default_value_t = false)]
-    pub msgboard_pulse_v344: bool,
 }
 
 impl Default for MsgboardArgs {
@@ -156,7 +137,6 @@ impl Default for MsgboardArgs {
             msgboard_commit_every: Duration::from_secs(15),
             msgboard_log_every: Duration::from_secs(30),
             msgboard_gossip_disable: false,
-            msgboard_pulse_v344: false,
         }
     }
 }
@@ -172,7 +152,6 @@ impl MsgboardArgs {
             block_range: self.msgboard_block_range,
             stale_block_buffer: self.msgboard_stale_block_buffer,
             gossip_disabled: self.msgboard_gossip_disable,
-            pulse_v344: self.msgboard_pulse_v344,
         }
     }
 }
@@ -220,10 +199,6 @@ mod tests {
         assert_eq!(args.msgboard_commit_every, Duration::from_secs(15), "erigon CommitEvery");
         assert_eq!(args.msgboard_log_every, Duration::from_secs(30), "erigon LogEvery");
         assert!(!args.msgboard_gossip_disable, "gossip is on by default");
-        assert!(
-            !args.msgboard_pulse_v344,
-            "the newer erigon behaviour set is opt-in: peers still speak the older one",
-        );
         assert_eq!(args.msgboard_db_dir, None, "db dir defaults to <datadir>/msgboard");
     }
 
@@ -243,7 +218,6 @@ mod tests {
             msgboard_commit_every: Duration::from_secs(77),
             msgboard_log_every: Duration::from_secs(88),
             msgboard_gossip_disable: true,
-            msgboard_pulse_v344: true,
         };
 
         let cfg = args.into_config();
@@ -254,7 +228,6 @@ mod tests {
         assert_eq!(cfg.block_range, 55);
         assert_eq!(cfg.stale_block_buffer, 66);
         assert!(cfg.gossip_disabled);
-        assert!(cfg.pulse_v344);
     }
 
     /// Flag names are an operator-facing contract (`docs/msgboard-parity-gaps.md`
@@ -274,7 +247,6 @@ mod tests {
             "--msgboard.commit-every=7s",
             "--msgboard.log-every=8s",
             "--msgboard.gossip-disable",
-            "--msgboard.pulse-v344",
         ]);
 
         assert_eq!(args.msgboard_work_multiplier, 1);
@@ -287,7 +259,6 @@ mod tests {
         assert_eq!(args.msgboard_commit_every, Duration::from_secs(7));
         assert_eq!(args.msgboard_log_every, Duration::from_secs(8));
         assert!(args.msgboard_gossip_disable);
-        assert!(args.msgboard_pulse_v344);
     }
 
     /// `--msgboard.size-limit` is capped at the packet ceiling.

@@ -8,9 +8,7 @@
 ///
 /// Most values are checked before accepting or relaying any
 /// [`PoWMsg`](crate::PoWMsg) and are local policy, not wire format — each node
-/// enforces its own. [`pulse_v344`](Self::pulse_v344) is the exception: it
-/// selects which erigon-pulse behaviour set the node matches, and that is
-/// visible to peers.
+/// enforces its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MsgboardConfig {
@@ -65,32 +63,6 @@ pub struct MsgboardConfig {
     /// Locally-submitted messages via JSON-RPC continue to work.
     /// Default: `false`.
     pub gossip_disabled: bool,
-
-    /// Match the erigon-pulse `pulse-v3.4.4` behaviour set instead of the one
-    /// before it.
-    ///
-    /// Erigon changed observable behaviour at `78fbcffb8b` without bumping
-    /// `ProtocolVersion`, which is still `1` at both commits
-    /// (`msgboard/protocol.go`). An old node and a new node therefore negotiate
-    /// `msg/1` and then reject each other's frames. This flag is how an
-    /// operator picks a side, so the binary can ship before the flag day and
-    /// flip on it.
-    ///
-    /// It currently selects the wire format of two opcodes:
-    ///
-    ///  - `GetBoardMessages` carries 32-byte message hashes, not 121-byte [`MsgID`](crate::MsgID)
-    ///    records.
-    ///  - `BoardMessages` carries [`WirePoWMsg`](crate::WirePoWMsg) elements, each a message
-    ///    paired with the hash its sender claims for it.
-    ///
-    /// The same release changed the board's eviction order, which is equally
-    /// peer-visible: two nodes fed the same messages must drop the same one or
-    /// they gossip different boards. The flag is named for the release rather
-    /// than for the wire so it can cover that too.
-    ///
-    /// Default: `false` — byte-identical to the behaviour before `78fbcffb8b`.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub pulse_v344: bool,
 }
 
 impl Default for MsgboardConfig {
@@ -103,7 +75,6 @@ impl Default for MsgboardConfig {
             block_range: 120,
             stale_block_buffer: 3,
             gossip_disabled: false,
-            pulse_v344: false,
         }
     }
 }
@@ -136,7 +107,6 @@ mod tests {
         assert_eq!(cfg.count_limit, 10_000);
         assert_eq!(cfg.block_range, 120);
         assert_eq!(cfg.stale_block_buffer, 3);
-        assert!(!cfg.pulse_v344, "the pre-78fbcffb8b behaviour set is the default");
     }
 
     #[test]

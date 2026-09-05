@@ -719,11 +719,9 @@ OR-comparator did not produce a block-sorted vec (§11). It had two consequences
    count`). A query whose range matches nothing returns **the entire board**.
 
 **Erigon guarded the comparator in `pulse-v3.4.4` (`78fbcffb8b`), and reth
-implements both comparators behind `MsgboardConfig::pulse_v344` (§26). Under
-the guard the board is block-sorted, so consequence 1 is gone** — the seeked
-slice and a per-message filter agree on any range that matches something.
-Below the guard, which is the default and what every deployed peer runs,
-consequence 1 stands as written. Consequence 2 survives either way: the
+implements the guarded comparator only (§26). Under the guard the board is
+block-sorted, so consequence 1 is gone** — the seeked slice and a per-message
+filter agree on any range that matches something. Consequence 2 survives: the
 fail-open depends on the seek not firing, not on the ordering.
 
 Worked case — board holding blocks 1, 2, 3, queried `from=10 to=20`: erigon
@@ -2489,18 +2487,21 @@ predicate now reproduces the linear scan exactly — verified, same digest over
 the 200k corpus. Reth keeps the scan because erigon scans, not because a search
 is unsafe.
 
-### 26.3 It is selectable, not adopted
+### 26.3 It is adopted outright
 
 Eviction order is wire-observable — two nodes fed the same messages must drop
-the same one, or they gossip different boards. `78fbcffb8b` lives on one
-unmerged, untagged branch and nowhere else in the repository, so no deployed
-peer runs the guarded comparator. Adopting it outright would have moved this
-node away from every peer it talks to.
+the same one, or they gossip different boards. So it moves with the wire
+format, not separately.
 
-Both comparators therefore ship, selected by
-`MsgboardConfig::pulse_v344` — the same flag that selects the wire format,
-because the network moves once. Off is the deployed ordering. The differential
-test pins **both** digests, so neither path can drift.
+`msg/1` is the format `78fbcffb8b` defines, and the one before it is obsolete.
+Reth therefore ships the guarded comparator alone, with no switch: a node
+speaking this `msg/1` sorts its board this way. The differential test pins the
+one digest, so the path cannot drift.
+
+The cost is a flag day. Until the network moves, a reth node and a
+pre-`78fbcffb8b` peer negotiate `msg/1`, fail to parse each other's frames,
+and disconnect. `ProtocolVersion` stays `1` by decision, so the handshake
+cannot separate them — see §26.7.
 
 ### 26.4 Measured impact of the guard
 
@@ -2535,11 +2536,23 @@ that matches something, so the "out-of-range messages ride along" half of
 §13.4 is gone. The fail-open half survives, because it depends on the seek not
 firing rather than on the ordering. §13.4 is updated in place.
 
-### 26.7 Still open, and larger than this section
+### 26.7 The wire format, and why `ProtocolVersion` stays `1`
 
 `78fbcffb8b` also changed the wire format: `WirePoWMsg` carries a claimed hash
 on `BOARD_MESSAGES`, and `GET_BOARD_MESSAGES` carries 32-byte hashes instead of
-121-byte `MsgID`s. A `(peer, hash)` want list gates inbound bodies. None of
-that is implemented here, and reth at HEAD and erigon at `78fbcffb8b` appear to
-ban each other on the first body request in either direction. That is tracked
-separately — it is a protocol decision, not a parity cleanup.
+121-byte `MsgID`s. A `(peer, hash)` want list gates inbound bodies. All of that
+is implemented here, and it is the only format reth speaks.
+
+`msgboard/README.md` says changing these limits "requires a new capability
+version (`msg/2`)", and `78fbcffb8b` changed them without bumping
+`ProtocolVersion`. Staying at `1` is a deliberate decision, not an oversight:
+msgboard is opt-in and experimental, nothing in production speaks the new
+format yet, and a coordinated flip costs less than burning a capability version
+on a format still taking shape.
+
+The consequence is that the handshake cannot separate the two formats. Until
+the network moves, a reth node and a pre-`78fbcffb8b` peer negotiate `msg/1`
+and then refuse each other's frames. On reth that is worse than on erigon,
+because `BadProtocol` scores against the peer rather than the sub-protocol, so
+one msgboard mismatch removes that peer from block sync too. Whoever runs the
+upgrade should keep the window short.

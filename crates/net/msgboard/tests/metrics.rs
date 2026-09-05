@@ -52,7 +52,6 @@ const fn easy_cfg() -> MsgboardConfig {
         block_range: 120,
         stale_block_buffer: 3,
         gossip_disabled: false,
-        pulse_v344: false,
     }
 }
 
