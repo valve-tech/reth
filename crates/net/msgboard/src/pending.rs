@@ -157,17 +157,11 @@ impl Default for PendingRequests {
 /// instance lives in each connection task, so the peer half of erigon's key is
 /// the instance itself and only the hash is stored.
 ///
-/// Which reservation a delivery spends depends on the behaviour set the node
-/// is running, because that is what decides whether the delivery says which
-/// message it is:
-///
-///  - [`take`](Self::take) spends the reservation for a named hash, mirroring erigon's `Take(peer,
-///    hash, now)`. It needs the claimed hash `WirePoWMsg` carries, so it is reachable only with
-///    `--msgboard.pulse-v344`.
-///  - [`take_any`](Self::take_any) spends the oldest live reservation instead. Without a claimed
-///    hash nothing identifies a delivery before verification — the index key is `sha256(challenge ‖
-///    category ‖ data)` and `challenge` *is* the curve point — so the count is exact and the
-///    identity is not.
+/// [`take`](Self::take) spends the reservation for a named hash, mirroring
+/// erigon's `Take(peer, hash, now)`. It relies on the claimed hash that
+/// `WirePoWMsg` carries: without one, nothing identifies a delivery before
+/// verification, because the index key is `sha256(challenge ‖ category ‖ data)`
+/// and `challenge` *is* the curve point.
 #[derive(Debug)]
 pub(crate) struct WantList {
     /// Reserved hashes in reservation order. Every entry shares one TTL, so
@@ -188,7 +182,7 @@ impl WantList {
 
     /// Drop every reservation older than the TTL.
     ///
-    /// Expiry is lazy, as in erigon: `reserve` and `take_any` prune, and
+    /// Expiry is lazy, as in erigon: `reserve` and `take` prune, and
     /// nothing runs on a timer.
     pub(crate) fn prune(&mut self, now: Instant) {
         while let Some(front) = self.queue.front() {
@@ -225,24 +219,6 @@ impl WantList {
         for hash in hashes {
             self.live.remove(&hash);
         }
-    }
-
-    /// Spend one reservation, authorising one `PoW` verification.
-    ///
-    /// Returns `false` when the peer has none left, which is the signal to drop
-    /// the message unverified. The oldest live reservation is spent because
-    /// reth cannot tell *which* message arrived before verifying it — see the
-    /// type comment. A spent reservation is not restored if the message then
-    /// fails validation, matching erigon: the peer is penalised, and another
-    /// peer may already hold its own reservation for the same message.
-    pub(crate) fn take_any(&mut self, now: Instant) -> bool {
-        self.prune(now);
-        while let Some(want) = self.queue.pop_front() {
-            if self.live.remove(&want.hash) {
-                return true;
-            }
-        }
-        false
     }
 
     /// Spend the reservation for `hash`, authorising one `PoW` verification.
@@ -376,22 +352,6 @@ mod tests {
     // ── want list ────────────────────────────────────────────────────────────
 
     #[test]
-    fn a_reservation_authorises_exactly_one_delivery() {
-        let mut wants = WantList::default();
-        let now = Instant::now();
-
-        assert!(wants.reserve(hash(1), now));
-        assert!(wants.take_any(now), "the message we asked for is paid for");
-        assert!(!wants.take_any(now), "a second message on one request is not");
-    }
-
-    #[test]
-    fn an_unrequested_delivery_is_never_authorised() {
-        let mut wants = WantList::default();
-        assert!(!wants.take_any(Instant::now()), "nothing was asked for");
-    }
-
-    #[test]
     fn re_announcing_an_owed_hash_does_not_buy_a_second_verification() {
         let mut wants = WantList::default();
         let now = Instant::now();
@@ -399,17 +359,6 @@ mod tests {
         assert!(wants.reserve(hash(1), now));
         assert!(!wants.reserve(hash(1), now), "the peer already owes us this one");
         assert_eq!(wants.len(), 1);
-    }
-
-    #[test]
-    fn a_reservation_stops_authorising_once_it_expires() {
-        let ttl = Duration::from_secs(15);
-        let mut wants = WantList::new(ttl, MAX_WANT_PER_PEER);
-        let now = Instant::now();
-
-        wants.reserve(hash(1), now);
-        assert!(!wants.take_any(now + ttl), "a late answer buys nothing");
-        assert_eq!(wants.len(), 0);
     }
 
     /// Unlike [`PendingRequests::claim`], which fails open, a full want list
@@ -438,8 +387,8 @@ mod tests {
         wants.release([hash(1)]);
 
         assert_eq!(wants.len(), 1);
-        assert!(wants.take_any(now), "the surviving reservation still pays for one");
-        assert!(!wants.take_any(now), "the released one does not");
+        assert!(wants.take(hash(2), now), "the surviving reservation still pays for one");
+        assert!(!wants.take(hash(1), now), "the released one does not");
     }
 
     /// A delivery that names itself spends its own reservation, not the oldest
@@ -492,7 +441,7 @@ mod tests {
         }
         wants.release([hash(0), hash(1)]);
 
-        assert!(wants.take_any(now));
-        assert!(!wants.take_any(now), "only one reservation survived the release");
+        assert!(wants.take(hash(2), now));
+        assert!(!wants.take(hash(2), now), "only one reservation survived the release");
     }
 }
