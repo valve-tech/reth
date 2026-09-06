@@ -233,5 +233,7 @@ use tracing as _;
 
 // Firehose
 mod firehose;
+mod msgboard_net;
 pub use firehose::{FirehoseExecutorBuilder, PulsechainFirehoseExecutorBuilder};
 use firehose_tracer as _;
+pub use msgboard_net::MsgboardNetworkBuilder;

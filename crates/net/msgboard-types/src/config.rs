@@ -6,8 +6,9 @@
 
 /// Configures msgboard protocol limits and `PoW` parameters.
 ///
-/// These values are checked before accepting or relaying any [`PoWMsg`](crate::PoWMsg).
-/// They are **not** part of the wire format — each node enforces its own policy.
+/// Most values are checked before accepting or relaying any
+/// [`PoWMsg`](crate::PoWMsg) and are local policy, not wire format — each node
+/// enforces its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MsgboardConfig {
@@ -58,6 +59,7 @@ pub struct MsgboardConfig {
     ///  - skips the bulk-announce on every peer connection,
     ///  - does not forward newly accepted messages to peers,
     ///  - skips inbound `BoardMessageIDs` requests.
+    ///
     /// Locally-submitted messages via JSON-RPC continue to work.
     /// Default: `false`.
     pub gossip_disabled: bool,

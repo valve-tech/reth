@@ -145,6 +145,7 @@ asm-keccak = [
     "reth-ethereum-cli/asm-keccak",
     "reth-node-ethereum/asm-keccak",
     "alloy-primitives/asm-keccak",
+    "alloy-evm/asm-keccak",
 ]
 keccak-cache-global = [
     "reth-node-core/keccak-cache-global",

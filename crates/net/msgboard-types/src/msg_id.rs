@@ -71,14 +71,18 @@ impl MsgID {
     /// Decode a slice of bytes into a list of `MsgID`s.
     ///
     /// Returns an error if `bytes.len()` is not a multiple of [`MSG_ID_SIZE`].
+    ///
+    /// The record count comes from the bytes the caller already holds, never
+    /// from a length a peer declares, so a hostile payload cannot make this
+    /// reserve more memory than it sent. `as_chunks` derives the length check
+    /// and the fixed-size conversion from one split, so neither can drift from
+    /// the other and no fallible conversion is left to unwrap.
     pub fn decode_list(bytes: &[u8]) -> Result<Vec<Self>, crate::MsgboardError> {
-        if !bytes.len().is_multiple_of(MSG_ID_SIZE) {
+        let (records, remainder) = bytes.as_chunks::<MSG_ID_SIZE>();
+        if !remainder.is_empty() {
             return Err(crate::MsgboardError::MalformedIdList);
         }
-        Ok(bytes
-            .chunks_exact(MSG_ID_SIZE)
-            .map(|chunk| Self(chunk.try_into().expect("chunk is exactly MSG_ID_SIZE bytes")))
-            .collect())
+        Ok(records.iter().copied().map(Self).collect())
     }
 
     /// Flatten a slice of `MsgID`s into a contiguous byte buffer.

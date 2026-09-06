@@ -13,9 +13,14 @@
 //! On connection — once the board reports `is_ready()` — the handler announces
 //! all locally-held message IDs to the peer. Thereafter it relays new-message
 //! announcements via a `broadcast` subscription on [`MsgBoard`].
+//!
+//! Each connection keeps a [`WantList`] of what it asked that peer for.
+//! Verifying a delivered message costs a secp256k1 scalar multiplication, so a
+//! `BoardMessages` frame is paid for only up to what the peer was asked to
+//! send; the rest is dropped undecoded. erigon-pulse does the same with
+//! `wantList.Take` (`msgboard/fetch.go`, `pulse-v3.4.4`).
 
 use std::{
-    collections::HashSet,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -31,20 +36,32 @@ use reth_eth_wire::{
     capability::SharedCapabilities, multiplex::ProtocolConnection, protocol::Protocol, Capability,
 };
 use reth_msgboard_types::{
-    decode_pow_msg_list, encode_pow_msg_list, MsgID, BOARD_MESSAGES, BOARD_MESSAGE_IDS,
-    GET_BOARD_MESSAGES, MSG_ID_SIZE, PROTOCOL_LENGTH, PROTOCOL_NAME, PROTOCOL_VERSION,
+    check_unique_hashes, decode_msg_hash_list, decode_wire_pow_msg_list, encode_msg_hash_list,
+    encode_wire_pow_msg_list, MsgID, MsgboardError, BOARD_MESSAGES, BOARD_MESSAGE_IDS,
+    GET_BOARD_MESSAGES, MAX_GET_BOARD_MESSAGES, MSG_HASH_SIZE, MSG_ID_SIZE, PROTOCOL_LENGTH,
+    PROTOCOL_NAME, PROTOCOL_VERSION,
 };
 use reth_network::protocol::{ConnectionHandler, OnNotSupported, ProtocolHandler};
 use reth_network_api::{Direction, PeerId, ReputationChangeKind};
-use tokio::sync::{broadcast, mpsc};
+use tokio::{
+    sync::{broadcast, mpsc},
+    time::MissedTickBehavior,
+};
 use tokio_stream::wrappers::ReceiverStream;
 
-use alloy_primitives::bytes::BytesMut;
+use alloy_primitives::{bytes::BytesMut, B256};
 
-use crate::{board::MsgBoard, metrics::MsgboardMetrics};
+use crate::{
+    board::MsgBoard,
+    metrics::MsgboardMetrics,
+    pending::{WantList, MAX_WANT_PER_PEER},
+};
 
-/// Approximate per-packet size limit for chunked P2P responses, matching erigon-pulse behavior.
-const P2P_MSG_PACKET_LIMIT: usize = 100 * 1024;
+/// Per-packet size limit for chunked P2P responses. Erigon's `MaxMessageSize`
+/// (`msgboard/protocol.go:26`), which it enforces on inbound payloads too:
+/// `len(req.Data) > MaxMessageSize` disconnects the sender
+/// (`msgboard/fetch.go:196-198`).
+pub(crate) const P2P_MSG_PACKET_LIMIT: usize = 100 * 1024;
 
 /// `MsgID`s that fit in one `P2P_MSG_PACKET_LIMIT` frame: `102_400 / 121` = 846.
 ///
@@ -53,6 +70,12 @@ const P2P_MSG_PACKET_LIMIT: usize = 100 * 1024;
 /// `GetBoardMessages`. They must stay the same value — the cap is safe against
 /// conforming peers precisely because no conforming peer can announce, and so
 /// none can request, more than one frame's worth at a time.
+///
+/// `BOARD_MESSAGE_IDS` did not change at `pulse-v3.4.4`, so the announce half
+/// holds under either behaviour set. The request half applies only to the
+/// older one; from `pulse-v3.4.4` a request is bounded by
+/// [`MAX_GET_BOARD_MESSAGES`] instead, and exceeding it is a kick rather than
+/// a truncation.
 const MAX_IDS_PER_FRAME: usize = P2P_MSG_PACKET_LIMIT / MSG_ID_SIZE;
 
 /// Bytes a frame carries on top of the payload the packers measure: the opcode
@@ -70,7 +93,7 @@ const FRAME_OVERHEAD_ALLOWANCE: usize = 8;
 /// `rlp.ListSize(content+enc)` — the encoded list — and the same release began
 /// disconnecting peers whose inbound frame exceeds it.
 ///
-/// Our packer now bounds the same quantity, so the frames we emit fit 102_400
+/// Our packer now bounds the same quantity, so the frames we emit fit `102_400`
 /// and this allowance is never needed for our own traffic. It stays because the
 /// opcode byte still rides outside the list on the wire, and refusing a frame
 /// that is legal by one plausible reading of the spec costs more than accepting
@@ -92,14 +115,10 @@ pub(crate) const MAX_INBOUND_FRAME_SIZE: usize = P2P_MSG_PACKET_LIMIT + FRAME_OV
 /// hold for any message an operator's limit admits, not just a typical one.
 const MSG_FIXED_FIELDS_RLP_LEN: usize = 1 + 33 + 9 + 9 + 9 + 33;
 
-/// Bytes on the wire for a `BoardMessages` frame carrying exactly one message
-/// whose `data` field is `data_len` long: the opcode, the outer list header,
-/// the message's own list header, and the payload.
-///
-/// One message per frame is the case that matters. The packer flushes only
-/// once the *next* message would cross [`P2P_MSG_PACKET_LIMIT`], so a message
-/// larger than that target is never packed with anything else — it gets a
-/// frame to itself, and that frame is as large as the message.
+/// Bytes an RLP string takes for a 32-byte hash: the byte count plus a
+/// one-byte header.
+const MSG_HASH_RLP_LEN: usize = MSG_HASH_SIZE + 1;
+
 /// Encoded length of an RLP list whose payload is `payload_len` bytes — the
 /// payload plus its own header.
 ///
@@ -114,36 +133,70 @@ const fn encoded_list_len(payload_len: usize) -> usize {
     length_of_length(payload_len) + payload_len
 }
 
-const fn lone_message_frame_len(data_len: usize) -> usize {
+/// Bytes a `BoardMessages` payload takes when it carries exactly one message
+/// whose `data` field is `data_len` long, opcode excluded.
+///
+/// The packed unit is a [`WirePoWMsg`](reth_msgboard_types::WirePoWMsg): the
+/// message's own list, the claimed hash beside it, the element list that pairs
+/// the two, and the outer list header. That is 37 bytes more than the bare
+/// `PoWMsg` this modelled before — 33 for the hash and four for the second
+/// header at this size.
+///
+/// One message per payload is the case that matters. The packer flushes only
+/// once the *next* message would cross [`P2P_MSG_PACKET_LIMIT`], so a message
+/// larger than that target is never packed with anything else — it gets a
+/// packet to itself, and that packet is as large as the message.
+///
+/// Mirrors erigon's `encodedWireMsgPacketSize`
+/// (`msgboard/pow_message.go:128-157`), which takes every integer at its widest
+/// for the same reason [`MSG_FIXED_FIELDS_RLP_LEN`] does.
+const fn encoded_wire_msg_packet_len(data_len: usize) -> usize {
     let data_rlp = length_of_length(data_len) + data_len;
     let msg_payload = MSG_FIXED_FIELDS_RLP_LEN + data_rlp;
-    let msg_rlp = length_of_length(msg_payload) + msg_payload;
-    1 + length_of_length(msg_rlp) + msg_rlp
+    let element_payload = encoded_list_len(msg_payload) + MSG_HASH_RLP_LEN;
+    encoded_list_len(encoded_list_len(element_payload))
 }
 
-/// Largest `--msgboard.size-limit` that cannot make us emit a frame our own
-/// inbound bound rejects.
+/// Largest `--msgboard.size-limit` that cannot make us emit a `BoardMessages`
+/// packet a conforming peer refuses.
 ///
 /// `size_limit` bounds the `data` field of every message we accept, and any
 /// message we accept we may later have to serve. Raise it past this figure and
-/// one `GetBoardMessages` for a single large message produces a frame over
-/// [`MAX_INBOUND_FRAME_SIZE`], which every reth peer drops undecoded while
-/// reporting us for a protocol violation — `BadProtocol` weighs `i32::MIN`, so
-/// that is a 12-hour ban from each of them. Erigon-pulse would neither request
-/// the message (`FilterMessageIDs` skips `id.Size() > cfg.MsgSizeLimit`,
-/// `msgboard/board.go:233`) nor object to the frame (its own inbound cap is
-/// `ProtocolMaxMsgSize` = 10 MiB), so the split is reth-against-reth and
-/// entirely self-inflicted. `msgboard.size-limit` is guarded at parse time in
-/// [`MsgboardArgs`](crate::MsgboardArgs) so it cannot be reached.
+/// one `GetBoardMessages` for a single large message produces a packet over
+/// [`P2P_MSG_PACKET_LIMIT`]. Every reth peer drops it undecoded and reports us
+/// for a protocol violation, and erigon-pulse disconnects us outright
+/// (`len(req.Data) > MaxMessageSize`, `msgboard/fetch.go:196-198`).
+/// `BadProtocol` weighs `i32::MIN`, so on the reth side that is a 12-hour ban
+/// from each peer we serve. `msgboard.size-limit` is guarded at parse time in
+/// [`MsgboardArgs`](crate::MsgboardArgs) so the figure cannot be reached.
+///
+/// Two earlier scopings were wrong, so the scoping matters more than the value:
+///
+///  - The packed unit was taken to be a bare `PoWMsg`. It is a
+///    [`WirePoWMsg`](reth_msgboard_types::WirePoWMsg), 37 bytes wider — see
+///    [`encoded_wire_msg_packet_len`].
+///  - The bound was taken against [`MAX_INBOUND_FRAME_SIZE`], which is our own inbound reading:
+///    eight bytes looser than the packet limit, and counting the opcode byte that rides outside the
+///    list. An earlier revision reasoned that the split was therefore reth-against-reth, because
+///    erigon's inbound cap was `ProtocolMaxMsgSize` = 10 MiB. That was true of `v3.0.0-RC8` and
+///    false from `pulse-v3.4.4` on, which is a disconnect from every upgraded peer.
+///
+/// Erigon derives its own ceiling exactly this way and applies it whatever the
+/// node's wire format: `validateMsgSizeLimit` refuses a `MsgSizeLimit` whose
+/// `encodedWireMsgPacketSize` exceeds `MaxMessageSize`
+/// (`msgboard/util.go:17-23`). Reth follows, so this guard does not move when
+/// `--msgboard.pulse-v344` does. A limit safe under one behaviour set is safe
+/// under both, and an operator does not have to re-check a flag file on the
+/// flag day.
 ///
 /// Solved rather than written down: the RLP header widths depend on the very
-/// length being solved for, and the answer moves the moment either
-/// [`P2P_MSG_PACKET_LIMIT`] or [`FRAME_OVERHEAD_ALLOWANCE`] does.
-/// `the_size_limit_ceiling_is_the_largest_body_that_fits_one_frame` checks the
+/// length being solved for, and the answer moves the moment
+/// [`P2P_MSG_PACKET_LIMIT`] does.
+/// `the_size_limit_ceiling_is_the_largest_body_that_fits_one_packet` checks the
 /// arithmetic against a real encoded message.
 pub(crate) const MAX_SAFE_SIZE_LIMIT: usize = {
-    let mut data_len = MAX_INBOUND_FRAME_SIZE;
-    while lone_message_frame_len(data_len) > MAX_INBOUND_FRAME_SIZE {
+    let mut data_len = P2P_MSG_PACKET_LIMIT;
+    while encoded_wire_msg_packet_len(data_len) > P2P_MSG_PACKET_LIMIT {
         data_len -= 1;
     }
     data_len
@@ -194,6 +247,19 @@ const MAX_QUEUED_OUTGOING_FRAMES: usize = 8;
 /// disconnects the whole session including eth; §15.5 records why we don't.
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often a connection re-checks whether the board became ready.
+///
+/// Readiness is checked at the top of the loop body, so before this tick
+/// existed the only thing that re-ran the check was the peer sending us a
+/// frame. Nothing else could: while the board is not ready the broadcast
+/// channel is silent by construction, because `add_remote_msgs` and
+/// `add_local_msg` both refuse. A board restored from disk on a quiet network
+/// therefore held a full inventory and announced none of it.
+///
+/// 5 s is erigon's `SyncNewPeersEvery` (`msgboard/msgboardcfg/config.go`), the
+/// ticker its `MainLoop` uses to re-run `syncNewPeers` for exactly this reason.
+const READY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Msgboard capability: `msg/1`.
 pub const MSG_CAPABILITY: Capability =
     Capability::new_static(PROTOCOL_NAME, PROTOCOL_VERSION as usize);
@@ -214,7 +280,7 @@ pub const MSG_PROTOCOL: Protocol = Protocol::new(MSG_CAPABILITY, PROTOCOL_LENGTH
 /// validation-rejected cases respectively.
 pub trait PeerReporter: std::fmt::Debug + Send + Sync {
     /// Peer delivered a payload whose individual messages failed validation
-    /// (bad PoW, missing fields, oversized data, …).
+    /// (bad `PoW`, missing fields, oversized data, …).
     fn report_bad_message(&self, peer_id: PeerId);
 
     /// Peer delivered a wire-level malformed payload (unparseable RLP,
@@ -472,35 +538,49 @@ enum Sent {
 /// Drives a single msgboard peer connection.
 ///
 /// Once the board reports `is_ready()`, announces current message IDs and then
-/// loops over incoming frames and broadcast notifications until the connection
-/// closes. While the board is not ready, the handler stays subscribed to the
-/// broadcast channel (so it doesn't accumulate `Lagged` errors) but does not
-/// announce, request, or serve anything — mirroring erigon-pulse's
-/// `handleInboundMessage` early-exit on `!Started()` and the
+/// loops over incoming frames, broadcast notifications and a readiness tick
+/// until the connection closes. While the board is not ready, the handler
+/// stays subscribed to the broadcast channel (so it doesn't accumulate `Lagged`
+/// errors) but does not announce, request, or serve anything — mirroring
+/// erigon-pulse's `handleInboundMessage` early-exit on `!Started()` and the
 /// `MainLoop`-only `syncNewPeers` schedule.
-async fn run_connection(
+///
+/// Generic over the frame stream so tests can drive the loop. Production passes
+/// [`ProtocolConnection`], which cannot be built outside `reth-eth-wire`.
+async fn run_connection<S>(
     board: Arc<MsgBoard>,
     reporter: Option<Arc<dyn PeerReporter>>,
     peer_id: PeerId,
-    mut conn: ProtocolConnection,
+    mut conn: S,
     tx: OutboundQueue,
-) {
+) where
+    S: futures::Stream<Item = BytesMut> + Unpin,
+{
     let metrics = board.metrics();
     // Held for the life of the session so the gauge falls on every exit path,
     // not just the one that returns normally.
     let _session = SessionGuard::new(metrics.clone());
     let mut new_msg_rx: broadcast::Receiver<_> = board.subscribe();
     let gossip_disabled = board.config().gossip_disabled;
+    // What this peer is allowed to deliver. Per connection, so erigon's
+    // `(peer, hash)` key is the instance plus the hash — see [`WantList`].
+    let mut wants = WantList::default();
+
+    // Re-checks readiness while the peer is silent. Disabled once the announce
+    // has fired, so a settled connection does not wake for nothing.
+    let mut ready_poll = tokio::time::interval(READY_POLL_INTERVAL);
+    ready_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     // Track whether we've already done the on-connect bulk announce so the
     // first ready→announce transition fires exactly once per connection.
-    let mut announced = false;
-    if !gossip_disabled && board.is_ready() {
+    let mut announced = if !gossip_disabled && board.is_ready() {
         if send_board_message_ids(&board, &tx, peer_id).await == Sent::Closed {
             return;
         }
-        announced = true;
-    }
+        true
+    } else {
+        false
+    };
 
     loop {
         // If we became ready after connect (i.e. the node finished initial
@@ -513,9 +593,14 @@ async fn run_connection(
             announced = true;
         }
 
+        // Deliberately unbiased. `biased` polls the peer first every time, and
+        // the multiplexer's inbound queue to a satellite protocol is unbounded
+        // and filled from the socket at line rate — so a peer that floods keeps
+        // a frame ready at every poll and the announcement branch is never
+        // reached. That peer then receives no gossip for as long as it floods,
+        // and the board can pass `BROADCAST_CAPACITY` behind it, which costs a
+        // full re-announce on the `Lagged` path.
         tokio::select! {
-            biased;
-
             // Incoming frame from the remote peer.
             maybe_raw = conn.next() => {
                 let Some(raw) = maybe_raw else {
@@ -523,7 +608,7 @@ async fn run_connection(
                     break;
                 };
                 let sent = handle_incoming(
-                    &board, reporter_as_deref(reporter.as_ref()), &tx, raw, peer_id,
+                    &board, reporter_as_deref(reporter.as_ref()), &tx, &mut wants, raw, peer_id,
                 ).await;
                 if sent == Sent::Closed {
                     break;
@@ -567,6 +652,10 @@ async fn run_connection(
                     }
                 }
             }
+
+            // Wakes the loop so the readiness check at the top runs again while
+            // the peer is silent and the board has nothing to broadcast.
+            _ = ready_poll.tick(), if !announced && !gossip_disabled => {}
         }
     }
 }
@@ -591,6 +680,11 @@ fn reporter_as_deref(opt: Option<&Arc<dyn PeerReporter>>) -> Option<&dyn PeerRep
 /// continue to be drained off the wire so peers don't stall, but their
 /// contents are dropped.
 ///
+/// A `BoardMessages` frame is verified only as far as `wants` authorises. The
+/// authorisation is spent per message, not per frame, and a message that
+/// arrives with none left is dropped before its `PoW` is checked — see
+/// [`WantList`].
+///
 /// Returns [`Sent::Closed`] once the outbound queue has lost its receiver, so
 /// the caller can stop driving a connection the multiplexer has torn down. Any
 /// frame this emits may be dropped under sustained backpressure — see
@@ -599,6 +693,7 @@ async fn handle_incoming(
     board: &Arc<MsgBoard>,
     reporter: Option<&dyn PeerReporter>,
     tx: &OutboundQueue,
+    wants: &mut WantList,
     mut raw: BytesMut,
     peer_id: PeerId,
 ) -> Sent {
@@ -636,6 +731,8 @@ async fn handle_incoming(
     let payload = raw.split_off(1);
 
     let gossip_disabled = board.config().gossip_disabled;
+    // Which erigon behaviour set this node speaks. Read once, so the three
+    // opcode arms below cannot disagree about it mid-frame.
     let ready = board.is_ready();
     let metrics = board.metrics();
     let deadline = frame_deadline();
@@ -662,6 +759,30 @@ async fn handle_incoming(
             if wanted.is_empty() {
                 return Sent::Ok;
             }
+            // Reserve before requesting. A message this peer is not authorised
+            // to deliver is dropped unverified when it arrives, so asking for it
+            // spends a round trip on nothing. `filter_wanted` has already
+            // claimed every ID it returned, so anything the want list refuses
+            // goes straight back — otherwise the peers still announcing it stay
+            // suppressed for the full claim TTL and nobody fetches it.
+            let now = Instant::now();
+            wants.prune(now);
+            let mut reserved = Vec::with_capacity(wanted.len());
+            let mut refused = Vec::new();
+            for id in wanted {
+                if wants.reserve(id.message_hash(), now) {
+                    reserved.push(id);
+                } else {
+                    refused.push(id);
+                }
+            }
+            if !refused.is_empty() {
+                metrics.wants_refused.increment(refused.len() as u64);
+                board.release_pending(&refused);
+            }
+            if reserved.is_empty() {
+                return Sent::Ok;
+            }
             // Chunked at `MAX_IDS_PER_FRAME`, unlike erigon-pulse, whose
             // `MessageId_BOARD_MESSAGE_IDS` arm sends `FlattenMsgIDs(mIDs)` in
             // one `SendMessageById` with no size bound. §13.2 accepted that
@@ -675,26 +796,47 @@ async fn handle_incoming(
             // the last outbound frame whose size the peer controls — see
             // `docs/msgboard-parity-gaps.md` §15.3.
             //
-            // `MAX_INBOUND_FRAME_SIZE` now caps an announcement at
-            // `MAX_IDS_PER_FRAME` IDs, so `wanted` never spans two chunks and
-            // this loop runs once. It stays as the inner guard: the bound and
-            // the chunk size are separate constants, and only this keeps them
-            // from drifting apart silently.
-            for (i, chunk) in wanted.chunks(MAX_IDS_PER_FRAME).enumerate() {
-                let mut buf = BytesMut::with_capacity(1 + chunk.len() * MSG_ID_SIZE);
+            // The request unit and its chunk size move together with the
+            // behaviour set, and so does how often this loop runs.
+            //
+            // Before `pulse-v3.4.4` a request carries 121-byte `MsgID`s and
+            // `MAX_INBOUND_FRAME_SIZE` caps an announcement at
+            // `MAX_IDS_PER_FRAME` of them, so `wanted` never spans two chunks
+            // and the loop runs once. It stays as the inner guard there: the
+            // bound and the chunk size are separate constants, and only this
+            // keeps them from drifting apart silently.
+            //
+            // From `pulse-v3.4.4` the request carries 32-byte hashes and a peer
+            // kicks a request naming more than `MAX_GET_BOARD_MESSAGES` = 256
+            // of them (`msgboard/fetch.go:248-250`). One legal 846-ID
+            // announcement therefore produces up to four request frames, and
+            // building a single frame from it would earn a ban from the peer
+            // that sent the announcement. Erigon chunks at the same figure
+            // (`RunWithHashChunks`, `msgboard/fetch.go:223`).
+            for (i, chunk) in reserved.chunks(MAX_GET_BOARD_MESSAGES).enumerate() {
+                let request = encode_hash_request(chunk);
+                let mut buf = BytesMut::with_capacity(1 + request.len());
                 buf.put_u8(GET_BOARD_MESSAGES);
-                buf.put_slice(&MsgID::encode_list(chunk));
+                buf.put_slice(&request);
                 metrics.requests_sent.increment(1);
                 match tx.send(&metrics, peer_id, deadline, buf).await {
                     Sent::Ok => {}
-                    // `filter_wanted` claimed every ID in `wanted`. A frame that
-                    // never reached the peer must give its claims back, or the
-                    // peers still announcing those messages stay suppressed for
-                    // the full claim TTL and we fetch nothing. On `Closed` that
-                    // also covers the chunks this loop will now never send.
-                    Sent::Dropped => board.release_pending(chunk),
+                    // `filter_wanted` claimed every ID in `reserved` and the
+                    // want list authorised every one. A frame that never reached
+                    // the peer must give both back: the claim, or the peers
+                    // still announcing those messages stay suppressed for the
+                    // full claim TTL and we fetch nothing; the reservation, or
+                    // this peer keeps an authorisation it can spend on something
+                    // we never asked it for. On `Closed` that also covers the
+                    // chunks this loop will now never send.
+                    Sent::Dropped => {
+                        board.release_pending(chunk);
+                        wants.release(chunk.iter().map(MsgID::message_hash));
+                    }
                     Sent::Closed => {
-                        board.release_pending(&wanted[i * MAX_IDS_PER_FRAME..]);
+                        let unsent = &reserved[i * MAX_GET_BOARD_MESSAGES..];
+                        board.release_pending(unsent);
+                        wants.release(unsent.iter().map(MsgID::message_hash));
                         return Sent::Closed;
                     }
                 }
@@ -703,9 +845,10 @@ async fn handle_incoming(
 
         GET_BOARD_MESSAGES => {
             metrics.requests_received.increment(1);
-            // Peer wants the full messages for these IDs.
-            let ids = match MsgID::decode_list(&payload) {
-                Ok(ids) => ids,
+            // The request names work hashes, and both of its bounds are
+            // kicks rather than truncations — see [`decode_hash_request`].
+            let hashes = match decode_hash_request(&payload) {
+                Ok(hashes) => hashes,
                 Err(err) => {
                     tracing::debug!(target: "msgboard", ?peer_id, %err, "malformed GetBoardMessages");
                     metrics.bad_protocol.increment(1);
@@ -718,91 +861,26 @@ async fn handle_incoming(
             if !ready {
                 return Sent::Ok;
             }
-
-            // Deduplicate and cap before serving — see
-            // `docs/msgboard-parity-gaps.md` §14.3.
-            //
-            // Erigon maps each requested ID to a message independently, with no
-            // cap and no dedup, so one ID repeated N times is served N times and
-            // an attacker needs to know only a single message on the board.
-            // Reth bounds both: at most one frame's worth of *distinct* IDs is
-            // honoured per request.
-            //
-            // Invisible to a conforming peer. Requests are built from a single
-            // inbound announcement, both clients announce in `MAX_IDS_PER_FRAME`
-            // chunks, and `filter_wanted` returns a subset — so no honest peer
-            // reaches either limit. A peer that does is either malfunctioning or
-            // probing, and gets a truncated response rather than a penalty,
-            // since neither client documents a bound it could have respected.
-            //
-            // The spec now documents one, and `MAX_INBOUND_FRAME_SIZE` enforces
-            // it before this arm runs: a request naming more than
-            // `MAX_IDS_PER_FRAME` distinct IDs is a frame over the packet
-            // limit, so the cap below is no longer reachable from the wire and
-            // the dedup is what still fires. Both stay — see §18.
-            let mut seen = HashSet::with_capacity(ids.len().min(MAX_IDS_PER_FRAME));
-            let mut requested = Vec::with_capacity(ids.len().min(MAX_IDS_PER_FRAME));
-            for id in &ids {
-                if requested.len() == MAX_IDS_PER_FRAME {
-                    break;
-                }
-                if seen.insert(*id) {
-                    requested.push(*id);
-                }
-            }
-            if requested.len() < ids.len() {
-                metrics.requests_truncated.increment(1);
-                tracing::debug!(
-                    target: "msgboard",
-                    ?peer_id,
-                    announced = ids.len(),
-                    served = requested.len(),
-                    "GetBoardMessages truncated to distinct IDs within one frame",
-                );
-            }
-
-            let msgs = board.get_messages_for_ids(&requested);
+            let msgs = board.get_wire_messages_for_hashes(&hashes);
             if msgs.is_empty() {
                 return Sent::Ok;
             }
             metrics.bodies_served.increment(msgs.len() as u64);
-            // Chunk messages into ~100KB packets to match erigon-pulse behavior.
-            let mut chunk = Vec::new();
-            let mut chunk_size = 0usize;
-            for msg in &msgs {
-                let msg_size = msg.length();
-                if !chunk.is_empty() &&
-                    encoded_list_len(chunk_size + msg_size) > P2P_MSG_PACKET_LIMIT
-                {
-                    let encoded_chunk = encode_pow_msg_list(&chunk);
-                    let mut buf = BytesMut::with_capacity(1 + encoded_chunk.len());
-                    buf.put_u8(BOARD_MESSAGES);
-                    buf.put_slice(&encoded_chunk);
-                    match tx.send(&metrics, peer_id, deadline, buf).await {
-                        Sent::Closed => return Sent::Closed,
-                        Sent::Ok | Sent::Dropped => {}
-                    }
-                    chunk.clear();
-                    chunk_size = 0;
-                }
-                chunk.push(msg.clone());
-                chunk_size += msg_size;
-            }
-            if !chunk.is_empty() {
-                let encoded_chunk = encode_pow_msg_list(&chunk);
-                let mut buf = BytesMut::with_capacity(1 + encoded_chunk.len());
-                buf.put_u8(BOARD_MESSAGES);
-                buf.put_slice(&encoded_chunk);
-                match tx.send(&metrics, peer_id, deadline, buf).await {
-                    Sent::Closed => return Sent::Closed,
-                    Sent::Ok | Sent::Dropped => {}
-                }
-            }
+            return send_packed_bodies(
+                &metrics,
+                tx,
+                peer_id,
+                deadline,
+                &msgs,
+                encode_wire_pow_msg_list,
+            )
+            .await;
         }
 
         BOARD_MESSAGES => {
-            // Peer delivered the messages we requested.
-            let msgs = match decode_pow_msg_list(&payload) {
+            // Peer delivered the messages we requested, each naming the
+            // hash it claims for itself.
+            let msgs = match decode_wire_pow_msg_list(&payload) {
                 Ok(msgs) => msgs,
                 Err(err) => {
                     tracing::debug!(target: "msgboard", ?peer_id, %err, "malformed BoardMessages");
@@ -813,28 +891,42 @@ async fn handle_incoming(
                     return Sent::Ok;
                 }
             };
-            // `add_remote_msgs` itself early-exits when `gossip_disabled` or
-            // `!is_ready`; the explicit check here keeps the kickable count
-            // honest (an observer node must not penalise peers).
+            // Before any reservation is spent, as erigon checks it
+            // (`msgboard/fetch.go:294-298`). A frame naming one hash twice
+            // would otherwise let a peer answer one request with two copies
+            // of the same body.
+            let claimed: Vec<B256> = msgs.iter().map(|m| m.hash).collect();
+            if let Err(err) = check_unique_hashes(&claimed) {
+                tracing::debug!(target: "msgboard", ?peer_id, %err, "duplicate claimed hashes");
+                metrics.bad_protocol.increment(1);
+                if let Some(r) = reporter {
+                    r.report_bad_protocol(peer_id);
+                }
+                return Sent::Ok;
+            }
             if !ready || gossip_disabled {
                 return Sent::Ok;
             }
             metrics.bodies_received.increment(msgs.len() as u64);
-            let (added, kickable) = board.add_remote_msgs(msgs);
-            if added > 0 {
-                tracing::debug!(target: "msgboard", ?peer_id, added, "accepted msgboard messages");
-            }
-            if kickable > 0 {
-                tracing::debug!(target: "msgboard", ?peer_id, kickable, "rejected non-circumstantial messages");
-                metrics.bad_message.increment(kickable as u64);
-                if let Some(r) = reporter {
-                    // One reputation hit per malformed/invalid message in the
-                    // batch — matches erigon's `PenalizePeer` per-call cost.
-                    for _ in 0..kickable {
-                        r.report_bad_message(peer_id);
-                    }
+            let delivered = msgs.len();
+            let now = Instant::now();
+            let mut authorised = Vec::with_capacity(delivered.min(MAX_WANT_PER_PEER));
+            for msg in msgs {
+                // Spent by hash, so an unsolicited message in the middle of
+                // a frame does not consume the reservation standing behind
+                // it. Erigon skips rather than stops here for the same
+                // reason (`msgboard/fetch.go:305-309`).
+                if wants.take(msg.hash, now) {
+                    authorised.push(msg);
                 }
             }
+            report_unsolicited(&metrics, peer_id, delivered, authorised.len());
+            if authorised.is_empty() {
+                return Sent::Ok;
+            }
+            let (added, kickable) = board.add_remote_wire_msgs(authorised);
+            report_ingest(reporter, &metrics, peer_id, added, kickable);
+            return Sent::Ok;
         }
 
         other => {
@@ -881,6 +973,141 @@ async fn send_board_message_ids(
     Sent::Ok
 }
 
+/// Builds one `GetBoardMessages` frame's payload from the IDs it asks for.
+/// Encode a `GetBoardMessages` request as the 32-byte work hashes the
+/// `pulse-v3.4.4` behaviour set expects (`FlattenMsgHashes`,
+/// `msgboard/hashes.go`).
+///
+/// The hash is all a responder ever reads out of a request. Erigon's older
+/// handler took 121-byte `MsgID` records and called `mID.MessageHash()`,
+/// discarding the rest of every one.
+fn encode_hash_request(ids: &[MsgID]) -> Vec<u8> {
+    let hashes: Vec<B256> = ids.iter().map(MsgID::message_hash).collect();
+    encode_msg_hash_list(&hashes)
+}
+
+/// Parse a `pulse-v3.4.4` `GetBoardMessages` payload, enforcing both bounds
+/// erigon kicks for before anything is looked up
+/// (`msgboard/fetch.go:243-253`).
+///
+/// All three failures are kicks rather than truncations, unlike the older
+/// arm's cap: the spec names the limit, so a peer that exceeds it had a bound
+/// it could have respected.
+fn decode_hash_request(payload: &[u8]) -> Result<Vec<B256>, MsgboardError> {
+    let hashes = decode_msg_hash_list(payload)?;
+    if hashes.len() > MAX_GET_BOARD_MESSAGES {
+        return Err(MsgboardError::GetTooManyHashes);
+    }
+    check_unique_hashes(&hashes)?;
+    Ok(hashes)
+}
+
+/// Pack bodies into `BoardMessages` frames of at most one packet each.
+///
+/// Mirrors erigon's `MaxSizeMsgChunks` (`msgboard/send.go:53-79`): flush once
+/// the *next* element would push the encoded list past
+/// [`P2P_MSG_PACKET_LIMIT`], so the bound is on the encoded list and never on
+/// its payload alone.
+///
+/// Generic over the element because the element is the thing the behaviour set
+/// changes — a bare `PoWMsg` before `pulse-v3.4.4`, a
+/// [`WirePoWMsg`](reth_msgboard_types::WirePoWMsg) after. The packing rule is
+/// the same either way, and one copy of it is what keeps the two paths from
+/// drifting.
+async fn send_packed_bodies<T: Encodable + Clone>(
+    metrics: &MsgboardMetrics,
+    tx: &OutboundQueue,
+    peer_id: PeerId,
+    deadline: tokio::time::Instant,
+    msgs: &[T],
+    encode: fn(&[T]) -> Vec<u8>,
+) -> Sent {
+    let mut chunk: Vec<T> = Vec::new();
+    let mut chunk_size = 0usize;
+    for msg in msgs {
+        let msg_size = msg.length();
+        if !chunk.is_empty() && encoded_list_len(chunk_size + msg_size) > P2P_MSG_PACKET_LIMIT {
+            if send_bodies_frame(metrics, tx, peer_id, deadline, &chunk, encode).await ==
+                Sent::Closed
+            {
+                return Sent::Closed;
+            }
+            chunk.clear();
+            chunk_size = 0;
+        }
+        chunk.push(msg.clone());
+        chunk_size += msg_size;
+    }
+    if !chunk.is_empty() &&
+        send_bodies_frame(metrics, tx, peer_id, deadline, &chunk, encode).await == Sent::Closed
+    {
+        return Sent::Closed;
+    }
+    Sent::Ok
+}
+
+/// Emit one packed chunk as a `BoardMessages` frame.
+async fn send_bodies_frame<T>(
+    metrics: &MsgboardMetrics,
+    tx: &OutboundQueue,
+    peer_id: PeerId,
+    deadline: tokio::time::Instant,
+    chunk: &[T],
+    encode: fn(&[T]) -> Vec<u8>,
+) -> Sent {
+    let encoded = encode(chunk);
+    let mut buf = BytesMut::with_capacity(1 + encoded.len());
+    buf.put_u8(BOARD_MESSAGES);
+    buf.put_slice(&encoded);
+    tx.send(metrics, peer_id, deadline, buf).await
+}
+
+/// Count the delivered messages a peer held no reservation for.
+///
+/// Dropping one earns no penalty, as in erigon: a peer answering a request we
+/// withdrew, or racing another peer's answer, is not misbehaving.
+fn report_unsolicited(
+    metrics: &MsgboardMetrics,
+    peer_id: PeerId,
+    delivered: usize,
+    authorised: usize,
+) {
+    let unsolicited = delivered - authorised;
+    if unsolicited > 0 {
+        metrics.rejected_unsolicited.increment(unsolicited as u64);
+        tracing::debug!(
+            target: "msgboard",
+            ?peer_id,
+            unsolicited,
+            delivered,
+            "dropped msgboard messages this peer was not asked for",
+        );
+    }
+}
+
+/// Log what a delivery added and penalise the peer once per kickable message,
+/// matching erigon's per-call `PenalizePeer` cost.
+fn report_ingest(
+    reporter: Option<&dyn PeerReporter>,
+    metrics: &MsgboardMetrics,
+    peer_id: PeerId,
+    added: usize,
+    kickable: usize,
+) {
+    if added > 0 {
+        tracing::debug!(target: "msgboard", ?peer_id, added, "accepted msgboard messages");
+    }
+    if kickable > 0 {
+        tracing::debug!(target: "msgboard", ?peer_id, kickable, "rejected non-circumstantial messages");
+        metrics.bad_message.increment(kickable as u64);
+        if let Some(r) = reporter {
+            for _ in 0..kickable {
+                r.report_bad_message(peer_id);
+            }
+        }
+    }
+}
+
 /// Adapter: implement [`PeerReporter`] over any type that exposes the reth
 /// `Peers` API. Lives outside `bin/reth` so it can be unit-tested.
 ///
@@ -925,7 +1152,9 @@ mod tests {
     use alloy_primitives::{Bytes, B256};
     use futures::poll;
     use reth_msgboard_types::{
-        encode_pow_msg_list, CheckedPoWMsg, MsgboardConfig, PoWMsg, VERSION_V1,
+        decode_msg_hash_list, decode_wire_pow_msg_list, encode_msg_hash_list, encode_pow_msg_list,
+        encode_wire_pow_msg_list, CheckedPoWMsg, MsgboardConfig, PoWMsg, WirePoWMsg,
+        MAX_GET_BOARD_MESSAGES, VERSION_V1,
     };
     use tokio::sync::mpsc::Receiver;
 
@@ -980,6 +1209,53 @@ mod tests {
             stale_block_buffer: 3,
             gossip_disabled: false,
         }
+    }
+
+    /// A claimed hash a peer can put on the wire without being able to back it.
+    ///
+    /// Non-zero, because a zero claim is refused before any reservation is
+    /// consulted.
+    fn claim(n: u64) -> B256 {
+        let mut raw = [0u8; 32];
+        raw[..8].copy_from_slice(&n.to_be_bytes());
+        raw[31] = 1;
+        B256::from(raw)
+    }
+
+    /// A `BoardMessages` payload whose elements claim `hashes` without backing
+    /// them, which is what an unmined flood looks like on the wire.
+    fn delivery_claiming(msgs: &[PoWMsg], hashes: &[B256]) -> Vec<u8> {
+        let wire: Vec<WirePoWMsg> =
+            msgs.iter().zip(hashes).map(|(m, h)| WirePoWMsg::new(m.clone(), *h)).collect();
+        encode_wire_pow_msg_list(&wire)
+    }
+
+    /// A want list authorising exactly the messages in `msgs`.
+    ///
+    /// Reservations are spent by claimed hash, so a want list must hold the
+    /// real work hashes — a synthetic one authorises nothing.
+    fn authorised_for_msgs(msgs: &[PoWMsg]) -> WantList {
+        let hashes: Vec<B256> =
+            msgs.iter().map(|m| m.clone().verify().expect("a mined message")).collect();
+        authorised_for_hashes(&hashes)
+    }
+
+    /// A `BoardMessages` payload carrying `msgs`, each paired with the work
+    /// hash its receiver will recompute.
+    fn delivery(msgs: &[PoWMsg]) -> Vec<u8> {
+        let wire: Vec<WirePoWMsg> = msgs
+            .iter()
+            .map(|m| WirePoWMsg::new(m.clone(), m.clone().verify().expect("a mined message")))
+            .collect();
+        encode_wire_pow_msg_list(&wire)
+    }
+
+    /// A `GetBoardMessages` request naming the same messages as `ids`.
+    ///
+    /// The request unit is the 32-byte work hash; `MsgID` remains the unit of
+    /// the `BoardMessageIDs` announce that precedes it.
+    fn get_request(ids: &[MsgID]) -> Vec<u8> {
+        encode_msg_hash_list(&ids.iter().map(MsgID::message_hash).collect::<Vec<_>>())
     }
 
     fn pow_msg(nonce: u64, data: &[u8]) -> PoWMsg {
@@ -1040,43 +1316,6 @@ mod tests {
         out
     }
 
-    /// Regression test for the reflection amplification closed in §14.3.
-    ///
-    /// Erigon maps each requested ID to a message independently, so one ID
-    /// repeated N times is served N times — an attacker needed to know only a
-    /// single message on the board. Measured before the fix: a 60,501 B request
-    /// of 500 repeats drew 4,135,710 B of response, 68x amplification.
-    #[tokio::test]
-    async fn get_board_messages_deduplicates_repeated_ids() {
-        let board = board_at(10);
-        // A message at the default 8 KiB `size_limit`, so the served bytes
-        // reflect what an attacker would actually target.
-        let big = vec![0x9u8; 8 * 1024];
-        let id = board.add_local_msg(mined(&big, 10)).unwrap().msg_id();
-
-        const REPEATS: usize = 500;
-        let payload: Vec<u8> =
-            std::iter::repeat_n(id, REPEATS).flat_map(|i| i.as_bytes().to_vec()).collect();
-        let request_bytes = 1 + payload.len();
-
-        let (tx, mut rx) = channel();
-        handle_incoming(&board, None, &tx, frame(GET_BOARD_MESSAGES, &payload), peer()).await;
-
-        let frames = drain(&mut rx);
-        let response_bytes: usize = frames.iter().map(|f| f.len()).sum();
-        let served: usize = frames
-            .iter()
-            .map(|f| decode_pow_msg_list(&f[1..]).expect("valid response").len())
-            .sum();
-
-        assert_eq!(served, 1, "the message is served once, not once per duplicate");
-        assert!(
-            response_bytes < request_bytes,
-            "a duplicate flood must no longer amplify: response {response_bytes} B \
-             vs request {request_bytes} B",
-        );
-    }
-
     /// A request for more than one frame's worth of distinct IDs is rejected,
     /// not truncated.
     ///
@@ -1106,7 +1345,8 @@ mod tests {
         assert!(raw.len() > MAX_INBOUND_FRAME_SIZE, "the request must be over the packet limit");
 
         let (tx, mut rx) = channel();
-        handle_incoming(&board, Some(rep.as_ref()), &tx, raw, peer()).await;
+        handle_incoming(&board, Some(rep.as_ref()), &tx, &mut WantList::default(), raw, peer())
+            .await;
 
         assert!(drain(&mut rx).is_empty(), "nothing may be served from an oversized request");
         assert_eq!(rep.bad_protocol(), 1, "the spec disconnects the sender");
@@ -1121,13 +1361,21 @@ mod tests {
         let ids: Vec<MsgID> =
             (0..5u8).map(|i| board.add_local_msg(mined(&[i], 10)).unwrap().msg_id()).collect();
 
-        let payload: Vec<u8> = ids.iter().flat_map(|i| i.as_bytes().to_vec()).collect();
+        let payload = get_request(&ids);
         let (tx, mut rx) = channel();
-        handle_incoming(&board, None, &tx, frame(GET_BOARD_MESSAGES, &payload), peer()).await;
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &payload),
+            peer(),
+        )
+        .await;
 
         let served: usize = drain(&mut rx)
             .iter()
-            .map(|f| decode_pow_msg_list(&f[1..]).expect("valid response").len())
+            .map(|f| decode_wire_pow_msg_list(&f[1..]).expect("valid response").len())
             .sum();
         assert_eq!(served, 5, "every distinct requested message is returned");
     }
@@ -1189,11 +1437,13 @@ mod tests {
         // Capacity 1 so the second frame has nowhere to go.
         let (tx, mut rx) = mpsc::channel::<BytesMut>(1);
         let tx = OutboundQueue::new(tx);
+        let mut wants = WantList::default();
         let mut serving = Box::pin(handle_incoming(
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            &mut wants,
+            frame(GET_BOARD_MESSAGES, &get_request(&ids)),
             peer(),
         ));
 
@@ -1235,7 +1485,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&ids)),
             peer(),
         )
         .await;
@@ -1261,7 +1512,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&ids)),
             peer(),
         )
         .await;
@@ -1287,7 +1539,7 @@ mod tests {
     async fn a_flooding_peer_cannot_throttle_our_read_loop_frame_by_frame() {
         let board = board_at(10);
         let ids = seed_multi_frame_response(&board);
-        let request = frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids));
+        let request = frame(GET_BOARD_MESSAGES, &get_request(&ids));
 
         let (tx, _rx) = mpsc::channel::<BytesMut>(1);
         let tx = OutboundQueue::new(tx);
@@ -1295,7 +1547,8 @@ mod tests {
 
         const FRAMES: usize = 10;
         for _ in 0..FRAMES {
-            handle_incoming(&board, None, &tx, request.clone(), peer()).await;
+            handle_incoming(&board, None, &tx, &mut WantList::default(), request.clone(), peer())
+                .await;
         }
 
         assert!(
@@ -1317,13 +1570,13 @@ mod tests {
     async fn a_peer_that_resumes_reading_is_waited_on_again() {
         let board = board_at(10);
         let ids = seed_multi_frame_response(&board);
-        let request = frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids));
+        let request = frame(GET_BOARD_MESSAGES, &get_request(&ids));
 
         let (raw_tx, mut rx) = mpsc::channel::<BytesMut>(1);
         let tx = OutboundQueue::new(raw_tx);
 
         // Stall it: the one slot fills and the rest of the response is dropped.
-        handle_incoming(&board, None, &tx, request.clone(), peer()).await;
+        handle_incoming(&board, None, &tx, &mut WantList::default(), request.clone(), peer()).await;
         assert!(
             tx.stalled.load(Ordering::Relaxed),
             "a peer that never read must be marked stalled"
@@ -1334,7 +1587,8 @@ mod tests {
 
         // Serving it again: the first frame is taken, which clears the flag, so
         // the handler must go back to waiting once the queue refills.
-        let mut serving = Box::pin(handle_incoming(&board, None, &tx, request, peer()));
+        let mut wants = WantList::default();
+        let mut serving = Box::pin(handle_incoming(&board, None, &tx, &mut wants, request, peer()));
         assert!(
             poll!(serving.as_mut()).is_pending(),
             "a recovered peer must be waited on again, not dropped for the rest of the connection",
@@ -1355,7 +1609,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&[id])),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&[id])),
             peer(),
         )
         .await;
@@ -1379,7 +1634,15 @@ mod tests {
         let rep = Arc::new(RecordingReporter::default());
         let (tx, mut rx) = channel();
 
-        handle_incoming(&board, Some(rep.as_ref()), &tx, BytesMut::new(), peer()).await;
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut WantList::default(),
+            BytesMut::new(),
+            peer(),
+        )
+        .await;
 
         assert!(drain(&mut rx).is_empty());
         assert_eq!(rep.bad_protocol(), 0, "an empty frame is not a protocol violation");
@@ -1392,7 +1655,15 @@ mod tests {
         let rep = Arc::new(RecordingReporter::default());
         let (tx, mut rx) = channel();
 
-        handle_incoming(&board, Some(rep.as_ref()), &tx, frame(0x7F, &[]), peer()).await;
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut WantList::default(),
+            frame(0x7F, &[]),
+            peer(),
+        )
+        .await;
 
         assert!(drain(&mut rx).is_empty());
         assert_eq!(rep.bad_protocol(), 1);
@@ -1403,10 +1674,35 @@ mod tests {
         let board = board_at(10);
         let (tx, _rx) = channel();
         // Every penalising path, with no reporter wired.
-        handle_incoming(&board, None, &tx, frame(0x7F, &[]), peer()).await;
-        handle_incoming(&board, None, &tx, frame(BOARD_MESSAGE_IDS, &[0u8; 5]), peer()).await;
-        handle_incoming(&board, None, &tx, frame(GET_BOARD_MESSAGES, &[0u8; 5]), peer()).await;
-        handle_incoming(&board, None, &tx, frame(BOARD_MESSAGES, &[0xFF, 0xFF]), peer()).await;
+        handle_incoming(&board, None, &tx, &mut WantList::default(), frame(0x7F, &[]), peer())
+            .await;
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut WantList::default(),
+            frame(BOARD_MESSAGE_IDS, &[0u8; 5]),
+            peer(),
+        )
+        .await;
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &[0u8; 5]),
+            peer(),
+        )
+        .await;
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut WantList::default(),
+            frame(BOARD_MESSAGES, &[0xFF, 0xFF]),
+            peer(),
+        )
+        .await;
     }
 
     // ── inbound frame size ───────────────────────────────────────────────────
@@ -1434,7 +1730,7 @@ mod tests {
     /// The body length is solved for rather than guessed: one data byte moves
     /// the encoded frame by one byte in this range, so the correction lands in
     /// a couple of rounds.
-    fn board_messages_frame_of(target: usize) -> BytesMut {
+    fn board_messages_frame_of(target: usize) -> (BytesMut, PoWMsg) {
         let build = |len: usize| PoWMsg {
             work_divisor: 1_000_000_000,
             data: Bytes::from(vec![0x5A; len]),
@@ -1443,14 +1739,14 @@ mod tests {
         let mut data_len = target - 200;
         for _ in 0..8 {
             let msg = build(data_len);
-            let encoded = encode_pow_msg_list(std::slice::from_ref(&msg));
+            let encoded = delivery(std::slice::from_ref(&msg));
             let frame_len = 1 + encoded.len();
             if frame_len == target {
                 assert!(
-                    msg.to_checked(10, 0).is_ok(),
+                    msg.clone().to_checked(10, 0).is_ok(),
                     "the first nonce must clear a difficulty of 1",
                 );
-                return frame(BOARD_MESSAGES, &encoded);
+                return (frame(BOARD_MESSAGES, &encoded), msg);
             }
             data_len = (data_len as isize + target as isize - frame_len as isize) as usize;
         }
@@ -1521,9 +1817,9 @@ mod tests {
     /// does not fit one packet.
     ///
     /// This is the discriminating case. Until `pulse-v3.4.4` the packer bounded
-    /// the payload, so these three went out as a single 102_404-byte list — four
+    /// the payload, so these three went out as a single `102_404`-byte list — four
     /// bytes past what an upgraded erigon peer accepts before it disconnects and
-    /// penalises. The sibling test below uses 102_396 and is one chunk under
+    /// penalises. The sibling test below uses `102_396` and is one chunk under
     /// either rule, so it cannot catch a regression here.
     #[tokio::test]
     async fn a_payload_of_exactly_one_packet_splits_because_the_list_header_does_not_fit() {
@@ -1549,7 +1845,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&ids)),
             peer(),
         )
         .await;
@@ -1565,9 +1862,15 @@ mod tests {
                 "encoded list of {} B is over the limit every conforming peer enforces",
                 f.len() - 1,
             );
-            served += decode_pow_msg_list(&f[1..]).expect("each chunk decodes").len();
+            served += decode_wire_pow_msg_list(&f[1..]).expect("each chunk decodes").len();
         }
         assert_eq!(served, 3, "splitting must not drop a message");
+    }
+
+    /// The wire length of one `BoardMessages` element: the message, the 32-byte
+    /// claimed hash beside it, and the two-element list header around both.
+    fn wire_elem_len(msg_len: usize) -> usize {
+        encoded_list_len(msg_len + 33)
     }
 
     /// This drives the real packer with real messages. The previous version
@@ -1585,8 +1888,11 @@ mod tests {
         // An earlier revision used the full limit here and asserted the three
         // went in one chunk — which is the behaviour `pulse-v3.4.4` peers
         // disconnect us for, since the encoded list came to 102_404.
-        let lens = [40_000usize, 30_000, 32_396];
-        let payload = lens.iter().sum::<usize>();
+        //
+        // Each wire element wraps the message with its 32-byte claimed hash, so
+        // a body must be smaller than it was to leave the list at one packet.
+        let lens = [40_000usize, 30_000, 32_288];
+        let payload = lens.iter().map(|&l| wire_elem_len(l)).sum::<usize>();
         assert_eq!(encoded_list_len(payload), P2P_MSG_PACKET_LIMIT, "the sum must be worst case");
         let mut ids: Vec<MsgID> = lens
             .iter()
@@ -1601,7 +1907,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&ids)),
             peer(),
         )
         .await;
@@ -1626,7 +1933,7 @@ mod tests {
             sole.len(),
         );
         assert_eq!(
-            decode_pow_msg_list(&sole[1..]).expect("the chunk decodes").len(),
+            decode_wire_pow_msg_list(&sole[1..]).expect("the chunk decodes").len(),
             3,
             "nothing may be dropped to keep the frame small",
         );
@@ -1638,7 +1945,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&ids)),
             peer(),
         )
         .await;
@@ -1652,7 +1960,7 @@ mod tests {
                 "chunk of {} B is over the {MAX_INBOUND_FRAME_SIZE} B inbound bound",
                 f.len(),
             );
-            served += decode_pow_msg_list(&f[1..]).expect("each chunk decodes").len();
+            served += decode_wire_pow_msg_list(&f[1..]).expect("each chunk decodes").len();
         }
         assert_eq!(served, 4, "every requested message is delivered exactly once");
     }
@@ -1663,30 +1971,64 @@ mod tests {
     ///
     /// Both halves matter. Too high and the guard admits a `size_limit` that
     /// gets us banned; too low and it refuses a configuration that is fine.
+    ///
+    /// The packed unit is a `WirePoWMsg`, whatever the node's behaviour set:
+    /// the ceiling has to hold for a node that flips `--msgboard.pulse-v344`
+    /// without re-checking its size limit, and erigon applies its own
+    /// unconditionally too (`validateMsgSizeLimit`, `msgboard/util.go:17-23`).
     #[test]
-    fn the_size_limit_ceiling_is_the_largest_body_that_fits_one_frame() {
+    fn the_size_limit_ceiling_is_the_largest_body_that_fits_one_packet() {
         // Every integer at its widest, which is what `MSG_FIXED_FIELDS_RLP_LEN`
-        // assumes. A narrower message only makes the frame smaller.
-        let build = |data_len: usize| PoWMsg {
-            version: VERSION_V1,
-            block_hash: B256::repeat_byte(0xAB),
-            nonce: u64::MAX,
-            work_multiplier: u64::MAX,
-            work_divisor: u64::MAX,
-            category: B256::repeat_byte(0xCD),
-            data: Bytes::from(vec![0x5A; data_len]),
+        // assumes. A narrower message only makes the packet smaller.
+        let build = |data_len: usize| {
+            WirePoWMsg::new(
+                PoWMsg {
+                    version: VERSION_V1,
+                    block_hash: B256::repeat_byte(0xFF),
+                    nonce: u64::MAX,
+                    work_multiplier: u64::MAX,
+                    work_divisor: u64::MAX,
+                    category: B256::repeat_byte(0xFF),
+                    // 0xFF, not a low byte: a one-byte `data` field below 0x80
+                    // encodes as itself with no header, which the model does
+                    // not claim to cover. Erigon's own fixture sets the same
+                    // byte for the same reason (`msgboard/pow_message.go:139`).
+                    data: Bytes::from(vec![0xFF; data_len]),
+                },
+                B256::repeat_byte(0xFF),
+            )
         };
-        let frame_len =
-            |data_len: usize| 1 + encode_pow_msg_list(std::slice::from_ref(&build(data_len))).len();
+        let packet_len = |data_len: usize| {
+            encode_wire_pow_msg_list(std::slice::from_ref(&build(data_len))).len()
+        };
+
+        // The model and a real encoding must agree before either is trusted.
+        for data_len in [0usize, 1, 55, 56, 8 * 1024, MAX_SAFE_SIZE_LIMIT] {
+            assert_eq!(
+                encoded_wire_msg_packet_len(data_len),
+                packet_len(data_len),
+                "the model must match the encoder at data_len={data_len}",
+            );
+        }
 
         assert_eq!(
-            frame_len(MAX_SAFE_SIZE_LIMIT),
-            MAX_INBOUND_FRAME_SIZE,
-            "a message at the ceiling must fill the inbound bound exactly",
+            packet_len(MAX_SAFE_SIZE_LIMIT),
+            P2P_MSG_PACKET_LIMIT,
+            "a message at the ceiling must fill one packet exactly",
         );
         assert!(
-            frame_len(MAX_SAFE_SIZE_LIMIT + 1) > MAX_INBOUND_FRAME_SIZE,
+            packet_len(MAX_SAFE_SIZE_LIMIT + 1) > P2P_MSG_PACKET_LIMIT,
             "one byte past the ceiling must not still fit — the guard would be too strict",
+        );
+
+        // The bare-`PoWMsg` model this replaced was 37 bytes optimistic, which
+        // is exactly the claimed hash plus the element list header.
+        let bare =
+            |data_len: usize| encode_pow_msg_list(std::slice::from_ref(&build(data_len).msg));
+        assert_eq!(
+            packet_len(MAX_SAFE_SIZE_LIMIT) - bare(MAX_SAFE_SIZE_LIMIT).len(),
+            37,
+            "the claimed hash and its element header are what the old ceiling ignored",
         );
     }
 
@@ -1696,9 +2038,10 @@ mod tests {
         let rep = Arc::new(RecordingReporter::default());
         let (tx, mut rx) = channel();
 
-        let raw = board_messages_frame_of(MAX_INBOUND_FRAME_SIZE);
+        let (raw, msg) = board_messages_frame_of(MAX_INBOUND_FRAME_SIZE);
         assert_eq!(raw.len(), MAX_INBOUND_FRAME_SIZE);
-        handle_incoming(&board, Some(rep.as_ref()), &tx, raw, peer()).await;
+        let mut wants = authorised_for_msgs(std::slice::from_ref(&msg));
+        handle_incoming(&board, Some(rep.as_ref()), &tx, &mut wants, raw, peer()).await;
 
         assert_eq!(board.all_message_ids().len(), 1, "a frame at the limit is handled normally");
         assert!(drain(&mut rx).is_empty(), "BoardMessages draws no reply");
@@ -1715,8 +2058,9 @@ mod tests {
         let rep = Arc::new(RecordingReporter::default());
         let (tx, mut rx) = channel();
 
-        let raw = board_messages_frame_of(MAX_INBOUND_FRAME_SIZE + 1);
-        handle_incoming(&board, Some(rep.as_ref()), &tx, raw, peer()).await;
+        let (raw, msg) = board_messages_frame_of(MAX_INBOUND_FRAME_SIZE + 1);
+        let mut wants = authorised_for_msgs(std::slice::from_ref(&msg));
+        handle_incoming(&board, Some(rep.as_ref()), &tx, &mut wants, raw, peer()).await;
 
         assert!(board.all_message_ids().is_empty(), "the payload must never be decoded");
         assert!(drain(&mut rx).is_empty(), "an oversized frame draws no response");
@@ -1747,7 +2091,8 @@ mod tests {
 
             let rep = Arc::new(RecordingReporter::default());
             let (tx, mut rx) = channel();
-            handle_incoming(&board, Some(rep.as_ref()), &tx, raw, peer()).await;
+            handle_incoming(&board, Some(rep.as_ref()), &tx, &mut WantList::default(), raw, peer())
+                .await;
 
             assert!(drain(&mut rx).is_empty(), "garbage={garbage}: nothing may be served");
             assert_eq!(rep.bad_protocol(), 1, "garbage={garbage}");
@@ -1771,6 +2116,7 @@ mod tests {
                 &board,
                 Some(rep.as_ref()),
                 &tx,
+                &mut WantList::default(),
                 frame(opcode, &[0u8; MSG_ID_SIZE + 1]),
                 peer(),
             )
@@ -1793,6 +2139,7 @@ mod tests {
             &board,
             None,
             &tx,
+            &mut WantList::default(),
             frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&[want])),
             peer(),
         )
@@ -1801,7 +2148,11 @@ mod tests {
         let frames = drain(&mut rx);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0][0], GET_BOARD_MESSAGES, "must request the bodies");
-        assert_eq!(&frames[0][1..], want.as_bytes(), "payload is the requested ID");
+        assert_eq!(
+            &frames[0][1..],
+            want.message_hash().as_slice(),
+            "payload is the requested work hash",
+        );
     }
 
     #[tokio::test]
@@ -1815,6 +2166,7 @@ mod tests {
             &board,
             None,
             &tx,
+            &mut WantList::default(),
             frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&[id])),
             peer(),
         )
@@ -1844,6 +2196,7 @@ mod tests {
             &board,
             None,
             &tx,
+            &mut WantList::default(),
             frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&[bogus])),
             peer(),
         )
@@ -1871,6 +2224,7 @@ mod tests {
             &board,
             None,
             &tx,
+            &mut WantList::default(),
             frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&[unknown_block])),
             peer(),
         )
@@ -1885,8 +2239,15 @@ mod tests {
         let rep = Arc::new(RecordingReporter::default());
         let (tx, mut rx) = channel();
 
-        handle_incoming(&board, Some(rep.as_ref()), &tx, frame(BOARD_MESSAGE_IDS, &[]), peer())
-            .await;
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut WantList::default(),
+            frame(BOARD_MESSAGE_IDS, &[]),
+            peer(),
+        )
+        .await;
 
         assert!(drain(&mut rx).is_empty());
         assert_eq!(rep.bad_protocol(), 0, "an empty list is well-formed");
@@ -1907,11 +2268,19 @@ mod tests {
 
         for (opcode, payload) in [
             (BOARD_MESSAGE_IDS, MsgID::encode_list(&[want])),
-            (GET_BOARD_MESSAGES, MsgID::encode_list(&[want])),
+            (GET_BOARD_MESSAGES, get_request(&[want])),
         ] {
             let board = make();
             let (tx, mut rx) = channel();
-            handle_incoming(&board, None, &tx, frame(opcode, &payload), peer()).await;
+            handle_incoming(
+                &board,
+                None,
+                &tx,
+                &mut WantList::default(),
+                frame(opcode, &payload),
+                peer(),
+            )
+            .await;
             assert!(drain(&mut rx).is_empty(), "opcode {opcode:#x} replied while not ready");
         }
     }
@@ -1923,9 +2292,17 @@ mod tests {
         let rep = Arc::new(RecordingReporter::default());
         let (tx, _rx) = channel();
 
-        let payload = encode_pow_msg_list(&[mined(&[1], 10)]);
-        handle_incoming(&board, Some(rep.as_ref()), &tx, frame(BOARD_MESSAGES, &payload), peer())
-            .await;
+        let msgs = [mined(&[1], 10)];
+        let payload = delivery(&msgs);
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut authorised_for_msgs(&msgs),
+            frame(BOARD_MESSAGES, &payload),
+            peer(),
+        )
+        .await;
 
         assert_eq!(board.status().2, 0, "nothing should be accepted while not ready");
         assert_eq!(rep.bad_message(), 0, "a syncing node must not penalise peers");
@@ -1944,6 +2321,7 @@ mod tests {
             &board,
             None,
             &tx,
+            &mut WantList::default(),
             frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&[want])),
             peer(),
         )
@@ -1953,9 +2331,17 @@ mod tests {
         let board = board_with_cfg(cfg, 10);
         let rep = Arc::new(RecordingReporter::default());
         let (tx, _rx) = channel();
-        let payload = encode_pow_msg_list(&[mined(&[1], 10)]);
-        handle_incoming(&board, Some(rep.as_ref()), &tx, frame(BOARD_MESSAGES, &payload), peer())
-            .await;
+        let msgs = [mined(&[1], 10)];
+        let payload = delivery(&msgs);
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut authorised_for_msgs(&msgs),
+            frame(BOARD_MESSAGES, &payload),
+            peer(),
+        )
+        .await;
         assert_eq!(board.status().2, 0, "observer must not ingest");
         assert_eq!(rep.bad_message(), 0, "observer must not penalise");
     }
@@ -1975,7 +2361,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&[id])),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&[id])),
             peer(),
         )
         .await;
@@ -1997,7 +2384,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&[checked_msg.msg_id()])),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&[checked_msg.msg_id()])),
             peer(),
         )
         .await;
@@ -2006,9 +2394,10 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0][0], BOARD_MESSAGES);
         // Payload must decode back to the message we hold.
-        let decoded = decode_pow_msg_list(&frames[0][1..]).expect("valid list");
+        let decoded = decode_wire_pow_msg_list(&frames[0][1..]).expect("valid list");
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0], checked_msg.msg);
+        assert_eq!(decoded[0].msg, checked_msg.msg);
+        assert_eq!(decoded[0].hash, checked_msg.hash, "the frame names the message it carries");
     }
 
     #[tokio::test]
@@ -2021,7 +2410,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&[unknown])),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&[unknown])),
             peer(),
         )
         .await;
@@ -2093,7 +2483,8 @@ mod tests {
             &board,
             None,
             &tx,
-            frame(GET_BOARD_MESSAGES, &MsgID::encode_list(&ids)),
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&ids)),
             peer(),
         )
         .await;
@@ -2115,7 +2506,8 @@ mod tests {
                 "encoded list of {} B exceeds the packet limit; every conforming peer disconnects",
                 f.len() - 1,
             );
-            total += decode_pow_msg_list(&f[1..]).expect("each chunk decodes independently").len();
+            total +=
+                decode_wire_pow_msg_list(&f[1..]).expect("each chunk decodes independently").len();
         }
         assert_eq!(total, 64, "every requested message must be delivered exactly once");
     }
@@ -2126,9 +2518,18 @@ mod tests {
     async fn delivered_messages_are_accepted_onto_the_board() {
         let board = board_at(10);
         let (tx, _rx) = channel();
-        let payload = encode_pow_msg_list(&[mined(&[1], 10), mined(&[2], 10)]);
+        let msgs = [mined(&[1], 10), mined(&[2], 10)];
+        let payload = delivery(&msgs);
 
-        handle_incoming(&board, None, &tx, frame(BOARD_MESSAGES, &payload), peer()).await;
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut authorised_for_msgs(&msgs),
+            frame(BOARD_MESSAGES, &payload),
+            peer(),
+        )
+        .await;
 
         assert_eq!(board.status().2, 2, "both messages should be on the board");
     }
@@ -2143,6 +2544,7 @@ mod tests {
             &board,
             Some(rep.as_ref()),
             &tx,
+            &mut WantList::default(),
             frame(BOARD_MESSAGES, &[0xFF, 0xFF, 0xFF]),
             peer(),
         )
@@ -2162,10 +2564,19 @@ mod tests {
         let rep = Arc::new(RecordingReporter::default());
         let (tx, _rx) = channel();
 
-        let big = vec![0u8; 100];
-        let payload = encode_pow_msg_list(&[mined(&big, 10), mined(&big, 10)]);
-        handle_incoming(&board, Some(rep.as_ref()), &tx, frame(BOARD_MESSAGES, &payload), peer())
-            .await;
+        // Distinct payloads, so the frame carries two distinct claimed hashes.
+        // A repeated hash is a protocol violation, which is a different test.
+        let msgs = [mined(&[0u8; 100], 10), mined(&[1u8; 100], 10)];
+        let payload = delivery(&msgs);
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut authorised_for_msgs(&msgs),
+            frame(BOARD_MESSAGES, &payload),
+            peer(),
+        )
+        .await;
 
         assert_eq!(board.status().2, 0);
         assert!(rep.bad_message() >= 1, "oversized payloads must be kickable");
@@ -2182,9 +2593,17 @@ mod tests {
         let msg = mined(&[6], 10);
         board.add_local_msg(msg.clone()).unwrap();
 
-        let payload = encode_pow_msg_list(&[msg]);
-        handle_incoming(&board, Some(rep.as_ref()), &tx, frame(BOARD_MESSAGES, &payload), peer())
-            .await;
+        let msgs = [msg];
+        let payload = delivery(&msgs);
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut authorised_for_msgs(&msgs),
+            frame(BOARD_MESSAGES, &payload),
+            peer(),
+        )
+        .await;
 
         assert_eq!(rep.bad_message(), 0, "duplicates are circumstantial, not kickable");
         assert_eq!(board.status().2, 1);
@@ -2300,18 +2719,30 @@ mod tests {
     // the loop — announce → request → deliver, board to board, with no frame
     // authored by the test.
 
-    /// One side of a link: a board plus the channel the handler writes into.
+    /// One side of a link: a board, the channel the handler writes into, and
+    /// what the peer across the link is authorised to deliver.
     struct Node {
         board: Arc<MsgBoard>,
         rep: Arc<RecordingReporter>,
         tx: OutboundQueue,
         rx: Receiver<BytesMut>,
+        wants: WantList,
     }
 
     impl Node {
         fn at(height: u64) -> Self {
+            Self::with_cfg(easy_cfg(), height)
+        }
+
+        fn with_cfg(cfg: MsgboardConfig, height: u64) -> Self {
             let (tx, rx) = channel();
-            Self { board: board_at(height), rep: Arc::new(RecordingReporter::default()), tx, rx }
+            Self {
+                board: board_with_cfg(cfg, height),
+                rep: Arc::new(RecordingReporter::default()),
+                tx,
+                rx,
+                wants: WantList::default(),
+            }
         }
 
         fn hashes(&self) -> Vec<B256> {
@@ -2324,11 +2755,12 @@ mod tests {
     /// Deliver every frame `from` has queued into `to`'s handler, returning the
     /// opcodes that crossed the link. Replies land on `to`'s own channel, so
     /// alternating calls walk the protocol forward one hop at a time.
-    async fn deliver(from: &mut Node, to: &Node) -> Vec<u8> {
+    async fn deliver(from: &mut Node, to: &mut Node) -> Vec<u8> {
         let mut opcodes = Vec::new();
         for frame in drain(&mut from.rx) {
             opcodes.push(frame[0]);
-            handle_incoming(&to.board, Some(to.rep.as_ref()), &to.tx, frame, peer()).await;
+            handle_incoming(&to.board, Some(to.rep.as_ref()), &to.tx, &mut to.wants, frame, peer())
+                .await;
         }
         opcodes
     }
@@ -2347,13 +2779,13 @@ mod tests {
 
         // A announces what it holds.
         send_board_message_ids(&a.board, &a.tx, peer()).await;
-        assert_eq!(deliver(&mut a, &b).await, vec![BOARD_MESSAGE_IDS]);
+        assert_eq!(deliver(&mut a, &mut b).await, vec![BOARD_MESSAGE_IDS]);
 
         // B asks for the bodies it is missing.
-        assert_eq!(deliver(&mut b, &a).await, vec![GET_BOARD_MESSAGES]);
+        assert_eq!(deliver(&mut b, &mut a).await, vec![GET_BOARD_MESSAGES]);
 
         // A serves them; B ingests.
-        assert_eq!(deliver(&mut a, &b).await, vec![BOARD_MESSAGES]);
+        assert_eq!(deliver(&mut a, &mut b).await, vec![BOARD_MESSAGES]);
 
         assert_eq!(b.hashes(), a.hashes(), "B should now hold exactly what A holds");
         assert_eq!(b.board.status().2, 3);
@@ -2365,7 +2797,7 @@ mod tests {
         assert_eq!(b.rep.bad_protocol(), 0);
 
         // And it must settle: B has nothing left to say.
-        assert!(deliver(&mut b, &a).await.is_empty(), "converged link should fall silent");
+        assert!(deliver(&mut b, &mut a).await.is_empty(), "converged link should fall silent");
     }
 
     /// Re-announcing to an already-synced peer must not restart the cycle —
@@ -2377,16 +2809,16 @@ mod tests {
         a.board.add_local_msg(mined(&[1], 10)).expect("accepted");
 
         send_board_message_ids(&a.board, &a.tx, peer()).await;
-        deliver(&mut a, &b).await;
-        deliver(&mut b, &a).await;
-        deliver(&mut a, &b).await;
+        deliver(&mut a, &mut b).await;
+        deliver(&mut b, &mut a).await;
+        deliver(&mut a, &mut b).await;
         assert_eq!(b.hashes(), a.hashes(), "first cycle should converge");
 
         // Announce the same IDs again.
         send_board_message_ids(&a.board, &a.tx, peer()).await;
-        assert_eq!(deliver(&mut a, &b).await, vec![BOARD_MESSAGE_IDS]);
+        assert_eq!(deliver(&mut a, &mut b).await, vec![BOARD_MESSAGE_IDS]);
         assert!(
-            deliver(&mut b, &a).await.is_empty(),
+            deliver(&mut b, &mut a).await.is_empty(),
             "a synced peer should request nothing on re-announcement",
         );
     }
@@ -2405,18 +2837,26 @@ mod tests {
         a.board.add_local_msg(mined(&[3], 10)).expect("accepted");
 
         send_board_message_ids(&a.board, &a.tx, peer()).await;
-        deliver(&mut a, &b).await;
+        deliver(&mut a, &mut b).await;
 
         // Inspect B's request before it crosses the link.
         let request = drain(&mut b.rx);
         assert_eq!(request.len(), 1);
         assert_eq!(request[0][0], GET_BOARD_MESSAGES);
-        let requested = MsgID::decode_list(&request[0][1..]).expect("well-formed id list");
+        let requested = decode_msg_hash_list(&request[0][1..]).expect("well-formed hash list");
         assert_eq!(requested.len(), 2, "only the two unheld messages should be requested");
 
         // Complete the exchange by hand from here, since the frame was consumed.
-        handle_incoming(&a.board, Some(a.rep.as_ref()), &a.tx, request[0].clone(), peer()).await;
-        assert_eq!(deliver(&mut a, &b).await, vec![BOARD_MESSAGES]);
+        handle_incoming(
+            &a.board,
+            Some(a.rep.as_ref()),
+            &a.tx,
+            &mut WantList::default(),
+            request[0].clone(),
+            peer(),
+        )
+        .await;
+        assert_eq!(deliver(&mut a, &mut b).await, vec![BOARD_MESSAGES]);
         assert_eq!(b.hashes(), a.hashes());
     }
 
@@ -2431,15 +2871,15 @@ mod tests {
 
         // A → B
         send_board_message_ids(&a.board, &a.tx, peer()).await;
-        deliver(&mut a, &b).await;
-        deliver(&mut b, &a).await;
-        deliver(&mut a, &b).await;
+        deliver(&mut a, &mut b).await;
+        deliver(&mut b, &mut a).await;
+        deliver(&mut a, &mut b).await;
 
         // B → A
         send_board_message_ids(&b.board, &b.tx, peer()).await;
-        deliver(&mut b, &a).await;
-        deliver(&mut a, &b).await;
-        deliver(&mut b, &a).await;
+        deliver(&mut b, &mut a).await;
+        deliver(&mut a, &mut b).await;
+        deliver(&mut b, &mut a).await;
 
         assert_eq!(a.board.status().2, 2, "A should hold the union");
         assert_eq!(b.board.status().2, 2, "B should hold the union");
@@ -2471,16 +2911,15 @@ mod tests {
     }
 
     /// The largest announcement a peer may legally send is one frame's worth of
-    /// IDs, and the request we build from it must itself be a legal frame.
+    /// IDs, and every request we build from it must itself be a legal frame.
     ///
-    /// §15.3 added the chunk loop because a peer could announce more than
-    /// `MAX_IDS_PER_FRAME` in a single frame, and a reth responder then
-    /// truncated the request and lost the overflow. `MAX_INBOUND_FRAME_SIZE`
-    /// now rejects that announcement before it is decoded — 847 IDs is 102,488
-    /// bytes — so the loop can no longer emit a second chunk. It stays as the
-    /// inner guard; what the wire can still reach is this case.
+    /// The announce unit is still the 121-byte `MsgID`, but the request unit is
+    /// the 32-byte hash and a request names at most `MAX_GET_BOARD_MESSAGES` of
+    /// them. So one legal announcement no longer maps to one request: it splits,
+    /// and a responder that built a single frame from it would be kicked by the
+    /// peer that announced.
     #[tokio::test]
-    async fn a_full_frame_of_announced_ids_is_requested_in_one_legal_frame() {
+    async fn a_full_frame_of_announced_ids_splits_into_legal_request_frames() {
         let board = board_at(10);
         let announced = wantable_ids(MAX_IDS_PER_FRAME);
         let raw = frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&announced));
@@ -2494,17 +2933,23 @@ mod tests {
         board.release_pending(&wanted);
 
         let (tx, mut rx) = channel();
-        handle_incoming(&board, None, &tx, raw, peer()).await;
+        handle_incoming(&board, None, &tx, &mut WantList::default(), raw, peer()).await;
 
         let frames = drain(&mut rx);
-        assert_eq!(frames.len(), 1, "a legal announcement never needs a second request frame");
+        assert_eq!(
+            frames.len(),
+            MAX_IDS_PER_FRAME.div_ceil(MAX_GET_BOARD_MESSAGES),
+            "one announcement's worth of IDs splits at the hash cap",
+        );
         assert_eq!(frames[0][0], GET_BOARD_MESSAGES);
         assert!(
             frames[0].len() <= MAX_INBOUND_FRAME_SIZE,
             "a legal announcement must not provoke a request a strict peer would ban",
         );
-        let requested = MsgID::decode_list(&frames[0][1..]).expect("valid id list");
-        assert_eq!(requested, announced, "no wanted ID may be dropped or reordered");
+        let requested = decode_msg_hash_list(&frames[0][1..]).expect("valid hash list");
+        let expected: Vec<B256> =
+            announced[..MAX_GET_BOARD_MESSAGES].iter().map(MsgID::message_hash).collect();
+        assert_eq!(requested, expected, "the first chunk keeps announcement order");
     }
 
     /// Gossip means every peer announces every message. Only the first
@@ -2522,18 +2967,26 @@ mod tests {
         let frame_in = frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&announced));
 
         let (tx_first, mut rx_first) = channel();
-        handle_incoming(&board, None, &tx_first, frame_in.clone(), peer()).await;
+        handle_incoming(
+            &board,
+            None,
+            &tx_first,
+            &mut WantList::default(),
+            frame_in.clone(),
+            peer(),
+        )
+        .await;
         let first = drain(&mut rx_first);
         assert_eq!(first.len(), 1, "the first peer to announce should be asked");
         assert_eq!(
-            MsgID::decode_list(&first[0][1..]).expect("valid id list"),
-            announced,
+            decode_msg_hash_list(&first[0][1..]).expect("valid hash list"),
+            announced.iter().map(MsgID::message_hash).collect::<Vec<_>>(),
             "and asked for every announced id",
         );
 
         // A second peer announcing the same messages, before any reply lands.
         let (tx_second, mut rx_second) = channel();
-        handle_incoming(&board, None, &tx_second, frame_in, peer()).await;
+        handle_incoming(&board, None, &tx_second, &mut WantList::default(), frame_in, peer()).await;
         assert!(
             drain(&mut rx_second).is_empty(),
             "a second peer announcing an in-flight message must not be asked again",
@@ -2559,13 +3012,17 @@ mod tests {
             &board,
             None,
             &tx,
+            &mut WantList::default(),
             frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&announced)),
             peer(),
         )
         .await;
         let frames = drain(&mut rx);
         assert_eq!(frames.len(), 1, "a released id must be requestable again");
-        assert_eq!(MsgID::decode_list(&frames[0][1..]).expect("valid id list"), announced,);
+        assert_eq!(
+            decode_msg_hash_list(&frames[0][1..]).expect("valid hash list"),
+            announced.iter().map(MsgID::message_hash).collect::<Vec<_>>(),
+        );
     }
 
     /// A board too large to announce in one frame still transfers in full.
@@ -2596,9 +3053,15 @@ mod tests {
         assert_eq!(a.board.status().2, total as u64);
 
         send_board_message_ids(&a.board, &a.tx, peer()).await;
-        assert_eq!(deliver(&mut a, &b).await.len(), 2, "A must announce in two frames");
-        assert_eq!(deliver(&mut b, &a).await.len(), 2, "B must ask in two frames");
-        deliver(&mut a, &b).await;
+        assert_eq!(deliver(&mut a, &mut b).await.len(), 2, "A must announce in two frames");
+        // The announce chunks at 846 IDs; the requests chunk at 256 hashes, so
+        // the first announcement alone costs four request frames.
+        assert_eq!(
+            deliver(&mut b, &mut a).await.len(),
+            MAX_IDS_PER_FRAME.div_ceil(MAX_GET_BOARD_MESSAGES) + 1,
+            "B must ask in hash-sized chunks",
+        );
+        deliver(&mut a, &mut b).await;
 
         assert_eq!(b.board.status().2, total as u64, "every announced message must transfer");
         assert_eq!(b.hashes(), a.hashes());
@@ -2611,6 +3074,9 @@ mod tests {
     /// `a_full_frame_of_announced_ids_is_requested_in_one_legal_frame`. This
     /// test keeps the weaker end-to-end property pinned: a request provoked by
     /// our own chunked announcements stays inside the packet limit.
+    ///
+    /// The property survives the behaviour set, because 256 hashes is a much
+    /// smaller frame than 846 `MsgID`s. Only the older path is driven here.
     #[tokio::test]
     async fn requests_provoked_by_our_own_announcements_stay_within_the_packet_limit() {
         let mut a = Node::at(10);
@@ -2630,7 +3096,7 @@ mod tests {
         }
 
         send_board_message_ids(&a.board, &a.tx, peer()).await;
-        let announcements = deliver(&mut a, &b).await;
+        let announcements = deliver(&mut a, &mut b).await;
         assert_eq!(announcements.len(), 2, "900 IDs must announce as two chunks");
 
         let requests = drain(&mut b.rx);
@@ -2649,17 +3115,774 @@ mod tests {
     #[tokio::test]
     async fn a_peer_behind_the_live_window_does_not_ingest_expired_messages() {
         let mut a = Node::at(10);
-        let b = Node::at(10);
+        let mut b = Node::at(10);
         a.board.add_local_msg(mined(&[1], 10)).expect("accepted");
 
         // B advances far past the message's anchor block, expiring it.
         b.board.set_head(10 + easy_cfg().block_range + 5, B256::repeat_byte(0x02));
 
         send_board_message_ids(&a.board, &a.tx, peer()).await;
-        deliver(&mut a, &b).await;
+        deliver(&mut a, &mut b).await;
 
         assert_eq!(b.board.status().2, 0, "expired announcements are not requested");
         assert_eq!(b.rep.bad_message(), 0, "being out of window is not misbehaviour");
         assert_eq!(b.rep.bad_protocol(), 0);
+    }
+
+    // ── unsolicited BoardMessages: measurement ───────────────────────────────
+
+    /// A full-size `BoardMessages` frame of well-formed but unmined messages.
+    ///
+    /// Every message declares the production minimum work ratio and carries the
+    /// live block hash, so it clears the three cheap checks in
+    /// `add_remote_msgs` — size, declared ratio, block lookup — and reaches the
+    /// secp256k1 scalar multiplication inside `to_checked`. Only the nonce
+    /// varies, so each verification is distinct work rather than a repeat.
+    ///
+    /// Returns the frame and the number of messages in it.
+    fn unmined_flood_frame() -> (BytesMut, usize, Vec<B256>) {
+        let build = |nonce: u64| PoWMsg {
+            version: VERSION_V1,
+            block_hash: block_hash_one(),
+            // The top bit keeps every nonce at its widest RLP encoding, so the
+            // message count does not drift with the loop counter.
+            nonce: nonce | (1 << 63),
+            work_multiplier: MsgboardConfig::default().work_multiplier,
+            work_divisor: MsgboardConfig::default().work_divisor,
+            category: category_hash(),
+            data: Bytes::new(),
+        };
+        let per_msg = build(1).length();
+        let mut count = (MAX_INBOUND_FRAME_SIZE - 8) / per_msg;
+        loop {
+            let msgs: Vec<PoWMsg> = (1..=count as u64).map(build).collect();
+            let claims: Vec<B256> = (1..=count as u64).map(claim).collect();
+            let encoded = delivery_claiming(&msgs, &claims);
+            // The opcode byte rides outside the encoded list.
+            if encoded.len() < MAX_INBOUND_FRAME_SIZE {
+                return (frame(BOARD_MESSAGES, &encoded), count, claims);
+            }
+            count -= 1;
+        }
+    }
+
+    /// The measurement that made the case, kept as the regression.
+    ///
+    /// Before the want list, one 100 KiB frame of messages nobody asked for
+    /// reached `to_checked` 1,190 times — 1,190 secp256k1 scalar
+    /// multiplications on the connection task, 3.78 s under the test profile
+    /// and 24 ms at release optimisation, for a peer that had sent no
+    /// announcement and paid 102,345 bytes. It also drew 1,190
+    /// `report_bad_message` calls; four bans a peer.
+    ///
+    /// The frame is unchanged. What changed is that none of it is verified.
+    #[tokio::test]
+    async fn an_unrequested_frame_is_dropped_before_any_pow_work() {
+        let board = board_with_cfg(MsgboardConfig::default(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, mut rx) = channel();
+        let (raw, count, _) = unmined_flood_frame();
+        assert!(
+            raw.len() > MAX_INBOUND_FRAME_SIZE - 200,
+            "the frame must be full to be worth measuring: {count} messages, {} B",
+            raw.len(),
+        );
+
+        let start = Instant::now();
+        handle_incoming(&board, Some(rep.as_ref()), &tx, &mut WantList::default(), raw, peer())
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            rep.bad_message() + board.all_message_ids().len(),
+            0,
+            "not one of the {count} unrequested messages may reach to_checked",
+        );
+        assert!(drain(&mut rx).is_empty(), "an unsolicited delivery draws no reply");
+        assert_eq!(rep.bad_message(), 0, "dropping an unsolicited body is not a penalty");
+        assert_eq!(rep.bad_protocol(), 0, "the frame itself is well-formed");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "{count} unrequested messages cost {elapsed:?}; the PoW is still being paid",
+        );
+    }
+
+    /// The budget is exactly what the peer was asked for. A peer that answers a
+    /// one-message request with a full frame gets one verification, not 1,190.
+    #[tokio::test]
+    async fn a_peer_gets_one_verification_per_message_it_was_asked_for() {
+        let board = board_with_cfg(MsgboardConfig::default(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, _rx) = channel();
+        let (raw, count, claims) = unmined_flood_frame();
+
+        // One reservation, for a hash the frame really does claim.
+        let mut wants = authorised_for_hashes(&claims[..1]);
+        handle_incoming(&board, Some(rep.as_ref()), &tx, &mut wants, raw, peer()).await;
+
+        assert_eq!(
+            rep.bad_message(),
+            1,
+            "one reservation must buy one verification out of {count} delivered messages",
+        );
+    }
+
+    /// A reservation is spent whether or not the message it paid for was any
+    /// good, so a peer cannot answer one request twice.
+    #[tokio::test]
+    async fn a_spent_reservation_is_not_returned_by_a_failed_message() {
+        let board = board_with_cfg(MsgboardConfig::default(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, _rx) = channel();
+        let (first, _, claims) = unmined_flood_frame();
+        let (second, _, _) = unmined_flood_frame();
+        let mut wants = authorised_for_hashes(&claims[..1]);
+
+        handle_incoming(&board, Some(rep.as_ref()), &tx, &mut wants, first, peer()).await;
+        assert_eq!(rep.bad_message(), 1);
+
+        handle_incoming(&board, Some(rep.as_ref()), &tx, &mut wants, second, peer()).await;
+        assert_eq!(rep.bad_message(), 1, "the second frame must buy nothing");
+    }
+
+    /// Measures Finding 4: the reputation hits one hostile frame produces.
+    ///
+    /// `BAD_MESSAGE_REPUTATION_CHANGE` is 16 units and `BANNED_REPUTATION` is
+    /// 50, so four hits ban a peer for 12 hours. The frame used to be worth
+    /// 1,190 of them. It is now worth as many as the peer was authorised for,
+    /// which is the number of messages it actually asked us to verify.
+    #[tokio::test]
+    async fn one_frame_earns_at_most_one_penalty_per_authorised_message() {
+        let board = board_with_cfg(MsgboardConfig::default(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, _rx) = channel();
+        let (raw, count, claims) = unmined_flood_frame();
+
+        const AUTHORISED: usize = 3;
+        let mut wants = authorised_for_hashes(&claims[..AUTHORISED]);
+        handle_incoming(&board, Some(rep.as_ref()), &tx, &mut wants, raw, peer()).await;
+
+        assert_eq!(
+            rep.bad_message(),
+            AUTHORISED,
+            "a {count}-message frame may only be penalised for what it was asked for",
+        );
+    }
+
+    /// An ID this peer already owes us is not requested twice, so a peer cannot
+    /// grow its verification budget by re-announcing.
+    #[tokio::test]
+    async fn re_announcing_the_same_id_does_not_grow_the_peers_budget() {
+        let board = board_at(10);
+        let (tx, mut rx) = channel();
+        let want = checked(&[1, 2, 3], 10).msg_id();
+        let announcement = frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&[want]));
+        let mut wants = WantList::default();
+
+        handle_incoming(&board, None, &tx, &mut wants, announcement.clone(), peer()).await;
+        assert_eq!(drain(&mut rx).len(), 1, "the first announcement is requested");
+        assert_eq!(wants.len(), 1);
+
+        // The claim in `PendingRequests` expires after 10 s; the reservation
+        // lasts 15 s. So a re-announcement past the claim TTL passes
+        // `filter_wanted` again and is stopped here instead.
+        board.release_pending(&[want]);
+        handle_incoming(&board, None, &tx, &mut wants, announcement, peer()).await;
+
+        assert!(drain(&mut rx).is_empty(), "the peer already owes us this message");
+        assert_eq!(wants.len(), 1, "and it must not hold two authorisations for it");
+    }
+
+    /// A request that never reaches the peer must give back its authorisation
+    /// as well as its claim, or the peer keeps a credit it can spend on
+    /// something we never asked for.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_never_reaches_its_peer_releases_its_reservation() {
+        let board = board_at(10);
+        let want = checked(&[7, 7], 10).msg_id();
+        let mut wants = WantList::default();
+
+        // A live receiver that is never polled: the request is dropped on the
+        // outbound deadline.
+        let (raw_tx, _rx) = mpsc::channel::<BytesMut>(1);
+        raw_tx.try_send(BytesMut::new()).expect("fill the one slot");
+        let tx = OutboundQueue::new(raw_tx);
+
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut wants,
+            frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&[want])),
+            peer(),
+        )
+        .await;
+
+        assert_eq!(wants.len(), 0, "a request that was dropped authorises nothing");
+    }
+
+    // ── the connection loop ──────────────────────────────────────────────────
+    //
+    // `run_connection` is generic over the frame stream so these can drive it.
+    // Production passes `ProtocolConnection`, which is `Stream<Item = BytesMut>`
+    // and cannot be built outside `reth-eth-wire`.
+
+    /// The select must not be `biased`.
+    ///
+    /// `biased` polls the peer first every time, and the multiplexer's inbound
+    /// queue to a satellite protocol is unbounded and filled from the socket at
+    /// line rate — so a peer that floods keeps a frame ready at every poll and
+    /// the broadcast branch is never reached. The peer receives no gossip for
+    /// as long as it floods, and once the board has accepted
+    /// `BROADCAST_CAPACITY` = 1024 messages behind it the receiver lags, which
+    /// costs a full re-announce.
+    ///
+    /// Measured against the biased version: the announcement arrived only after
+    /// all 200 queued frames were served, at position 200.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flooding_peer_does_not_starve_the_announcement_branch() {
+        let board = board_at(10);
+
+        // Each frame announces an ID we lack, so each one draws a
+        // `GetBoardMessages` and the read loop always has work to do.
+        let ids = wantable_ids(200);
+        let (conn_tx, conn_rx) = mpsc::channel::<BytesMut>(512);
+        for id in &ids {
+            conn_tx
+                .try_send(frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(std::slice::from_ref(id))))
+                .expect("queue the flood");
+        }
+
+        // One outbound slot and nothing draining it, so the task parks inside
+        // its first send and cannot run ahead of this test.
+        let (out_tx, mut out_rx) = mpsc::channel::<BytesMut>(1);
+        let task = tokio::spawn(run_connection(
+            Arc::clone(&board),
+            None,
+            peer(),
+            ReceiverStream::new(conn_rx),
+            OutboundQueue::new(out_tx),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A message reaches the board while the peer is flooding.
+        board.add_local_msg(mined(&[0xAA], 10)).expect("accepted");
+
+        let mut requests_first = 0usize;
+        loop {
+            let f = out_rx.recv().await.expect("the connection task stopped early");
+            if f[0] == BOARD_MESSAGE_IDS {
+                break;
+            }
+            requests_first += 1;
+            assert!(
+                requests_first < ids.len(),
+                "the announcement never got a turn: {requests_first} inbound frames served first",
+            );
+        }
+        task.abort();
+
+        assert!(
+            requests_first < 20,
+            "the announcement waited behind {requests_first} inbound frames; the peer controls \
+             how long that is",
+        );
+    }
+
+    /// A board that becomes ready while the peer is silent must still announce.
+    ///
+    /// The readiness check sits at the top of the loop body, so it only runs
+    /// when the select resolves. Before the board is ready the broadcast
+    /// channel is silent by construction — `add_remote_msgs` and `add_local_msg`
+    /// both refuse — so the only wakeup was the peer sending us a frame. A board
+    /// restored from disk on a quiet network therefore held a full inventory
+    /// and announced none of it, for as long as the peer stayed quiet.
+    ///
+    /// Without [`READY_POLL_INTERVAL`] this test hangs on the final recv.
+    #[tokio::test(start_paused = true)]
+    async fn a_board_that_becomes_ready_announces_to_a_silent_peer() {
+        // A board restored from disk: the index is populated before the node
+        // reports itself synced, which is the only way to reach this state.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let env = crate::db::open_msgboard_db(dir.path()).expect("open db");
+        let stored = [checked(&[1], 10), checked(&[2], 10)];
+        crate::db::db_flush(&env, &stored, &[]).expect("seed the db");
+
+        let board = Arc::new(MsgBoard::with_db(easy_cfg(), env));
+        board.set_head(10, block_hash_one());
+        assert_eq!(board.load_from_db().expect("load"), 2);
+        assert!(!board.is_ready(), "the node has not finished syncing");
+
+        // The peer is connected and silent: it sends nothing, ever.
+        let (_conn_tx, conn_rx) = mpsc::channel::<BytesMut>(1);
+        let (tx, mut rx) = channel();
+        let task = tokio::spawn(run_connection(
+            Arc::clone(&board),
+            None,
+            peer(),
+            ReceiverStream::new(conn_rx),
+            tx,
+        ));
+
+        tokio::time::sleep(READY_POLL_INTERVAL * 3).await;
+        assert!(drain(&mut rx).is_empty(), "a board that is not ready announces nothing");
+
+        board.set_ready();
+        let announced = tokio::time::timeout(READY_POLL_INTERVAL * 3, rx.recv())
+            .await
+            .expect("the ready board never announced to its silent peer")
+            .expect("the connection task closed the queue");
+        task.abort();
+
+        assert_eq!(announced[0], BOARD_MESSAGE_IDS);
+        assert_eq!(
+            MsgID::decode_list(&announced[1..]).expect("well-formed").len(),
+            2,
+            "the whole restored inventory must be announced",
+        );
+    }
+
+    /// The tick must not turn into a heartbeat. Once the announce has fired
+    /// there is nothing left for it to re-check, and an observer node never
+    /// announces at all.
+    #[tokio::test(start_paused = true)]
+    async fn the_readiness_tick_stops_once_the_announce_has_fired() {
+        let board = board_at(10);
+        board.add_local_msg(mined(&[1], 10)).expect("accepted");
+
+        let (_conn_tx, conn_rx) = mpsc::channel::<BytesMut>(1);
+        let (tx, mut rx) = channel();
+        let task = tokio::spawn(run_connection(
+            Arc::clone(&board),
+            None,
+            peer(),
+            ReceiverStream::new(conn_rx),
+            tx,
+        ));
+
+        tokio::time::sleep(READY_POLL_INTERVAL * 10).await;
+        task.abort();
+
+        assert_eq!(
+            drain(&mut rx).len(),
+            1,
+            "a settled connection must announce once, not once per tick",
+        );
+    }
+
+    // ── interop with erigon-pulse `78fbcffb8b` (pulse-v3.4.4) ────────────────
+    //
+    // That release changed two of the three opcodes and reth still speaks the
+    // older shape. These tests pin what happens on the wire today so the cost
+    // of the divergence is a measurement rather than a reading. They describe
+    // the break; they do not endorse it. See `docs/msgboard-parity-gaps.md`.
+
+    /// The announce opcode is unchanged, so the break is two of three: peers
+    /// still learn what we hold and can still ask us for it in our own dialect.
+    #[tokio::test]
+    async fn the_announce_opcode_still_interoperates() {
+        let board = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, mut rx) = channel();
+        let want = checked(&[1, 2, 3], 10).msg_id();
+
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut WantList::default(),
+            frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&[want])),
+            peer(),
+        )
+        .await;
+
+        assert_eq!(drain(&mut rx).len(), 1, "a 121-byte MsgID announce is still understood");
+        assert_eq!(rep.bad_protocol(), 0);
+    }
+
+    // ── the pulse-v3.4.4 behaviour set (`--msgboard.pulse-v344`) ─────────────
+    //
+    // Erigon changed two of the three opcodes at `78fbcffb8b` and left
+    // `ProtocolVersion` at 1, so nothing in the handshake separates the two
+    // dialects. The flag is what separates them here. These tests drive both
+    // sides of it: on, the newer shape is served and the older one refused; off,
+    // the reverse. Anything that passes under both would not be evidence.
+    //
+    // The frames below are built with this crate's own encoders. That is not
+    // circular: `crates/net/msgboard-types/tests/erigon_wire_vectors.rs` pins
+    // those encoders against bytes erigon's own compiled encoders emitted, and
+    // `an_erigon_board_messages_frame_is_ingested_only_with_the_flag_on` feeds
+    // one of those byte strings through this handler unchanged.
+
+    /// `EncodeRLPWireMsgList` over two messages, from erigon-pulse `78fbcffb8b`.
+    /// The same string the codec's golden-vector test uses; see
+    /// `crates/net/msgboard-types/tests/erigon_wire_vectors.rs` for how it was
+    /// generated.
+    const ERIGON_BOARD_MESSAGES: &str = "f8e7f874f85101a001aa00000000000000000000000000000000000000000000000000000000000002822710830f4240a001cc0000000000000000000000000000000000000000000000000000000000008568656c6c6fa001ee000000000000000000000000000000000000000000000000000000000000f86ff84c01a002aa00000000000000000000000000000000000000000000000000000000000003822710830f4240a002cc00000000000000000000000000000000000000000000000000000000000080a002ee000000000000000000000000000000000000000000000000000000000000";
+
+    fn from_hex(hex_str: &str) -> Vec<u8> {
+        (0..hex_str.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    /// A want list authorising exactly these hashes.
+    fn authorised_for_hashes(hashes: &[B256]) -> WantList {
+        let mut wants = WantList::default();
+        let now = Instant::now();
+        for h in hashes {
+            assert!(wants.reserve(*h, now), "reservation for {h} refused");
+        }
+        wants
+    }
+
+    // ── GetBoardMessages: 32-byte hashes ─────────────────────────────────────
+
+    /// A request names 32-byte hashes and is served by hash.
+    #[tokio::test]
+    async fn a_hash_request_is_served_by_hash() {
+        {
+            let board = board_with_cfg(easy_cfg(), 10);
+            let held = board.add_local_msg(mined(&[1, 2], 10)).unwrap();
+            let rep = Arc::new(RecordingReporter::default());
+            let (tx, mut rx) = channel();
+
+            let payload = encode_msg_hash_list(&[held.hash]);
+            handle_incoming(
+                &board,
+                Some(rep.as_ref()),
+                &tx,
+                &mut WantList::default(),
+                frame(GET_BOARD_MESSAGES, &payload),
+                peer(),
+            )
+            .await;
+
+            let frames = drain(&mut rx);
+            assert_eq!(frames.len(), 1, "the body must be served by hash");
+            assert_eq!(frames[0][0], BOARD_MESSAGES);
+            let decoded = decode_wire_pow_msg_list(&frames[0][1..]).expect("a WirePoWMsg list");
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].msg, held.msg);
+            assert_eq!(decoded[0].hash, held.hash, "the reply carries the work hash");
+            assert_eq!(rep.bad_protocol(), 0);
+        }
+    }
+
+    /// Erigon kicks a request naming more than `MaxGetBoardMessages` hashes
+    /// before it looks anything up (`msgboard/fetch.go:248-250`).
+    #[tokio::test]
+    async fn a_hash_request_over_the_cap_is_kicked() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, mut rx) = channel();
+
+        let hashes: Vec<B256> = (0..=MAX_GET_BOARD_MESSAGES)
+            .map(|i| {
+                let mut raw = [0u8; 32];
+                raw[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+                B256::from(raw)
+            })
+            .collect();
+        let raw = frame(GET_BOARD_MESSAGES, &encode_msg_hash_list(&hashes));
+        assert!(raw.len() <= MAX_INBOUND_FRAME_SIZE, "the cap must bite before the frame bound");
+
+        handle_incoming(&board, Some(rep.as_ref()), &tx, &mut WantList::default(), raw, peer())
+            .await;
+
+        assert!(drain(&mut rx).is_empty(), "nothing may be served past the cap");
+        assert_eq!(rep.bad_protocol(), 1);
+    }
+
+    /// A hash named twice is a protocol violation, not something to serve twice
+    /// (`CheckUniqueHashes`, `msgboard/fetch.go:251-253`).
+    #[tokio::test]
+    async fn a_hash_request_naming_the_same_hash_twice_is_kicked() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let held = board.add_local_msg(mined(&[3], 10)).unwrap();
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, mut rx) = channel();
+
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &encode_msg_hash_list(&[held.hash, held.hash])),
+            peer(),
+        )
+        .await;
+
+        assert!(drain(&mut rx).is_empty(), "a duplicate request is refused, not amplified");
+        assert_eq!(rep.bad_protocol(), 1);
+    }
+
+    /// Outbound, a request is chunked at `MAX_GET_BOARD_MESSAGES` hashes.
+    ///
+    /// One announcement frame holds up to `MAX_IDS_PER_FRAME` = 846 IDs, and an
+    /// upgraded peer kicks a request naming more than 256 hashes. Building one
+    /// request from a full announcement therefore earns a ban from the peer that
+    /// sent the announcement.
+    #[tokio::test]
+    async fn requests_chunk_at_the_hash_cap() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let announced = wantable_ids(MAX_GET_BOARD_MESSAGES + 44);
+        let (tx, mut rx) = channel();
+
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut WantList::default(),
+            frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&announced)),
+            peer(),
+        )
+        .await;
+
+        let frames = drain(&mut rx);
+        assert_eq!(frames.len(), 2, "300 wanted hashes must split into 256 + 44");
+        let mut requested = Vec::new();
+        for f in &frames {
+            assert_eq!(f[0], GET_BOARD_MESSAGES);
+            let hashes = decode_msg_hash_list(&f[1..]).expect("a flat hash list");
+            assert!(hashes.len() <= MAX_GET_BOARD_MESSAGES, "an upgraded peer kicks past the cap");
+            requested.extend(hashes);
+        }
+        assert_eq!(
+            requested,
+            announced.iter().map(MsgID::message_hash).collect::<Vec<_>>(),
+            "no wanted message may be dropped or reordered across the seam",
+        );
+    }
+
+    // ── BoardMessages: message plus claimed hash ─────────────────────────────
+
+    /// Erigon's own bytes, unmodified, through this handler.
+    ///
+    /// The want list is the discriminator. With the flag on the frame decodes
+    /// and each delivery is matched to the reservation for its own claimed
+    /// hash, spending both. With it off the frame is unreadable, nothing is
+    /// matched, and the sender earns a `BadProtocol` hit — which weighs
+    /// `i32::MIN`, so it is a 12-hour ban on the first offence.
+    #[tokio::test]
+    async fn an_erigon_board_messages_frame_is_ingested() {
+        let payload = from_hex(ERIGON_BOARD_MESSAGES);
+        let claimed: Vec<B256> = decode_wire_pow_msg_list(&payload)
+            .expect("the codec parses erigon's bytes")
+            .iter()
+            .map(|m| m.hash)
+            .collect();
+
+        {
+            let board = board_with_cfg(easy_cfg(), 10);
+            let rep = Arc::new(RecordingReporter::default());
+            let (tx, _rx) = channel();
+            let mut wants = authorised_for_hashes(&claimed);
+
+            handle_incoming(
+                &board,
+                Some(rep.as_ref()),
+                &tx,
+                &mut wants,
+                frame(BOARD_MESSAGES, &payload),
+                peer(),
+            )
+            .await;
+
+            assert_eq!(rep.bad_protocol(), 0, "erigon's frame must decode");
+            assert_eq!(wants.len(), 0, "each delivery must find its own reservation");
+            // The fixture's messages are anchored to a block no test board ever
+            // saw, which is circumstantial: the peer may simply be ahead.
+            assert_eq!(rep.bad_message(), 0);
+            assert_eq!(board.status().2, 0);
+        }
+    }
+
+    /// A delivery is ingested and the reply shape round-trips through the board.
+    #[tokio::test]
+    async fn a_wire_delivery_is_accepted_onto_the_board() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let (tx, _rx) = channel();
+
+        let wire: Vec<WirePoWMsg> = [mined(&[1], 10), mined(&[2], 10)]
+            .into_iter()
+            .map(|m| {
+                let hash = m.clone().to_checked(10, 0).expect("valid pow").hash;
+                WirePoWMsg::new(m, hash)
+            })
+            .collect();
+        let claimed: Vec<B256> = wire.iter().map(|m| m.hash).collect();
+
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut authorised_for_hashes(&claimed),
+            frame(BOARD_MESSAGES, &encode_wire_pow_msg_list(&wire)),
+            peer(),
+        )
+        .await;
+
+        assert_eq!(board.status().2, 2, "both delivered messages must land");
+    }
+
+    /// A frame claiming the same hash twice is a protocol violation
+    /// (`CheckUniqueHashes`, `msgboard/fetch.go:296-298`). Without it a peer
+    /// buys one verification per copy from a single reservation's worth of
+    /// distinct work.
+    #[tokio::test]
+    async fn a_wire_delivery_claiming_one_hash_twice_is_kicked() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, _rx) = channel();
+
+        let msg = mined(&[5], 10);
+        let hash = msg.clone().to_checked(10, 0).expect("valid pow").hash;
+        let dup = vec![WirePoWMsg::new(msg.clone(), hash), WirePoWMsg::new(msg, hash)];
+
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut authorised_for_hashes(&[hash]),
+            frame(BOARD_MESSAGES, &encode_wire_pow_msg_list(&dup)),
+            peer(),
+        )
+        .await;
+
+        assert_eq!(rep.bad_protocol(), 1, "the frame is refused whole");
+        assert_eq!(board.status().2, 0, "and nothing in it is ingested");
+    }
+
+    /// The reservation spent is the one for the hash that arrived.
+    ///
+    /// Two messages are reserved and one is delivered. Spending the oldest
+    /// reservation instead would consume the wrong one, and the message we are
+    /// still waiting for would arrive unauthorised.
+    #[tokio::test]
+    async fn a_wire_delivery_spends_the_reservation_for_its_own_hash() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let (tx, _rx) = channel();
+
+        let first = mined(&[1], 10);
+        let second = mined(&[2], 10);
+        let first_hash = first.clone().to_checked(10, 0).expect("valid pow").hash;
+        let second_hash = second.clone().to_checked(10, 0).expect("valid pow").hash;
+        let mut wants = authorised_for_hashes(&[first_hash, second_hash]);
+
+        // The second message arrives first.
+        let wire = [WirePoWMsg::new(second, second_hash)];
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut wants,
+            frame(BOARD_MESSAGES, &encode_wire_pow_msg_list(&wire)),
+            peer(),
+        )
+        .await;
+        assert_eq!(board.status().2, 1);
+
+        // The first message's reservation must have survived.
+        let wire = [WirePoWMsg::new(first, first_hash)];
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut wants,
+            frame(BOARD_MESSAGES, &encode_wire_pow_msg_list(&wire)),
+            peer(),
+        )
+        .await;
+        assert_eq!(board.status().2, 2, "the late answer must still be authorised");
+    }
+
+    // ── the claimed hash straddles verification ──────────────────────────────
+
+    /// A message we already hold costs nothing to re-receive.
+    ///
+    /// The body here is deliberately unmineable — its nonce solves nothing — so
+    /// verification would reject it as kickable. It claims the hash of a message
+    /// already on the board, and erigon's `addMsgLocked` probes the index with
+    /// that claim *before* `ToCheckedMsg` (`msgboard/board.go:416-418`). Reaching
+    /// verification at all is the failure this test names: a re-delivered
+    /// duplicate would cost a secp256k1 scalar multiplication and ban an honest
+    /// peer.
+    #[tokio::test]
+    async fn a_redelivery_of_a_held_message_short_circuits_before_verification() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, _rx) = channel();
+
+        let held = board.add_local_msg(mined(&[7], 10)).unwrap();
+        let junk = (1u64..=1_000_000)
+            .map(|n| PoWMsg { nonce: n, ..pow_msg(1, &[7, 7]) })
+            .find(|m| m.clone().to_checked(10, 0).is_err())
+            .expect("some nonce fails the work check");
+
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut authorised_for_hashes(&[held.hash]),
+            frame(BOARD_MESSAGES, &encode_wire_pow_msg_list(&[WirePoWMsg::new(junk, held.hash)])),
+            peer(),
+        )
+        .await;
+
+        assert_eq!(rep.bad_message(), 0, "a duplicate is circumstantial, and never verified");
+        assert_eq!(board.status().2, 1, "the held message is untouched");
+    }
+
+    /// The claim is never trusted. A body that verifies to a different hash than
+    /// its sender claimed is kickable (`msgboard/board.go:424-426`).
+    #[tokio::test]
+    async fn a_claimed_hash_that_does_not_match_the_body_is_kickable() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, _rx) = channel();
+
+        let msg = mined(&[9], 10);
+        let lie = B256::repeat_byte(0xBE);
+        assert_ne!(msg.clone().to_checked(10, 0).expect("valid pow").hash, lie);
+
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut authorised_for_hashes(&[lie]),
+            frame(BOARD_MESSAGES, &encode_wire_pow_msg_list(&[WirePoWMsg::new(msg, lie)])),
+            peer(),
+        )
+        .await;
+
+        assert_eq!(rep.bad_message(), 1, "a lying claim is misbehaviour");
+        assert_eq!(board.status().2, 0, "and the body is not kept");
+    }
+
+    // ── flag isolation ───────────────────────────────────────────────────────
+
+    /// Two boards on the newer behaviour set converge, with every byte produced
+    /// by the implementation. The cycle is the same three hops; only the payload
+    /// units changed.
+    #[tokio::test]
+    async fn two_boards_converge_through_the_full_cycle() {
+        let mut a = Node::with_cfg(easy_cfg(), 10);
+        let mut b = Node::with_cfg(easy_cfg(), 10);
+
+        for data in [&[1u8][..], &[2u8][..], &[3u8][..]] {
+            a.board.add_local_msg(mined(data, 10)).expect("accepted");
+        }
+
+        send_board_message_ids(&a.board, &a.tx, peer()).await;
+        assert_eq!(deliver(&mut a, &mut b).await, vec![BOARD_MESSAGE_IDS]);
+        assert_eq!(deliver(&mut b, &mut a).await, vec![GET_BOARD_MESSAGES]);
+        assert_eq!(deliver(&mut a, &mut b).await, vec![BOARD_MESSAGES]);
+
+        assert_eq!(b.hashes(), a.hashes(), "B must hold exactly what A holds");
+        assert_eq!(a.rep.bad_message() + a.rep.bad_protocol(), 0);
+        assert_eq!(b.rep.bad_message() + b.rep.bad_protocol(), 0);
+        assert!(deliver(&mut b, &mut a).await.is_empty(), "a converged link falls silent");
     }
 }
