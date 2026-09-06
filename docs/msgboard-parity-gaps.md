@@ -709,8 +709,8 @@ if from != 0 {
 }
 ```
 
-Two consequences, both from that comment's assumption being false — the
-OR-comparator does not produce a block-sorted vec, which is the whole of §11:
+That comment's assumption used to be false, because the pre-`pulse-v3.4.4`
+OR-comparator did not produce a block-sorted vec (§11). It had two consequences:
 
 1. **Out-of-range messages ride along.** Any message between the two bounds is
    returned regardless of its own block number.
@@ -718,10 +718,18 @@ OR-comparator does not produce a block-sorted vec, which is the whole of §11:
    fires and the index keeps its initial value (`leftIdx = 0`, `rightIdx =
    count`). A query whose range matches nothing returns **the entire board**.
 
-Measured over randomised boards: **68% of range-filtered `msgboard_content`
-queries return a different set**, and on 30% reth returns empty where erigon
-returns a non-empty slice. Worked case — board holding blocks 1, 2, 3, queried
-`from=10 to=20`: erigon returns all three messages, reth returns none.
+**Erigon guarded the comparator in `pulse-v3.4.4` (`78fbcffb8b`), and reth
+implements the guarded comparator only (§26). Under the guard the board is
+block-sorted, so consequence 1 is gone** — the seeked slice and a per-message
+filter agree on any range that matches something. Consequence 2 survives: the
+fail-open depends on the seek not firing, not on the ordering.
+
+Worked case — board holding blocks 1, 2, 3, queried `from=10 to=20`: erigon
+returns all three messages, reth returns none. That is still true.
+
+The earlier measurement in this section — 68% of range-filtered queries
+differing, 30% where reth returns empty against a non-empty erigon slice — was
+taken against the unguarded comparator and no longer describes either client.
 
 **Decision: keep reth's per-message filter. Divergence accepted and
 documented.** This is the one place in this document where parity loses, and
@@ -2439,3 +2447,112 @@ opposite box, and `msg_count` converges between the two.
 If `peer_sessions` reaches 1 and `accepted_remote` stays at zero, the fault is
 downstream of the session and §22's read order says the receive path is finally
 worth reading.
+
+## 26. Round-18: erigon fixed the comparator, and reth followed
+
+**Audit date:** 2026-09-04
+**Trigger:** an external preliminary security review of the module, and a
+check for upstream changes it prompted.
+
+### 26.1 The reference moved
+
+The newest erigon msgboard code is not on any tag. It is on the branch
+`origin/pulse-v3.4.4`, tip `78fbcffb8b` (2026-08-28). That resolves the
+`pulse-v3.4.4` citations in `protocol.rs`, which looked dangling because
+`git tag | grep pulse` finds nothing.
+
+`git merge-base 7a85cb10c0 origin/pulse-v3.4.4` returns nothing — the local
+`valve/msgboard-pow-v2` line and upstream are **disjoint lineages**, not one
+history. The v2 proof of work exists on both and agrees byte for byte, but by
+independent derivation. Read diffs between them as a comparison of two
+implementations, never as a changelog.
+
+### 26.2 The comparator became monotonic
+
+`msgboard/message_index.go:164-165` at `78fbcffb8b`:
+
+```go
+if newMsg.BlockNumber < msg.BlockNumber ||
+    (newMsg.BlockNumber == msg.BlockNumber && cmpRatio(...) < 0) {
+```
+
+The ratio term is now guarded by block equality. Two changes from the version
+§13.1 quotes: the guard, and `cmpRatio` cross-multiplication replacing `float64`
+ratios. The fast path took the same treatment and its shape is unchanged.
+
+**This retires the premise of §11 and §13.1.** Erigon's comparator is a strict
+`(block, ratio)` lexicographic order, so the board is block-sorted, so the
+search strategy is no longer observable. `sort.Search` over the guarded
+predicate now reproduces the linear scan exactly — verified, same digest over
+the 200k corpus. Reth keeps the scan because erigon scans, not because a search
+is unsafe.
+
+### 26.3 It is adopted outright
+
+Eviction order is wire-observable — two nodes fed the same messages must drop
+the same one, or they gossip different boards. So it moves with the wire
+format, not separately.
+
+`msg/1` is the format `78fbcffb8b` defines, and the one before it is obsolete.
+Reth therefore ships the guarded comparator alone, with no switch: a node
+speaking this `msg/1` sorts its board this way. The differential test pins the
+one digest, so the path cannot drift.
+
+The cost is a flag day. Until the network moves, a reth node and a
+pre-`78fbcffb8b` peer negotiate `msg/1`, fail to parse each other's frames,
+and disconnect. `ProtocolVersion` stays `1` by decision, so the handshake
+cannot separate them — see §26.7.
+
+### 26.4 Measured impact of the guard
+
+Both comparators run in Go over the same 200k-sequence corpus:
+
+| Metric | Rate |
+|---|---|
+| Sequences producing a different board order | **74.6%** |
+| Sequences producing a different eviction target (`msgs[0]`) | **39.4%** |
+
+`ERIGON_INSERT_DIGEST` moves from `14248539691690691664` to
+`7673666368459825830`.
+
+That is a larger swing than either wrong fix in §11 or §13.1 produced. The
+difference is provenance: this digest comes from erigon's current `Insert`
+compiled and run, and the generator was validated by reproducing the previous
+digest from the previous comparator before the new one was trusted.
+
+### 26.5 Method, since the last two rounds got this wrong
+
+The generator in `index.rs`'s differential test was run in Go against **both**
+comparators. The old one reproduced the committed constant exactly. Only then
+was the new constant taken. Every hand-written expected order in the index
+tests was re-derived by running erigon's `Insert` over that specific sequence,
+not adjusted by hand until the test passed.
+
+### 26.6 Consequence: §13.4 is half retired, under the guard
+
+A block-sorted board makes erigon's "assuming msgs are sorted by block number"
+true. Its seeked slice and reth's per-message filter now agree on any range
+that matches something, so the "out-of-range messages ride along" half of
+§13.4 is gone. The fail-open half survives, because it depends on the seek not
+firing rather than on the ordering. §13.4 is updated in place.
+
+### 26.7 The wire format, and why `ProtocolVersion` stays `1`
+
+`78fbcffb8b` also changed the wire format: `WirePoWMsg` carries a claimed hash
+on `BOARD_MESSAGES`, and `GET_BOARD_MESSAGES` carries 32-byte hashes instead of
+121-byte `MsgID`s. A `(peer, hash)` want list gates inbound bodies. All of that
+is implemented here, and it is the only format reth speaks.
+
+`msgboard/README.md` says changing these limits "requires a new capability
+version (`msg/2`)", and `78fbcffb8b` changed them without bumping
+`ProtocolVersion`. Staying at `1` is a deliberate decision, not an oversight:
+msgboard is opt-in and experimental, nothing in production speaks the new
+format yet, and a coordinated flip costs less than burning a capability version
+on a format still taking shape.
+
+The consequence is that the handshake cannot separate the two formats. Until
+the network moves, a reth node and a pre-`78fbcffb8b` peer negotiate `msg/1`
+and then refuse each other's frames. On reth that is worse than on erigon,
+because `BadProtocol` scores against the peer rather than the sub-protocol, so
+one msgboard mismatch removes that peer from block sync too. Whoever runs the
+upgrade should keep the window short.

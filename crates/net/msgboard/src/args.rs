@@ -5,7 +5,7 @@ use std::{path::PathBuf, time::Duration};
 use clap::Args;
 use reth_msgboard_types::MsgboardConfig;
 
-use crate::protocol::{MAX_INBOUND_FRAME_SIZE, MAX_SAFE_SIZE_LIMIT};
+use crate::protocol::{MAX_SAFE_SIZE_LIMIT, P2P_MSG_PACKET_LIMIT};
 
 /// Default DB flush interval. Mirrors `CommitEvery = 15s` in
 /// `private-erigon-pulse/msgboardcfg/config.go`.
@@ -16,16 +16,16 @@ const DEFAULT_COMMIT_EVERY: &str = "15s";
 const DEFAULT_LOG_EVERY: &str = "30s";
 
 /// Parse `--msgboard.size-limit`, refusing a value that would make us emit a
-/// `BoardMessages` frame every other reth node bans us for.
+/// `BoardMessages` packet our peers ban us for.
 ///
 /// `size_limit` bounds the `data` field of every message the board accepts,
 /// and a message the board accepts is one it may later be asked to serve. The
 /// `BoardMessages` packer flushes only once the *next* message would cross the
-/// 100 KiB chunking target, so a message above that target travels alone in a
-/// frame as large as itself. Past [`MAX_SAFE_SIZE_LIMIT`] that frame exceeds
-/// [`MAX_INBOUND_FRAME_SIZE`], and a reth peer drops it undecoded and reports
-/// the sender for a protocol violation — a 12-hour ban, from every reth peer
-/// we serve.
+/// 100 KiB packet limit, so a message above that limit travels alone in a
+/// packet as large as itself. Past [`MAX_SAFE_SIZE_LIMIT`] that packet exceeds
+/// [`P2P_MSG_PACKET_LIMIT`]: a reth peer drops it undecoded and reports the
+/// sender for a protocol violation — a 12-hour ban — and an erigon-pulse peer
+/// disconnects outright.
 ///
 /// Failing at parse time rather than at first send is the point: the send only
 /// happens once a message that large exists and someone asks for it, which can
@@ -34,14 +34,15 @@ const DEFAULT_LOG_EVERY: &str = "30s";
 ///
 /// This bounds nothing on the wire and rejects no message any peer sends. The
 /// default of 8 KiB is erigon-pulse's, three orders of magnitude below the
-/// ceiling, so no existing configuration changes.
+/// ceiling, so no existing configuration changes. Erigon guards the same value
+/// the same way at startup (`validateMsgSizeLimit`, `msgboard/util.go:17-23`).
 fn parse_size_limit(raw: &str) -> Result<usize, String> {
     let limit: usize = raw.parse().map_err(|_| format!("`{raw}` is not a byte count"))?;
     if limit > MAX_SAFE_SIZE_LIMIT {
         return Err(format!(
             "{limit} exceeds the {MAX_SAFE_SIZE_LIMIT}-byte ceiling: a message that size \
              occupies a BoardMessages frame on its own, and the frame would be larger than \
-             the {MAX_INBOUND_FRAME_SIZE}-byte msg/1 packet every reth peer accepts, so \
+             the {P2P_MSG_PACKET_LIMIT}-byte msg/1 packet every conforming peer accepts, so \
              serving it would get us banned"
         ));
     }
@@ -260,14 +261,12 @@ mod tests {
         assert!(args.msgboard_gossip_disable);
     }
 
-    /// `--msgboard.size-limit` is capped at the frame ceiling.
+    /// `--msgboard.size-limit` is capped at the packet ceiling.
     ///
     /// The cap is a wire invariant, not taste: a message above it occupies a
-    /// `BoardMessages` frame on its own, and that frame is larger than the
-    /// `msg/1` packet every reth peer accepts, so the first peer that asks for
-    /// the message bans us. Erigon-pulse would not even request it
-    /// (`FilterMessageIDs` skips `id.Size() > cfg.MsgSizeLimit`), so the split
-    /// is reth against reth.
+    /// `BoardMessages` packet on its own, and that packet is larger than the
+    /// `msg/1` limit every conforming peer enforces, so the first peer that
+    /// asks for the message bans us.
     ///
     /// Both directions are asserted. Refusing the ceiling itself would be a
     /// guard that is simply too strict.

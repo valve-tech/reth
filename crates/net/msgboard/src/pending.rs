@@ -20,10 +20,11 @@
 //! | `direct-a-evm-1` | 65 | 1 | 64 (98%) |
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
+use alloy_primitives::B256;
 use reth_msgboard_types::MsgID;
 
 /// How long a claimed ID blocks further requests for the same message.
@@ -49,6 +50,26 @@ pub(crate) const PENDING_REQUEST_TTL: Duration = Duration::from_secs(10);
 /// holds at most 846 IDs, so this absorbs nearly ten peers announcing wholly
 /// disjoint full frames at once.
 pub(crate) const MAX_PENDING_REQUESTS: usize = 8192;
+
+/// How long a reservation authorises a peer to deliver one message.
+///
+/// Erigon's `WantTimeout` (`msgboard/protocol.go`). It is deliberately longer
+/// than [`PENDING_REQUEST_TTL`]: the claim stops us re-asking, and it must
+/// expire first so another peer can be asked, while the reservation still
+/// authorises the original peer's late answer.
+pub(crate) const WANT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Reservations one peer may hold at once.
+///
+/// Erigon's `MaxWantPerPeer`. It bounds what a peer can make us verify: to buy
+/// one scalar multiplication it must first announce an ID we want, and it can
+/// be owed at most this many at a time. Above `MAX_IDS_PER_FRAME` = 846, so a
+/// peer announcing a full frame is never refused.
+///
+/// Erigon also caps the total across peers at `MaxWantEntries` = 4096. Reth has
+/// no equivalent: the list is per connection, so the fleet-wide bound is this
+/// figure times the msgboard peer count — 32 KiB of hashes per peer.
+pub(crate) const MAX_WANT_PER_PEER: usize = 1024;
 
 /// Tracks message IDs that have been requested but not yet received.
 ///
@@ -118,6 +139,124 @@ impl Default for PendingRequests {
     fn default() -> Self {
         Self::new(PENDING_REQUEST_TTL, MAX_PENDING_REQUESTS)
     }
+}
+
+/// The messages one peer is authorised to deliver.
+///
+/// [`PendingRequests`] decides what we *ask* for; this decides what we are
+/// willing to *pay* for when it arrives. They are separate questions and the
+/// second one was unasked until now: the `BOARD_MESSAGES` arm handed whatever a
+/// peer sent straight to `add_remote_msgs`, which runs a secp256k1 scalar
+/// multiplication per message. One 100 KiB frame holds about 1,200 minimal
+/// messages, so a peer that had requested nothing still bought ~1,200 scalar
+/// multiplications on the connection task.
+///
+/// Mirrors erigon-pulse's `wantList` (`msgboard/want_list.go`, `pulse-v3.4.4`
+/// `78fbcffb8b`), which keys pending requests by `(peer, hash)` and calls
+/// `Take(peer, hash, now)` on the inbound path before any `PoW` work. One
+/// instance lives in each connection task, so the peer half of erigon's key is
+/// the instance itself and only the hash is stored.
+///
+/// [`take`](Self::take) spends the reservation for a named hash, mirroring
+/// erigon's `Take(peer, hash, now)`. It relies on the claimed hash that
+/// `WirePoWMsg` carries: without one, nothing identifies a delivery before
+/// verification, because the index key is `sha256(challenge ‖ category ‖ data)`
+/// and `challenge` *is* the curve point.
+#[derive(Debug)]
+pub(crate) struct WantList {
+    /// Reserved hashes in reservation order. Every entry shares one TTL, so
+    /// insertion order is expiry order and the front is always the oldest.
+    queue: VecDeque<Want>,
+    /// Membership, so a peer re-announcing an ID it already owes us does not
+    /// reserve a second slot.
+    live: HashSet<B256>,
+    ttl: Duration,
+    capacity: usize,
+}
+
+impl WantList {
+    /// Create a want list with the given expiry and entry cap.
+    pub(crate) fn new(ttl: Duration, capacity: usize) -> Self {
+        Self { queue: VecDeque::new(), live: HashSet::new(), ttl, capacity }
+    }
+
+    /// Drop every reservation older than the TTL.
+    ///
+    /// Expiry is lazy, as in erigon: `reserve` and `take` prune, and
+    /// nothing runs on a timer.
+    pub(crate) fn prune(&mut self, now: Instant) {
+        while let Some(front) = self.queue.front() {
+            if now < front.expires_at {
+                break;
+            }
+            let expired = self.queue.pop_front().expect("front exists");
+            self.live.remove(&expired.hash);
+        }
+    }
+
+    /// Reserve `hash`, authorising this peer to deliver one message.
+    ///
+    /// Returns `false` when the peer already owes us that hash or the list is
+    /// full. Unlike [`PendingRequests::claim`] this fails **closed**, matching
+    /// erigon's `Reserve`: a reservation we do not record is a message we would
+    /// refuse to verify on arrival, so requesting it would waste the round trip.
+    /// The caller must hand a refused ID back to [`PendingRequests`] rather than
+    /// request it.
+    pub(crate) fn reserve(&mut self, hash: B256, now: Instant) -> bool {
+        if self.live.contains(&hash) || self.queue.len() >= self.capacity {
+            return false;
+        }
+        self.queue.push_back(Want { hash, expires_at: now + self.ttl });
+        self.live.insert(hash);
+        true
+    }
+
+    /// Give back reservations for a request that never reached the peer.
+    ///
+    /// The queue entry is left in place and skipped when it surfaces, so this
+    /// stays O(1) per hash. Mirrors erigon's `Drop`.
+    pub(crate) fn release(&mut self, hashes: impl IntoIterator<Item = B256>) {
+        for hash in hashes {
+            self.live.remove(&hash);
+        }
+    }
+
+    /// Spend the reservation for `hash`, authorising one `PoW` verification.
+    ///
+    /// Returns `false` when this peer does not owe us that hash, which is the
+    /// signal to drop the message unverified. Mirrors erigon's
+    /// `Take(peer, hash, now)` (`msgboard/want_list.go`, `pulse-v3.4.4`): the
+    /// delivery names itself, so an unsolicited message in the middle of a
+    /// frame does not spend the reservation standing behind it.
+    ///
+    /// The queue entry is left in place and skipped when it surfaces, keeping
+    /// this O(1) — the same bookkeeping [`release`](Self::release) uses. A
+    /// spent reservation is not restored if the message then fails validation,
+    /// matching erigon: the peer is penalised, and another peer may already
+    /// hold its own reservation for the same message.
+    pub(crate) fn take(&mut self, hash: B256, now: Instant) -> bool {
+        self.prune(now);
+        self.live.remove(&hash)
+    }
+
+    /// Number of live reservations, for tests.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.live.len()
+    }
+}
+
+impl Default for WantList {
+    fn default() -> Self {
+        Self::new(WANT_TIMEOUT, MAX_WANT_PER_PEER)
+    }
+}
+
+/// One reserved hash and the instant it stops authorising anything.
+#[derive(Debug)]
+struct Want {
+    hash: B256,
+    expires_at: Instant,
 }
 
 #[cfg(test)]
@@ -204,5 +343,105 @@ mod tests {
         assert!(pending.claim(id(200), now), "claims past the cap must still be granted");
         assert!(pending.claim(id(200), now), "and are not deduplicated, by design");
         assert_eq!(pending.len(), capacity, "but the map does not grow");
+    }
+
+    fn hash(n: u8) -> B256 {
+        B256::repeat_byte(n)
+    }
+
+    // ── want list ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn re_announcing_an_owed_hash_does_not_buy_a_second_verification() {
+        let mut wants = WantList::default();
+        let now = Instant::now();
+
+        assert!(wants.reserve(hash(1), now));
+        assert!(!wants.reserve(hash(1), now), "the peer already owes us this one");
+        assert_eq!(wants.len(), 1);
+    }
+
+    /// Unlike [`PendingRequests::claim`], which fails open, a full want list
+    /// refuses — an unrecorded reservation is a message we would drop on
+    /// arrival, so asking for it wastes the round trip.
+    #[test]
+    fn the_want_list_fails_closed_at_capacity() {
+        let capacity = 4;
+        let mut wants = WantList::new(WANT_TIMEOUT, capacity);
+        let now = Instant::now();
+
+        for n in 0..u8::try_from(capacity).unwrap() {
+            assert!(wants.reserve(hash(n), now));
+        }
+        assert!(!wants.reserve(hash(200), now), "past the cap a reservation is refused");
+        assert_eq!(wants.len(), capacity);
+    }
+
+    #[test]
+    fn releasing_a_reservation_withdraws_its_authorisation() {
+        let mut wants = WantList::default();
+        let now = Instant::now();
+
+        wants.reserve(hash(1), now);
+        wants.reserve(hash(2), now);
+        wants.release([hash(1)]);
+
+        assert_eq!(wants.len(), 1);
+        assert!(wants.take(hash(2), now), "the surviving reservation still pays for one");
+        assert!(!wants.take(hash(1), now), "the released one does not");
+    }
+
+    /// A delivery that names itself spends its own reservation, not the oldest
+    /// one. Erigon keys the want list by `(peer, hash)` and takes by hash, so a
+    /// late answer to an earlier request stays authorised.
+    #[test]
+    fn taking_by_hash_spends_only_that_hash() {
+        let mut wants = WantList::default();
+        let now = Instant::now();
+
+        wants.reserve(hash(1), now);
+        wants.reserve(hash(2), now);
+
+        assert!(wants.take(hash(2), now), "the message that arrived is paid for");
+        assert!(!wants.take(hash(2), now), "and only once");
+        assert_eq!(wants.len(), 1);
+        assert!(wants.take(hash(1), now), "the older reservation survived");
+    }
+
+    #[test]
+    fn taking_a_hash_we_never_reserved_authorises_nothing() {
+        let mut wants = WantList::default();
+        let now = Instant::now();
+        wants.reserve(hash(1), now);
+
+        assert!(!wants.take(hash(9), now), "an unrequested message is not authorised");
+        assert_eq!(wants.len(), 1, "and it does not consume someone else's reservation");
+    }
+
+    #[test]
+    fn a_reservation_taken_by_hash_stops_authorising_once_it_expires() {
+        let ttl = Duration::from_secs(15);
+        let mut wants = WantList::new(ttl, MAX_WANT_PER_PEER);
+        let now = Instant::now();
+
+        wants.reserve(hash(1), now);
+        assert!(!wants.take(hash(1), now + ttl), "a late answer buys nothing");
+        assert_eq!(wants.len(), 0);
+    }
+
+    /// Released entries stay in the queue and are skipped when they surface, so
+    /// a release must not shorten the budget of the reservations behind it.
+    #[test]
+    fn a_released_entry_does_not_consume_a_later_reservation() {
+        let mut wants = WantList::default();
+        let now = Instant::now();
+
+        for n in 0..3 {
+            wants.reserve(hash(n), now);
+        }
+        wants.release([hash(0), hash(1)]);
+
+        assert!(wants.take(hash(2), now));
+        assert!(!wants.take(hash(2), now), "only one reservation survived the release");
     }
 }
