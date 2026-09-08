@@ -11,21 +11,71 @@ use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 #[unsafe(export_name = "malloc_conf")]
 static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use clap::Parser;
 use reth::{
     cli::Cli, FirehoseExecutorBuilder, MsgboardNetworkBuilder, PulsechainFirehoseExecutorBuilder,
 };
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_msgboard::{args::MsgboardArgs, MsgboardLauncher};
+use reth_msgboard::{args::MsgboardArgs, launch::MSGBOARD_RPC_NAMESPACE, MsgboardLauncher};
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
 use reth_pulsechain_node::{
     consensus::PulsechainConsensus, evm::PulsechainEvmConfig, gas::install_gas_estimation_margin,
     launch::inject_pulsechain_bootnodes_if_unset, spec::PulsechainChainSpec,
     PulsechainChainSpecParser, PulsechainNode,
 };
+use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection, RpcModuleValidator};
 use tracing::info;
+
+/// Accepts reth's standard RPC module names plus the namespaces THIS binary
+/// actually serves.
+///
+/// WHY THIS EXISTS. The msgboard RPC methods register under
+/// `RethRpcModule::Other("msgboard")` and are installed with
+/// `merge_if_module_configured`, so they appear on a transport only when that
+/// transport's `--http.api` / `--ws.api` names `msgboard`. But the CLI
+/// validates the selection BEFORE any of that, and upstream's
+/// `DefaultRpcModuleValidator` rejects every `Other(_)` variant outright:
+///
+///     Error: Invalid RPC module 'msgboard' in http.api: Unknown RPC module: 'msgboard'
+///
+/// So the module honoured an allowlist that would not accept its own name, and
+/// msgboard RPC could not be enabled by configuration at all. Measured on
+/// direct-a-evm-943 on 2026-09-08: adding `msgboard` to `--http.api` put reth
+/// into a crash loop, while omitting it left `msgboard_content` answering
+/// -32601 on that box and returning the board on its sibling, which still ran
+/// the older build where the namespace leaked onto every transport.
+///
+/// WHY NOT `LenientRpcModuleValidator`. Upstream ships one, and it accepts any
+/// name at all. That would take a typo — `--http.api eth,mssgboard` — and
+/// silently start a node with no msgboard and no complaint, which is the
+/// failure this validator exists to keep catching. Allow the one namespace we
+/// serve; keep rejecting everything else.
+///
+/// Adding a namespace here is not enough on its own to serve it: something
+/// must also merge methods under the matching `RethRpcModule::Other`.
+#[derive(Debug, Clone, Copy)]
+pub struct ValveRpcModuleValidator;
+
+impl RpcModuleValidator for ValveRpcModuleValidator {
+    fn parse_selection(s: &str) -> Result<RpcModuleSelection, String> {
+        let selection = RpcModuleSelection::from_str(s)
+            .map_err(|e| format!("Failed to parse RPC modules: {e}"))?;
+
+        if let RpcModuleSelection::Selection(modules) = &selection {
+            for module in modules {
+                if let RethRpcModule::Other(name) = module {
+                    if name != MSGBOARD_RPC_NAMESPACE {
+                        return Err(format!("Unknown RPC module: '{name}'"));
+                    }
+                }
+            }
+        }
+
+        Ok(selection)
+    }
+}
 
 /// Chain names that route to upstream `EthereumNode` (full Pectra / EIP-7702
 /// support). Anything else falls through to [`PulsechainNode`].
@@ -129,7 +179,7 @@ fn requested_ethereum_chain() -> bool {
 /// Uses upstream [`EthereumNode`] with stock components. Msgboard is wired
 /// identically to the PulseChain path so the same binary serves both.
 fn run_ethereum_node() -> eyre::Result<()> {
-    Cli::<EthereumChainSpecParser, EthereumExtArgs>::parse().run(
+    Cli::<EthereumChainSpecParser, EthereumExtArgs, ValveRpcModuleValidator>::parse().run(
         async move |builder, ext: EthereumExtArgs| {
             let EthereumExtArgs { msgboard: msgboard_args, firehose_enabled } = ext;
             let launcher = MsgboardLauncher::new(msgboard_args);
@@ -257,58 +307,59 @@ fn run_pulsechain_node() -> eyre::Result<()> {
         (PulsechainEvmConfig::new(spec.clone()), Arc::new(PulsechainConsensus::new(spec)))
     };
 
-    Cli::<PulsechainChainSpecParser, MsgboardArgs>::parse().run_with_components::<PulsechainNode>(
-        components,
-        async move |mut builder, msgboard_args: MsgboardArgs| {
-            info!(target: "reth::cli", "Launching PulseChain node");
-            // Firehose is unconditional on this path, so `--jit` is always inert here.
-            warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
+    Cli::<PulsechainChainSpecParser, MsgboardArgs, ValveRpcModuleValidator>::parse()
+        .run_with_components::<PulsechainNode>(
+            components,
+            async move |mut builder, msgboard_args: MsgboardArgs| {
+                info!(target: "reth::cli", "Launching PulseChain node");
+                // Firehose is unconditional on this path, so `--jit` is always inert here.
+                warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
 
-            let chain_id = builder.config().chain.chain().id();
-            inject_pulsechain_bootnodes_if_unset(
-                &mut builder.config_mut().network.bootnodes,
-                chain_id,
-            );
+                let chain_id = builder.config().chain.chain().id();
+                inject_pulsechain_bootnodes_if_unset(
+                    &mut builder.config_mut().network.bootnodes,
+                    chain_id,
+                );
 
-            let launcher = MsgboardLauncher::new(msgboard_args);
-            let launcher_for_rpc = launcher.clone();
+                let launcher = MsgboardLauncher::new(msgboard_args);
+                let launcher_for_rpc = launcher.clone();
 
-            // Build via the components fluent API so we can swap in
-            // PulsechainFirehoseExecutorBuilder + install the firehose ExEx.
-            // Mirrors the run_ethereum_node path but with PulseChain's
-            // pool/network/consensus/payload builders.
-            let handle = builder
-                .with_types::<PulsechainNode>()
-                .with_components(
-                    PulsechainNode::components()
-                        .executor(PulsechainFirehoseExecutorBuilder::default())
-                        .network(MsgboardNetworkBuilder::new(launcher.clone())),
-                )
-                .with_add_ons(EthereumAddOns::default())
-                .extend_rpc_modules(move |ctx| {
-                    launcher_for_rpc.install_rpc(ctx.modules)?;
+                // Build via the components fluent API so we can swap in
+                // PulsechainFirehoseExecutorBuilder + install the firehose ExEx.
+                // Mirrors the run_ethereum_node path but with PulseChain's
+                // pool/network/consensus/payload builders.
+                let handle = builder
+                    .with_types::<PulsechainNode>()
+                    .with_components(
+                        PulsechainNode::components()
+                            .executor(PulsechainFirehoseExecutorBuilder::default())
+                            .network(MsgboardNetworkBuilder::new(launcher.clone())),
+                    )
+                    .with_add_ons(EthereumAddOns::default())
+                    .extend_rpc_modules(move |ctx| {
+                        launcher_for_rpc.install_rpc(ctx.modules)?;
 
-                    // Replace eth_estimateGas with a version that adds a 20% margin.
-                    let eth_api = ctx.registry.eth_api().clone();
-                    install_gas_estimation_margin(ctx.modules, eth_api)?;
+                        // Replace eth_estimateGas with a version that adds a 20% margin.
+                        let eth_api = ctx.registry.eth_api().clone();
+                        install_gas_estimation_margin(ctx.modules, eth_api)?;
 
-                    Ok(())
-                })
-                .install_exex("firehose", |ctx| async move {
-                    Ok(async move { reth_firehose::run_exex(ctx).await })
-                })
-                .launch()
-                .await?;
+                        Ok(())
+                    })
+                    .install_exex("firehose", |ctx| async move {
+                        Ok(async move { reth_firehose::run_exex(ctx).await })
+                    })
+                    .launch()
+                    .await?;
 
-            launcher.install_post_launch_tasks(
-                handle.node.network.clone(),
-                handle.node.provider.clone(),
-            );
-            let exit = handle.wait_for_node_exit().await;
-            launcher.final_flush();
-            exit
-        },
-    )
+                launcher.install_post_launch_tasks(
+                    handle.node.network.clone(),
+                    handle.node.provider.clone(),
+                );
+                let exit = handle.wait_for_node_exit().await;
+                launcher.final_flush();
+                exit
+            },
+        )
 }
 
 /// Warns when `--jit` is passed on a firehose-instrumented node, where it does nothing.
@@ -335,5 +386,69 @@ fn warn_if_jit_requested_with_firehose(jit_enabled: bool) {
              JIT are mutually exclusive: the JIT's compiled path does not fire the Inspector \
              hooks firehose reads from. Drop the flag to silence this warning."
         );
+    }
+}
+
+#[cfg(test)]
+mod validator_tests {
+    use super::*;
+
+    /// The regression this validator exists for. `msgboard` must survive the
+    /// CLI, or `merge_if_module_configured` can never see it and the namespace
+    /// is unreachable by configuration.
+    #[test]
+    fn accepts_the_msgboard_namespace() {
+        let selection = ValveRpcModuleValidator::parse_selection(
+            "eth,net,web3,debug,trace,txpool,rpc,reth,ots,msgboard",
+        )
+        .expect("msgboard must be accepted");
+
+        let RpcModuleSelection::Selection(modules) = selection else {
+            panic!("expected an explicit selection");
+        };
+        assert!(modules.contains(&RethRpcModule::Other(MSGBOARD_RPC_NAMESPACE.to_string())));
+        assert!(modules.contains(&RethRpcModule::Eth));
+    }
+
+    /// The property that makes this better than `LenientRpcModuleValidator`.
+    /// A typo must still fail loudly: accepting it would start a node with no
+    /// msgboard and no complaint, which is harder to notice than a crash.
+    #[test]
+    fn still_rejects_a_typo() {
+        let err = ValveRpcModuleValidator::parse_selection("eth,mssgboard")
+            .expect_err("a misspelled namespace must be rejected");
+        assert!(err.contains("mssgboard"), "the error must name the offending module: {err}");
+    }
+
+    #[test]
+    fn rejects_an_unrelated_unknown_namespace() {
+        assert!(ValveRpcModuleValidator::parse_selection("eth,definitely_not_a_module").is_err());
+    }
+
+    /// Standard selections must behave exactly as they did under the default
+    /// validator — this validator widens the allowlist by one name and changes
+    /// nothing else.
+    #[test]
+    fn leaves_standard_selections_alone() {
+        for s in ["eth", "eth,net,web3", "all", "none"] {
+            assert!(
+                ValveRpcModuleValidator::parse_selection(s).is_ok(),
+                "standard selection {s} must stay valid"
+            );
+        }
+    }
+
+    /// `validate_selection` is what the CLI actually calls, and it takes an
+    /// already-parsed selection. Exercising only `parse_selection` would miss a
+    /// break in the path the binary uses.
+    #[test]
+    fn validate_selection_accepts_msgboard_and_rejects_a_typo() {
+        let parsed = RpcModuleSelection::from_str("eth,msgboard").unwrap();
+        assert!(ValveRpcModuleValidator::validate_selection(&parsed, "http.api").is_ok());
+
+        let typo = RpcModuleSelection::from_str("eth,mssgboard").unwrap();
+        let err = ValveRpcModuleValidator::validate_selection(&typo, "http.api")
+            .expect_err("validate_selection must reject a typo too");
+        assert!(err.contains("http.api"), "the error must name the argument: {err}");
     }
 }
