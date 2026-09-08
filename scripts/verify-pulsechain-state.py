@@ -12,6 +12,13 @@ Usage:
                                        [--list-categories]
                                        [--fail-fast]
 
+Every endpoint (`--ours` and each `--ref`) may be given as http(s)://,
+ws(s)://, ipc:///path/to/reth.ipc, or a bare filesystem path to an IPC socket:
+
+    --ours http://127.0.0.1:8545
+    --ours ws://127.0.0.1:8546
+    --ours /mnt/data/reth.ipc          # or ipc:///mnt/data/reth.ipc
+
 Default reference RPCs are public PulseChain endpoints. Default `ours` is the
 loopback assumed when run on the reth box (`http://127.0.0.1:8545`). The script
 exits non-zero if any check mismatches.
@@ -25,12 +32,20 @@ re-execution).
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import hashlib
+import itertools
 import json
+import os
+import socket
+import ssl
+import struct
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -66,20 +81,312 @@ DEFAULT_REFS = [
 
 # ─── Wire ─────────────────────────────────────────────────────────────────────
 
+USER_AGENT = "verify-pulsechain-state/0.1"
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+_JSON = json.JSONDecoder()
+_rpc_ids = itertools.count(1)
+_thread_state = threading.local()
+
 
 def rpc(url: str, method: str, params: list[Any], timeout: float = 25.0) -> Any:
-    """Single JSON-RPC call. Raises on transport or RPC-layer error."""
-    body = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1})
-    req = urllib.request.Request(
-        url,
-        data=body.encode(),
-        headers={"Content-Type": "application/json", "User-Agent": "verify-pulsechain-state/0.1"},
+    """Single JSON-RPC call over http(s), ws(s), or a local IPC socket.
+
+    Raises on transport or RPC-layer error.
+    """
+    return transport_for(url).call(method, params, timeout)
+
+
+def transport_for(url: str) -> Transport:
+    """Return this thread's transport for `url`, creating it on first use.
+
+    Transports are per-thread so the connection-oriented ones (WebSocket, IPC)
+    never have two requests in flight on one socket — that lets them read the
+    response synchronously instead of demultiplexing by request id.
+    """
+    cache = getattr(_thread_state, "transports", None)
+    if cache is None:
+        cache = _thread_state.transports = {}
+    transport = cache.get(url)
+    if transport is None:
+        transport = cache[url] = make_transport(url)
+    return transport
+
+
+def make_transport(url: str) -> Transport:
+    """Pick a transport from the endpoint's scheme. Raises ValueError if unknown.
+
+    Accepted forms:
+        http://host:port/…, https://…       — one request per connection
+        ws://host:port/…, wss://…           — persistent websocket
+        ipc:///path/to/reth.ipc             — unix domain socket
+        /path/to/reth.ipc, ./x.ipc, ~/x.ipc — unix domain socket (path shorthand)
+    """
+    if url.startswith(("http://", "https://")):
+        return HttpTransport(url)
+    if url.startswith(("ws://", "wss://")):
+        return WsTransport(url)
+    if url.startswith("ipc://"):
+        return IpcTransport(url, url[len("ipc://"):])
+    if url.startswith(("/", "./", "../", "~")) or url.endswith(".ipc"):
+        return IpcTransport(url, url)
+    raise ValueError(
+        f"unsupported endpoint {url!r}: expected http(s)://, ws(s)://, ipc://, or a path to a .ipc socket"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        payload = json.loads(resp.read())
+
+
+def _unwrap(payload: Any, url: str) -> Any:
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{url}: malformed response {payload!r}")
     if "error" in payload:
         raise RuntimeError(f"{url} rpc error: {payload['error']}")
     return payload.get("result")
+
+
+class Transport:
+    """A JSON-RPC endpoint bound to one URL."""
+
+    def call(self, method: str, params: list[Any], timeout: float) -> Any:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class HttpTransport(Transport):
+    def __init__(self, url: str):
+        self.url = url
+
+    def call(self, method: str, params: list[Any], timeout: float = 25.0) -> Any:
+        body = json.dumps(
+            {"jsonrpc": "2.0", "method": method, "params": params, "id": next(_rpc_ids)}
+        )
+        req = urllib.request.Request(
+            self.url,
+            data=body.encode(),
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _unwrap(json.loads(resp.read()), self.url)
+
+
+class StreamTransport(Transport):
+    """Shared plumbing for connection-oriented transports (websocket, IPC).
+
+    Holds one lazily-opened socket plus the bytes read past the end of the last
+    message. Never share an instance between threads.
+    """
+
+    def __init__(self, url: str):
+        self.url = url
+        self._sock: socket.socket | None = None
+        self._buf = b""
+
+    def call(self, method: str, params: list[Any], timeout: float = 25.0) -> Any:
+        req_id = next(_rpc_ids)
+        body = json.dumps(
+            {"jsonrpc": "2.0", "method": method, "params": params, "id": req_id}
+        ).encode()
+        # Two attempts: a pooled connection may have been dropped while idle,
+        # which only surfaces when we write to it.
+        for attempt in range(2):
+            try:
+                if self._sock is None:
+                    self._sock = self._connect(timeout)
+                deadline = time.monotonic() + timeout
+                self._sock.settimeout(timeout)
+                self._send(body)
+                while True:
+                    payload = self._recv_json(deadline)
+                    # Skip subscription notifications and responses to a request
+                    # abandoned by an earlier timeout.
+                    if isinstance(payload, dict) and payload.get("id") == req_id:
+                        return _unwrap(payload, self.url)
+            except (TimeoutError, socket.timeout):
+                self.close()
+                raise
+            except (OSError, EOFError):
+                self.close()
+                if attempt:
+                    raise
+        raise AssertionError("unreachable")
+
+    def close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        self._sock = None
+        self._buf = b""
+
+    def _connect(self, timeout: float) -> socket.socket:
+        raise NotImplementedError
+
+    def _send(self, body: bytes) -> None:
+        raise NotImplementedError
+
+    def _recv_json(self, deadline: float) -> Any:
+        raise NotImplementedError
+
+    def _fill(self, deadline: float) -> None:
+        """Append one chunk from the socket to the read buffer."""
+        assert self._sock is not None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"{self.url}: timed out waiting for a response")
+        self._sock.settimeout(remaining)
+        chunk = self._sock.recv(65536)
+        if not chunk:
+            raise EOFError(f"{self.url}: connection closed by peer")
+        self._buf += chunk
+
+    def _recv_exact(self, count: int, deadline: float) -> bytes:
+        while len(self._buf) < count:
+            self._fill(deadline)
+        out, self._buf = self._buf[:count], self._buf[count:]
+        return out
+
+
+class IpcTransport(StreamTransport):
+    """JSON-RPC over a unix domain socket, as exposed by `reth --ipcpath`."""
+
+    def __init__(self, url: str, path: str):
+        super().__init__(url)
+        self.path = os.path.expanduser(path)
+
+    def _connect(self, timeout: float) -> socket.socket:
+        if not hasattr(socket, "AF_UNIX"):
+            raise RuntimeError("IPC endpoints need unix domain socket support")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(self.path)
+        return sock
+
+    def _send(self, body: bytes) -> None:
+        assert self._sock is not None
+        self._sock.sendall(body + b"\n")
+
+    def _recv_json(self, deadline: float) -> Any:
+        # The IPC stream has no framing: responses are concatenated JSON values,
+        # so decode incrementally and keep whatever follows for the next call.
+        while True:
+            stripped = self._buf.lstrip()
+            if stripped:
+                try:
+                    value, end = _JSON.raw_decode(stripped.decode())
+                except ValueError:
+                    pass  # incomplete value, read more
+                else:
+                    self._buf = stripped[end:]
+                    return value
+            self._fill(deadline)
+
+
+class WsTransport(StreamTransport):
+    """Minimal RFC 6455 client — enough for request/response JSON-RPC.
+
+    Deliberately stdlib-only so the script keeps running on a bare node box
+    without `websockets` or `websocket-client` installed.
+    """
+
+    def __init__(self, url: str):
+        super().__init__(url)
+        parsed = urllib.parse.urlsplit(url)
+        self.secure = parsed.scheme == "wss"
+        self.host = parsed.hostname or "127.0.0.1"
+        self.port = parsed.port or (443 if self.secure else 80)
+        self.resource = parsed.path or "/"
+        if parsed.query:
+            self.resource += "?" + parsed.query
+
+    def _connect(self, timeout: float) -> socket.socket:
+        sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        if self.secure:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self.host)
+        key = base64.b64encode(os.urandom(16)).decode()
+        handshake = (
+            f"GET {self.resource} HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            f"User-Agent: {USER_AGENT}\r\n"
+            "\r\n"
+        )
+        sock.sendall(handshake.encode())
+
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                sock.close()
+                raise EOFError(f"{self.url}: connection closed during websocket handshake")
+            head += chunk
+        head, _, rest = head.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        if "101" not in lines[0].split(" ")[:2]:
+            sock.close()
+            raise RuntimeError(f"{self.url}: websocket handshake failed: {lines[0]}")
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        headers = {
+            k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:]) if k
+        }
+        if headers.get("sec-websocket-accept") != accept:
+            sock.close()
+            raise RuntimeError(f"{self.url}: websocket handshake returned a bad accept key")
+        # Bytes read past the handshake are already frame data.
+        self._buf = rest
+        return sock
+
+    def _send(self, body: bytes) -> None:
+        self._send_frame(0x1, body)
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        assert self._sock is not None
+        header = bytearray([0x80 | opcode])
+        size = len(payload)
+        if size < 126:
+            header.append(0x80 | size)
+        elif size < 1 << 16:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", size)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", size)
+        # Clients must mask every frame they send (RFC 6455 §5.3).
+        mask = os.urandom(4)
+        header += mask
+        self._sock.sendall(bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def _recv_json(self, deadline: float) -> Any:
+        message = b""
+        while True:
+            first, second = self._recv_exact(2, deadline)
+            fin, opcode = first & 0x80, first & 0x0F
+            if second & 0x80:
+                raise RuntimeError(f"{self.url}: server sent a masked frame")
+            size = second & 0x7F
+            if size == 126:
+                size = struct.unpack(">H", self._recv_exact(2, deadline))[0]
+            elif size == 127:
+                size = struct.unpack(">Q", self._recv_exact(8, deadline))[0]
+            payload = self._recv_exact(size, deadline) if size else b""
+
+            if opcode == 0x9:  # ping
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:  # pong
+                continue
+            if opcode == 0x8:  # close
+                raise EOFError(f"{self.url}: server closed the websocket")
+            if opcode in (0x0, 0x1, 0x2):  # continuation / text / binary
+                message += payload
+                if fin:
+                    return json.loads(message.decode())
+                continue
+            raise RuntimeError(f"{self.url}: unexpected websocket opcode {opcode:#x}")
 
 
 # ─── Check model ──────────────────────────────────────────────────────────────
@@ -99,6 +406,11 @@ def _summarize(val: Any, width: int = 24) -> str:
         return f"len={(len(val) - 2) // 2}B sha={digest}"
     if isinstance(val, str) and len(val) > width:
         return val[: width - 3] + "..."
+    if isinstance(val, dict):
+        # Block objects: identify by hash instead of dumping every field.
+        if "hash" in val:
+            return f"block {val.get('number', '?')} hash={val['hash'][:12]}…"
+        return f"{{{len(val)} keys}}"
     return str(val)
 
 
@@ -251,8 +563,9 @@ def build_checks(fork_block: int) -> list[Check]:
                             comparator=lambda a, b: a["stateRoot"].lower() == b["stateRoot"].lower()))
 
     # Current tip — both sides should converge; we tolerate a few-block lag in ref.
+    chain_id = "0x3af" if fork_block == PRIMORDIAL_PULSE_TESTNET_V4 else "0x171"  # 943 / 369
     checks.append(Check("chain-history", "eth_chainId",
-                        "eth_chainId", [], expected="0x3af"))  # 943 testnet v4
+                        "eth_chainId", [], expected=chain_id))
 
     # ── Invariants ────────────────────────────────────────────────────────────
     # The parentHash chain at the fork: block(N).parentHash must equal block(N-1).hash.
@@ -315,9 +628,9 @@ def run_check(check: Check, ours_url: str, ref_urls: list[str]) -> Result:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ours", default="http://127.0.0.1:8545",
-                        help="Our reth node's JSON-RPC URL")
+                        help="Our reth node's endpoint: http(s)://, ws(s)://, ipc://<path>, or a path to an IPC socket")
     parser.add_argument("--ref", action="append", default=None,
-                        help="Reference JSON-RPC URL (repeatable; defaults to public Pulse testnet RPCs)")
+                        help="Reference endpoint, same forms as --ours (repeatable; defaults to public Pulse testnet RPCs)")
     parser.add_argument("--chain", choices=["testnet-v4", "mainnet"], default="testnet-v4",
                         help="Which PulseChain to verify (selects PrimordialPulse fork block)")
     parser.add_argument("--categories", default=None,
@@ -338,6 +651,13 @@ def main() -> int:
         cats = sorted({c.category for c in checks})
         print("\n".join(cats))
         return 0
+
+    # Fail fast and clearly on a bad endpoint instead of once per check.
+    for url in [args.ours, *refs]:
+        try:
+            make_transport(url)
+        except ValueError as e:
+            parser.error(str(e))
 
     if args.categories:
         wanted = set(args.categories.split(","))
