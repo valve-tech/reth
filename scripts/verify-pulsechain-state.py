@@ -97,6 +97,28 @@ def rpc(url: str, method: str, params: list[Any], timeout: float = 25.0) -> Any:
     return transport_for(url).call(method, params, timeout)
 
 
+# TLS trust for https:// and wss://. `None` means the system store, which is
+# what the public reference endpoints need. Set once from --cafile before the
+# thread pool starts, so the per-thread transports all see the same value.
+_TLS_CONTEXT = None
+
+
+def set_ca_file(path):
+    """Additionally trust the CA bundle at `path`, for a node behind a private CA.
+
+    Adds to the system trust store rather than replacing it. `create_default_context(cafile=…)`
+    would load only that bundle, which breaks the public reference endpoints this
+    script compares against — the whole point is to talk to both at once.
+    """
+    global _TLS_CONTEXT
+    if not path:
+        _TLS_CONTEXT = None
+        return
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations(cafile=path)
+    _TLS_CONTEXT = ctx
+
+
 def transport_for(url: str) -> Transport:
     """Return this thread's transport for `url`, creating it on first use.
 
@@ -166,7 +188,7 @@ class HttpTransport(Transport):
             data=body.encode(),
             headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_TLS_CONTEXT) as resp:
             return _unwrap(json.loads(resp.read()), self.url)
 
 
@@ -303,7 +325,8 @@ class WsTransport(StreamTransport):
     def _connect(self, timeout: float) -> socket.socket:
         sock = socket.create_connection((self.host, self.port), timeout=timeout)
         if self.secure:
-            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self.host)
+            ctx = _TLS_CONTEXT or ssl.create_default_context()
+            sock = ctx.wrap_socket(sock, server_hostname=self.host)
         key = base64.b64encode(os.urandom(16)).decode()
         handshake = (
             f"GET {self.resource} HTTP/1.1\r\n"
@@ -639,9 +662,21 @@ def main() -> int:
                         help="Print available categories and exit")
     parser.add_argument("--fail-fast", action="store_true",
                         help="Stop on first mismatch")
+    parser.add_argument("--cafile", default=None,
+                        help="PEM bundle to additionally trust when verifying https:// and "
+                             "wss:// endpoints, for a node served by a private CA — a local "
+                             "Caddy or mkcert root. The system trust store still applies, so "
+                             "public reference endpoints keep working.")
     parser.add_argument("--parallel", type=int, default=4,
                         help="Number of RPC requests to run in parallel (default 4)")
     args = parser.parse_args()
+
+    # Before any transport is built, so every thread's connection uses it.
+    try:
+        set_ca_file(args.cafile)
+    except OSError as e:
+        print(f"--cafile {args.cafile}: {e}", file=sys.stderr)
+        return 2
 
     fork = PRIMORDIAL_PULSE_TESTNET_V4 if args.chain == "testnet-v4" else PRIMORDIAL_PULSE_MAINNET
     refs = args.ref or DEFAULT_REFS
