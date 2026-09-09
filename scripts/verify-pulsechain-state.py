@@ -7,7 +7,7 @@ that a wrong implementation would silently corrupt.
 
 Usage:
     python3 verify-pulsechain-state.py [--ours URL] [--ref URL [--ref URL ...]]
-                                       [--chain testnet-v4|mainnet]
+                                       [--chain mainnet|testnet-v4|ethereum|sepolia]
                                        [--categories cat1,cat2,...]
                                        [--list-categories]
                                        [--fail-fast]
@@ -19,7 +19,10 @@ ws(s)://, ipc:///path/to/reth.ipc, or a bare filesystem path to an IPC socket:
     --ours ws://127.0.0.1:8546
     --ours /mnt/data/reth.ipc          # or ipc:///mnt/data/reth.ipc
 
-Default reference RPCs are public PulseChain endpoints (testnet-v4 and mainnet).
+Chains it knows: PulseChain mainnet and testnet-v4, plus Ethereum and Sepolia,
+which get the checks that do not depend on a PrimordialPulse fork. Adding one is
+adding a `ChainProfile` to CHAINS. Default reference RPCs are public endpoints
+for whichever chain the node turns out to be on.
 Default `ours` is the loopback assumed when run on the reth box (`http://127.0.0.1:8545`).
 The script exits non-zero if any check mismatches.
 
@@ -57,6 +60,14 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 # ─── Constants from reth_pulsechain_forks::primordial_pulse ──────────────────
+# The Ethereum merge. PulseChain replays Ethereum history, so this height sits
+# below both PrimordialPulse forks and has to agree with a reference there.
+#
+# This check was written as `0xed14b2`, which is 15,537,330 — 64 blocks short of
+# the height its own label claimed. It still compared like for like across
+# nodes, so it passed; it just was not testing the block it said it was.
+ETH_MERGE_BLOCK = 15_537_394
+
 PRIMORDIAL_PULSE_TESTNET_V4 = 16_492_700
 PRIMORDIAL_PULSE_MAINNET = 17_233_000
 
@@ -79,18 +90,65 @@ PULSE_DEPOSIT_ZEROHASHES = {
     # tests these 5; for full coverage we compare slot-by-slot against a ref RPC.)
 }
 
-DEFAULT_REFS_TESTNET_V4 = [
-    "https://rpc.v4.testnet.pulsechain.com",
-    "https://rpc-testnet-pulsechain.g4mm4.io",
-]
-DEFAULT_REFS_MAINNET = [
-    "https://rpc.pulsechain.com",
-    "https://rpc-pulsechain.g4mm4.io",
-]
+@dataclass(frozen=True)
+class ChainProfile:
+    """Everything that differs between the chains this script can verify.
 
-# `eth_chainId` values for the chains this script knows how to verify. Anything
-# else is refused rather than guessed at: the checks encode one fork schedule.
-CHAIN_NAMES = {"0x171": "mainnet", "0x3af": "testnet-v4"}
+    Adding a chain is adding an entry to CHAINS. A chain with no PrimordialPulse
+    fork simply leaves `primordial_pulse` unset and names some heights to sample
+    headers at instead.
+    """
+
+    chain_id: str
+    refs: tuple[str, ...]
+    # PulseChain only. When set, the whole PrimordialPulse suite applies.
+    primordial_pulse: int | None = None
+    # Testnet v4 only: the address the fork credits.
+    treasury: str | None = None
+    # Heights to compare headers at on a chain with no fork block to anchor on.
+    # Any height works — the check is parity with the references, not a claim
+    # about what happened at that height.
+    header_samples: tuple[tuple[str, int], ...] = ()
+
+
+CHAINS: dict[str, ChainProfile] = {
+    "mainnet": ChainProfile(
+        chain_id="0x171",
+        refs=("https://rpc.pulsechain.com", "https://rpc-pulsechain.g4mm4.io"),
+        primordial_pulse=PRIMORDIAL_PULSE_MAINNET,
+    ),
+    "testnet-v4": ChainProfile(
+        chain_id="0x3af",
+        refs=("https://rpc.v4.testnet.pulsechain.com", "https://rpc-testnet-pulsechain.g4mm4.io"),
+        primordial_pulse=PRIMORDIAL_PULSE_TESTNET_V4,
+        treasury=TESTNET_V4_TREASURY,
+    ),
+    "ethereum": ChainProfile(
+        chain_id="0x1",
+        refs=("https://eth.drpc.org", "https://1rpc.io/eth"),
+        header_samples=(
+            ("block 1M", 1_000_000),
+            ("block 10M", 10_000_000),
+            ("the merge", ETH_MERGE_BLOCK),
+            ("block 20M", 20_000_000),
+        ),
+    ),
+    "sepolia": ChainProfile(
+        chain_id="0xaa36a7",
+        refs=("https://ethereum-sepolia-rpc.publicnode.com",
+              "https://sepolia.gateway.tenderly.co"),
+        header_samples=(
+            ("block 1M", 1_000_000),
+            ("the merge", 1_450_409),
+            ("block 3M", 3_000_000),
+            ("block 5M", 5_000_000),
+        ),
+    ),
+}
+
+# `eth_chainId` value to chain name. A node on anything not listed here is
+# refused rather than guessed at.
+CHAIN_NAMES = {profile.chain_id: name for name, profile in CHAINS.items()}
 
 
 # ─── Wire ─────────────────────────────────────────────────────────────────────
@@ -534,8 +592,13 @@ def _block_hex(n: int) -> str:
     return hex(n)
 
 
-def build_checks(fork_block: int) -> list[Check]:
-    """Return all checks parametrized over the chain's PrimordialPulse fork block.
+def build_checks(profile: ChainProfile) -> list[Check]:
+    """Return the checks that apply to `profile`.
+
+    A chain with no PrimordialPulse fork — Ethereum, Sepolia — gets the checks
+    that do not depend on one: genesis, sampled block headers, and chain id.
+    Those still compare our node against independent references at heights deep
+    in its history, which is what the tool is for.
 
     Categories (used by --categories filter):
         block-headers           — block hash + stateRoot at key heights
@@ -547,6 +610,60 @@ def build_checks(fork_block: int) -> list[Check]:
         chain-history           — sanity at genesis, merge, tip
         invariants              — cross-block invariants (e.g. state-root chain)
     """
+    checks: list[Check] = []
+
+    if profile.primordial_pulse is not None:
+        checks += _primordial_pulse_checks(profile.primordial_pulse, profile.treasury)
+
+    for height_label, height in profile.header_samples:
+        checks += _header_checks(height_label, _block_hex(height))
+
+    checks += _chain_history_checks(profile)
+    return checks
+
+
+def _header_checks(height_label: str, blk: str) -> list[Check]:
+    """Header-field parity at one height, against every reference."""
+    return [
+        Check("block-headers", f"{field} @ {height_label}",
+              "eth_getBlockByNumber", [blk, False],
+              comparator=lambda a, b, f=field: a[f].lower() == b[f].lower())
+        for field in ("hash", "stateRoot", "receiptsRoot", "transactionsRoot")
+    ]
+
+
+def _chain_history_checks(profile: ChainProfile) -> list[Check]:
+    """Checks that hold on any chain: genesis agreement and the chain id."""
+    checks = [
+        Check("chain-history", "genesis (block 0) hash",
+              "eth_getBlockByNumber", ["0x0", False],
+              comparator=lambda a, b: a["hash"].lower() == b["hash"].lower()),
+        Check("chain-history", "genesis stateRoot",
+              "eth_getBlockByNumber", ["0x0", False],
+              comparator=lambda a, b: a["stateRoot"].lower() == b["stateRoot"].lower()),
+    ]
+
+    # PulseChain replays Ethereum history, so the Ethereum merge block sits below
+    # its fork and must still agree. Chains that sample their own heights cover
+    # this through `header_samples` instead.
+    if profile.primordial_pulse is not None and profile.primordial_pulse > ETH_MERGE_BLOCK:
+        merge = _block_hex(ETH_MERGE_BLOCK)
+        checks += [
+            Check("chain-history", "ETH merge block hash",
+                  "eth_getBlockByNumber", [merge, False],
+                  comparator=lambda a, b: a["hash"].lower() == b["hash"].lower()),
+            Check("chain-history", "ETH merge block stateRoot",
+                  "eth_getBlockByNumber", [merge, False],
+                  comparator=lambda a, b: a["stateRoot"].lower() == b["stateRoot"].lower()),
+        ]
+
+    checks.append(Check("chain-history", "eth_chainId", "eth_chainId", [],
+                        expected=profile.chain_id))
+    return checks
+
+
+def _primordial_pulse_checks(fork_block: int, treasury: str | None) -> list[Check]:
+    """The suite that only means anything on a chain with a PrimordialPulse fork."""
     pre = _block_hex(fork_block - 1)
     fork = _block_hex(fork_block)
     post = _block_hex(fork_block + 1)
@@ -561,18 +678,7 @@ def build_checks(fork_block: int) -> list[Check]:
         ("PrimordialPulse+1", post),
         ("PrimordialPulse+100", post100),
     ]:
-        checks.append(Check("block-headers", f"hash @ {height_label}",
-                            "eth_getBlockByNumber", [blk, False],
-                            comparator=lambda a, b: a["hash"].lower() == b["hash"].lower()))
-        checks.append(Check("block-headers", f"stateRoot @ {height_label}",
-                            "eth_getBlockByNumber", [blk, False],
-                            comparator=lambda a, b: a["stateRoot"].lower() == b["stateRoot"].lower()))
-        checks.append(Check("block-headers", f"receiptsRoot @ {height_label}",
-                            "eth_getBlockByNumber", [blk, False],
-                            comparator=lambda a, b: a["receiptsRoot"].lower() == b["receiptsRoot"].lower()))
-        checks.append(Check("block-headers", f"transactionsRoot @ {height_label}",
-                            "eth_getBlockByNumber", [blk, False],
-                            comparator=lambda a, b: a["transactionsRoot"].lower() == b["transactionsRoot"].lower()))
+        checks += _header_checks(height_label, blk)
 
     # ── ETH deposit contract: alive pre-fork, gone post-fork ─────────────────
     checks.append(Check("eth-deposit-contract", "code present @ pre-fork",
@@ -618,14 +724,14 @@ def build_checks(fork_block: int) -> list[Check]:
                         "eth_getStorageAt", [PULSE_DEPOSIT_CONTRACT, "0x41", fork],
                         expected="0x" + "00" * 32))
 
-    # ── Treasury (testnet v4 only — mainnet skipped via category filter) ──────
-    if fork_block == PRIMORDIAL_PULSE_TESTNET_V4:
+    # ── Treasury (only chains whose profile names one) ────────────────────────
+    if treasury:
         checks.append(Check("treasury", "treasury balance @ pre-fork == 0",
-                            "eth_getBalance", [TESTNET_V4_TREASURY, pre], expected="0x0"))
+                            "eth_getBalance", [treasury, pre], expected="0x0"))
         checks.append(Check("treasury", "treasury balance @ fork == ref",
-                            "eth_getBalance", [TESTNET_V4_TREASURY, fork]))
+                            "eth_getBalance", [treasury, fork]))
         checks.append(Check("treasury", "treasury balance @ +100 == ref",
-                            "eth_getBalance", [TESTNET_V4_TREASURY, post100]))
+                            "eth_getBalance", [treasury, post100]))
 
     # ── Sacrifice credits — sample addresses from decoded firehose chunk ─────
     # Picked to span the address space (early, several middles, late). Any
@@ -646,29 +752,6 @@ def build_checks(fork_block: int) -> list[Check]:
                             "eth_getBalance", [addr, pre]))
         checks.append(Check("sacrifice-credits", f"balance @ fork {addr[:10]}…",
                             "eth_getBalance", [addr, fork]))
-
-    # ── Chain-history sanity ──────────────────────────────────────────────────
-    # Block 0 is shared Ethereum mainnet genesis — must agree across nodes.
-    checks.append(Check("chain-history", "genesis (block 0) hash",
-                        "eth_getBlockByNumber", ["0x0", False],
-                        comparator=lambda a, b: a["hash"].lower() == b["hash"].lower()))
-    checks.append(Check("chain-history", "genesis stateRoot",
-                        "eth_getBlockByNumber", ["0x0", False],
-                        comparator=lambda a, b: a["stateRoot"].lower() == b["stateRoot"].lower()))
-
-    # Ethereum Merge block (15,537,394) — pre-PrimordialPulse, post-merge sanity.
-    if fork_block > 15_537_394:
-        checks.append(Check("chain-history", "ETH merge block hash",
-                            "eth_getBlockByNumber", ["0xed14b2", False],
-                            comparator=lambda a, b: a["hash"].lower() == b["hash"].lower()))
-        checks.append(Check("chain-history", "ETH merge block stateRoot",
-                            "eth_getBlockByNumber", ["0xed14b2", False],
-                            comparator=lambda a, b: a["stateRoot"].lower() == b["stateRoot"].lower()))
-
-    # Current tip — both sides should converge; we tolerate a few-block lag in ref.
-    chain_id = "0x3af" if fork_block == PRIMORDIAL_PULSE_TESTNET_V4 else "0x171"  # 943 / 369
-    checks.append(Check("chain-history", "eth_chainId",
-                        "eth_chainId", [], expected=chain_id))
 
     # ── Invariants ────────────────────────────────────────────────────────────
     # The parentHash chain at the fork: block(N).parentHash must equal block(N-1).hash.
@@ -752,7 +835,7 @@ def main() -> int:
                         help="Our reth node's endpoint: http(s)://, ws(s)://, ipc://<path>, or a path to an IPC socket")
     parser.add_argument("--ref", action="append", default=None,
                         help="Reference endpoint, same forms as --ours (repeatable; defaults to public Pulse testnet RPCs)")
-    parser.add_argument("--chain", choices=["testnet-v4", "mainnet"], default=None,
+    parser.add_argument("--chain", choices=sorted(CHAINS), default=None,
                         help="Chain you expect the node to be on. The chain is always read "
                              "from the node itself; this asserts the answer and exits non-zero "
                              "on a mismatch, so a run against the wrong endpoint fails instead "
@@ -789,7 +872,8 @@ def main() -> int:
     # The category list is the same on every chain, so answer it before touching
     # the network. This flag has to work with no node running.
     if args.list_categories:
-        cats = sorted({c.category for c in build_checks(PRIMORDIAL_PULSE_TESTNET_V4)})
+        # testnet-v4 carries every category, so it lists the full set.
+        cats = sorted({c.category for c in build_checks(CHAINS["testnet-v4"])})
         print("\n".join(cats))
         return 0
 
@@ -817,8 +901,8 @@ def main() -> int:
         print(redact(f"expected {args.chain}, but {args.ours} is on {chain}"), file=sys.stderr)
         return 2
 
-    fork = PRIMORDIAL_PULSE_TESTNET_V4 if chain == "testnet-v4" else PRIMORDIAL_PULSE_MAINNET
-    refs = args.ref or (DEFAULT_REFS_TESTNET_V4 if chain == "testnet-v4" else DEFAULT_REFS_MAINNET)
+    profile = CHAINS[chain]
+    refs = list(args.ref or profile.refs)
 
     # A reference on another chain disagrees with ours on nearly every check. That
     # reads as scores of failures when the cause is one wrong endpoint, so name the
@@ -839,7 +923,7 @@ def main() -> int:
             print(redact(f"  {url} → {name}"), file=sys.stderr)
         return 2
 
-    checks = build_checks(fork)
+    checks = build_checks(profile)
 
     if args.categories:
         wanted = set(args.categories.split(","))
