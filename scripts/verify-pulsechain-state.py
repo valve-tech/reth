@@ -7,7 +7,6 @@ that a wrong implementation would silently corrupt.
 
 Usage:
     python3 verify-pulsechain-state.py [--ours URL] [--ref URL [--ref URL ...]]
-                                       [--chain testnet-v4|mainnet]
                                        [--categories cat1,cat2,...]
                                        [--list-categories]
                                        [--fail-fast]
@@ -19,9 +18,9 @@ ws(s)://, ipc:///path/to/reth.ipc, or a bare filesystem path to an IPC socket:
     --ours ws://127.0.0.1:8546
     --ours /mnt/data/reth.ipc          # or ipc:///mnt/data/reth.ipc
 
-Default reference RPCs are public PulseChain endpoints. Default `ours` is the
-loopback assumed when run on the reth box (`http://127.0.0.1:8545`). The script
-exits non-zero if any check mismatches.
+Default reference RPCs are public PulseChain endpoints (testnet-v4 and mainnet).
+Default `ours` is the loopback assumed when run on the reth box (`http://127.0.0.1:8545`).
+The script exits non-zero if any check mismatches.
 
 Add new checks by extending CHECKS — each entry is (category, label, method,
 params, optional_expected, optional_comparator). Category filtering lets CI
@@ -73,9 +72,13 @@ PULSE_DEPOSIT_ZEROHASHES = {
     # tests these 5; for full coverage we compare slot-by-slot against a ref RPC.)
 }
 
-DEFAULT_REFS = [
+DEFAULT_REFS_TESTNET_V4 = [
     "https://rpc.v4.testnet.pulsechain.com",
     "https://rpc-testnet-pulsechain.g4mm4.io",
+]
+DEFAULT_REFS_MAINNET = [
+    "https://rpc.pulsechain.com",
+    "https://rpc-pulsechain.g4mm4.io",
 ]
 
 
@@ -654,8 +657,6 @@ def main() -> int:
                         help="Our reth node's endpoint: http(s)://, ws(s)://, ipc://<path>, or a path to an IPC socket")
     parser.add_argument("--ref", action="append", default=None,
                         help="Reference endpoint, same forms as --ours (repeatable; defaults to public Pulse testnet RPCs)")
-    parser.add_argument("--chain", choices=["testnet-v4", "mainnet"], default="testnet-v4",
-                        help="Which PulseChain to verify (selects PrimordialPulse fork block)")
     parser.add_argument("--categories", default=None,
                         help="Comma-separated list of categories to run (default: all)")
     parser.add_argument("--list-categories", action="store_true",
@@ -678,8 +679,39 @@ def main() -> int:
         print(f"--cafile {args.cafile}: {e}", file=sys.stderr)
         return 2
 
-    fork = PRIMORDIAL_PULSE_TESTNET_V4 if args.chain == "testnet-v4" else PRIMORDIAL_PULSE_MAINNET
-    refs = args.ref or DEFAULT_REFS
+    # Fail fast and clearly on a bad endpoint instead of once per check.
+    for url in [args.ours, *(args.ref or [])]:
+        try:
+            make_transport(url)
+        except ValueError as e:
+            parser.error(str(e))
+
+    # Derive chain from passed url,
+    def get_chain_id(url: str) -> str:
+        """Retrieve the chain ID from an RPC endpoint via eth_chainId."""
+        return rpc(url, "eth_chainId", [])
+
+    _CHAIN_NAMES = {"0x171": "mainnet", "0x3af": "testnet-v4"}
+
+    # chainid = get_chain_id(args.ours)
+    chain = _CHAIN_NAMES[get_chain_id(args.ours)]
+    if chain not in ["testnet-v4", "mainnet"]:
+        print(f"{args.ours} is not on testnet-v4 or mainnet", file=sys.stderr)
+        raise RuntimeError("RPC Network Mismatch")
+
+    # chain = _CHAIN_NAMES[chainid]
+    fork = PRIMORDIAL_PULSE_TESTNET_V4 if chain == "testnet-v4" else PRIMORDIAL_PULSE_MAINNET
+
+    refs = args.ref or (DEFAULT_REFS_TESTNET_V4 if chain == "testnet-v4" else DEFAULT_REFS_MAINNET)
+
+    ref_ids = {url: _CHAIN_NAMES.get(get_chain_id(url), "other") for url in refs}
+    if any(cid != chain for cid in ref_ids.values()):
+        print("Your Node:", file=sys.stderr)
+        print(f"  {args.ours} → {chain}", file=sys.stderr)
+        print("Reference Nodes:", file=sys.stderr)
+        for url, cid in ref_ids.items():
+            print(f"  {url} → {cid}", file=sys.stderr)
+        raise RuntimeError("Reference RPC Mismatch")
 
     checks = build_checks(fork)
     if args.list_categories:
@@ -687,18 +719,11 @@ def main() -> int:
         print("\n".join(cats))
         return 0
 
-    # Fail fast and clearly on a bad endpoint instead of once per check.
-    for url in [args.ours, *refs]:
-        try:
-            make_transport(url)
-        except ValueError as e:
-            parser.error(str(e))
-
     if args.categories:
         wanted = set(args.categories.split(","))
         checks = [c for c in checks if c.category in wanted]
 
-    print(f"running {len(checks)} checks against ours={args.ours} ref(s)={refs} chain={args.chain}", file=sys.stderr)
+    print(f"running {len(checks)} checks against ours={args.ours} ref(s)={refs} chain={chain}", file=sys.stderr)
     t0 = time.time()
 
     results: list[Result] = []
