@@ -8,6 +8,26 @@
 //! This module provides [`install_gas_estimation_margin`], which replaces the stock
 //! `eth_estimateGas` RPC method with a wrapper that applies a configurable margin
 //! (default 20%) to the result.
+//!
+//! # This is the ONLY place the fork adds a gas margin
+//!
+//! It is installed from `bin/reth/src/main.rs` on the PulseChain node path
+//! alone, which is what keeps Ethereum mainnet on stock estimates.
+//!
+//! A second margin once existed inside the SHARED core estimator
+//! (`reth_rpc_eth_api::helpers::estimate`). The two compounded, and because
+//! the shared one was ungated it also inflated mainnet. Measured 2026-09-08 on
+//! a plain 21,000-gas transfer:
+//!
+//! | chain | returned | factor |
+//! |---|---|---|
+//! | 369, 943 | 30,564 | 1.4554x |
+//! | 1 (mainnet) | 25,470 | 1.2129x |
+//!
+//! `30,564 = 25,470 x 1.2` exactly. Both margins came from the fork's original
+//! integration work, in two separate commits, each written as though it were
+//! the only one. If a margin is ever needed in the shared estimator, remove
+//! this wrapper first — never run both.
 
 use alloy_primitives::U256;
 use alloy_rpc_types_eth::{state::StateOverride, BlockId, BlockOverrides, TransactionRequest};
@@ -106,5 +126,43 @@ mod tests {
     fn margin_saturates_instead_of_overflowing() {
         let expected = U256::MAX / U256::from(GAS_MARGIN_DENOMINATOR);
         assert_eq!(apply_gas_margin(U256::MAX), expected);
+    }
+
+    /// The SHARED estimator must not pad as well, or the two margins compound.
+    ///
+    /// This is a source check, not a behavioural one: there is no RPC harness
+    /// in this workspace that can call `eth_estimateGas` end to end, and the
+    /// compounding is invisible from inside either crate. It reads the core
+    /// estimator and asserts it returns the binary-search result unpadded.
+    ///
+    /// SCOPE, stated plainly: this catches a margin written the way the last
+    /// one was — arithmetic on `highest_gas_limit` after the search loop. A
+    /// margin expressed some other way would slip past it. It is a tripwire on
+    /// the known regression, not a proof of absence. If it ever fails to
+    /// compile because the file moved, fix the path; do not delete the test.
+    #[test]
+    fn shared_estimator_adds_no_margin_of_its_own() {
+        const CORE_ESTIMATOR: &str =
+            include_str!("../../../rpc/rpc-eth-api/src/helpers/estimate.rs");
+
+        // Guard the guard: if the path ever resolves to something that is not
+        // the estimator, the assertions below would pass vacuously.
+        assert!(
+            CORE_ESTIMATOR.contains("fn estimate_gas_with"),
+            "include_str! no longer points at the core gas estimator"
+        );
+
+        for pattern in [
+            "highest_gas_limit.saturating_add(highest_gas_limit / 5)",
+            "highest_gas_limit / 5",
+            "highest_gas_limit * 6 / 5",
+        ] {
+            assert!(
+                !CORE_ESTIMATOR.contains(pattern),
+                "the shared estimator pads with `{pattern}`; combined with this \
+                 module's wrapper that is TWO 20% margins on every PulseChain \
+                 estimate. Remove one — see this module's header."
+            );
+        }
     }
 }
