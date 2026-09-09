@@ -28,6 +28,29 @@
 //! integration work, in two separate commits, each written as though it were
 //! the only one. If a margin is ever needed in the shared estimator, remove
 //! this wrapper first — never run both.
+//!
+//! `crates/ethereum/node/tests/e2e/estimate.rs` pins the shared estimator to the
+//! exact cost against a running node, so the compounding cannot come back
+//! unnoticed. Add a margin there and those tests fail.
+//!
+//! # The margin is capped by what the sender can afford
+//!
+//! Erigon pads and then re-caps, in `rpc/jsonrpc/eth_call.go`:
+//!
+//! ```text
+//! hi = hi + hi/5
+//! if accountGasLimit != 0 && hi > accountGasLimit { hi = accountGasLimit }
+//! ```
+//!
+//! The cap matters because the core estimator already limits its *search* by the
+//! caller's allowance, so padding afterwards can push the answer back above what
+//! the sender can pay. Without the re-cap a tight-balance sender receives an
+//! estimate that nothing rejects at estimation time, and the send fails later at
+//! submission — a much harder failure to read, and exactly the "send max" case.
+//!
+//! [`cap_by_affordability`] reproduces it. The allowance is computed inside the
+//! estimator and is gone by the time a result reaches this wrapper, so the
+//! balance is read back at the same block the estimate ran against.
 
 use alloy_primitives::U256;
 use alloy_rpc_types_eth::{state::StateOverride, BlockId, BlockOverrides, TransactionRequest};
@@ -46,6 +69,41 @@ const GAS_MARGIN_DENOMINATOR: u64 = 5;
 /// saturates at `U256::MAX` instead of panicking).
 fn apply_gas_margin(gas: U256) -> U256 {
     gas.saturating_mul(U256::from(GAS_MARGIN_NUMERATOR)) / U256::from(GAS_MARGIN_DENOMINATOR)
+}
+
+/// The fee per gas the sender would pay, which is what the affordability cap divides by.
+///
+/// Mirrors erigon's `feeCap`: an explicit `gasPrice` wins, then `maxFeePerGas`. A request
+/// that names neither is not paying for gas, so there is nothing to cap.
+fn fee_cap(request: &TransactionRequest) -> Option<U256> {
+    request.gas_price.or(request.max_fee_per_gas).map(U256::from).filter(|fee| !fee.is_zero())
+}
+
+/// Caps a padded estimate by the gas the sender can actually pay for.
+///
+/// The core estimator caps its **search** by this allowance, but the margin is applied
+/// afterwards and can push the answer back above it. Erigon caps after padding for the same
+/// reason, in `rpc/jsonrpc/eth_call.go`:
+///
+/// ```text
+/// hi = hi + hi/5
+/// if accountGasLimit != 0 && hi > accountGasLimit { hi = accountGasLimit }
+/// ```
+///
+/// Without this, a sender whose balance barely covers the transaction gets an estimate they
+/// cannot pay for. Nothing rejects it at estimation time: the send fails later, at
+/// submission, which is a much harder failure to read.
+///
+/// Returns `padded` unchanged when the request names no fee, since then the sender pays
+/// nothing for gas and no balance can constrain it.
+fn cap_by_affordability(padded: U256, balance: U256, request: &TransactionRequest) -> U256 {
+    let Some(fee) = fee_cap(request) else { return padded };
+
+    // The value being sent is not available to pay for gas.
+    let available = balance.saturating_sub(request.value.unwrap_or_default());
+    let allowance = available / fee;
+
+    padded.min(allowance)
 }
 
 /// Replaces `eth_estimateGas` in all configured transports with a wrapper that
@@ -85,11 +143,35 @@ where
         let state_override: Option<StateOverride> = seq.optional_next()?;
         let block_overrides: Option<Box<BlockOverrides>> = seq.optional_next()?;
 
-        let estimate: RpcResult<U256> =
-            EthApiServer::estimate_gas(&**ctx, request, block_id, state_override, block_overrides)
-                .await;
+        let estimate: U256 = EthApiServer::estimate_gas(
+            &**ctx,
+            request.clone(),
+            block_id,
+            state_override,
+            block_overrides,
+        )
+        .await?;
 
-        estimate.map(apply_gas_margin)
+        let padded = apply_gas_margin(estimate);
+
+        // Only a request naming both a sender and a fee can be capped, because only then is
+        // there a gas bill the sender might not afford. Everything else keeps the padded
+        // figure — including a failed balance lookup, since a cap we cannot compute must
+        // not turn a working estimate into an error.
+        let capped = match (request.from, fee_cap(&request)) {
+            (Some(from), Some(_)) => {
+                // Read the balance at the block the estimate ran against, so the cap and
+                // the estimate see one state.
+                match EthApiServer::balance(&**ctx, from, block_id).await {
+                    Ok(balance) => cap_by_affordability(padded, balance, &request),
+                    Err(_) => padded,
+                }
+            }
+            _ => padded,
+        };
+
+        let result: RpcResult<U256> = Ok(capped);
+        result
     })?;
 
     modules.replace_configured(module)?;
@@ -126,6 +208,81 @@ mod tests {
     fn margin_saturates_instead_of_overflowing() {
         let expected = U256::MAX / U256::from(GAS_MARGIN_DENOMINATOR);
         assert_eq!(apply_gas_margin(U256::MAX), expected);
+    }
+
+    /// Builds a request paying `fee` per gas and sending `value`.
+    fn paying(fee: u64, value: u64) -> TransactionRequest {
+        TransactionRequest {
+            from: Some(alloy_primitives::Address::ZERO),
+            gas_price: Some(fee as u128),
+            value: Some(U256::from(value)),
+            ..Default::default()
+        }
+    }
+
+    /// A sender with room to spare keeps the padded estimate.
+    #[test]
+    fn affordable_estimate_keeps_the_margin() {
+        // 25,200 gas at 100 wei costs 2,520,000. The balance covers it many times over.
+        let padded = U256::from(25_200u64);
+        let capped = cap_by_affordability(padded, U256::from(1_000_000_000u64), &paying(100, 0));
+
+        assert_eq!(capped, padded, "a sender who can pay keeps the full margin");
+    }
+
+    /// A sender who cannot pay for the margin is capped, not handed a bill they cannot meet.
+    ///
+    /// This is the case erigon re-caps for. The core estimator limits its search to the
+    /// 21,000 the sender can afford; padding that to 25,200 would exceed the balance.
+    #[test]
+    fn unaffordable_margin_is_capped_to_the_allowance() {
+        // Exactly 21,000 gas at 100 wei, and not a wei more.
+        let balance = U256::from(2_100_000u64);
+        let capped = cap_by_affordability(U256::from(25_200u64), balance, &paying(100, 0));
+
+        assert_eq!(capped, U256::from(21_000u64), "capped to what the balance buys");
+    }
+
+    /// Value being sent is not available to pay for gas.
+    #[test]
+    fn value_is_deducted_before_the_allowance() {
+        // 2,100,000 total, 1,050,000 of it sent as value, leaving 10,500 gas at 100 wei.
+        let capped = cap_by_affordability(
+            U256::from(25_200u64),
+            U256::from(2_100_000u64),
+            &paying(100, 1_050_000),
+        );
+
+        assert_eq!(capped, U256::from(10_500u64), "the transferred value cannot also buy gas");
+    }
+
+    /// A request naming no fee pays nothing for gas, so no balance can constrain it.
+    #[test]
+    fn a_request_without_a_fee_is_never_capped() {
+        let padded = U256::from(25_200u64);
+        let free = TransactionRequest {
+            from: Some(alloy_primitives::Address::ZERO),
+            ..Default::default()
+        };
+
+        assert_eq!(cap_by_affordability(padded, U256::ZERO, &free), padded);
+    }
+
+    /// An explicit `gasPrice` wins over `maxFeePerGas`, matching erigon's `feeCap`.
+    #[test]
+    fn gas_price_takes_precedence_over_max_fee() {
+        let mut request = paying(100, 0);
+        request.max_fee_per_gas = Some(1);
+
+        assert_eq!(fee_cap(&request), Some(U256::from(100u64)));
+    }
+
+    /// A zero fee is treated as no fee rather than dividing by zero.
+    #[test]
+    fn a_zero_fee_does_not_divide_by_zero() {
+        let padded = U256::from(25_200u64);
+
+        assert_eq!(cap_by_affordability(padded, U256::ZERO, &paying(0, 0)), padded);
     }
 
     /// The SHARED estimator must not pad as well, or the two margins compound.
