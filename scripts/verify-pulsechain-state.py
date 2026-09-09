@@ -628,6 +628,10 @@ class Result:
     refs: dict[str, Any]
     ok: bool
     notes: list[str]
+    # Nothing was compared: the check has no expected value and no reference
+    # answered. Reported apart from a failure because the two need different
+    # actions — one says the node is wrong, the other says we do not know.
+    unverified: bool = False
 
 
 def run_check(check: Check, ours_url: str, ref_urls: list[str]) -> Result:
@@ -647,6 +651,14 @@ def run_check(check: Check, ours_url: str, ref_urls: list[str]) -> Result:
 
     ok = True
 
+    # Whether this check compared our answer against anything at all. A check
+    # with no expected value gets all of its meaning from the references, so if
+    # every reference fails there is nothing left to compare and the check must
+    # not be counted as a pass. Rate limiting makes this reachable in practice:
+    # a 429 from each public endpoint used to produce a green run that verified
+    # nothing.
+    compared = check.expected is not None
+
     # Compare against expected (if specified)
     if check.expected is not None:
         if not check.comparator(ours_val, check.expected):
@@ -657,11 +669,16 @@ def run_check(check: Check, ours_url: str, ref_urls: list[str]) -> Result:
     for ref_url, ref_val in refs.items():
         if isinstance(ref_val, str) and ref_val.startswith("ERROR:"):
             continue  # already noted
+        compared = True
         if not check.comparator(ours_val, ref_val):
             ok = False
             notes.append(
                 f"ours != {ref_url} ({_summarize(ours_val)} vs {_summarize(ref_val)})"
             )
+
+    if not compared:
+        notes.append("nothing to compare against: no reference answered")
+        return Result(check, ours_val, refs, ok=False, notes=notes, unverified=True)
 
     return Result(check, ours_val, refs, ok, notes)
 
@@ -784,21 +801,31 @@ def main() -> int:
     ordered = [by_check[id(c)] for c in checks if id(c) in by_check]
 
     cur_cat = None
-    fails = 0
     for r in ordered:
         if r.check.category != cur_cat:
             cur_cat = r.check.category
             print(f"\n── {cur_cat} ──")
-        status = "✓" if r.ok else "✗"
+        status = "?" if r.unverified else ("✓" if r.ok else "✗")
         print(f"  {status} {r.check.label:<55} {_summarize(r.ours)}")
         for n in r.notes:
             print(f"      ↳ {n}")
-        if not r.ok:
-            fails += 1
+
+    unverified = sum(1 for r in ordered if r.unverified)
+    fails = sum(1 for r in ordered if not r.ok and not r.unverified)
+    passed = len(ordered) - fails - unverified
 
     elapsed = time.time() - t0
-    print(f"\n{len(ordered) - fails}/{len(ordered)} passed in {elapsed:.1f}s", file=sys.stderr)
-    return 0 if fails == 0 else 1
+    summary = f"{passed}/{len(ordered)} passed in {elapsed:.1f}s"
+    if unverified:
+        summary += f", {unverified} unverified (no reference answered)"
+    if fails:
+        summary += f", {fails} failed"
+    print(f"\n{summary}", file=sys.stderr)
+
+    # An unverified check is not a pass. Exiting zero here would report success
+    # for a run that checked nothing, which is the failure this distinction
+    # exists to prevent.
+    return 0 if fails == 0 and unverified == 0 else 1
 
 
 if __name__ == "__main__":
