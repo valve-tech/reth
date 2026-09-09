@@ -81,6 +81,10 @@ DEFAULT_REFS_MAINNET = [
     "https://rpc-pulsechain.g4mm4.io",
 ]
 
+# `eth_chainId` values for the chains this script knows how to verify. Anything
+# else is refused rather than guessed at: the checks encode one fork schedule.
+CHAIN_NAMES = {"0x171": "mainnet", "0x3af": "testnet-v4"}
+
 
 # ─── Wire ─────────────────────────────────────────────────────────────────────
 
@@ -98,6 +102,11 @@ def rpc(url: str, method: str, params: list[Any], timeout: float = 25.0) -> Any:
     Raises on transport or RPC-layer error.
     """
     return transport_for(url).call(method, params, timeout)
+
+
+def chain_name(url: str) -> str | None:
+    """Which chain an endpoint is on, or `None` if it is not one we verify."""
+    return CHAIN_NAMES.get(rpc(url, "eth_chainId", []))
 
 
 # TLS trust for https:// and wss://. `None` means the system store, which is
@@ -686,38 +695,53 @@ def main() -> int:
         except ValueError as e:
             parser.error(str(e))
 
-    # Derive chain from passed url,
-    def get_chain_id(url: str) -> str:
-        """Retrieve the chain ID from an RPC endpoint via eth_chainId."""
-        return rpc(url, "eth_chainId", [])
-
-    _CHAIN_NAMES = {"0x171": "mainnet", "0x3af": "testnet-v4"}
-
-    # chainid = get_chain_id(args.ours)
-    chain = _CHAIN_NAMES[get_chain_id(args.ours)]
-    if chain not in ["testnet-v4", "mainnet"]:
-        print(f"{args.ours} is not on testnet-v4 or mainnet", file=sys.stderr)
-        raise RuntimeError("RPC Network Mismatch")
-
-    # chain = _CHAIN_NAMES[chainid]
-    fork = PRIMORDIAL_PULSE_TESTNET_V4 if chain == "testnet-v4" else PRIMORDIAL_PULSE_MAINNET
-
-    refs = args.ref or (DEFAULT_REFS_TESTNET_V4 if chain == "testnet-v4" else DEFAULT_REFS_MAINNET)
-
-    ref_ids = {url: _CHAIN_NAMES.get(get_chain_id(url), "other") for url in refs}
-    if any(cid != chain for cid in ref_ids.values()):
-        print("Your Node:", file=sys.stderr)
-        print(f"  {args.ours} → {chain}", file=sys.stderr)
-        print("Reference Nodes:", file=sys.stderr)
-        for url, cid in ref_ids.items():
-            print(f"  {url} → {cid}", file=sys.stderr)
-        raise RuntimeError("Reference RPC Mismatch")
-
-    checks = build_checks(fork)
+    # The category list is the same on every chain, so answer it before touching
+    # the network. This flag has to work with no node running.
     if args.list_categories:
-        cats = sorted({c.category for c in checks})
+        cats = sorted({c.category for c in build_checks(PRIMORDIAL_PULSE_TESTNET_V4)})
         print("\n".join(cats))
         return 0
+
+    # Ask the node which chain it is on rather than trusting a flag. A flag can
+    # disagree with the endpoint, and the failure that produces is a full run of
+    # mismatches against the wrong fork block — expensive to read, easy to blame
+    # on the node.
+    #
+    # Every transport error already names the URL it came from, so these handlers
+    # report one line and exit instead of raising a traceback at someone.
+    try:
+        chain = chain_name(args.ours)
+    except Exception as e:
+        print(f"cannot read the chain id from {args.ours}: {e}", file=sys.stderr)
+        return 2
+
+    if chain is None:
+        print(f"{args.ours} is not PulseChain mainnet or testnet-v4", file=sys.stderr)
+        return 2
+
+    fork = PRIMORDIAL_PULSE_TESTNET_V4 if chain == "testnet-v4" else PRIMORDIAL_PULSE_MAINNET
+    refs = args.ref or (DEFAULT_REFS_TESTNET_V4 if chain == "testnet-v4" else DEFAULT_REFS_MAINNET)
+
+    # A reference on another chain disagrees with ours on nearly every check. That
+    # reads as scores of failures when the cause is one wrong endpoint, so name the
+    # chains and stop.
+    ref_chains: dict[str, str] = {}
+    for url in refs:
+        try:
+            ref_chains[url] = chain_name(url) or "other"
+        except Exception as e:
+            print(f"cannot read the chain id from {url}: {e}", file=sys.stderr)
+            return 2
+
+    if any(name != chain for name in ref_chains.values()):
+        print("Your node:", file=sys.stderr)
+        print(f"  {args.ours} → {chain}", file=sys.stderr)
+        print("Reference nodes:", file=sys.stderr)
+        for url, name in ref_chains.items():
+            print(f"  {url} → {name}", file=sys.stderr)
+        return 2
+
+    checks = build_checks(fork)
 
     if args.categories:
         wanted = set(args.categories.split(","))
