@@ -7,6 +7,7 @@ that a wrong implementation would silently corrupt.
 
 Usage:
     python3 verify-pulsechain-state.py [--ours URL] [--ref URL [--ref URL ...]]
+                                       [--chain testnet-v4|mainnet]
                                        [--categories cat1,cat2,...]
                                        [--list-categories]
                                        [--fail-fast]
@@ -21,6 +22,11 @@ ws(s)://, ipc:///path/to/reth.ipc, or a bare filesystem path to an IPC socket:
 Default reference RPCs are public PulseChain endpoints (testnet-v4 and mainnet).
 Default `ours` is the loopback assumed when run on the reth box (`http://127.0.0.1:8545`).
 The script exits non-zero if any check mismatches.
+
+The chain always comes from the node, never from an argument. `--chain` states
+which chain you expect and fails if the node is on a different one, which is
+what you want when the endpoint is a variable: a run against the wrong box
+otherwise passes every check and tells you nothing.
 
 Add new checks by extending CHECKS — each entry is (category, label, method,
 params, optional_expected, optional_comparator). Category filtering lets CI
@@ -666,6 +672,11 @@ def main() -> int:
                         help="Our reth node's endpoint: http(s)://, ws(s)://, ipc://<path>, or a path to an IPC socket")
     parser.add_argument("--ref", action="append", default=None,
                         help="Reference endpoint, same forms as --ours (repeatable; defaults to public Pulse testnet RPCs)")
+    parser.add_argument("--chain", choices=["testnet-v4", "mainnet"], default=None,
+                        help="Chain you expect the node to be on. The chain is always read "
+                             "from the node itself; this asserts the answer and exits non-zero "
+                             "on a mismatch, so a run against the wrong endpoint fails instead "
+                             "of passing against the wrong chain.")
     parser.add_argument("--categories", default=None,
                         help="Comma-separated list of categories to run (default: all)")
     parser.add_argument("--list-categories", action="store_true",
@@ -717,6 +728,13 @@ def main() -> int:
 
     if chain is None:
         print(f"{args.ours} is not PulseChain mainnet or testnet-v4", file=sys.stderr)
+        return 2
+
+    # Detection alone cannot catch a run against the wrong endpoint: it adapts,
+    # verifies whatever it found, and reports a green run for a node nobody meant
+    # to check. `--chain` is how a caller says which node this was supposed to be.
+    if args.chain and args.chain != chain:
+        print(f"expected {args.chain}, but {args.ours} is on {chain}", file=sys.stderr)
         return 2
 
     fork = PRIMORDIAL_PULSE_TESTNET_V4 if chain == "testnet-v4" else PRIMORDIAL_PULSE_MAINNET
