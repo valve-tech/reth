@@ -419,7 +419,7 @@ mod tests {
     use super::*;
     use jsonrpsee::{
         core::middleware::BatchEntry,
-        types::{Id, Request},
+        types::{ErrorObject, Id, Request},
         ResponsePayload,
     };
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
@@ -443,6 +443,52 @@ mod tests {
         fn call<'a>(&self, req: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
             let id = req.id.into_owned();
             async move { MethodResponse::response(id, ResponsePayload::success("ok"), usize::MAX) }
+        }
+
+        fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+            let service = self.clone();
+            async move {
+                for entry in batch.into_iter().flatten() {
+                    if let BatchEntry::Call(req) = entry {
+                        let _ = service.call(req).await;
+                    }
+                }
+                MethodResponse::response(Id::Null, ResponsePayload::success("batch"), usize::MAX)
+            }
+        }
+
+        fn notification<'a>(
+            &self,
+            _n: Notification<'a>,
+        ) -> impl Future<Output = MethodResponse> + Send + 'a {
+            async move { MethodResponse::response(Id::Null, ResponsePayload::success("ok"), usize::MAX) }
+        }
+    }
+
+    /// The same fan-out, with one method that answers with an error.
+    ///
+    /// A batch entry that fails is the case the aggregate batch response cannot show:
+    /// `MethodResponse::from_batch` hard-codes success, so the outer response looks identical
+    /// whether every entry succeeded or none did.
+    #[derive(Clone, Debug)]
+    struct ErringFanOutService;
+
+    #[allow(clippy::manual_async_fn)]
+    impl RpcServiceT for ErringFanOutService {
+        type MethodResponse = MethodResponse;
+        type NotificationResponse = MethodResponse;
+        type BatchResponse = MethodResponse;
+
+        fn call<'a>(&self, req: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+            let fails = req.method.as_ref() == "eth_getLogs";
+            let id = req.id.into_owned();
+            async move {
+                if fails {
+                    MethodResponse::error(id, ErrorObject::owned(-32000, "boom", None::<()>))
+                } else {
+                    MethodResponse::response(id, ResponsePayload::success("ok"), usize::MAX)
+                }
+            }
         }
 
         fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
@@ -639,6 +685,61 @@ mod tests {
         assert_eq!(
             counter(&snap, "rpc_server.connections.requests_started_total", ("transport", "http")),
             counter(&snap, "rpc_server.connections.requests_finished_total", ("transport", "http")),
+        );
+    }
+
+    #[test]
+    fn a_batch_with_a_failed_entry_returns_the_gauge_to_where_it_started() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let (before, after) = ::metrics::with_local_recorder(&recorder, || {
+            let module = test_module();
+            let service = RpcRequestMetricsService::new(
+                ErringFanOutService,
+                RpcRequestMetrics::http(&module),
+            );
+
+            // Every call counter is registered when the service is built, so this is the gauge's
+            // starting value and not a missing key.
+            let before = snapshot(&snapshotter);
+
+            let mut batch = Batch::new();
+            batch.push(request("eth_getBlockByNumber"));
+            batch.push(request("eth_getLogs")); // this entry answers with an error
+            batch.push(request("eth_getLogs"));
+            let response = block_on(service.batch(batch));
+
+            // The aggregate response says success whatever the entries did, which is exactly why
+            // the entries cannot be credited to `successful_total`.
+            assert!(response.is_success());
+
+            (before, snapshot(&snapshotter))
+        });
+
+        for method in ["eth_getBlockByNumber", "eth_getLogs"] {
+            assert_eq!(in_flight(&before, method), 0, "the gauge starts at 0 for {method}");
+            assert_eq!(
+                in_flight(&after, method),
+                in_flight(&before, method),
+                "a batch carrying a failed entry must return {method} to its starting value",
+            );
+        }
+
+        // The failed entry is still counted, and it is counted in the one place whose meaning
+        // does not claim to know how it ended.
+        assert_eq!(
+            counter(&after, "rpc_server.calls.batch_entries_total", ("method", "eth_getLogs")),
+            2,
+        );
+        assert_eq!(
+            counter(&after, "rpc_server.calls.failed_total", ("method", "eth_getLogs")),
+            0,
+            "a batch entry has no observable outcome here, so it must not be guessed at",
+        );
+        assert_eq!(
+            counter(&after, "rpc_server.connections.batches_started_total", ("transport", "http")),
+            counter(&after, "rpc_server.connections.batches_finished_total", ("transport", "http")),
         );
     }
 
