@@ -43,6 +43,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import socket
 import ssl
 import struct
@@ -113,6 +114,67 @@ def rpc(url: str, method: str, params: list[Any], timeout: float = 25.0) -> Any:
 def chain_name(url: str) -> str | None:
     """Which chain an endpoint is on, or `None` if it is not one we verify."""
     return CHAIN_NAMES.get(rpc(url, "eth_chainId", []))
+
+
+# Gateways commonly carry the API key in the URL path, as in
+# `https://one.valve.city/rpc/<key>/evm/369`, and some carry it as userinfo.
+# Every line this script prints — the banner, each mismatch note, the text of a
+# transport exception — can contain the endpoint it was talking to, and that
+# output goes to terminals and CI logs. So no URL reaches a stream unredacted.
+_URL_IN_TEXT = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]+")
+
+# How long a path segment has to be before it is treated as a credential rather
+# than a route. Real segments in these URLs are short words or numbers — `rpc`,
+# `evm`, `369` — while keys are long and opaque.
+_SECRET_SEGMENT_LEN = 16
+
+# Query parameters whose name says the value is a credential, at any length.
+_CREDENTIAL_NAME = re.compile(r"key|token|secret|auth|pass|sig", re.IGNORECASE)
+
+
+def redact(text: Any) -> str:
+    """Render `text` with any credential in a URL removed.
+
+    Masks whole segments rather than showing a prefix: a partial key is still key
+    material, and the host plus the surrounding path are enough to tell two
+    endpoints apart. Only the path and userinfo are touched — the host is how a
+    reader knows which node the message is about.
+    """
+    def scrub(match: re.Match) -> str:
+        url = match.group(0)
+        # Trailing punctuation belongs to the sentence, not the URL.
+        url, tail = url.rstrip(".,;:)]}"), ""
+        tail = match.group(0)[len(url):]
+
+        parts = urllib.parse.urlsplit(url)
+        netloc = parts.netloc
+        if "@" in netloc:
+            netloc = "<redacted>@" + netloc.rsplit("@", 1)[1]
+
+        path = "/".join(
+            "<redacted>" if len(seg) >= _SECRET_SEGMENT_LEN else seg
+            for seg in parts.path.split("/")
+        )
+
+        # Gateways that take the key as `?apikey=…` are just as common as the
+        # path form, and a parameter named like a credential is one whatever its
+        # length.
+        query = "&".join(
+            f"{k}=<redacted>"
+            if len(v) >= _SECRET_SEGMENT_LEN or _CREDENTIAL_NAME.search(k)
+            else f"{k}={v}"
+            for k, v in (
+                p.split("=", 1) if "=" in p else (p, "")
+                for p in parts.query.split("&")
+            )
+            if parts.query
+        )
+
+        return urllib.parse.urlunsplit(
+            (parts.scheme, netloc, path, query, parts.fragment)
+        ) + tail
+
+    return _URL_IN_TEXT.sub(scrub, str(text))
 
 
 # TLS trust for https:// and wss://. `None` means the system store, which is
@@ -640,14 +702,15 @@ def run_check(check: Check, ours_url: str, ref_urls: list[str]) -> Result:
     try:
         ours_val = rpc(ours_url, check.method, check.params)
     except Exception as e:
-        return Result(check, f"ERROR: {e}", {}, ok=False, notes=[f"ours rpc failed: {e}"])
+        return Result(check, f"ERROR: {redact(e)}", {}, ok=False,
+                      notes=[redact(f"ours rpc failed: {e}")])
 
     for ref_url in ref_urls:
         try:
             refs[ref_url] = rpc(ref_url, check.method, check.params)
         except Exception as e:
             refs[ref_url] = f"ERROR: {e}"
-            notes.append(f"{ref_url} failed: {e}")
+            notes.append(redact(f"{ref_url} failed: {e}"))
 
     ok = True
 
@@ -673,7 +736,7 @@ def run_check(check: Check, ours_url: str, ref_urls: list[str]) -> Result:
         if not check.comparator(ours_val, ref_val):
             ok = False
             notes.append(
-                f"ours != {ref_url} ({_summarize(ours_val)} vs {_summarize(ref_val)})"
+                redact(f"ours != {ref_url} ({_summarize(ours_val)} vs {_summarize(ref_val)})")
             )
 
     if not compared:
@@ -713,7 +776,7 @@ def main() -> int:
     try:
         set_ca_file(args.cafile)
     except OSError as e:
-        print(f"--cafile {args.cafile}: {e}", file=sys.stderr)
+        print(redact(f"--cafile {args.cafile}: {e}"), file=sys.stderr)
         return 2
 
     # Fail fast and clearly on a bad endpoint instead of once per check.
@@ -721,7 +784,7 @@ def main() -> int:
         try:
             make_transport(url)
         except ValueError as e:
-            parser.error(str(e))
+            parser.error(redact(e))
 
     # The category list is the same on every chain, so answer it before touching
     # the network. This flag has to work with no node running.
@@ -740,18 +803,18 @@ def main() -> int:
     try:
         chain = chain_name(args.ours)
     except Exception as e:
-        print(f"cannot read the chain id from {args.ours}: {e}", file=sys.stderr)
+        print(redact(f"cannot read the chain id from {args.ours}: {e}"), file=sys.stderr)
         return 2
 
     if chain is None:
-        print(f"{args.ours} is not PulseChain mainnet or testnet-v4", file=sys.stderr)
+        print(redact(f"{args.ours} is not PulseChain mainnet or testnet-v4"), file=sys.stderr)
         return 2
 
     # Detection alone cannot catch a run against the wrong endpoint: it adapts,
     # verifies whatever it found, and reports a green run for a node nobody meant
     # to check. `--chain` is how a caller says which node this was supposed to be.
     if args.chain and args.chain != chain:
-        print(f"expected {args.chain}, but {args.ours} is on {chain}", file=sys.stderr)
+        print(redact(f"expected {args.chain}, but {args.ours} is on {chain}"), file=sys.stderr)
         return 2
 
     fork = PRIMORDIAL_PULSE_TESTNET_V4 if chain == "testnet-v4" else PRIMORDIAL_PULSE_MAINNET
@@ -765,15 +828,15 @@ def main() -> int:
         try:
             ref_chains[url] = chain_name(url) or "other"
         except Exception as e:
-            print(f"cannot read the chain id from {url}: {e}", file=sys.stderr)
+            print(redact(f"cannot read the chain id from {url}: {e}"), file=sys.stderr)
             return 2
 
     if any(name != chain for name in ref_chains.values()):
         print("Your node:", file=sys.stderr)
-        print(f"  {args.ours} → {chain}", file=sys.stderr)
+        print(redact(f"  {args.ours} → {chain}"), file=sys.stderr)
         print("Reference nodes:", file=sys.stderr)
         for url, name in ref_chains.items():
-            print(f"  {url} → {name}", file=sys.stderr)
+            print(redact(f"  {url} → {name}"), file=sys.stderr)
         return 2
 
     checks = build_checks(fork)
@@ -782,7 +845,8 @@ def main() -> int:
         wanted = set(args.categories.split(","))
         checks = [c for c in checks if c.category in wanted]
 
-    print(f"running {len(checks)} checks against ours={args.ours} ref(s)={refs} chain={chain}", file=sys.stderr)
+    print(redact(f"running {len(checks)} checks against ours={args.ours} "
+                 f"ref(s)={refs} chain={chain}"), file=sys.stderr)
     t0 = time.time()
 
     results: list[Result] = []
