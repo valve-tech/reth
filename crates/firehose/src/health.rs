@@ -205,7 +205,6 @@ fn spawn_loopback_server(path: PathBuf) {
                     return;
                 }
             };
-            // Ensure accept can be interrupted eventually; we only serve until process exit.
             let _ = listener.set_nonblocking(false);
             info!(
                 target: "firehose::health",
@@ -218,7 +217,6 @@ fn spawn_loopback_server(path: PathBuf) {
                 match conn {
                     Ok(stream) => {
                         let path = path.clone();
-                        // Brief timeout so a wedged client cannot pin the acceptor forever.
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                         if let Err(err) = handle_health_http(stream, &path) {
@@ -243,7 +241,6 @@ fn handle_health_http(mut stream: TcpStream, path: &Path) -> std::io::Result<()>
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
 
-    // Strip query string if any.
     let path_only = target.split('?').next().unwrap_or(target);
 
     if method != "GET" || path_only != HEALTH_HTTP_PATH {
@@ -284,3 +281,7 @@ fn write_http_response(
     stream.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "health_tests.rs"]
+mod tests;
