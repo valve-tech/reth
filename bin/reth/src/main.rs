@@ -59,8 +59,12 @@ struct EthereumExtArgs {
     #[arg(long = "firehose.enabled", env = "RETH_FIREHOSE_ENABLED", default_value_t = false)]
     firehose_enabled: bool,
 
-    #[arg(long = "firehose.replica", env = "FIREHOSE_REPLICA", default_value = "a")]
-    firehose_replica: String,
+    /// Replica letter stamped into firehose health.json (`a` / `b`).
+    ///
+    /// Optional. When unset, the ExEx infers from hostname
+    /// (`direct-b-evm-369`, `evm943b`) or `VALVE_REPLICA`.
+    #[arg(long = "firehose.replica", env = "FIREHOSE_REPLICA")]
+    firehose_replica: Option<String>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -68,8 +72,12 @@ struct PulsechainExtArgs {
     #[command(flatten)]
     msgboard: MsgboardArgs,
 
-    #[arg(long = "firehose.replica", env = "FIREHOSE_REPLICA", default_value = "a")]
-    firehose_replica: String,
+    /// Replica letter stamped into firehose health.json (`a` / `b`).
+    ///
+    /// Optional. When unset, the ExEx infers from hostname
+    /// (`direct-b-evm-369`, `evm943b`) or `VALVE_REPLICA`.
+    #[arg(long = "firehose.replica", env = "FIREHOSE_REPLICA")]
+    firehose_replica: Option<String>,
 }
 
 fn sync_firehose_replica_env(replica: &str) {
@@ -133,7 +141,9 @@ fn run_ethereum_node() -> eyre::Result<()> {
                 firehose_enabled,
                 firehose_replica,
             } = ext;
-            sync_firehose_replica_env(&firehose_replica);
+            if let Some(replica) = firehose_replica.as_deref() {
+                sync_firehose_replica_env(replica);
+            }
             let launcher = MsgboardLauncher::new(msgboard_args);
 
             if firehose_enabled {
@@ -218,7 +228,9 @@ fn run_pulsechain_node() -> eyre::Result<()> {
             components,
             async move |mut builder, ext: PulsechainExtArgs| {
                 let PulsechainExtArgs { msgboard: msgboard_args, firehose_replica } = ext;
-                sync_firehose_replica_env(&firehose_replica);
+                if let Some(replica) = firehose_replica.as_deref() {
+                    sync_firehose_replica_env(replica);
+                }
                 info!(target: "reth::cli", "Launching PulseChain node");
                 warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
 
