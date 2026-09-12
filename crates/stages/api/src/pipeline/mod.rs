@@ -585,6 +585,7 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
                         target: "sync::pipeline",
                         stage = %stage_id,
                         bad_block = %block.block.number,
+                        bad_block_hash = %block.block.hash,
                         "Stage encountered a validation error: {validation_error}. Exiting instead of unwinding."
                     );
 
@@ -626,6 +627,7 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
                         target: "sync::pipeline",
                         stage = %stage_id,
                         bad_block = %block.block.number,
+                        bad_block_hash = %block.block.hash,
                         "Stage encountered an execution error: {execution_error}. Exiting instead of unwinding."
                     );
 
