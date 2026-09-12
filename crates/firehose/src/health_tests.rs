@@ -65,6 +65,18 @@ fn atomic_write_roundtrip() {
 }
 
 #[test]
+fn replica_from_host_direct_and_evm_names() {
+    assert_eq!(replica_from_host("direct-b-evm-369").as_deref(), Some("b"));
+    assert_eq!(replica_from_host("direct-a-evm-1").as_deref(), Some("a"));
+    assert_eq!(replica_from_host("direct-b-evm-11155111.internal").as_deref(), Some("b"));
+    assert_eq!(replica_from_host("evm943b").as_deref(), Some("b"));
+    assert_eq!(replica_from_host("evm1b").as_deref(), Some("b"));
+    assert_eq!(replica_from_host("evm369a").as_deref(), Some("a"));
+    assert_eq!(replica_from_host("localhost"), None);
+    assert_eq!(replica_from_host("evma"), None);
+}
+
+#[test]
 fn resolve_replica_returns_nonempty() {
     let r = resolve_replica();
     assert!(!r.is_empty());
