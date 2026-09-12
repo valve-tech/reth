@@ -3,7 +3,6 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
-// Required for "override_allocator_on_supported_platforms".
 #[cfg(all(feature = "jemalloc", unix))]
 use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
@@ -28,33 +27,6 @@ use reth_pulsechain_node::{
 use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection, RpcModuleValidator};
 use tracing::info;
 
-/// Accepts reth's standard RPC module names plus the namespaces THIS binary
-/// actually serves.
-///
-/// WHY THIS EXISTS. The msgboard RPC methods register under
-/// `RethRpcModule::Other("msgboard")` and are installed with
-/// `merge_if_module_configured`, so they appear on a transport only when that
-/// transport's `--http.api` / `--ws.api` names `msgboard`. But the CLI
-/// validates the selection BEFORE any of that, and upstream's
-/// `DefaultRpcModuleValidator` rejects every `Other(_)` variant outright:
-///
-///     Error: Invalid RPC module 'msgboard' in http.api: Unknown RPC module: 'msgboard'
-///
-/// So the module honoured an allowlist that would not accept its own name, and
-/// msgboard RPC could not be enabled by configuration at all. Measured on
-/// direct-a-evm-943 on 2026-09-08: adding `msgboard` to `--http.api` put reth
-/// into a crash loop, while omitting it left `msgboard_content` answering
-/// -32601 on that box and returning the board on its sibling, which still ran
-/// the older build where the namespace leaked onto every transport.
-///
-/// WHY NOT `LenientRpcModuleValidator`. Upstream ships one, and it accepts any
-/// name at all. That would take a typo — `--http.api eth,mssgboard` — and
-/// silently start a node with no msgboard and no complaint, which is the
-/// failure this validator exists to keep catching. Allow the one namespace we
-/// serve; keep rejecting everything else.
-///
-/// Adding a namespace here is not enough on its own to serve it: something
-/// must also merge methods under the matching `RethRpcModule::Other`.
 #[derive(Debug, Clone, Copy)]
 pub struct ValveRpcModuleValidator;
 
@@ -77,46 +49,34 @@ impl RpcModuleValidator for ValveRpcModuleValidator {
     }
 }
 
-/// Chain names that route to upstream `EthereumNode` (full Pectra / EIP-7702
-/// support). Anything else falls through to [`PulsechainNode`].
-///
-/// `PulsechainNode`'s block executor uses PulseChain's hardfork schedule which
-/// does not activate Pectra; running it on `--chain mainnet` rejects EIP-7702
-/// transactions post-block 22,431,084 with `Eip7702NotSupported`. Routing on
-/// chain name (rather than chain id of an already-parsed spec) is necessary
-/// because the chosen `Cli<ChainSpecParser, _>` type — and therefore the
-/// produced chain spec — is fixed at parse time.
 const ETHEREUM_CHAIN_NAMES: &[&str] = &["mainnet", "sepolia", "holesky", "hoodi"];
 
-/// Extra CLI args for the Ethereum dispatch path: the msgboard knobs, plus the
-/// firehose opt-in.
-///
-/// Firehose is **opt-in on Ethereum** and unconditional on PulseChain. The
-/// asymmetry is deliberate: PulseChain boxes are all either firehose producers
-/// or already carrying the ExEx, whereas chain-1 has both kinds. `direct-a-evm-1`
-/// is a plain RPC replica with no fireeth reader consuming its output, so
-/// installing the ExEx there would spend WAL writes and journald volume on a
-/// FIRE stream nobody reads. `direct-b-evm-1` is the firehose box and passes
-/// the flag.
-///
-/// Accepts either form, so a fireeth `reader-node-arguments` block and a
-/// systemd `Environment=` line are both viable:
-///
-/// ```text
-/// --firehose.enabled
-/// RETH_FIREHOSE_ENABLED=true
-/// ```
 #[derive(Debug, Clone, clap::Args)]
 struct EthereumExtArgs {
     #[command(flatten)]
     msgboard: MsgboardArgs,
 
-    /// Install the firehose tracer, executor wrapper and ExEx on this node.
-    ///
-    /// Off by default. Only turn it on where a fireeth reader-node is actually
-    /// consuming this process's FIRE output.
     #[arg(long = "firehose.enabled", env = "RETH_FIREHOSE_ENABLED", default_value_t = false)]
     firehose_enabled: bool,
+
+    #[arg(long = "firehose.replica", env = "FIREHOSE_REPLICA", default_value = "a")]
+    firehose_replica: String,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct PulsechainExtArgs {
+    #[command(flatten)]
+    msgboard: MsgboardArgs,
+
+    #[arg(long = "firehose.replica", env = "FIREHOSE_REPLICA", default_value = "a")]
+    firehose_replica: String,
+}
+
+fn sync_firehose_replica_env(replica: &str) {
+    if std::env::var_os("VALVE_REPLICA").is_some() {
+        return;
+    }
+    unsafe { std::env::set_var("FIREHOSE_REPLICA", replica) };
 }
 
 fn main() {
@@ -134,16 +94,10 @@ fn main() {
 
     reth_cli_util::sigsegv_handler::install();
 
-    // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    // Firehose tracer init happens inside each dispatch path, never before the
-    // branch — see the comment in `run_pulsechain_node` for the
-    // lifecycle-contract reason it cannot run unconditionally here. On the
-    // PulseChain path it is unconditional; on the Ethereum path it is gated
-    // behind `--firehose.enabled` (see `EthereumExtArgs`).
     let result =
         if requested_ethereum_chain() { run_ethereum_node() } else { run_pulsechain_node() };
 
@@ -153,9 +107,6 @@ fn main() {
     }
 }
 
-/// Peek `--chain X` / `--chain=X` from argv and decide whether the user is
-/// requesting an Ethereum chain. We have to dispatch before `Cli::parse()`
-/// because the chain spec parser type is part of `Cli`'s type signature.
 fn requested_ethereum_chain() -> bool {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -174,30 +125,17 @@ fn requested_ethereum_chain() -> bool {
     false
 }
 
-/// Launch path for Ethereum chains (mainnet/sepolia/holesky/hoodi).
-///
-/// Uses upstream [`EthereumNode`] with stock components. Msgboard is wired
-/// identically to the PulseChain path so the same binary serves both.
 fn run_ethereum_node() -> eyre::Result<()> {
     Cli::<EthereumChainSpecParser, EthereumExtArgs, ValveRpcModuleValidator>::parse().run(
         async move |builder, ext: EthereumExtArgs| {
-            let EthereumExtArgs { msgboard: msgboard_args, firehose_enabled } = ext;
+            let EthereumExtArgs {
+                msgboard: msgboard_args,
+                firehose_enabled,
+                firehose_replica,
+            } = ext;
+            sync_firehose_replica_env(&firehose_replica);
             let launcher = MsgboardLauncher::new(msgboard_args);
 
-            // The tracer, the FirehoseExecutorBuilder and the "firehose" ExEx are
-            // ALL-OR-NOTHING, which is why this branches the whole builder chain
-            // instead of gating the three pieces individually.
-            //
-            // Initialising the tracer without the executor+ExEx is not a
-            // degraded mode, it is a crash: the tracer's
-            // `on_block_execution_start` hook asserts that `on_blockchain_init`
-            // has already fired, and the thing that fires it is the installed
-            // ExEx (`reth_firehose::run_exex`, crates/firehose/src/runner.rs).
-            // Stock `EthereumNode` never fires it, so the first executed block
-            // panics at firehose-tracer tracer.rs:1739. That is exactly the
-            // 2026-05-31 chain-1 incident — 56 restarts before the box was
-            // stopped. Keep these two arms symmetric; do not "simplify" this by
-            // hoisting `init_tracer` above the branch.
             if firehose_enabled {
                 info!(target: "reth::cli", "Launching Ethereum node (firehose-instrumented)");
                 warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
@@ -265,54 +203,23 @@ fn run_ethereum_node() -> eyre::Result<()> {
     )
 }
 
-/// Launch path for PulseChain chains (pulsechain mainnet/testnet) and any
-/// other chain not handled by [`run_ethereum_node`].
-///
-/// Uses [`PulsechainNode`] with [`PulsechainFirehoseExecutorBuilder`] swapped in
-/// for the default executor — the executor wraps [`PulsechainEvmConfig`] in
-/// `FirehoseEvmConfig` so PulseChain block execution fires the firehose tracer
-/// hooks (CHAINID override, Shanghai-gap consensus, PrimordialPulse transition
-/// all preserved). The "firehose" ExEx drives downstream block streaming.
-///
-/// PrimordialPulse fork-block tracing is wired separately in
-/// `crates/pulsechain/node/src/evm.rs` (see NOTES-firehose.md).
 fn run_pulsechain_node() -> eyre::Result<()> {
-    // Initialise the firehose tracer ONLY on the PulseChain dispatch path.
-    //
-    // The tracer's `on_block_execution_start` hook asserts that
-    // `on_blockchain_init` was fired earlier in the node lifecycle. The
-    // PulseChain path satisfies that contract via the firehose ExEx wired
-    // into `PulsechainFirehoseExecutorBuilder` below — it fires
-    // `on_blockchain_init` during the executor's chain-init pass.
-    //
-    // Upstream `EthereumNode` (used by `run_ethereum_node`) has no
-    // equivalent ExEx and never fires that hook. Installing the tracer
-    // before chain dispatch therefore panicked on `--chain mainnet` at the
-    // first block-execution call with:
-    //   "the OnBlockchainInit hook should have been called at this point"
-    // (firehose-tracer-5.0.0/src/tracer.rs:1739). Gating the init here so
-    // the tracer never enters the Ethereum lifecycle in the first place.
     reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer::config::Config {
         chain_client: firehose_tracer::config::ChainClient::Reth,
         ..Default::default()
     }));
 
-    // We use `run_with_components` (instead of the convenience `run`) because our chain
-    // spec is `PulsechainChainSpec` (a wrapper that overrides Shanghai detection for the
-    // pre-PrimordialPulse Ethereum-replay range). `Cli::run` is hard-bound to upstream
-    // `ChainSpec`, so we pass the components closure ourselves. The closure provides
-    // (EvmConfig, Consensus) for non-launch CLI commands; the actual launch path below
-    // uses the components-builder API to swap in firehose-instrumented components.
     let components = |spec: Arc<PulsechainChainSpec>| {
         (PulsechainEvmConfig::new(spec.clone()), Arc::new(PulsechainConsensus::new(spec)))
     };
 
-    Cli::<PulsechainChainSpecParser, MsgboardArgs, ValveRpcModuleValidator>::parse()
+    Cli::<PulsechainChainSpecParser, PulsechainExtArgs, ValveRpcModuleValidator>::parse()
         .run_with_components::<PulsechainNode>(
             components,
-            async move |mut builder, msgboard_args: MsgboardArgs| {
+            async move |mut builder, ext: PulsechainExtArgs| {
+                let PulsechainExtArgs { msgboard: msgboard_args, firehose_replica } = ext;
+                sync_firehose_replica_env(&firehose_replica);
                 info!(target: "reth::cli", "Launching PulseChain node");
-                // Firehose is unconditional on this path, so `--jit` is always inert here.
                 warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
 
                 let chain_id = builder.config().chain.chain().id();
@@ -324,10 +231,6 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                 let launcher = MsgboardLauncher::new(msgboard_args);
                 let launcher_for_rpc = launcher.clone();
 
-                // Build via the components fluent API so we can swap in
-                // PulsechainFirehoseExecutorBuilder + install the firehose ExEx.
-                // Mirrors the run_ethereum_node path but with PulseChain's
-                // pool/network/consensus/payload builders.
                 let handle = builder
                     .with_types::<PulsechainNode>()
                     .with_components(
@@ -339,7 +242,6 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                     .extend_rpc_modules(move |ctx| {
                         launcher_for_rpc.install_rpc(ctx.modules)?;
 
-                        // Replace eth_estimateGas with a version that adds a 20% margin.
                         let eth_api = ctx.registry.eth_api().clone();
                         install_gas_estimation_margin(ctx.modules, eth_api)?;
 
@@ -362,22 +264,6 @@ fn run_pulsechain_node() -> eyre::Result<()> {
         )
 }
 
-/// Warns when `--jit` is passed on a firehose-instrumented node, where it does nothing.
-///
-/// A firehose node builds its EVM through `FirehoseExecutorBuilder` /
-/// `PulsechainFirehoseExecutorBuilder`, neither of which reads `ctx.config().jit` — unlike
-/// `EthereumExecutorBuilder`, the only launch-path consumer of those args. So every `--jit*` flag
-/// is inert here: no revmc backend, no compiler workers, no metrics task.
-///
-/// That inertness is enforced, not incidental: `FirehoseEvmConfig::new` panics on a JIT-capable
-/// inner config, because revmc's compiled path never fires `Inspector::step`/`step_end` and routes
-/// logs through `Inspector::log` (which firehose does not override), which would make firehose
-/// silently drop every SSTORE, KECCAK256 preimage, log and value-transfer balance change from
-/// JIT-compiled contracts. See `reth_firehose::reject_jit_capable_inner`.
-///
-/// So this is a warning rather than a hard error: the combination is provably harmless today, and
-/// failing startup would break existing units that pass the flag for no safety gain. It exists so
-/// an operator expecting a speedup learns they are not getting one.
 fn warn_if_jit_requested_with_firehose(jit_enabled: bool) {
     if jit_enabled {
         tracing::warn!(
@@ -393,9 +279,6 @@ fn warn_if_jit_requested_with_firehose(jit_enabled: bool) {
 mod validator_tests {
     use super::*;
 
-    /// The regression this validator exists for. `msgboard` must survive the
-    /// CLI, or `merge_if_module_configured` can never see it and the namespace
-    /// is unreachable by configuration.
     #[test]
     fn accepts_the_msgboard_namespace() {
         let selection = ValveRpcModuleValidator::parse_selection(
@@ -410,9 +293,6 @@ mod validator_tests {
         assert!(modules.contains(&RethRpcModule::Eth));
     }
 
-    /// The property that makes this better than `LenientRpcModuleValidator`.
-    /// A typo must still fail loudly: accepting it would start a node with no
-    /// msgboard and no complaint, which is harder to notice than a crash.
     #[test]
     fn still_rejects_a_typo() {
         let err = ValveRpcModuleValidator::parse_selection("eth,mssgboard")
@@ -425,9 +305,6 @@ mod validator_tests {
         assert!(ValveRpcModuleValidator::parse_selection("eth,definitely_not_a_module").is_err());
     }
 
-    /// Standard selections must behave exactly as they did under the default
-    /// validator — this validator widens the allowlist by one name and changes
-    /// nothing else.
     #[test]
     fn leaves_standard_selections_alone() {
         for s in ["eth", "eth,net,web3", "all", "none"] {
@@ -438,9 +315,6 @@ mod validator_tests {
         }
     }
 
-    /// `validate_selection` is what the CLI actually calls, and it takes an
-    /// already-parsed selection. Exercising only `parse_selection` would miss a
-    /// break in the path the binary uses.
     #[test]
     fn validate_selection_accepts_msgboard_and_rejects_a_typo() {
         let parsed = RpcModuleSelection::from_str("eth,msgboard").unwrap();

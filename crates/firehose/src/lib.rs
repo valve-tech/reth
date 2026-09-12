@@ -40,6 +40,8 @@ pub mod prelude;
 pub mod primordial_pulse;
 /// Runner module for executing processing tasks.
 pub mod runner;
+/// thatis health.json publisher (on-disk + loopback GET).
+pub mod health;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
@@ -48,6 +50,10 @@ pub use executor::{
     PostTxExtras, PreTxAdjust,
 };
 pub use runner::run_exex;
+pub use health::{
+    default_health_path, resolve_replica, write_health_json, HealthPublisher, HealthStatus,
+    HEALTH_HTTP_PATH, HEALTH_LISTEN_ADDR, HEALTH_REL_PATH,
+};
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
