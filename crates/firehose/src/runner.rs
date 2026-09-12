@@ -17,10 +17,6 @@ use reth_revm::{
     State,
 };
 
-/// Executes EVM transactions in a block one by one, firing tracer hooks at the appropriate times.
-///
-/// This is a re-implementation for usage within ExEx and compatible with Firehose Geth Live
-/// Tracing.
 pub fn trace_block<Node: FullNodeComponents, F>(
     ctx: &ExExContext<Node>,
     evm_config: &Node::Evm,
@@ -37,14 +33,6 @@ where
 
     let tracer = &mut *crate::tracer();
 
-    // Block 1 used to short-circuit here and emit `on_genesis_block` with block 1's
-    // data + chain-spec alloc, which was wrong on two counts: (a) the genesis-block
-    // event represents block 0 not block 1, and (b) firing it during block-execution
-    // means it never fires for nodes where reth's pipeline has already advanced past
-    // block 1. The proper genesis emit now happens in `run_exex` at chain-init time
-    // (see below) when `last_block_number() == 0`. Block 1 flows through the normal
-    // `on_block_start` → execute → `on_block_end` path like any other block.
-
     tracer.on_block_start(firehose_tracer::types::BlockEvent {
         block: mapper::to_block_data(block.sealed_block()),
         finalized: mapper::to_finalized_ref(ctx.provider().finalized_block_num_hash()),
@@ -54,32 +42,14 @@ where
     let evm_env = evm_config
         .evm_env(block.header())
         .wrap_err_with(|| format!("Failed to build EVM env for block {}", block.number()))?;
-    // context_for_block type-checks because FullNodeComponents bounds Node::Evm:
-    // ConfigureEvm<Primitives = <Node::Types as NodeTypes>::Primitives>
     let exec_ctx = evm_config
         .context_for_block(block.sealed_block())
         .wrap_err_with(|| format!("Failed to build EVM context for block {}", block.number()))?;
 
-    // Inspector borrows tracer mutably for the duration of the block execution.
-    // All tracer lifecycle calls (on_tx_start, on_tx_end, etc.) go through
-    // executor.evm_mut().inspector_mut().tracer_mut() while the inspector is live.
     let inspector = inspector::FirehoseInspector::new(tracer);
-    // The EVM borrows `shared_state` mutably for the duration of this block. Bundle updates
-    // from prior blocks in the same ChainCommitted notification are already reflected in its
-    // cache via earlier `commit_transaction` calls, so nonce / balance reads here see the
-    // correct pre-block state without re-querying the historical provider.
     let evm = evm_config.evm_with_env_and_inspector(&mut *shared_state, evm_env, inspector);
     let mut executor = evm_config.create_executor(evm, exec_ctx);
 
-    // AFAIK this is actually unused for tracing, commented out to try, will delete if conclusive
-    // // Set state hook to log EvmState changes after each transaction and system call
-    // executor.set_state_hook(Some(Box::new(
-    //     |source: reth_evm::block::StateChangeSource, state: &reth::revm::revm::state::EvmState| {
-    //         inspector::log_evm_state(&format!("state_hook({source:?})"), state);
-    //     },
-    // )));
-
-    // System calls (EIP-4788, EIP-2935, etc.) — handled by apply_pre_execution_changes
     executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
     executor.apply_pre_execution_changes().wrap_err_with(|| {
         format!("Failed to apply pre-execution changes for block {}", block.number())
@@ -95,24 +65,6 @@ where
         let tx: &SignedTx<Node> = &**recovered_tx;
         let (r, s, v) = get_signature(tx);
         let tx_event = mapper::signed_tx_to_tx_event(tx, recovered_tx.signer(), tx_index, r, s, v);
-
-        // Fresh state reader per transaction for on_tx_start StateReader.
-        //
-        // KNOWN LIMITATION: this reader is resolved from the provider at `parent_hash`, not
-        // from the live `shared_state`. The firehose StateReader observations it produces are
-        // pre-block, not pre-tx. EVM-level nonce validation is unaffected (that uses the
-        // shared_state cache, not this reader).
-        //let state_reader_provider = ctx
-        //    .provider()
-        //    .state_by_block_hash(parent_hash)
-        //    .wrap_err_with(|| {
-        //        format!(
-        //            "Failed to get state reader for block {} tx_index={tx_index} tx_hash={}",
-        //            block.number(),
-        //            recovered_tx.tx_hash()
-        //        )
-        //    })?;
-        //let state_reader = Box::new(mapper::StateReaderAdapter(state_reader_provider));
 
         executor.evm_mut().inspector_mut().tracer_mut().on_tx_start(tx_event, None);
 
@@ -130,9 +82,6 @@ where
             .nonce;
         info!(target: "firehose", block = block.number(), tx_index, tx_hash = ?recovered_tx.tx_hash(), caller_nonce, "Executing transaction");
 
-        // execute_transaction_without_commit runs the full EVM execution (including po
-        // gas refund and miner fee) and returns the final EvmState without committing to DB.
-        // Inspector hooks (on_call_enter, on_call_exit, on_opcode, etc.) fire during transact().
         let tx_result =
             executor.execute_transaction_without_commit(recovered_tx).wrap_err_with(|| {
                 format!(
@@ -142,9 +91,6 @@ where
                 )
             })?;
 
-        // Emit post-execution balance changes (gas refund to sender, miner fee to coinbase).
-        // revm's post_execution runs reimburse_caller and reward_beneficiary after the last
-        // inspector hook, so we explicitly compute and emit them using Ethereum gas rules.
         {
             let result_gas_used = {
                 use alloy_evm::block::TxResult as _;
@@ -163,7 +109,6 @@ where
                 tx.gas_price().unwrap_or(0)
             };
 
-            // Committed log count from the ExecutionResult (empty on Revert/Halt).
             let committed_log_count = {
                 use alloy_evm::block::TxResult as _;
                 tx_result.result().result.logs().len() as u32
@@ -186,8 +131,6 @@ where
         let cumulative_gas = receipt.cumulative_gas_used();
         let gas_used = cumulative_gas - prev_cumulative_gas;
         let log_count = receipt.logs().len() as u32;
-        // EIP-4844 receipt fields. `blob_gas_used()` returns `None` for non-blob tx types;
-        // `blob_gasprice()` returns `None` for pre-Cancun blocks. Matches Geth's receipt shape.
         let blob_gas_used = tx.blob_gas_used().unwrap_or(0);
         let blob_gas_price = executor.evm().block().blob_gasprice().map(U256::from);
         let receipt_data = mapper::to_receipt_data(
@@ -206,15 +149,10 @@ where
 
     executor.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
 
-    // Post-execution changes (block rewards, withdrawals, etc.)
-    // This consumes the executor, dropping the inspector and releasing the tracer borrow.
-    // State mutations (pre-execution changes, tx commits, post-execution changes) remain in
-    // `shared_state`, ready for the next block in this chain notification.
     executor.apply_post_execution_changes().wrap_err_with(|| {
         format!("Failed to apply post-execution changes for block {}", block.number())
     })?;
 
-    // Tracer borrow released — can call directly again
     tracer.on_system_call_end();
 
     tracer.on_block_end(None);
@@ -222,10 +160,6 @@ where
     Ok(())
 }
 
-/// ExEx entry point for Firehose live-block tracing.
-///
-/// Loops over `ChainCommitted` notifications, re-executes each block with `trace_block`, and
-/// signals `FinishedHeight` after each block so the WAL can be pruned.
 pub async fn run_exex<Node>(mut ctx: ExExContext<Node>) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
@@ -234,35 +168,21 @@ where
     SignedTx<Node>: mapper::SignatureFields,
 {
     let chain_id = ctx.config.chain.chain().id();
+    let replica = crate::health::resolve_replica();
+    let datadir = ctx.config.datadir().data_dir().to_path_buf();
+    let mut health = crate::health::HealthPublisher::start(&datadir, chain_id, replica)?;
+
     crate::tracer().on_blockchain_init(
         "reth",
         env!("CARGO_PKG_VERSION"),
         firehose_tracer::config::ChainConfig::new(chain_id),
     );
 
-    // Emit FIRE BLOCK 0 ONCE when reth boots on a fresh chain (canonical head == 0,
-    // i.e. only the chain-spec-installed genesis block is in the DB, nothing synced
-    // past it). This synthesizes the genesis block event with the chain's pre-allocated
-    // state (balances, code, nonces, storage) carried inside as `REASON_GENESIS_BALANCE`
-    // / OnCodeChange / OnNonceChange / OnStorageChange events — mirroring geth's
-    // `OnGenesisBlock` hook fired from `core/blockchain.go:500-514`.
-    //
-    // Without this, no `0000000000-*.dbin.zst` one-block file is ever produced, and the
-    // downstream fireeth merger sits in a "too many unlinkable blocks at base 401" loop
-    // forever because block 1's parent_hash (the genesis hash) has no anchor in the stream.
-    //
-    // On restarts where reth's head is already past 0 (i.e. the firehose pipeline already
-    // received the genesis event in an earlier run), this is a no-op. Reading the head via
-    // `last_block_number` rather than checking for the absence of a one-block file in the
-    // downstream MinIO bucket keeps the ExEx ignorant of downstream storage state.
     let head = ctx
         .provider()
         .last_block_number()
         .wrap_err("failed to read last_block_number — provider not initialized?")?;
     if head == 0 {
-        // Pull the genesis block from the provider (reth initializes it from the chain spec
-        // at first boot) and seal it into a SealedBlock. `SealedBlock::seal_slow` computes the
-        // hash from the header — fine here since this fires once per chain lifetime.
         let genesis_block = ctx
             .provider()
             .block_by_number(0)
@@ -293,34 +213,27 @@ where
 
         if let Some(committed) = notification.committed_chain() {
             info!(chain = ?committed.range(), "Chain committed, tracing {} blocks", committed.len());
-            //let first_block = committed.first();
-            //let parent_hash = first_block.parent_hash();
-
-            //let state_provider =
-            //    ctx.provider().state_by_block_hash(parent_hash).wrap_err_with(|| {
-            //        format!("Failed to get state provider for parent block {}", parent_hash)
-            //    })?;
-
-            //let mut _shared_state = State::builder()
-            //    .with_database(StateProviderDatabase::new(state_provider))
-            //    .with_bundle_update()
-            //    .build();
-
-            //let _evm_config = ctx.evm_config().clone();
 
             for (block, _receipts) in committed.blocks_and_receipts() {
-                // trace_block(
-                //     &ctx,
-                //     &evm_config,
-                //     block,
-                //     receipts,
-                //     &|tx: &SignedTx<Node>| tx.signature_fields(),
-                //     &mut shared_state,
-                // )?;
 
-                ctx.events.send(ExExEvent::FinishedHeight(block.num_hash()))?;
+                let num_hash = block.num_hash();
+                let block_time = block.header().timestamp();
+                if let Err(err) = health.record_finished_height(num_hash.number, block_time) {
+                    warn!(
+                        target: "firehose::health",
+                        error = %err,
+                        height = num_hash.number,
+                        "Failed to write firehose health.json"
+                    );
+                }
+
+                ctx.events.send(ExExEvent::FinishedHeight(num_hash))?;
             }
         }
+    }
+
+    if let Err(err) = health.mark_dead() {
+        warn!(target: "firehose::health", error = %err, "Failed to write dead health.json on shutdown");
     }
 
     Ok(())
