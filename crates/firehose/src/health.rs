@@ -80,10 +80,60 @@ impl HealthStatus {
     }
 }
 
+/// Parse replica letter from a valve host name.
+///
+/// Accepts `direct-b-evm-369`, `direct-a-evm-1.internal`, `evm943b`, `evm1b`.
+pub fn replica_from_host(host: &str) -> Option<String> {
+    let host = host.trim().to_ascii_lowercase();
+    let name = host.split('.').next().unwrap_or(&host);
+
+    if let Some(rest) = name.strip_prefix("direct-") {
+        let letter = rest.chars().next()?;
+        if letter == 'a' || letter == 'b' {
+            return Some(letter.to_string());
+        }
+    }
+
+    if let Some(rest) = name.strip_prefix("evm") {
+        let letter = rest.chars().last()?;
+        if (letter == 'a' || letter == 'b')
+            && rest.chars().rev().nth(1).is_some_and(|c| c.is_ascii_digit())
+        {
+            return Some(letter.to_string());
+        }
+    }
+
+    None
+}
+
+fn current_hostname() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("VALVE_HOST").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// Replica stamp for health.json.
+///
+/// Order: `VALVE_REPLICA`, `FIREHOSE_REPLICA`, hostname (`direct-{a|b}-evm-*` /
+/// `evm*{a|b}`), then `"a"`.
 pub fn resolve_replica() -> String {
-    std::env::var("VALVE_REPLICA")
-        .or_else(|_| std::env::var("FIREHOSE_REPLICA"))
-        .unwrap_or_else(|_| "a".to_string())
+    if let Ok(v) = std::env::var("VALVE_REPLICA").or_else(|_| std::env::var("FIREHOSE_REPLICA")) {
+        let v = v.trim().to_ascii_lowercase();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Some(from_host) = current_hostname().and_then(|h| replica_from_host(&h)) {
+        return from_host;
+    }
+    "a".to_string()
 }
 
 pub fn default_health_path(datadir: impl AsRef<Path>) -> PathBuf {
