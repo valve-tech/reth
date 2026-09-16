@@ -17,7 +17,10 @@ use alloy_eips::BlockId;
 use alloy_genesis::Genesis;
 use alloy_primitives::{address, bytes, Address, U256};
 use alloy_provider::{DynProvider, Provider};
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_rpc_types_eth::{
+    state::{AccountOverride, StateOverride},
+    TransactionRequest,
+};
 use eyre::Result;
 use reth_chainspec::ChainSpec;
 use reth_node_builder::{NodeBuilder, NodeHandle};
@@ -115,6 +118,33 @@ async fn storage_write_estimates_the_execution_cost() -> Result<()> {
     let estimate = provider.estimate_gas(request).block(BlockId::latest()).await?;
 
     assert_no_margin(estimate, INTRINSIC + SSTORE_EXECUTION, "a cold zero-to-non-zero write");
+    Ok(())
+}
+
+/// An override that puts code at the destination must not get a transfer's estimate.
+///
+/// [`EOA`] holds no code, so a call to it is a basic transfer. The override below gives that
+/// account the code of [`SSTORE_CONTRACT`], so the same call writes storage and costs far
+/// more than a transfer.
+///
+/// Two separate guards keep the answer right, and this test holds the outcome rather than
+/// either mechanism. The estimator decides whether a call is a basic transfer by reading the
+/// account, and that read must go through the override layer. Even when it does not, the
+/// shortcut runs the call at 21000 gas first and falls through to the binary search when
+/// that run fails — which it does here. Remove the trial run and make the account read
+/// bypass overrides, and this call is estimated at 21000 and runs out of gas.
+#[tokio::test]
+async fn state_override_that_adds_code_defeats_the_transfer_shortcut() -> Result<()> {
+    let (_handle, provider) = spawn_node().await?;
+
+    let mut overrides = StateOverride::default();
+    overrides.insert(EOA, AccountOverride::default().with_code(bytes!("0x600160005500")));
+
+    let request = TransactionRequest::default().from(SENDER).to(EOA);
+    let estimate =
+        provider.estimate_gas(request).overrides(overrides).block(BlockId::latest()).await?;
+
+    assert_no_margin(estimate, INTRINSIC + SSTORE_EXECUTION, "an override that adds code");
     Ok(())
 }
 
