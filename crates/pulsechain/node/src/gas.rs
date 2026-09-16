@@ -96,14 +96,36 @@ fn fee_cap(request: &TransactionRequest) -> Option<U256> {
 ///
 /// Returns `padded` unchanged when the request names no fee, since then the sender pays
 /// nothing for gas and no balance can constrain it.
-fn cap_by_affordability(padded: U256, balance: U256, request: &TransactionRequest) -> U256 {
+///
+/// # The cap never returns less gas than the transaction needs
+///
+/// The cap may only remove margin. It may never fall below `estimate`, the figure the core
+/// estimator arrived at, because that figure is what the transaction actually costs.
+///
+/// The clamp is load-bearing, because this allowance and the estimator's allowance divide by
+/// different prices. The estimator divides by the tx env's `gas_price`, which for a request
+/// naming `maxFeePerGas` is the EFFECTIVE price, `min(maxFeePerGas, baseFee + priorityFee)`
+/// (`CallFees::get_effective_gas_price` in alloy-evm). This function divides by `feeCap`,
+/// which is `maxFeePerGas` itself. A wallet normally sets `maxFeePerGas` well above the base
+/// fee, so the divisor here is the larger one and the allowance the smaller. Without the
+/// clamp, a sender with a thin balance is handed an estimate below the intrinsic cost of
+/// their own transfer — the exact case this cap exists to protect.
+///
+/// Erigon has no such gap: it derives its search ceiling and its cap from one `feeCap`, so
+/// its cap is always at or above its own estimate. The clamp reproduces that property here.
+fn cap_by_affordability(
+    estimate: U256,
+    padded: U256,
+    balance: U256,
+    request: &TransactionRequest,
+) -> U256 {
     let Some(fee) = fee_cap(request) else { return padded };
 
     // The value being sent is not available to pay for gas.
     let available = balance.saturating_sub(request.value.unwrap_or_default());
     let allowance = available / fee;
 
-    padded.min(allowance)
+    padded.min(allowance).max(estimate)
 }
 
 /// Replaces `eth_estimateGas` in all configured transports with a wrapper that
@@ -160,10 +182,18 @@ where
         // not turn a working estimate into an error.
         let capped = match (request.from, fee_cap(&request)) {
             (Some(from), Some(_)) => {
-                // Read the balance at the block the estimate ran against, so the cap and
-                // the estimate see one state.
+                // This balance and the one the estimator used can differ, in two ways.
+                // `block_id` is `None` for most calls, so each side resolves `latest`
+                // separately and a block can land between them. State overrides are
+                // invisible here as well: `balance` reads committed state, while the
+                // estimator ran against the overridden state, so an override-funded
+                // sender reads as 0 on this side.
+                //
+                // Both are harmless because `cap_by_affordability` never returns less
+                // than `estimate`. A stale or override-blind balance can shave the
+                // margin; it cannot report less gas than the transaction costs.
                 match EthApiServer::balance(&**ctx, from, block_id).await {
-                    Ok(balance) => cap_by_affordability(padded, balance, &request),
+                    Ok(balance) => cap_by_affordability(estimate, padded, balance, &request),
                     Err(_) => padded,
                 }
             }
@@ -225,7 +255,12 @@ mod tests {
     fn affordable_estimate_keeps_the_margin() {
         // 25,200 gas at 100 wei costs 2,520,000. The balance covers it many times over.
         let padded = U256::from(25_200u64);
-        let capped = cap_by_affordability(padded, U256::from(1_000_000_000u64), &paying(100, 0));
+        let capped = cap_by_affordability(
+            U256::from(21_000u64),
+            padded,
+            U256::from(1_000_000_000u64),
+            &paying(100, 0),
+        );
 
         assert_eq!(capped, padded, "a sender who can pay keeps the full margin");
     }
@@ -238,7 +273,12 @@ mod tests {
     fn unaffordable_margin_is_capped_to_the_allowance() {
         // Exactly 21,000 gas at 100 wei, and not a wei more.
         let balance = U256::from(2_100_000u64);
-        let capped = cap_by_affordability(U256::from(25_200u64), balance, &paying(100, 0));
+        let capped = cap_by_affordability(
+            U256::from(21_000u64),
+            U256::from(25_200u64),
+            balance,
+            &paying(100, 0),
+        );
 
         assert_eq!(capped, U256::from(21_000u64), "capped to what the balance buys");
     }
@@ -247,7 +287,9 @@ mod tests {
     #[test]
     fn value_is_deducted_before_the_allowance() {
         // 2,100,000 total, 1,050,000 of it sent as value, leaving 10,500 gas at 100 wei.
+        // The estimate sits below that allowance, so the clamp does not mask the deduction.
         let capped = cap_by_affordability(
+            U256::from(10_000u64),
             U256::from(25_200u64),
             U256::from(2_100_000u64),
             &paying(100, 1_050_000),
@@ -265,7 +307,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(cap_by_affordability(padded, U256::ZERO, &free), padded);
+        assert_eq!(cap_by_affordability(U256::from(21_000u64), padded, U256::ZERO, &free), padded);
     }
 
     /// An explicit `gasPrice` wins over `maxFeePerGas`, matching erigon's `feeCap`.
@@ -282,7 +324,33 @@ mod tests {
     fn a_zero_fee_does_not_divide_by_zero() {
         let padded = U256::from(25_200u64);
 
-        assert_eq!(cap_by_affordability(padded, U256::ZERO, &paying(0, 0)), padded);
+        assert_eq!(
+            cap_by_affordability(U256::from(21_000u64), padded, U256::ZERO, &paying(0, 0)),
+            padded
+        );
+    }
+
+    /// The cap may remove margin. It may never report less gas than the transaction needs.
+    ///
+    /// This allowance divides the balance by `maxFeePerGas`, while the core estimator divides
+    /// it by the effective price, `min(maxFeePerGas, baseFee + priorityFee)`. A wallet sets
+    /// `maxFeePerGas` above the base fee as a matter of course, so this allowance is the
+    /// smaller of the two and can fall under the estimate itself.
+    ///
+    /// Here the sender holds 210,000 wei and names a 100 wei fee cap, which buys 2,100 gas —
+    /// a tenth of the 21,000 the transfer costs. Returning 2,100 would report a transfer as
+    /// costing less than its own intrinsic gas, and the send would run out of gas.
+    #[test]
+    fn the_cap_never_falls_below_the_estimate() {
+        let estimate = U256::from(21_000u64);
+        let capped = cap_by_affordability(
+            estimate,
+            U256::from(25_200u64),
+            U256::from(210_000u64),
+            &paying(100, 0),
+        );
+
+        assert_eq!(capped, estimate, "the cap must not report less gas than the estimate");
     }
 
     /// The SHARED estimator must not pad as well, or the two margins compound.

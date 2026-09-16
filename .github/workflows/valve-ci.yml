@@ -115,4 +115,6 @@ jobs:
       # returns exact figures. They sit in an upstream crate, so the package list
       # above never reaches them. Name them here or they only ever run by hand.
       - name: cargo nextest (gas estimation)
-        run: cargo nextest run -p reth-node-ethereum --test e2e -E 'test(estimate::)'
+        # `--no-tests=fail` because a filter that matches nothing — after a rename,
+        # say — would otherwise report success while testing nothing at all.
+        run: cargo nextest run -p reth-node-ethereum --test e2e -E 'test(estimate::)' --no-tests=fail
