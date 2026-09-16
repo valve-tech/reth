@@ -134,7 +134,7 @@ async fn storage_write_estimates_the_execution_cost() -> Result<()> {
 /// that run fails — which it does here. Remove the trial run and make the account read
 /// bypass overrides, and this call is estimated at 21000 and runs out of gas.
 #[tokio::test]
-async fn state_override_that_adds_code_defeats_the_transfer_shortcut() -> Result<()> {
+async fn override_that_adds_code_is_estimated_at_the_full_execution_cost() -> Result<()> {
     let (_handle, provider) = spawn_node().await?;
 
     let mut overrides = StateOverride::default();

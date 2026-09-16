@@ -194,7 +194,19 @@ where
                 // margin; it cannot report less gas than the transaction costs.
                 match EthApiServer::balance(&**ctx, from, block_id).await {
                     Ok(balance) => cap_by_affordability(estimate, padded, balance, &request),
-                    Err(_) => padded,
+                    Err(err) => {
+                        // A cap we cannot compute must not turn a working estimate into an
+                        // error, so the padded figure stands. Say so, though: a balance
+                        // lookup that fails on every request is a broken cap, and silence
+                        // would hide it.
+                        reth_tracing::tracing::debug!(
+                            target: "rpc::eth::estimate",
+                            %from,
+                            %err,
+                            "balance lookup failed; returning the padded estimate uncapped"
+                        );
+                        padded
+                    }
                 }
             }
             _ => padded,
