@@ -5,6 +5,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     task::{ready, Context, Poll},
+    time::Duration,
 };
 
 use alloy_primitives::bytes::BytesMut;
@@ -13,9 +14,9 @@ use reth_eth_wire::{
     capability::SharedCapabilities, multiplex::ProtocolConnection, protocol::Protocol,
 };
 use reth_network::{
-    protocol::{ConnectionHandler, OnNotSupported, ProtocolHandler},
+    protocol::{ConnectionHandler, IntoRlpxSubProtocol, OnNotSupported, ProtocolHandler},
     test_utils::{NetworkEventStream, Testnet},
-    NetworkConfigBuilder, NetworkEventListenerProvider, NetworkManager,
+    NetworkConfigBuilder, NetworkEventListenerProvider, NetworkManager, NetworkProtocols,
 };
 use reth_network_api::{Direction, NetworkInfo, PeerId, Peers};
 use reth_provider::{noop::NoopProvider, test_utils::MockEthProvider};
@@ -144,13 +145,36 @@ mod proto {
 #[derive(Debug)]
 struct PingPongProtoHandler {
     state: ProtocolState,
+    /// What the handler does when the remote does not speak the protocol.
+    ///
+    /// Both answers are in use. `Disconnect` drops the peer, which is what a required
+    /// protocol wants. `KeepAlive` holds the session open without the protocol, which is
+    /// what an optional one wants — and it is the case worth testing, because such a
+    /// session looks healthy from every angle except the negotiated capability list.
+    on_unsupported: OnNotSupported,
+}
+
+impl PingPongProtoHandler {
+    /// Drops any peer that does not speak the protocol.
+    const fn disconnecting(state: ProtocolState) -> Self {
+        Self { state, on_unsupported: OnNotSupported::Disconnect }
+    }
+
+    /// Stays connected to a peer that does not speak the protocol.
+    const fn optional(state: ProtocolState) -> Self {
+        Self { state, on_unsupported: OnNotSupported::KeepAlive }
+    }
+
+    fn connection_handler(&self) -> PingPongConnectionHandler {
+        PingPongConnectionHandler { state: self.state.clone(), on_unsupported: self.on_unsupported }
+    }
 }
 
 impl ProtocolHandler for PingPongProtoHandler {
     type ConnectionHandler = PingPongConnectionHandler;
 
     fn on_incoming(&self, _socket_addr: SocketAddr) -> Option<Self::ConnectionHandler> {
-        Some(PingPongConnectionHandler { state: self.state.clone() })
+        Some(self.connection_handler())
     }
 
     fn on_outgoing(
@@ -158,7 +182,7 @@ impl ProtocolHandler for PingPongProtoHandler {
         _socket_addr: SocketAddr,
         _peer_id: PeerId,
     ) -> Option<Self::ConnectionHandler> {
-        Some(PingPongConnectionHandler { state: self.state.clone() })
+        Some(self.connection_handler())
     }
 }
 
@@ -188,6 +212,7 @@ enum Command {
 
 struct PingPongConnectionHandler {
     state: ProtocolState,
+    on_unsupported: OnNotSupported,
 }
 
 impl ConnectionHandler for PingPongConnectionHandler {
@@ -203,7 +228,7 @@ impl ConnectionHandler for PingPongConnectionHandler {
         _direction: Direction,
         _peer_id: PeerId,
     ) -> OnNotSupported {
-        OnNotSupported::Disconnect
+        self.on_unsupported
     }
 
     fn into_connection(
@@ -294,7 +319,8 @@ async fn test_connect_to_non_multiplex_peer() {
     let mut network = NetworkManager::new(config).await.unwrap();
 
     let (tx, _) = mpsc::unbounded_channel();
-    network.add_rlpx_sub_protocol(PingPongProtoHandler { state: ProtocolState { events: tx } });
+    network
+        .add_rlpx_sub_protocol(PingPongProtoHandler::disconnecting(ProtocolState { events: tx }));
 
     let handle = network.handle().clone();
     tokio::task::spawn(network);
@@ -327,11 +353,11 @@ async fn test_proto_multiplex() {
 
     let (tx, mut from_peer0) = mpsc::unbounded_channel();
     net.peers_mut()[0]
-        .add_rlpx_sub_protocol(PingPongProtoHandler { state: ProtocolState { events: tx } });
+        .add_rlpx_sub_protocol(PingPongProtoHandler::disconnecting(ProtocolState { events: tx }));
 
     let (tx, mut from_peer1) = mpsc::unbounded_channel();
     net.peers_mut()[1]
-        .add_rlpx_sub_protocol(PingPongProtoHandler { state: ProtocolState { events: tx } });
+        .add_rlpx_sub_protocol(PingPongProtoHandler::disconnecting(ProtocolState { events: tx }));
 
     let handle = net.spawn();
     // connect all the peers
@@ -368,4 +394,93 @@ async fn test_proto_multiplex() {
 
     let response = rx.await.unwrap();
     assert_eq!(response, "hello from peer1!");
+}
+
+/// A sub-protocol registered before the network spawns reaches a peer the node dials.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sub_protocol_registered_before_spawn_reaches_a_dialled_peer() {
+    reth_tracing::init_test_tracing();
+
+    assert!(
+        dialler_establishes_sub_protocol(Registration::BeforeSpawn).await,
+        "a protocol registered before the network spawns must reach a dialled peer"
+    );
+}
+
+/// A sub-protocol registered after a session exists never appears on that session.
+///
+/// devp2p fixes the capability set during the `Hello` exchange, and `SessionManager` reads
+/// the registered protocol list once per connection. Nothing renegotiates afterwards, so the
+/// protocol stays absent for the life of the session. A node dials its trusted peers as it
+/// starts and then holds those links open, which makes late registration permanent for
+/// exactly the peers it most wants to talk to.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sub_protocol_registered_after_spawn_misses_an_existing_session() {
+    reth_tracing::init_test_tracing();
+
+    assert!(
+        !dialler_establishes_sub_protocol(Registration::AfterSession).await,
+        "a protocol registered after the session was negotiated must not appear on it"
+    );
+}
+
+/// When the dialling node registers the sub-protocol, relative to its own startup.
+#[derive(Clone, Copy)]
+enum Registration {
+    /// Before the network spawns, which is the only ordering that works.
+    BeforeSpawn,
+    /// Once the session with the peer is already established.
+    AfterSession,
+}
+
+/// Dials a peer that speaks the ping-pong protocol, and reports whether the protocol
+/// established on the dialling side.
+async fn dialler_establishes_sub_protocol(registration: Registration) -> bool {
+    // The peer being dialled always registers before it spawns, so it is never the reason
+    // the protocol is missing.
+    let mut listener = Testnet::create_with(1, MockEthProvider::default()).await;
+    let (listener_tx, _listener_events) = mpsc::unbounded_channel();
+    listener.peers_mut()[0].add_rlpx_sub_protocol(PingPongProtoHandler::optional(ProtocolState {
+        events: listener_tx,
+    }));
+
+    let mut handles = listener.handles();
+    let listener_handle = handles.next().unwrap();
+    let listener_id = *listener_handle.peer_id();
+    let listener_addr = listener_handle.local_addr();
+    drop(handles);
+    let _listener = listener.spawn();
+
+    let secret_key = SecretKey::new(&mut rand_08::thread_rng());
+    let config = NetworkConfigBuilder::eth(secret_key, Runtime::test())
+        .listener_port(0)
+        .disable_discovery()
+        .build(NoopProvider::default());
+    let mut network = NetworkManager::new(config).await.unwrap();
+
+    let (tx, mut protocol_events) = mpsc::unbounded_channel();
+    let state = ProtocolState { events: tx };
+
+    if matches!(registration, Registration::BeforeSpawn) {
+        network.add_rlpx_sub_protocol(PingPongProtoHandler::optional(state.clone()));
+    }
+
+    let handle = network.handle().clone();
+    let mut sessions = NetworkEventStream::new(handle.event_listener());
+    tokio::task::spawn(network);
+
+    handle.add_peer(listener_id, listener_addr);
+
+    if matches!(registration, Registration::AfterSession) {
+        // Register only once the session has negotiated, so the outcome is the ordering
+        // under test rather than a race against the dial.
+        sessions.next_session_established().await;
+        handle
+            .add_rlpx_sub_protocol(PingPongProtoHandler::optional(state).into_rlpx_sub_protocol());
+    }
+
+    matches!(
+        tokio::time::timeout(Duration::from_secs(5), protocol_events.recv()).await,
+        Ok(Some(ProtocolEvent::Established { .. }))
+    )
 }
