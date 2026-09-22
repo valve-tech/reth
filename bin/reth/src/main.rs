@@ -56,8 +56,26 @@ struct EthereumExtArgs {
     #[command(flatten)]
     msgboard: MsgboardArgs,
 
-    #[arg(long = "firehose.enabled", env = "RETH_FIREHOSE_ENABLED", default_value_t = false)]
+    /// Enable firehose instrumentation (FIRE protocol + ExEx). Default off.
+    ///
+    /// Accepts `--firehose.enabled`, `--firehose.enabled=true|false`, and
+    /// `RETH_FIREHOSE_ENABLED`.
+    #[arg(
+        long = "firehose.enabled",
+        env = "RETH_FIREHOSE_ENABLED",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+    )]
     firehose_enabled: bool,
+
+    /// Write FIRE protocol lines to this path instead of stdout.
+    ///
+    /// Only used when `--firehose.enabled` is set. Producers can point this at a
+    /// FIFO that fireeth reads; otherwise FIRE lines go to stdout.
+    #[arg(long = "firehose.output", env = "FIREHOSE_OUTPUT")]
+    firehose_output: Option<String>,
 
     /// Replica letter stamped into firehose health.json (`a` / `b`).
     ///
@@ -72,6 +90,29 @@ struct PulsechainExtArgs {
     #[command(flatten)]
     msgboard: MsgboardArgs,
 
+    /// Enable firehose instrumentation (FIRE protocol + ExEx).
+    ///
+    /// **Default off.** Plain RPC / A replicas leave this unset so journals are
+    /// not flooded with FIRE lines. Firehose producers must set
+    /// `--firehose.enabled` / `--firehose.enabled=true` or
+    /// `RETH_FIREHOSE_ENABLED=true` or FIRE output dies.
+    #[arg(
+        long = "firehose.enabled",
+        env = "RETH_FIREHOSE_ENABLED",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+    )]
+    firehose_enabled: bool,
+
+    /// Write FIRE protocol lines to this path instead of stdout.
+    ///
+    /// Only used when `--firehose.enabled` is set. Producers can point this at a
+    /// FIFO that fireeth reads; otherwise FIRE lines go to stdout.
+    #[arg(long = "firehose.output", env = "FIREHOSE_OUTPUT")]
+    firehose_output: Option<String>,
+
     /// Replica letter stamped into firehose health.json (`a` / `b`).
     ///
     /// Optional. When unset, the ExEx infers from hostname
@@ -85,6 +126,17 @@ fn sync_firehose_replica_env(replica: &str) {
         return;
     }
     unsafe { std::env::set_var("FIREHOSE_REPLICA", replica) };
+}
+
+fn firehose_tracer_config(output: Option<String>) -> firehose_tracer::config::Config {
+    let mut config = firehose_tracer::config::Config {
+        chain_client: firehose_tracer::config::ChainClient::Reth,
+        ..Default::default()
+    };
+    if let Some(path) = output {
+        config = config.with_output_path(path);
+    }
+    config
 }
 
 fn main() {
@@ -139,6 +191,7 @@ fn run_ethereum_node() -> eyre::Result<()> {
             let EthereumExtArgs {
                 msgboard: msgboard_args,
                 firehose_enabled,
+                firehose_output,
                 firehose_replica,
             } = ext;
             if let Some(replica) = firehose_replica.as_deref() {
@@ -150,12 +203,9 @@ fn run_ethereum_node() -> eyre::Result<()> {
                 info!(target: "reth::cli", "Launching Ethereum node (firehose-instrumented)");
                 warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
 
-                reth_firehose::init_tracer(firehose_tracer::Tracer::new(
-                    firehose_tracer::config::Config {
-                        chain_client: firehose_tracer::config::ChainClient::Reth,
-                        ..Default::default()
-                    },
-                ));
+                reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer_config(
+                    firehose_output,
+                )));
 
                 let launcher_for_rpc = launcher.clone();
                 let handle = builder
@@ -214,34 +264,40 @@ fn run_ethereum_node() -> eyre::Result<()> {
 }
 
 fn run_pulsechain_node() -> eyre::Result<()> {
-    reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer::config::Config {
-        chain_client: firehose_tracer::config::ChainClient::Reth,
-        ..Default::default()
-    }));
-
     let components = |spec: Arc<PulsechainChainSpec>| {
         (PulsechainEvmConfig::new(spec.clone()), Arc::new(PulsechainConsensus::new(spec)))
     };
 
     Cli::<PulsechainChainSpecParser, PulsechainExtArgs, ValveRpcModuleValidator>::parse()
         .run_with_components::<PulsechainNode>(
-            components,
-            async move |mut builder, ext: PulsechainExtArgs| {
-                let PulsechainExtArgs { msgboard: msgboard_args, firehose_replica } = ext;
-                if let Some(replica) = firehose_replica.as_deref() {
-                    sync_firehose_replica_env(replica);
-                }
-                info!(target: "reth::cli", "Launching PulseChain node");
+        components,
+        async move |mut builder, ext: PulsechainExtArgs| {
+            let PulsechainExtArgs {
+                msgboard: msgboard_args,
+                firehose_enabled,
+                firehose_output,
+                firehose_replica,
+            } = ext;
+            if let Some(replica) = firehose_replica.as_deref() {
+                sync_firehose_replica_env(replica);
+            }
+
+            let chain_id = builder.config().chain.chain().id();
+            inject_pulsechain_bootnodes_if_unset(
+                &mut builder.config_mut().network.bootnodes,
+                chain_id,
+            );
+
+            let launcher = MsgboardLauncher::new(msgboard_args);
+            let launcher_for_rpc = launcher.clone();
+
+            if firehose_enabled {
+                info!(target: "reth::cli", "Launching PulseChain node (firehose-instrumented)");
                 warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
 
-                let chain_id = builder.config().chain.chain().id();
-                inject_pulsechain_bootnodes_if_unset(
-                    &mut builder.config_mut().network.bootnodes,
-                    chain_id,
-                );
-
-                let launcher = MsgboardLauncher::new(msgboard_args);
-                let launcher_for_rpc = launcher.clone();
+                reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer_config(
+                    firehose_output,
+                )));
 
                 let handle = builder
                     .with_types::<PulsechainNode>()
@@ -272,8 +328,37 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                 let exit = handle.wait_for_node_exit().await;
                 launcher.final_flush();
                 exit
-            },
-        )
+            } else {
+                info!(target: "reth::cli", "Launching PulseChain node (stock, firehose disabled)");
+
+                let handle = builder
+                    .with_types::<PulsechainNode>()
+                    .with_components(
+                        PulsechainNode::components()
+                            .network(MsgboardNetworkBuilder::new(launcher.clone())),
+                    )
+                    .with_add_ons(EthereumAddOns::default())
+                    .extend_rpc_modules(move |ctx| {
+                        launcher_for_rpc.install_rpc(ctx.modules)?;
+
+                        let eth_api = ctx.registry.eth_api().clone();
+                        install_gas_estimation_margin(ctx.modules, eth_api)?;
+
+                        Ok(())
+                    })
+                    .launch()
+                    .await?;
+
+                launcher.install_post_launch_tasks(
+                    handle.node.network.clone(),
+                    handle.node.provider.clone(),
+                );
+                let exit = handle.wait_for_node_exit().await;
+                launcher.final_flush();
+                exit
+            }
+        },
+    )
 }
 
 fn warn_if_jit_requested_with_firehose(jit_enabled: bool) {
@@ -336,5 +421,73 @@ mod validator_tests {
         let err = ValveRpcModuleValidator::validate_selection(&typo, "http.api")
             .expect_err("validate_selection must reject a typo too");
         assert!(err.contains("http.api"), "the error must name the argument: {err}");
+    }
+}
+
+#[cfg(test)]
+mod firehose_args_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct PulseWrap {
+        #[command(flatten)]
+        ext: PulsechainExtArgs,
+    }
+
+    #[derive(Debug, Parser)]
+    struct EthWrap {
+        #[command(flatten)]
+        ext: EthereumExtArgs,
+    }
+
+    #[test]
+    fn pulsechain_firehose_defaults_disabled() {
+        let w = PulseWrap::try_parse_from(["test"]).expect("parse");
+        assert!(!w.ext.firehose_enabled, "PulseChain firehose must default off");
+        assert!(w.ext.firehose_output.is_none());
+    }
+
+    #[test]
+    fn pulsechain_firehose_flag_and_output() {
+        let w = PulseWrap::try_parse_from([
+            "test",
+            "--firehose.enabled",
+            "--firehose.output=/tmp/fire.fifo",
+        ])
+        .expect("parse");
+        assert!(w.ext.firehose_enabled);
+        assert_eq!(w.ext.firehose_output.as_deref(), Some("/tmp/fire.fifo"));
+
+        let w = PulseWrap::try_parse_from([
+            "test",
+            "--firehose.enabled=true",
+            "--firehose.output=/tmp/fire.fifo",
+        ])
+        .expect("parse equals-true");
+        assert!(w.ext.firehose_enabled);
+    }
+
+    #[test]
+    fn pulsechain_firehose_equals_false_disables() {
+        let w = PulseWrap::try_parse_from(["test", "--firehose.enabled=false"]).expect("parse");
+        assert!(!w.ext.firehose_enabled);
+    }
+
+    #[test]
+    fn ethereum_firehose_defaults_disabled() {
+        let w = EthWrap::try_parse_from(["test"]).expect("parse");
+        assert!(!w.ext.firehose_enabled);
+        assert!(w.ext.firehose_output.is_none());
+    }
+
+    #[test]
+    fn firehose_tracer_config_applies_output_path() {
+        let with = firehose_tracer_config(Some("/tmp/fire.fifo".into()));
+        assert_eq!(with.output_path.as_deref(), Some("/tmp/fire.fifo"));
+        assert!(matches!(with.chain_client, firehose_tracer::config::ChainClient::Reth));
+
+        let without = firehose_tracer_config(None);
+        assert!(without.output_path.is_none());
     }
 }
