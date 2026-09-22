@@ -80,7 +80,7 @@ where
                 )
             })?
             .nonce;
-        info!(target: "firehose", block = block.number(), tx_index, tx_hash = ?recovered_tx.tx_hash(), caller_nonce, "Executing transaction");
+        debug!(target: "firehose", block = block.number(), tx_index, tx_hash = ?recovered_tx.tx_hash(), caller_nonce, "Executing transaction");
 
         let tx_result =
             executor.execute_transaction_without_commit(recovered_tx).wrap_err_with(|| {
@@ -212,10 +212,9 @@ where
         let notification = notification?;
 
         if let Some(committed) = notification.committed_chain() {
-            info!(chain = ?committed.range(), "Chain committed, tracing {} blocks", committed.len());
+            debug!(chain = ?committed.range(), "Chain committed, tracing {} blocks", committed.len());
 
             for (block, _receipts) in committed.blocks_and_receipts() {
-
                 let num_hash = block.num_hash();
                 let block_time = block.header().timestamp();
                 if let Err(err) = health.record_finished_height(num_hash.number, block_time) {
