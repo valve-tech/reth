@@ -2,7 +2,7 @@
 use std::{
     fs,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -119,21 +119,36 @@ fn current_hostname() -> Option<String> {
         })
 }
 
+/// Testable replica resolution: env lookup + optional hostname, no process globals.
+///
+/// Order: `VALVE_REPLICA`, `FIREHOSE_REPLICA`, hostname (`direct-{a|b}-evm-*` /
+/// `evm*{a|b}`), then `"a"`. Empty/whitespace values fall through to the next source.
+pub fn resolve_replica_from(
+    mut env_get: impl FnMut(&str) -> Option<String>,
+    hostname: Option<&str>,
+) -> String {
+    for key in ["VALVE_REPLICA", "FIREHOSE_REPLICA"] {
+        if let Some(v) = env_get(key) {
+            let v = v.trim().to_ascii_lowercase();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    if let Some(host) = hostname {
+        if let Some(from_host) = replica_from_host(host) {
+            return from_host;
+        }
+    }
+    "a".to_string()
+}
+
 /// Replica stamp for health.json.
 ///
 /// Order: `VALVE_REPLICA`, `FIREHOSE_REPLICA`, hostname (`direct-{a|b}-evm-*` /
 /// `evm*{a|b}`), then `"a"`.
 pub fn resolve_replica() -> String {
-    if let Ok(v) = std::env::var("VALVE_REPLICA").or_else(|_| std::env::var("FIREHOSE_REPLICA")) {
-        let v = v.trim().to_ascii_lowercase();
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    if let Some(from_host) = current_hostname().and_then(|h| replica_from_host(&h)) {
-        return from_host;
-    }
-    "a".to_string()
+    resolve_replica_from(|k| std::env::var(k).ok(), current_hostname().as_deref())
 }
 
 pub fn default_health_path(datadir: impl AsRef<Path>) -> PathBuf {
@@ -166,6 +181,26 @@ pub struct HealthPublisher {
 
 impl HealthPublisher {
     pub fn start(datadir: impl AsRef<Path>, chain_id: u64, replica: impl Into<String>) -> eyre::Result<Self> {
+        Self::start_inner(datadir, chain_id, replica, true)
+    }
+
+    /// Like [`Self::start`] but skips the loopback HTTP listener.
+    ///
+    /// Prefer this in unit tests to avoid binding [`HEALTH_LISTEN_ADDR`].
+    pub fn start_without_http(
+        datadir: impl AsRef<Path>,
+        chain_id: u64,
+        replica: impl Into<String>,
+    ) -> eyre::Result<Self> {
+        Self::start_inner(datadir, chain_id, replica, false)
+    }
+
+    fn start_inner(
+        datadir: impl AsRef<Path>,
+        chain_id: u64,
+        replica: impl Into<String>,
+        spawn_http: bool,
+    ) -> eyre::Result<Self> {
         let replica = replica.into();
         let path = default_health_path(datadir);
         let status = HealthStatus::alive_starting(chain_id, replica.clone());
@@ -176,10 +211,13 @@ impl HealthPublisher {
             chain_id,
             replica = %replica,
             listen = HEALTH_LISTEN_ADDR,
+            spawn_http,
             "Wrote initial firehose health.json (exex_alive=true, timestamps omitted)"
         );
 
-        spawn_loopback_server(path.clone());
+        if spawn_http {
+            spawn_loopback_server(path.clone());
+        }
 
         Ok(Self {
             path,
@@ -282,7 +320,7 @@ fn spawn_loopback_server(path: PathBuf) {
         .expect("failed to spawn firehose health HTTP thread");
 }
 
-fn handle_health_http(mut stream: TcpStream, path: &Path) -> std::io::Result<()> {
+fn handle_health_http(mut stream: impl Read + Write, path: &Path) -> std::io::Result<()> {
     let mut buf = [0u8; 2048];
     let n = stream.read(&mut buf)?;
     let req = String::from_utf8_lossy(&buf[..n]);
@@ -311,7 +349,7 @@ fn handle_health_http(mut stream: TcpStream, path: &Path) -> std::io::Result<()>
 }
 
 fn write_http_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
     content_type: &str,
     body: &[u8],
