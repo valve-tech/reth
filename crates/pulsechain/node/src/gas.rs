@@ -128,6 +128,26 @@ fn cap_by_affordability(
     padded.min(allowance).max(estimate)
 }
 
+/// Pure decision tree used by the `eth_estimateGas` wrapper after the core estimate
+/// returns.
+///
+/// `balance` is `Some` only when the balance lookup for `request.from` succeeded.
+/// A failed or inapplicable lookup leaves the padded figure uncapped — matching the
+/// wrapper's "a cap we cannot compute must not turn a working estimate into an error"
+/// rule. Extracted so the cold wrapper arms stay unit-testable without an RPC harness.
+fn finalize_gas_estimate(
+    estimate: U256,
+    request: &TransactionRequest,
+    balance: Option<U256>,
+) -> U256 {
+    let padded = apply_gas_margin(estimate);
+    match (request.from, fee_cap(request), balance) {
+        (Some(_), Some(_), Some(bal)) => cap_by_affordability(estimate, padded, bal, request),
+        // No sender, no fee, or no balance → padded stands.
+        _ => padded,
+    }
+}
+
 /// Replaces `eth_estimateGas` in all configured transports with a wrapper that
 /// applies a 20% margin to the result.
 ///
@@ -174,44 +194,42 @@ where
         )
         .await?;
 
-        let padded = apply_gas_margin(estimate);
-
         // Only a request naming both a sender and a fee can be capped, because only then is
         // there a gas bill the sender might not afford. Everything else keeps the padded
         // figure — including a failed balance lookup, since a cap we cannot compute must
         // not turn a working estimate into an error.
-        let capped = match (request.from, fee_cap(&request)) {
-            (Some(from), Some(_)) => {
-                // This balance and the one the estimator used can differ, in two ways.
-                // `block_id` is `None` for most calls, so each side resolves `latest`
-                // separately and a block can land between them. State overrides are
-                // invisible here as well: `balance` reads committed state, while the
-                // estimator ran against the overridden state, so an override-funded
-                // sender reads as 0 on this side.
-                //
-                // Both are harmless because `cap_by_affordability` never returns less
-                // than `estimate`. A stale or override-blind balance can shave the
-                // margin; it cannot report less gas than the transaction costs.
-                match EthApiServer::balance(&**ctx, from, block_id).await {
-                    Ok(balance) => cap_by_affordability(estimate, padded, balance, &request),
-                    Err(err) => {
-                        // A cap we cannot compute must not turn a working estimate into an
-                        // error, so the padded figure stands. Say so, though: a balance
-                        // lookup that fails on every request is a broken cap, and silence
-                        // would hide it.
-                        reth_tracing::tracing::debug!(
-                            target: "rpc::eth::estimate",
-                            %from,
-                            %err,
-                            "balance lookup failed; returning the padded estimate uncapped"
-                        );
-                        padded
-                    }
+        //
+        // This balance and the one the estimator used can differ, in two ways.
+        // `block_id` is `None` for most calls, so each side resolves `latest`
+        // separately and a block can land between them. State overrides are
+        // invisible here as well: `balance` reads committed state, while the
+        // estimator ran against the overridden state, so an override-funded
+        // sender reads as 0 on this side.
+        //
+        // Both are harmless because `cap_by_affordability` never returns less
+        // than `estimate`. A stale or override-blind balance can shave the
+        // margin; it cannot report less gas than the transaction costs.
+        let balance = match (request.from, fee_cap(&request)) {
+            (Some(from), Some(_)) => match EthApiServer::balance(&**ctx, from, block_id).await {
+                Ok(balance) => Some(balance),
+                Err(err) => {
+                    // A cap we cannot compute must not turn a working estimate into an
+                    // error, so the padded figure stands. Say so, though: a balance
+                    // lookup that fails on every request is a broken cap, and silence
+                    // would hide it.
+                    reth_tracing::tracing::debug!(
+                        target: "rpc::eth::estimate",
+                        %from,
+                        %err,
+                        "balance lookup failed; returning the padded estimate uncapped"
+                    );
+                    None
                 }
-            }
-            _ => padded,
+            },
+            _ => None,
         };
 
+        let capped = finalize_gas_estimate(estimate, &request, balance);
         let result: RpcResult<U256> = Ok(capped);
         result
     })?;
@@ -363,6 +381,56 @@ mod tests {
         );
 
         assert_eq!(capped, estimate, "the cap must not report less gas than the estimate");
+    }
+
+    /// `max_fee_per_gas` alone is a valid fee cap when `gas_price` is absent.
+    #[test]
+    fn fee_cap_falls_back_to_max_fee() {
+        let request = TransactionRequest { max_fee_per_gas: Some(42), ..Default::default() };
+        assert_eq!(fee_cap(&request), Some(U256::from(42u64)));
+    }
+
+    /// Wrapper path: no sender → always padded (cannot look up a balance).
+    #[test]
+    fn finalize_without_from_keeps_padding() {
+        let estimate = U256::from(21_000u64);
+        let request = TransactionRequest { gas_price: Some(100), ..Default::default() };
+        assert_eq!(
+            finalize_gas_estimate(estimate, &request, Some(U256::ZERO)),
+            apply_gas_margin(estimate),
+            "without `from` the balance is irrelevant — padding stands"
+        );
+    }
+
+    /// Wrapper path: balance lookup failed (`None`) → padded, never an error.
+    #[test]
+    fn finalize_with_failed_balance_lookup_keeps_padding() {
+        let estimate = U256::from(21_000u64);
+        let request = paying(100, 0);
+        assert_eq!(finalize_gas_estimate(estimate, &request, None), apply_gas_margin(estimate));
+    }
+
+    /// Wrapper path: sender + fee + tight balance → affordability cap wins.
+    #[test]
+    fn finalize_caps_when_sender_fee_and_balance_are_present() {
+        let estimate = U256::from(21_000u64);
+        // Exactly 21,000 gas at 100 wei.
+        let balance = U256::from(2_100_000u64);
+        assert_eq!(
+            finalize_gas_estimate(estimate, &paying(100, 0), Some(balance)),
+            estimate,
+            "tight balance must shave the margin via finalize_gas_estimate"
+        );
+    }
+
+    /// Wrapper path: sender + fee + ample balance → full margin.
+    #[test]
+    fn finalize_keeps_margin_when_affordable() {
+        let estimate = U256::from(21_000u64);
+        assert_eq!(
+            finalize_gas_estimate(estimate, &paying(100, 0), Some(U256::from(1_000_000_000u64))),
+            apply_gas_margin(estimate)
+        );
     }
 
     /// The SHARED estimator must not pad as well, or the two margins compound.
