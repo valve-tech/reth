@@ -51,8 +51,8 @@ pub use executor::{
 };
 pub use runner::run_exex;
 pub use health::{
-    default_health_path, resolve_replica, write_health_json, HealthPublisher, HealthStatus,
-    HEALTH_HTTP_PATH, HEALTH_LISTEN_ADDR, HEALTH_REL_PATH,
+    default_health_path, resolve_replica, resolve_replica_from, write_health_json, HealthPublisher,
+    HealthStatus, HEALTH_HTTP_PATH, HEALTH_LISTEN_ADDR, HEALTH_REL_PATH,
 };
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
