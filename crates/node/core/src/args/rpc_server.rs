@@ -39,6 +39,13 @@ pub(crate) const RPC_DEFAULT_MAX_REQUEST_SIZE_MB: u32 = 15;
 /// This is only relevant for very large trace responses.
 pub(crate) const RPC_DEFAULT_MAX_RESPONSE_SIZE_MB: u32 = 160;
 
+/// Default max response size in MB on Sepolia.
+///
+/// The `trace_block` response for Sepolia block 6,747,896 is 201,207,630 bytes: one transaction
+/// passes the same 100 KB buffer to 1,000 calls, and every call's input is written out in full.
+/// That is past the 160 MB default, so an indexer that scrapes traces stalls on the block.
+pub(crate) const RPC_SEPOLIA_MAX_RESPONSE_SIZE_MB: &str = "256";
+
 /// Default number of incoming connections.
 ///
 /// This restricts how many active connections (http, ws) the server accepts.
@@ -536,7 +543,9 @@ pub struct RpcServerArgs {
     pub rpc_max_request_size: MaxU32,
 
     /// Set the maximum RPC response payload size for both HTTP and WS in megabytes.
-    #[arg(long = "rpc.max-response-size", alias = "rpc-max-response-size", visible_alias = "rpc.returndata.limit", default_value_t = DefaultRpcServerArgs::get_global().rpc_max_response_size)]
+    ///
+    /// Defaults to 256 on Sepolia, where the `trace_block` response for block 6747896 is ~192 MB.
+    #[arg(long = "rpc.max-response-size", alias = "rpc-max-response-size", visible_alias = "rpc.returndata.limit", default_value_t = DefaultRpcServerArgs::get_global().rpc_max_response_size, default_value_if("chain", "sepolia", RPC_SEPOLIA_MAX_RESPONSE_SIZE_MB))]
     pub rpc_max_response_size: MaxU32,
 
     /// Set the maximum concurrent subscriptions per connection.

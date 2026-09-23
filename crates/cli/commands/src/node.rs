@@ -289,6 +289,34 @@ mod tests {
         }
     }
 
+    /// Sepolia carries a ~200 MB `trace_block` response at block 6,747,896, past the 160 MB
+    /// default, so the default rises to 256 MB there and nowhere else.
+    #[test]
+    fn sepolia_defaults_to_a_larger_response_limit() {
+        let response_limit = |args: &[&str]| {
+            let cmd: NodeCommand<EthereumChainSpecParser> = NodeCommand::try_parse_args_from(
+                std::iter::once("reth").chain(args.iter().copied()),
+            )
+            .unwrap();
+            cmd.rpc.rpc_max_response_size.get()
+        };
+
+        assert_eq!(response_limit(&["--chain", "sepolia"]), 256);
+        assert_eq!(response_limit(&["--chain=sepolia"]), 256);
+        assert_eq!(response_limit(&["--chain", "mainnet"]), 160, "other chains keep 160");
+        assert_eq!(response_limit(&[]), 160, "the default chain keeps 160");
+        assert_eq!(
+            response_limit(&["--chain", "sepolia", "--rpc.max-response-size", "160"]),
+            160,
+            "an explicit value wins on Sepolia"
+        );
+        assert_eq!(
+            response_limit(&["--chain", "sepolia", "--rpc.returndata.limit", "100"]),
+            100,
+            "so does the alias"
+        );
+    }
+
     #[test]
     fn parse_discovery_addr() {
         let cmd: NodeCommand<EthereumChainSpecParser> =
