@@ -44,3 +44,7 @@ serde_json.workspace = true
 [[test]]
 name = "prestate"
 path = "tests/prestate.rs"
+
+[[test]]
+name = "batch_executor"
+path = "tests/batch_executor.rs"

@@ -121,6 +121,11 @@ impl BlockExecutorFactory for CustomEvmConfig {
     }
 }
 
+impl reth_firehose::FirehoseLiveHooks for CustomEvmConfig {
+    type PreTxAdjust = reth_firehose::NoPreTxAdjust;
+    type PostTxExtras = reth_firehose::NoPostTxExtras;
+}
+
 impl ConfigureEvm for CustomEvmConfig {
     type Primitives = <EthEvmConfig as ConfigureEvm>::Primitives;
     type Error = <EthEvmConfig as ConfigureEvm>::Error;

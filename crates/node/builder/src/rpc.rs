@@ -1457,6 +1457,7 @@ where
     // and PulseChain primitives satisfies this via blanket impls in `reth_firehose::mapper`.
     <<Node::Types as reth_node_api::NodeTypes>::Primitives as reth_node_api::NodePrimitives>::SignedTx:
         reth_firehose::mapper::SignatureFields,
+    Node::Evm: reth_firehose::FirehoseLiveHooks,
 {
     type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;
 

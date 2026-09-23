@@ -19,14 +19,63 @@ use std::{
     fmt::Debug,
 };
 
+/// The largest preimage, in bytes, recorded in `Call.keccak_preimages`. The map exists so a
+/// consumer can walk a storage slot back to the expression that produced it, and Solidity's slot
+/// derivations are all small: 32 bytes for a dynamic array or a long `bytes`/`string`, 64 bytes
+/// for a mapping with a value-type key (one level per nesting), and 32 bytes plus the key for a
+/// `mapping(string => V)` or `mapping(bytes => V)`. 256 bytes covers those with room for a
+/// 224-byte dynamic key. Anything larger is contract-level hashing, not slot derivation, and is
+/// dropped rather than truncated: a truncated preimage does not hash back to its key and would be
+/// worse than no entry at all.
+const MAX_KECCAK_PREIMAGE_SIZE: usize = 256;
+
 struct StepContext {
     start_journal_idx: usize,
+    pc: u64,
+    gas: u64,
+    depth: i32,
     opcode: u8,
     /// For KECCAK256: preimage captured in `step` (where stack still holds offset/size),
     /// emitted from `step_end` only when the opcode did not halt. Mirrors Geth's firehose
     /// tracer, which hooks the opcode body after the gas charge and so emits no preimage
     /// when KECCAK256 fails (e.g. OOG on memory expansion).
     keccak_preimage: Option<(B256, Vec<u8>)>,
+}
+
+/// Gas-fee parameters for the post-transaction `GasRefund` and `RewardTransactionFee` balance
+/// changes of one transaction.
+///
+/// [`PostTxGasAccounting::ethereum`] reproduces Ethereum: unused gas is refunded at the effective
+/// gas price and the beneficiary is credited the priority fee of every consumed gas unit, the base
+/// fee being burned. Chains that price gas differently (a base fee that is not burned, a data fee
+/// paid to the beneficiary, or gas charged outside the native balance) return their own values
+/// from [`crate::PostTxExtras::gas_accounting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostTxGasAccounting {
+    /// Wei refunded to the sender per unit of unused gas.
+    pub refund_gas_price: u128,
+    /// Wei credited to the beneficiary per unit of consumed gas.
+    pub reward_gas_price: u128,
+    /// Wei credited to the beneficiary on top of `reward_gas_price * gas_used`, in the same
+    /// `RewardTransactionFee` change.
+    pub extra_reward: U256,
+}
+
+impl PostTxGasAccounting {
+    /// Ethereum accounting for a transaction paying `effective_gas_price` in a block whose base
+    /// fee is `base_fee` (0 before London).
+    pub const fn ethereum(effective_gas_price: u128, base_fee: u64) -> Self {
+        Self {
+            refund_gas_price: effective_gas_price,
+            reward_gas_price: effective_gas_price.saturating_sub(base_fee as u128),
+            extra_reward: U256::ZERO,
+        }
+    }
+
+    /// Accounting for a transaction that moves no native balance for gas.
+    pub const fn none() -> Self {
+        Self { refund_gas_price: 0, reward_gas_price: 0, extra_reward: U256::ZERO }
+    }
 }
 
 /// FirehoseInspector captures execution traces for the Firehose format
@@ -180,28 +229,12 @@ impl<'a> FirehoseInspector<'a> {
         };
 
         let len = size.saturating_to::<usize>();
-        if len == 0 {
-            return Some((alloy_primitives::utils::KECCAK256_EMPTY, Vec::new()));
+        if len > MAX_KECCAK_PREIMAGE_SIZE {
+            return None;
         }
 
-        // Sanity cap on the preimage size.
-        //
-        // `size` is read off the EVM stack as a U256 — `saturating_to::<usize>()` returns
-        // `usize::MAX` for values that don't fit, and `vec![0u8; usize::MAX]` triggers
-        // RawVec's capacity-overflow panic. This actually happens in the wild: at pulsechain
-        // testnet v4 block ~4,219,263 (Bug 4), some tx pushes a huge `size` and we land in
-        // the zero-pad branch below because `step` fires before memory resize.
-        //
-        // Two reasons it's safe to bail with None here:
-        //   1. Real EVM keccak is bounded by gas — practical max is ~512 KiB at a 30M-gas block
-        //      limit (quadratic memory cost). 32 MiB is well past anything legitimate.
-        //   2. Per the comment block above the call site (line 1061+), preimage is only *emitted*
-        //      from `step_end` when the opcode actually executes. A tx hashing 32 MiB+ would OOG on
-        //      memory expansion anyway, so the emission path is dead. Returning None just skips the
-        //      doomed allocation.
-        const MAX_KECCAK_PREIMAGE_LEN: usize = 32 * 1024 * 1024;
-        if len > MAX_KECCAK_PREIMAGE_LEN {
-            return None;
+        if len == 0 {
+            return Some((alloy_primitives::utils::KECCAK256_EMPTY, Vec::new()));
         }
 
         let offset = offset.saturating_to::<usize>();
@@ -869,15 +902,45 @@ impl<'a> FirehoseInspector<'a> {
         effective_gas_price: u128,
         base_fee: u64,
         committed_log_count: u32,
+        get_pre_tx_balance: F,
+    ) where
+        F: FnMut(Address) -> U256,
+    {
+        self.process_post_tx_gas_accounting(
+            sender,
+            coinbase,
+            gas_limit,
+            gas_used,
+            PostTxGasAccounting::ethereum(effective_gas_price, base_fee),
+            committed_log_count,
+            get_pre_tx_balance,
+        );
+    }
+
+    /// Same as [`Self::process_post_tx_balance_changes`] with chain-supplied gas-fee
+    /// parameters instead of Ethereum's.
+    ///
+    /// The refund is `(gas_limit - gas_used) * accounting.refund_gas_price` and the reward is
+    /// `gas_used * accounting.reward_gas_price + accounting.extra_reward`; each change is only
+    /// emitted when its amount is non-zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_post_tx_gas_accounting<F>(
+        &mut self,
+        sender: Address,
+        coinbase: Address,
+        gas_limit: u64,
+        gas_used: u64,
+        accounting: PostTxGasAccounting,
+        committed_log_count: u32,
         mut get_pre_tx_balance: F,
     ) where
         F: FnMut(Address) -> U256,
     {
         use pb::sf::ethereum::r#type::v2::balance_change::Reason;
 
-        let gas_buy_cost = U256::from(gas_limit) * U256::from(effective_gas_price);
+        let gas_buy_cost = U256::from(gas_limit) * U256::from(accounting.refund_gas_price);
         let remaining_gas = gas_limit.saturating_sub(gas_used);
-        let refund_amount = U256::from(remaining_gas) * U256::from(effective_gas_price);
+        let refund_amount = U256::from(remaining_gas) * U256::from(accounting.refund_gas_price);
 
         // Derive sender's balance after execution (before gas refund). Seed with the
         // post-pre-exec balance captured at root call entry — this is the only reliable
@@ -896,7 +959,7 @@ impl<'a> FirehoseInspector<'a> {
             &mut get_pre_tx_balance,
         );
 
-        // Gas refund to sender: reimburse unused gas at effective_gas_price.
+        // Gas refund to sender: reimburse unused gas at the refund gas price.
         // gas_used from ExecutionResult already accounts for the capped refund counter,
         // so remaining_gas = gas_limit - gas_used includes both unspent gas and EVM refunds.
         if remaining_gas > 0 {
@@ -904,13 +967,12 @@ impl<'a> FirehoseInspector<'a> {
             self.tracer.on_balance_change(sender, sender_balance, new_balance, Reason::GasRefund);
         }
 
-        // Coinbase reward: the priority fee portion of consumed gas.
-        // Post-EIP-1559 the base fee is burned, only the tip goes to the coinbase.
-        // Pre-EIP-1559 (base_fee == 0) the entire gas price goes to coinbase.
-        let priority_fee_per_gas = effective_gas_price.saturating_sub(base_fee as u128);
-        if gas_used > 0 && priority_fee_per_gas > 0 {
-            let reward_amount = U256::from(gas_used) * U256::from(priority_fee_per_gas);
-
+        // Coinbase reward. With Ethereum accounting this is the priority fee portion of consumed
+        // gas: post-EIP-1559 the base fee is burned, pre-EIP-1559 (base_fee == 0) the entire gas
+        // price goes to coinbase.
+        let reward_amount = (U256::from(gas_used) * U256::from(accounting.reward_gas_price))
+            .saturating_add(accounting.extra_reward);
+        if !reward_amount.is_zero() {
             // When sender == coinbase, the gas refund event was emitted first; use the
             // sender's updated balance as the coinbase's old_balance. Otherwise derive
             // independently from the journal snapshot (coinbase has no gas-buy BalanceChange,
@@ -1080,7 +1142,12 @@ where
 
         let start_journal_idx = journal.journal().len();
 
-        self.tracer.on_opcode(pc, op, gas, 0, &[], depth, None);
+        // SELFDESTRUCT is reported from `step_end`, once it is known whether the instruction
+        // table defines it: the tracer marks the call as self-destructed as soon as it is told
+        // the opcode runs, and a chain may replace SELFDESTRUCT with an undefined instruction.
+        if op != Opcode::SelfDestruct as u8 {
+            self.tracer.on_opcode(pc, op, gas, 0, &[], depth, None);
+        }
 
         // For KECCAK256, capture the (hash, preimage) now while the stack still holds
         // offset/size, but defer emission to `step_end` so that we only record preimages
@@ -1090,7 +1157,8 @@ where
         let keccak_preimage =
             (op == Opcode::Keccak256 as u8).then(|| Self::step_keccak256(interp)).flatten();
 
-        self.last_step = Some(StepContext { start_journal_idx, opcode: op, keccak_preimage });
+        self.last_step =
+            Some(StepContext { start_journal_idx, pc, gas, depth, opcode: op, keccak_preimage });
     }
 
     /// Called after each opcode executes; used to detect SSTORE and SELFDESTRUCT state changes.
@@ -1135,7 +1203,33 @@ where
                 }
             }
         } else if step_ctx.opcode == Opcode::SelfDestruct as u8 {
-            self.process_selfdestruct_balance_changes(context, step_ctx.start_journal_idx);
+            use reth_revm::revm::interpreter::InstructionResult;
+
+            if interp.bytecode.instruction_result() == Some(InstructionResult::OpcodeNotFound) {
+                // The instruction table does not define 0xff: the frame halted on an undefined
+                // opcode and nothing self-destructed.
+                let err = StringError("opcode not found".to_string());
+                self.tracer.on_opcode(
+                    step_ctx.pc,
+                    step_ctx.opcode,
+                    step_ctx.gas,
+                    0,
+                    &[],
+                    step_ctx.depth,
+                    Some(&err),
+                );
+            } else {
+                self.tracer.on_opcode(
+                    step_ctx.pc,
+                    step_ctx.opcode,
+                    step_ctx.gas,
+                    0,
+                    &[],
+                    step_ctx.depth,
+                    None,
+                );
+                self.process_selfdestruct_balance_changes(context, step_ctx.start_journal_idx);
+            }
         }
     }
 
@@ -1429,19 +1523,18 @@ pub trait FirehoseInspectorApi {
         reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
     );
 
-    /// Type-erased version of [`FirehoseInspector::process_post_tx_balance_changes`].
+    /// Type-erased version of [`FirehoseInspector::process_post_tx_gas_accounting`].
     ///
     /// `get_pre_tx_balance` is passed as a trait object so the call site does not need to be
     /// generic over `F`, keeping the wrapper's signature free of extra type parameters.
     #[allow(clippy::too_many_arguments)]
-    fn process_post_tx_balance_changes_erased(
+    fn process_post_tx_gas_accounting_erased(
         &mut self,
         sender: Address,
         coinbase: Address,
         gas_limit: u64,
         gas_used: u64,
-        effective_gas_price: u128,
-        base_fee: u64,
+        accounting: PostTxGasAccounting,
         committed_log_count: u32,
         get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
     );
@@ -1459,24 +1552,22 @@ impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
         Self::set_root_balance_reason(self, reason);
     }
 
-    fn process_post_tx_balance_changes_erased(
+    fn process_post_tx_gas_accounting_erased(
         &mut self,
         sender: Address,
         coinbase: Address,
         gas_limit: u64,
         gas_used: u64,
-        effective_gas_price: u128,
-        base_fee: u64,
+        accounting: PostTxGasAccounting,
         committed_log_count: u32,
         get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
     ) {
-        self.process_post_tx_balance_changes(
+        self.process_post_tx_gas_accounting(
             sender,
             coinbase,
             gas_limit,
             gas_used,
-            effective_gas_price,
-            base_fee,
+            accounting,
             committed_log_count,
             |addr| get_pre_tx_balance(addr),
         );

@@ -42,6 +42,7 @@ reth-tracing.workspace = true
 # reth — EVM configuration and execution
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
+reth-firehose.workspace = true
 
 # reth — CLI chain spec parser
 reth-cli.workspace = true

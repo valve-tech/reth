@@ -3681,6 +3681,7 @@ dependencies = [
  "alloy-sol-types",
  "eyre",
  "reth-ethereum",
+ "reth-firehose",
 ]
 
 [[package]]
@@ -3799,6 +3800,7 @@ dependencies = [
  "reth-engine-tree",
  "reth-ethereum",
  "reth-evm",
+ "reth-firehose",
  "reth-primitives-traits",
  "reth-provider",
  "reth-storage-overlay",
@@ -7905,6 +7907,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
+ "reth-firehose",
  "reth-node-api",
  "reth-node-builder",
  "reth-node-core",
@@ -9196,6 +9199,7 @@ dependencies = [
  "reth-ethereum-forks",
  "reth-ethereum-primitives",
  "reth-evm",
+ "reth-evm-ethereum",
  "reth-execution-types",
  "reth-exex",
  "reth-node-api",
@@ -10127,6 +10131,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-execution-types",
+ "reth-firehose",
  "reth-network",
  "reth-network-peers",
  "reth-node-api",
