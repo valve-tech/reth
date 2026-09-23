@@ -418,7 +418,9 @@ RPC:
           [default: 15]
 
       --rpc.max-response-size <RPC_MAX_RESPONSE_SIZE>
-          Set the maximum RPC response payload size for both HTTP and WS in megabytes
+          Set the maximum RPC response payload size for both HTTP and WS in megabytes.
+
+          Defaults to 256 on Sepolia, where the `trace_block` response for block 6747896 is ~192 MB.
 
           [default: 160]
           [aliases: --rpc.returndata.limit]
@@ -1261,6 +1263,29 @@ Msgboard:
           Disable outbound P2P gossip of msgboard messages.
 
           When set, the node still **receives** announcements and full messages from peers and serves `GetBoardMessages` requests, but it does **not** announce its own message IDs (neither the bulk announce on peer connect nor per-message announces as new messages are accepted). Useful for read-only observability nodes.
+
+      --firehose.enabled [<FIREHOSE_ENABLED>]
+          Enable firehose instrumentation (FIRE protocol + ExEx).
+
+          **Default off.** Plain RPC / A replicas leave this unset so journals are not flooded with FIRE lines. Firehose producers must set `--firehose.enabled` / `--firehose.enabled=true` or `RETH_FIREHOSE_ENABLED=true` or FIRE output dies.
+
+          [env: RETH_FIREHOSE_ENABLED=]
+          [default: false]
+          [possible values: true, false]
+
+      --firehose.output <FIREHOSE_OUTPUT>
+          Write FIRE protocol lines to this path instead of stdout.
+
+          Only used when `--firehose.enabled` is set. Producers can point this at a FIFO that fireeth reads; otherwise FIRE lines go to stdout.
+
+          [env: FIREHOSE_OUTPUT=]
+
+      --firehose.replica <FIREHOSE_REPLICA>
+          Replica letter stamped into firehose health.json (`a` / `b`).
+
+          Optional. When unset, the ExEx infers from hostname (`direct-b-evm-369`, `evm943b`) or `VALVE_REPLICA`.
+
+          [env: FIREHOSE_REPLICA=]
 
 Logging:
       --log.stdout.format <FORMAT>

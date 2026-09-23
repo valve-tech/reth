@@ -12,6 +12,7 @@ mod prestate;
 mod rpc;
 mod selfdestruct;
 mod simulate;
+mod trace_bomb;
 mod utils;
 
 const fn main() {}

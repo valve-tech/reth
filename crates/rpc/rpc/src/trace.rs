@@ -18,6 +18,10 @@ use alloy_rpc_types_trace::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use jsonrpsee::core::RpcResult;
+use jsonrpsee_types::{
+    error::{OVERSIZED_RESPONSE_CODE, OVERSIZED_RESPONSE_MSG},
+    ErrorObject,
+};
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_primitives_traits::{BlockBody, BlockHeader};
 use reth_rpc_api::TraceApiServer;
@@ -751,7 +755,11 @@ where
         block_id: BlockId,
     ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
         let _permit = self.acquire_trace_permit().await;
-        Ok(Self::trace_block(self, block_id).await.map_err(Into::into)?)
+        let traces = Self::trace_block(self, block_id).await.map_err(Into::into)?;
+        if let Some(traces) = &traces {
+            ensure_traces_fit_response(traces, self.inner.eth_config.max_response_size)?;
+        }
+        Ok(traces)
     }
 
     /// Handler for `trace_filter`
@@ -783,7 +791,11 @@ where
         hash: B256,
     ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
         let _permit = self.acquire_trace_permit().await;
-        Ok(Self::trace_transaction(self, hash).await.map_err(Into::into)?)
+        let traces = Self::trace_transaction(self, hash).await.map_err(Into::into)?;
+        if let Some(traces) = &traces {
+            ensure_traces_fit_response(traces, self.inner.eth_config.max_response_size)?;
+        }
+        Ok(traces)
     }
 
     /// Handler for `trace_transactionOpcodeGas`
@@ -871,9 +883,176 @@ fn reward_trace<H: BlockHeader>(
     }
 }
 
+/// Returns a lower bound, in bytes, on the JSON that `traces` serializes to.
+///
+/// Counts only the byte payloads — call input and output, create init code and deployed code —
+/// at two characters per byte, because each serializes as a `0x`-prefixed hex string. Every
+/// other field only adds to the total, so the real response is never smaller than this.
+fn traces_response_lower_bound(traces: &[LocalizedTransactionTrace]) -> usize {
+    traces.iter().map(trace_payload_bytes).fold(0usize, usize::saturating_add).saturating_mul(2)
+}
+
+/// Refuses `traces` when they cannot fit in a response of `limit` bytes.
+///
+/// jsonrpsee enforces the same limit, but only after the whole response has been serialized.
+/// A transaction that passes one large memory buffer as the input to many calls costs little
+/// gas and produces a trace of calls × input size: one Sepolia transaction at 270k gas produces
+/// ~200 MB. Checking a lower bound here refuses such a response before building it, and names
+/// the transaction responsible. Because the bound never exceeds the real size, nothing that
+/// would have fitted is refused.
+///
+/// The error is jsonrpsee's own oversized-response error, code and message unchanged, so
+/// clients that already recognise it keep doing so. eRPC, for one, matches on the message text.
+fn ensure_traces_fit_response(
+    traces: &[LocalizedTransactionTrace],
+    limit: usize,
+) -> Result<(), ErrorObject<'static>> {
+    let total = traces_response_lower_bound(traces);
+    if total <= limit {
+        return Ok(())
+    }
+
+    let mut per_transaction: HashMap<(Option<B256>, Option<u64>), usize> = HashMap::default();
+    for trace in traces {
+        let bytes = per_transaction
+            .entry((trace.transaction_hash, trace.transaction_position))
+            .or_default();
+        *bytes = bytes.saturating_add(trace_payload_bytes(trace).saturating_mul(2));
+    }
+    let ((hash, index), largest) = per_transaction
+        .into_iter()
+        .max_by_key(|(_, bytes)| *bytes)
+        .expect("a total above the limit has at least one trace");
+
+    let hash = hash.map_or_else(|| "without a hash".to_string(), |hash| hash.to_string());
+    let index = index.map_or_else(|| "unknown".to_string(), |index| index.to_string());
+    Err(ErrorObject::owned(
+        OVERSIZED_RESPONSE_CODE,
+        OVERSIZED_RESPONSE_MSG,
+        Some(format!(
+            "traces need at least {total} bytes against a response limit of {limit}; \
+             transaction {hash} (index {index}) alone needs at least {largest}"
+        )),
+    ))
+}
+
+/// The number of bytes in a trace's call input and output, or create init code and code.
+fn trace_payload_bytes(trace: &LocalizedTransactionTrace) -> usize {
+    let action = match &trace.trace.action {
+        Action::Call(call) => call.input.len(),
+        Action::Create(create) => create.init.len(),
+        Action::Selfdestruct(_) | Action::Reward(_) => 0,
+    };
+    let result = match &trace.trace.result {
+        Some(TraceOutput::Call(output)) => output.output.len(),
+        Some(TraceOutput::Create(output)) => output.code.len(),
+        None => 0,
+    };
+    action.saturating_add(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A call trace for transaction `tx_hash` whose input and output carry the given
+    /// number of bytes.
+    fn call_trace(
+        tx_hash: B256,
+        position: u64,
+        input_len: usize,
+        output_len: usize,
+    ) -> LocalizedTransactionTrace {
+        LocalizedTransactionTrace {
+            block_hash: Some(B256::ZERO),
+            block_number: Some(1),
+            transaction_hash: Some(tx_hash),
+            transaction_position: Some(position),
+            trace: TransactionTrace {
+                action: Action::Call(CallAction {
+                    input: Bytes::from(vec![0u8; input_len]),
+                    ..Default::default()
+                }),
+                result: Some(TraceOutput::Call(CallOutput {
+                    gas_used: 0,
+                    output: Bytes::from(vec![0u8; output_len]),
+                })),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn traces_within_the_limit_are_allowed() {
+        let traces = vec![call_trace(B256::repeat_byte(0xaa), 0, 100, 32)];
+
+        assert!(ensure_traces_fit_response(&traces, 1_000_000).is_ok());
+    }
+
+    /// The shape of the Sepolia trace bomb at block 6,747,896: one transaction making many
+    /// calls that each carry a large input, beside ordinary transactions. The refusal must be
+    /// jsonrpsee's own oversized-response error, so every downstream consumer that already
+    /// recognises it — eRPC matches on the text "is too big" — keeps doing so. And it must
+    /// name the transaction responsible, which today takes a custom tracer to find.
+    #[test]
+    fn traces_beyond_the_limit_are_refused_naming_the_dominant_transaction() {
+        let bomb = B256::repeat_byte(0xaa);
+        let ordinary = B256::repeat_byte(0xbb);
+        let mut traces: Vec<_> = (0..10).map(|_| call_trace(bomb, 29, 1_000, 0)).collect();
+        traces.push(call_trace(ordinary, 3, 10, 0));
+
+        let err = ensure_traces_fit_response(&traces, 5_000).unwrap_err();
+
+        assert_eq!(err.code(), OVERSIZED_RESPONSE_CODE);
+        assert_eq!(err.message(), OVERSIZED_RESPONSE_MSG);
+        assert!(err.message().contains("is too big"), "eRPC matches on this text");
+        let data = err.data().expect("the refusal explains itself").get();
+        assert!(data.contains(&bomb.to_string()), "names the dominant transaction: {data}");
+        assert!(data.contains("29"), "gives its index in the block: {data}");
+        assert!(!data.contains(&ordinary.to_string()), "does not blame the small one: {data}");
+    }
+
+    /// The refusal fires before serializing, on an estimate, so it is only safe if the estimate
+    /// can never exceed the real size. If it could, a response that would have fitted would be
+    /// refused. It must also count every input and output byte at its hex-encoded width, or the
+    /// trace bomb's 100 MB of input would slip under a 160 MB limit uncounted.
+    #[test]
+    fn size_estimate_is_a_lower_bound_that_counts_every_payload_byte() {
+        let mut traces = vec![
+            call_trace(B256::repeat_byte(1), 0, 0, 0),
+            call_trace(B256::repeat_byte(2), 1, 1, 0),
+            call_trace(B256::repeat_byte(3), 2, 31, 7),
+            call_trace(B256::repeat_byte(4), 3, 1_000, 32),
+        ];
+        traces.push(LocalizedTransactionTrace {
+            block_hash: Some(B256::ZERO),
+            block_number: Some(1),
+            transaction_hash: Some(B256::repeat_byte(5)),
+            transaction_position: Some(4),
+            trace: TransactionTrace {
+                action: Action::Create(CreateAction {
+                    init: Bytes::from(vec![0u8; 200]),
+                    ..Default::default()
+                }),
+                result: Some(TraceOutput::Create(CreateOutput {
+                    address: Address::ZERO,
+                    code: Bytes::from(vec![0u8; 150]),
+                    gas_used: 0,
+                })),
+                ..Default::default()
+            },
+        });
+        let payload_bytes = (1 + 31 + 7 + 1_000 + 32) + (200 + 150);
+
+        let estimate = traces_response_lower_bound(&traces);
+        let serialized = serde_json::to_vec(&traces).unwrap().len();
+
+        assert!(estimate <= serialized, "estimate {estimate} exceeds real size {serialized}");
+        assert!(
+            estimate >= 2 * payload_bytes,
+            "estimate {estimate} misses hex-encoded payload of {payload_bytes} bytes"
+        );
+    }
 
     fn localized_transaction_trace(
         block_number: u64,
