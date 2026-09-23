@@ -25,11 +25,18 @@
 //!
 //! If the executor is dropped before either, the stashed [`FirehoseBlockTracer`] is dropped,
 //! which emits `on_block_end(Some(err))` and discards the block.
+//!
+//! Only `execute_and_trace_one` traces. Every other [`Executor`] method, `execute` included, runs
+//! untraced: callers other than staged sync use them to re-execute blocks for other purposes
+//! (single-block ExEx backfill, for example), often blocks that were already emitted, and
+//! `execute` would flush a block before its caller validated it.
 
 use std::{collections::HashMap, fmt::Debug};
 
 use crate::{
-    block_tracer::FirehoseBlockTracer, inspector::FirehoseInspectorApi, mapper,
+    block_tracer::FirehoseBlockTracer,
+    inspector::{FirehoseInspector, FirehoseInspectorApi, PostTxGasAccounting},
+    mapper,
     mapper::SignatureFields,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt};
@@ -42,14 +49,15 @@ use alloy_evm::{
 use alloy_primitives::{Address, Log, Sealable, U256};
 use reth_evm::{
     execute::{BlockExecutionError, Executor},
-    ConfigureEvm, Evm as _, JitBackend, OnStateHook,
+    ConfigureEvm, Evm as _, EvmFor, JitBackend, OnStateHook,
 };
 use reth_execution_types::BlockExecutionResult;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredBlock, TxTy};
+use reth_provider::StateProviderBox;
 use reth_revm::{
-    db::states::bundle_state::BundleRetention, revm::context::Block as RevmBlock, Database as _,
-    State,
+    database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
+    revm::context::Block as RevmBlock, Database as _, State,
 };
 
 /// Chain-specific hook that emits additional post-tx balance changes after the generic
@@ -76,6 +84,16 @@ where
     /// Emit chain-specific post-tx balance changes. `gas_used` is the post-refund gas
     /// charged to the sender; `base_fee` is the block's EIP-1559 base fee (0 pre-London).
     fn emit_post_tx_extras(&self, evm: &mut E, gas_used: u64, base_fee: u64);
+
+    /// Gas-fee parameters for the generic `GasRefund` / `RewardTransactionFee` changes of the
+    /// current transaction, which is still available through `evm.ctx()`.
+    ///
+    /// `ethereum` holds the Ethereum parameters derived from the transaction envelope and the
+    /// block base fee; the default returns it unchanged. Runs before those changes are emitted
+    /// and before [`Self::emit_post_tx_extras`].
+    fn gas_accounting(&self, _evm: &mut E, ethereum: PostTxGasAccounting) -> PostTxGasAccounting {
+        ethereum
+    }
 }
 
 /// No-op [`PostTxExtras`] used on Ethereum mainnet (and any chain whose fee distribution is
@@ -341,8 +359,12 @@ where
         } else {
             gas_price_opt.unwrap_or(0)
         };
+        let accounting = self.extras.gas_accounting(
+            self.inner.evm_mut(),
+            PostTxGasAccounting::ethereum(effective_gas_price, base_fee),
+        );
 
-        // Post-tx balance changes (gas refund to sender, priority fee to coinbase). The DB at
+        // Post-tx balance changes (gas refund to sender, fee reward to coinbase). The DB at
         // this point reflects state up to but not including this transaction's commit, so
         // db.basic(addr) reads the pre-tx balance.
         {
@@ -350,13 +372,12 @@ where
             let mut get_pre = |addr: Address| -> U256 {
                 evm_db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or(U256::ZERO)
             };
-            inspector.process_post_tx_balance_changes_erased(
+            inspector.process_post_tx_gas_accounting_erased(
                 sender,
                 coinbase,
                 gas_limit,
                 gas_used,
-                effective_gas_price,
-                base_fee,
+                accounting,
                 committed_log_count,
                 &mut get_pre,
             );
@@ -571,6 +592,53 @@ where
     }
 }
 
+/// EVM type the live engine-API path executes Firehose-traced blocks with.
+pub type LiveTracedEvm<'db, 'tracer, Evm> = EvmFor<
+    Evm,
+    &'db mut State<StateProviderDatabase<StateProviderBox>>,
+    FirehoseInspector<'tracer>,
+>;
+
+/// Chain-specific hooks the live engine-API path installs on its traced block executor.
+///
+/// The engine tree's block validator wraps the traced executor in
+/// [`FirehoseWrappedExecutor::with_hooks`] with the hook types selected here by the node's EVM
+/// configuration. This is the live-path counterpart of [`ChainHooks`], which serves the pipeline.
+///
+/// Every EVM configuration used with the engine tree's block validator must implement this trait,
+/// so a chain cannot silently trace live blocks without its hooks.
+pub trait FirehoseLiveHooks: ConfigureEvm {
+    /// Hook that patches each transaction event before it reaches the tracer.
+    type PreTxAdjust: for<'db, 'tracer> PreTxAdjust<LiveTracedEvm<'db, 'tracer, Self>> + Default;
+    /// Hook that emits chain-specific balance changes after each transaction.
+    type PostTxExtras: for<'db, 'tracer> PostTxExtras<LiveTracedEvm<'db, 'tracer, Self>> + Default;
+}
+
+impl<F> FirehoseLiveHooks for FirehoseEvmConfig<F>
+where
+    Self: ConfigureEvm,
+{
+    type PreTxAdjust = NoPreTxAdjust;
+    type PostTxExtras = NoPostTxExtras;
+}
+
+impl<ChainSpec, EvmF> FirehoseLiveHooks for reth_evm_ethereum::EthEvmConfig<ChainSpec, EvmF>
+where
+    Self: ConfigureEvm,
+{
+    type PreTxAdjust = NoPreTxAdjust;
+    type PostTxExtras = NoPostTxExtras;
+}
+
+impl<Inner> FirehoseLiveHooks for reth_evm::noop::NoopEvmConfig<Inner>
+where
+    Inner: FirehoseLiveHooks,
+    Self: ConfigureEvm<BlockExecutorFactory = Inner::BlockExecutorFactory>,
+{
+    type PreTxAdjust = Inner::PreTxAdjust;
+    type PostTxExtras = Inner::PostTxExtras;
+}
+
 /// Pipeline [`Executor`] that runs each block through a per-block wrapping strategy
 /// ([`ChainHooks`]) and defers the end-of-block flush until post-execution validation
 /// succeeds. See the module-level docs.
@@ -648,9 +716,9 @@ where
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
         if !crate::is_tracer_initialized() {
-            return Err(BlockExecutionError::msg(
-                "FirehoseBlockExecutor requires the global tracer to be initialized for execute_and_trace_one",
-            ));
+            // Tracing disabled (e.g. FIREHOSE_DISABLED kill-switch): run the plain untraced
+            // executor so the node behaves exactly like the un-instrumented upstream.
+            return self.execute_one(block);
         }
 
         // The previous block has reached a point where the caller would have returned early on

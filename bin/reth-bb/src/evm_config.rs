@@ -137,6 +137,14 @@ const fn set_bal_index<DB: revm::Database>(state: &mut &mut revm::database::Stat
 // ConfigureEvm
 // ---------------------------------------------------------------------------
 
+impl<C> reth_firehose::FirehoseLiveHooks for BbEvmConfig<C>
+where
+    Self: ConfigureEvm,
+{
+    type PreTxAdjust = reth_firehose::NoPreTxAdjust;
+    type PostTxExtras = reth_firehose::NoPostTxExtras;
+}
+
 impl<C> ConfigureEvm for BbEvmConfig<C>
 where
     C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static,

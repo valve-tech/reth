@@ -135,7 +135,7 @@ where
         Types = EthereumNode,
         Evm: reth_ethereum::node::builder::ConfigureEngineEvm<
             alloy_rpc_types_engine::ExecutionData,
-        >,
+        > + reth_firehose::FirehoseLiveHooks,
     >,
 {
     type EngineValidator = BasicEngineValidator<
