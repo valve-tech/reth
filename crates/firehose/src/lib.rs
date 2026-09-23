@@ -46,9 +46,10 @@ pub mod health;
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
     reject_jit_capable_inner, run_wrapped_block, ChainHooks, FirehoseBlockExecutor,
-    FirehoseEvmConfig, FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras, NoPreTxAdjust,
-    PostTxExtras, PreTxAdjust,
+    FirehoseEvmConfig, FirehoseLiveHooks, FirehoseWrappedExecutor, LiveTracedEvm, NoChainHooks,
+    NoPostTxExtras, NoPreTxAdjust, PostTxExtras, PreTxAdjust,
 };
+pub use inspector::PostTxGasAccounting;
 pub use runner::run_exex;
 pub use health::{
     default_health_path, resolve_replica, resolve_replica_from, write_health_json, HealthPublisher,

@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 reth-ethereum = { workspace = true, features = ["node", "node-api", "evm", "cli"] }
 
+reth-firehose.workspace = true
+
 alloy-evm.workspace = true
 alloy-sol-types.workspace = true
 alloy-eips.workspace = true

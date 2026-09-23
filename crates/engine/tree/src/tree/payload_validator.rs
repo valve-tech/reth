@@ -478,6 +478,7 @@ where
         // PulseChain variants alike) already implements `SignatureFields` via the firehose
         // crate's blanket impls, so this propagates without disturbing any actual caller.
         TxTy<N>: reth_firehose::mapper::SignatureFields,
+        Evm: reth_firehose::FirehoseLiveHooks,
     {
         let parent_hash = input.parent_hash();
         let _txpool_pause = self.txpool_prewarm.as_ref().map(txpool_prewarm::Handle::pause);
@@ -1297,9 +1298,9 @@ where
     /// as part of Bug 6 fix (2026-05-22).
     #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
     #[expect(clippy::type_complexity)]
-    fn execute_and_trace_block<S, Err, T>(
+    fn execute_and_trace_block<Err, T>(
         &mut self,
-        state_provider: S,
+        state_provider: StateProviderBox,
         env: ExecutionEnv<Evm>,
         input: &BlockOrPayload<T>,
         tracer: &mut reth_firehose::FirehoseBlockTracer,
@@ -1314,12 +1315,12 @@ where
         InsertBlockErrorKind,
     >
     where
-        S: StateProvider + Send,
         Err: core::error::Error + Send + Sync + 'static,
         V: PayloadValidator<T, Block = N::Block>,
         T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
         TxTy<N>: reth_firehose::mapper::SignatureFields,
+        Evm: reth_firehose::FirehoseLiveHooks,
     {
         debug!(target: "engine::tree::payload_validator", "Executing block (with Firehose tracing)");
 
@@ -1365,12 +1366,14 @@ where
                 .execution_ctx_for(input)
                 .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
             let inner = self.evm_config.create_executor(evm, ctx);
-            // Firehose-specific: wrap the executor so system-call boundaries, EIP-4895
-            // withdrawals, and ommer rewards land in the tracer.
-            let executor = reth_firehose::executor::FirehoseWrappedExecutor::new(
+            // Firehose-specific: wrap with the chain's live hooks (PreTxAdjust / PostTxExtras)
+            // so fee-vault credits and deposit nonces match staged-sync traces.
+            let executor = reth_firehose::executor::FirehoseWrappedExecutor::with_hooks(
                 inner,
                 withdrawals,
                 ommer_beneficiaries,
+                <Evm as reth_firehose::FirehoseLiveHooks>::PreTxAdjust::default(),
+                <Evm as reth_firehose::FirehoseLiveHooks>::PostTxExtras::default(),
             );
             (spec_id, executor)
         };
@@ -2052,6 +2055,7 @@ where
     // are Ethereum + PulseChain `SignedTx` types, both satisfied via blanket impls in the
     // `reth_firehose::mapper` module.
     TxTy<N>: reth_firehose::mapper::SignatureFields,
+    Evm: reth_firehose::FirehoseLiveHooks,
 {
     fn validate_payload_attributes_against_header(
         &self,

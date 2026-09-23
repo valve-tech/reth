@@ -427,6 +427,14 @@ where
     }
 }
 
+impl<C, EvmF> reth_firehose::FirehoseLiveHooks for PulsechainEvmConfig<C, EvmF>
+where
+    Self: reth_evm::ConfigureEvm,
+{
+    type PreTxAdjust = reth_firehose::NoPreTxAdjust;
+    type PostTxExtras = reth_firehose::NoPostTxExtras;
+}
+
 impl<C, EvmF> reth_evm::ConfigureEvm for PulsechainEvmConfig<C, EvmF>
 where
     C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static,
