@@ -181,62 +181,73 @@ where
     E::Inspector: FirehoseInspectorApi,
     E::DB: reth_revm::Database,
 {
+    let (db, inspector, _) = evm.components_mut();
+    emit_primordial_pulse_into(db, inspector.tracer_mut(), pre);
+}
+
+/// Diff `pre` against the post-`inner.finish()` DB and emit firehose events via `tracer`.
+///
+/// Prefer [`emit_primordial_pulse_changes`] from production call sites. This entry point exists
+/// so unit tests can drive the emit shape with a mock [`Database`] and a real tracer without
+/// constructing a full [`reth_evm::Evm`].
+pub fn emit_primordial_pulse_into<DB>(
+    db: &mut DB,
+    tracer: &mut firehose_tracer::Tracer,
+    pre: &PrimordialPulsePreState,
+) where
+    DB: reth_revm::Database,
+{
     // ── Pass 1: block-level balance + code changes ────────────────────────────
-    {
-        let (db, inspector, _) = evm.components_mut();
-        let tracer = inspector.tracer_mut();
+    // Sacrifice credits + (testnet) treasury. Reason::GenesisBalance is the
+    // closest semantic fit — a hardfork-time allocation outside any EVM tx.
+    // `on_balance_change` drops events with reason=Unknown so this matters.
+    for &(addr, pre_bal, _credit) in &pre.balance_credits {
+        let post_bal = read_balance(db, addr);
+        tracer.on_balance_change(addr, pre_bal, post_bal, Reason::GenesisBalance);
+    }
 
-        // Sacrifice credits + (testnet) treasury. Reason::GenesisBalance is the
-        // closest semantic fit — a hardfork-time allocation outside any EVM tx.
-        // `on_balance_change` drops events with reason=Unknown so this matters.
-        for &(addr, pre_bal, _credit) in &pre.balance_credits {
-            let post_bal = read_balance(db, addr);
-            tracer.on_balance_change(addr, pre_bal, post_bal, Reason::GenesisBalance);
-        }
+    // ETH_DEPOSIT_CONTRACT: balance → 0 (selfdestruct), code → empty.
+    // Storage clearing is NOT emitted — see module-level docs.
+    let eth_addr = spec::ETH_DEPOSIT_CONTRACT;
+    let eth_post = read_account(db, eth_addr, &[]);
+    if pre.eth_deposit_pre.balance != eth_post.balance {
+        // Geth-pulse uses REASON_SUICIDE_WITHDRAW for this; we mirror.
+        tracer.on_balance_change(
+            eth_addr,
+            pre.eth_deposit_pre.balance,
+            eth_post.balance,
+            Reason::SuicideWithdraw,
+        );
+    }
+    if pre.eth_deposit_pre.code_hash != eth_post.code_hash {
+        tracer.on_code_change(
+            eth_addr,
+            pre.eth_deposit_pre.code_hash,
+            eth_post.code_hash,
+            &pre.eth_deposit_pre.code,
+            &eth_post.code,
+        );
+    }
 
-        // ETH_DEPOSIT_CONTRACT: balance → 0 (selfdestruct), code → empty.
-        // Storage clearing is NOT emitted — see module-level docs.
-        let eth_addr = spec::ETH_DEPOSIT_CONTRACT;
-        let eth_post = read_account(db, eth_addr, &[]);
-        if pre.eth_deposit_pre.balance != eth_post.balance {
-            // Geth-pulse uses REASON_SUICIDE_WITHDRAW for this; we mirror.
-            tracer.on_balance_change(
-                eth_addr,
-                pre.eth_deposit_pre.balance,
-                eth_post.balance,
-                Reason::SuicideWithdraw,
-            );
-        }
-        if pre.eth_deposit_pre.code_hash != eth_post.code_hash {
-            tracer.on_code_change(
-                eth_addr,
-                pre.eth_deposit_pre.code_hash,
-                eth_post.code_hash,
-                &pre.eth_deposit_pre.code,
-                &eth_post.code,
-            );
-        }
-
-        // PULSE_DEPOSIT_CONTRACT: balance change (if any) + code installation.
-        let pulse_addr = spec::PULSE_DEPOSIT_CONTRACT;
-        let pulse_post_basic = read_account(db, pulse_addr, &[]);
-        if pre.pulse_deposit_pre.balance != pulse_post_basic.balance {
-            tracer.on_balance_change(
-                pulse_addr,
-                pre.pulse_deposit_pre.balance,
-                pulse_post_basic.balance,
-                Reason::GenesisBalance,
-            );
-        }
-        if pre.pulse_deposit_pre.code_hash != pulse_post_basic.code_hash {
-            tracer.on_code_change(
-                pulse_addr,
-                pre.pulse_deposit_pre.code_hash,
-                pulse_post_basic.code_hash,
-                &pre.pulse_deposit_pre.code,
-                &pulse_post_basic.code,
-            );
-        }
+    // PULSE_DEPOSIT_CONTRACT: balance change (if any) + code installation.
+    let pulse_addr = spec::PULSE_DEPOSIT_CONTRACT;
+    let pulse_post_basic = read_account(db, pulse_addr, &[]);
+    if pre.pulse_deposit_pre.balance != pulse_post_basic.balance {
+        tracer.on_balance_change(
+            pulse_addr,
+            pre.pulse_deposit_pre.balance,
+            pulse_post_basic.balance,
+            Reason::GenesisBalance,
+        );
+    }
+    if pre.pulse_deposit_pre.code_hash != pulse_post_basic.code_hash {
+        tracer.on_code_change(
+            pulse_addr,
+            pre.pulse_deposit_pre.code_hash,
+            pulse_post_basic.code_hash,
+            &pre.pulse_deposit_pre.code,
+            &pulse_post_basic.code,
+        );
     }
 
     // ── Pass 2: synthetic system-call wrapping nonce + storage ────────────────
@@ -246,9 +257,6 @@ where
     // execution here — this is purely a container for state-diff events.
     const CALL_OPCODE: u8 = 0xf1;
     let zero_addr = Address::ZERO;
-
-    let (db, inspector, _) = evm.components_mut();
-    let tracer = inspector.tracer_mut();
 
     tracer.on_system_call_start();
     tracer.on_call_enter(0, CALL_OPCODE, zero_addr, zero_addr, &[], 0, U256::ZERO);
@@ -361,12 +369,11 @@ mod tests {
     // the EMIT PATH in this module consumes, so a change to the spec that would
     // alter the wire output fails loudly here too.
     //
-    // OUT OF HERMETIC SCOPE: asserting that `emit_primordial_pulse_changes`
-    // actually drives the inspector to produce those exact wire counts requires
-    // a live revm `Evm` + populated `Database` (pre/post account+storage state at
-    // the fork block) and a real `FirehoseInspector`. That path is validated
-    // on-wire and is not faked here — a mock DB returning post==pre would emit
-    // zero changes and prove nothing.
+    // Emit-shape coverage (credit/code/storage routing) lives in
+    // `emit_mainnet_like_shape_credits_code_storage` /
+    // `emit_testnet_like_includes_treasury_credit` below — those drive
+    // `emit_primordial_pulse_into` with a mock DB whose post-state differs from
+    // pre. Full per-chain wire counts remain validated on-wire.
 
     /// Block-level pass emits exactly 2 code changes: ETH deposit cleared +
     /// PULSE deposit installed. Both contract addresses must be the spec values.
@@ -411,5 +418,259 @@ mod tests {
             286_833,
             "testnet v4 on-wire balance_change total",
         );
+    }
+
+    // ── emit_primordial_pulse_into shape tests ────────────────────────────────
+    //
+    // Drive a miniature PrimordialPulsePreState through a HashMap-backed mock DB
+    // and a real Tracer. Asserts credit/code/storage emit shape for mainnet-like
+    // (no treasury) vs testnet-like (treasury first) pre-states — catching the
+    // firehose/parity skew the on-wire lock above documents.
+
+    use std::collections::HashMap;
+
+    use alloy_primitives::keccak256;
+    use firehose_tracer::{
+        config::{ChainConfig, Config},
+        pb::sf::ethereum::r#type::v2::{
+            balance_change::Reason as PbReason, Block as FirehoseBlock,
+        },
+        types::BlockEvent,
+        Tracer,
+    };
+    use prost::Message;
+    use revm::state::{AccountInfo, Bytecode};
+
+    /// Minimal [`reth_revm::Database`] returning scripted account/storage values.
+    #[derive(Default)]
+    struct MockDb {
+        accounts: HashMap<Address, AccountInfo>,
+        storage: HashMap<(Address, U256), U256>,
+        codes: HashMap<B256, Bytecode>,
+    }
+
+    impl reth_revm::Database for MockDb {
+        type Error = core::convert::Infallible;
+
+        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(self.accounts.get(&address).cloned())
+        }
+
+        fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(self.codes.get(&code_hash).cloned().unwrap_or_default())
+        }
+
+        fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+            Ok(self.storage.get(&(address, index)).copied().unwrap_or(U256::ZERO))
+        }
+
+        fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    fn parse_fire_block(raw: &[u8]) -> FirehoseBlock {
+        for line in raw.split(|&b| b == b'\n') {
+            let Ok(text) = std::str::from_utf8(line) else { continue };
+            if !text.starts_with("FIRE BLOCK") {
+                continue;
+            }
+            let payload = text.split_whitespace().last().expect("FIRE BLOCK payload");
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload)
+                .expect("base64");
+            return FirehoseBlock::decode(&*bytes).expect("protobuf Block");
+        }
+        panic!("no FIRE BLOCK line in tracer output");
+    }
+
+    /// Seed post-state for ETH deposit (cleared) + PULSE deposit (code + 31 slots)
+    /// and run emit; return the decoded Firehose block.
+    fn emit_and_decode(pre: &PrimordialPulsePreState, db: &mut MockDb) -> FirehoseBlock {
+        let (mut tracer, buffer) =
+            Tracer::with_buffer(Config::default(), ChainConfig::new(pre.chain_id), "test", "0.0.0");
+        tracer.on_block_start(BlockEvent {
+            block: firehose_tracer::types::BlockData {
+                number: pre.block_number,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        emit_primordial_pulse_into(db, &mut tracer, pre);
+        tracer.on_block_end(None);
+        parse_fire_block(&buffer.get_bytes())
+    }
+
+    fn seed_post_deposit_state(db: &mut MockDb) {
+        // ETH deposit wiped.
+        db.accounts.insert(
+            spec::ETH_DEPOSIT_CONTRACT,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash: B256::ZERO,
+                code: None,
+                ..Default::default()
+            },
+        );
+
+        let pulse_code = Bytecode::new_raw(spec::DEPOSIT_CONTRACT_BYTECODE.to_vec().into());
+        let pulse_hash = keccak256(spec::DEPOSIT_CONTRACT_BYTECODE);
+        db.codes.insert(pulse_hash, pulse_code.clone());
+        db.accounts.insert(
+            spec::PULSE_DEPOSIT_CONTRACT,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: pulse_hash,
+                code: Some(pulse_code),
+                ..Default::default()
+            },
+        );
+        for &(slot, value) in spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.iter() {
+            db.storage.insert(
+                (spec::PULSE_DEPOSIT_CONTRACT, U256::from_be_bytes(slot.0)),
+                U256::from_be_bytes(value.0),
+            );
+        }
+    }
+
+    #[test]
+    fn emit_mainnet_like_shape_credits_code_storage() {
+        let credit_addr = Address::repeat_byte(0x42);
+        let credit_amt = U256::from(1_000u64);
+        let eth_pre_bal = U256::from(50u64);
+        let eth_pre_code = vec![0x60, 0x00];
+        let eth_pre_hash = keccak256(&eth_pre_code);
+
+        let pre = PrimordialPulsePreState {
+            chain_id: 369,
+            block_number: 17_233_000,
+            balance_credits: vec![(credit_addr, U256::ZERO, credit_amt)],
+            eth_deposit_pre: AccountPreState {
+                balance: eth_pre_bal,
+                nonce: 5,
+                code_hash: eth_pre_hash,
+                code: eth_pre_code,
+                storage_slots_pre: vec![],
+            },
+            pulse_deposit_pre: AccountPreState {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash: B256::ZERO,
+                code: Vec::new(),
+                storage_slots_pre: spec::DEPOSIT_CONTRACT_INITIAL_STORAGE
+                    .iter()
+                    .map(|(s, _)| (*s, B256::ZERO))
+                    .collect(),
+            },
+        };
+
+        let mut db = MockDb::default();
+        // Post credit balance = pre + credit.
+        db.accounts.insert(credit_addr, AccountInfo { balance: credit_amt, ..Default::default() });
+        seed_post_deposit_state(&mut db);
+
+        let block = emit_and_decode(&pre, &mut db);
+
+        // Block-level: 1 credit + 1 suicide-withdraw (+ optional pulse balance=0 skipped)
+        let reasons: Vec<i32> = block.balance_changes.iter().map(|c| c.reason).collect();
+        assert!(
+            reasons.contains(&(PbReason::GenesisBalance as i32)),
+            "credit must emit GenesisBalance, got {reasons:?}"
+        );
+        assert!(
+            reasons.contains(&(PbReason::SuicideWithdraw as i32)),
+            "ETH deposit must emit SuicideWithdraw, got {reasons:?}"
+        );
+        assert_eq!(
+            block
+                .balance_changes
+                .iter()
+                .filter(|c| c.reason == PbReason::GenesisBalance as i32)
+                .count(),
+            1,
+            "mainnet-like: exactly one GenesisBalance (the credit; no treasury)"
+        );
+
+        // Two code changes: ETH cleared + PULSE installed.
+        assert_eq!(block.code_changes.len(), 2, "ETH clear + PULSE install");
+        let code_addrs: Vec<_> =
+            block.code_changes.iter().map(|c| Address::from_slice(&c.address)).collect();
+        assert!(code_addrs.contains(&spec::ETH_DEPOSIT_CONTRACT));
+        assert!(code_addrs.contains(&spec::PULSE_DEPOSIT_CONTRACT));
+
+        // System-call pass: 1 call carrying nonce + 31 storage changes.
+        assert_eq!(block.system_calls.len(), 1, "synthetic PrimordialPulse system call");
+        let call = &block.system_calls[0];
+        assert_eq!(call.storage_changes.len(), 31, "one StorageChange per initial-storage slot");
+        // ETH nonce 5→0 and PULSE nonce 0→1.
+        assert!(call.nonce_changes.len() >= 1, "at least the PULSE (and usually ETH) nonce change");
+        assert_eq!(call.nonce_changes.len(), 2, "ETH + PULSE nonce changes");
+    }
+
+    #[test]
+    fn emit_testnet_like_includes_treasury_credit() {
+        let treasury = spec::TESTNET_V4_TREASURY;
+        let credit_addr = Address::repeat_byte(0x43);
+        let credit_amt = U256::from(7u64);
+
+        let pre = PrimordialPulsePreState {
+            chain_id: 943,
+            block_number: 16_492_700,
+            // Treasury first, matching capture() order for chain 943.
+            balance_credits: vec![
+                (treasury, U256::ZERO, spec::TESTNET_V4_TREASURY_BALANCE),
+                (credit_addr, U256::ZERO, credit_amt),
+            ],
+            eth_deposit_pre: AccountPreState {
+                balance: U256::from(1u64),
+                nonce: 1,
+                code_hash: keccak256([0x01]),
+                code: vec![0x01],
+                storage_slots_pre: vec![],
+            },
+            pulse_deposit_pre: AccountPreState {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash: B256::ZERO,
+                code: Vec::new(),
+                storage_slots_pre: spec::DEPOSIT_CONTRACT_INITIAL_STORAGE
+                    .iter()
+                    .map(|(s, _)| (*s, B256::ZERO))
+                    .collect(),
+            },
+        };
+
+        let mut db = MockDb::default();
+        db.accounts.insert(
+            treasury,
+            AccountInfo { balance: spec::TESTNET_V4_TREASURY_BALANCE, ..Default::default() },
+        );
+        db.accounts.insert(credit_addr, AccountInfo { balance: credit_amt, ..Default::default() });
+        seed_post_deposit_state(&mut db);
+
+        let block = emit_and_decode(&pre, &mut db);
+
+        let genesis_balances: Vec<_> = block
+            .balance_changes
+            .iter()
+            .filter(|c| c.reason == PbReason::GenesisBalance as i32)
+            .map(|c| Address::from_slice(&c.address))
+            .collect();
+        assert_eq!(genesis_balances.len(), 2, "testnet-like: treasury + one sacrifice credit");
+        assert_eq!(genesis_balances[0], treasury, "treasury emits first");
+        assert_eq!(genesis_balances[1], credit_addr);
+        assert!(
+            block.balance_changes.iter().any(|c| c.reason == PbReason::SuicideWithdraw as i32),
+            "ETH deposit suicide-withdraw still present on testnet path"
+        );
+        assert_eq!(block.code_changes.len(), 2);
+        assert_eq!(block.system_calls[0].storage_changes.len(), 31);
+    }
+
+    #[test]
+    fn capture_returns_none_for_non_pulse_chain() {
+        let mut db = MockDb::default();
+        assert!(PrimordialPulsePreState::capture(&mut db, 1, 100).is_none());
     }
 }
