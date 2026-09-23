@@ -18,6 +18,9 @@ pub const DEFAULT_MAX_LOGS_PER_RESPONSE: usize = 20_000;
 /// The default maximum number of blocks for `trace_filter` requests.
 pub const DEFAULT_MAX_TRACE_FILTER_BLOCKS: u64 = 100;
 
+/// The default maximum size of an RPC response body, in bytes: `--rpc.max-response-size` of 160 MB.
+pub const DEFAULT_MAX_RESPONSE_SIZE_BYTES: usize = 160 * 1024 * 1024;
+
 /// Setting for how many concurrent (heavier) _blocking_ IO requests are allowed.
 ///
 /// What is considered a blocking IO request can depend on the RPC method. In general anything that

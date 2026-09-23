@@ -9,8 +9,8 @@ use crate::{
 use reqwest::Url;
 use reth_rpc_server_types::constants::{
     default_max_tracing_requests, DEFAULT_ETH_PROOF_WINDOW, DEFAULT_MAX_BLOCKING_IO_REQUEST,
-    DEFAULT_MAX_BLOCKS_PER_FILTER, DEFAULT_MAX_LOGS_PER_RESPONSE, DEFAULT_MAX_SIMULATE_BLOCKS,
-    DEFAULT_MAX_TRACE_FILTER_BLOCKS, DEFAULT_PROOF_PERMITS,
+    DEFAULT_MAX_BLOCKS_PER_FILTER, DEFAULT_MAX_LOGS_PER_RESPONSE, DEFAULT_MAX_RESPONSE_SIZE_BYTES,
+    DEFAULT_MAX_SIMULATE_BLOCKS, DEFAULT_MAX_TRACE_FILTER_BLOCKS, DEFAULT_PROOF_PERMITS,
     RPC_DEFAULT_SEND_RAW_TX_SYNC_TIMEOUT_SECS,
 };
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,11 @@ pub struct EthConfig {
     pub max_blocks_per_filter: u64,
     /// Maximum number of logs that can be returned in a single response in `eth_getLogs` calls.
     pub max_logs_per_response: usize,
+    /// Maximum size of an RPC response body, in bytes.
+    ///
+    /// The server enforces this on every response. Handlers that can produce very large
+    /// responses, such as `trace_block`, also read it to refuse before they serialize.
+    pub max_response_size: usize,
     /// Gas limit for `eth_call` and call tracing RPC methods.
     ///
     /// Defaults to [`RPC_DEFAULT_GAS_CAP`]
@@ -137,6 +142,7 @@ impl Default for EthConfig {
             max_trace_filter_blocks: DEFAULT_MAX_TRACE_FILTER_BLOCKS,
             max_blocks_per_filter: DEFAULT_MAX_BLOCKS_PER_FILTER,
             max_logs_per_response: DEFAULT_MAX_LOGS_PER_RESPONSE,
+            max_response_size: DEFAULT_MAX_RESPONSE_SIZE_BYTES,
             rpc_gas_cap: RPC_DEFAULT_GAS_CAP.into(),
             rpc_max_simulate_blocks: DEFAULT_MAX_SIMULATE_BLOCKS,
             compute_state_root_for_eth_simulate: false,
@@ -169,6 +175,12 @@ impl EthConfig {
     /// Configures the maximum number of tracing requests
     pub const fn max_tracing_requests(mut self, max_requests: usize) -> Self {
         self.max_tracing_requests = max_requests;
+        self
+    }
+
+    /// Configures the maximum size of an RPC response body, in bytes
+    pub const fn max_response_size(mut self, max_bytes: usize) -> Self {
+        self.max_response_size = max_bytes;
         self
     }
 
