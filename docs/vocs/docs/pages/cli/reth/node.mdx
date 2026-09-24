@@ -1295,6 +1295,29 @@ Msgboard:
 
           When set, the node still **receives** announcements and full messages from peers and serves `GetBoardMessages` requests, but it does **not** announce its own message IDs (neither the bulk announce on peer connect nor per-message announces as new messages are accepted). Useful for read-only observability nodes.
 
+      --firehose.enabled [<FIREHOSE_ENABLED>]
+          Enable firehose instrumentation (FIRE protocol + ExEx).
+
+          **Default off.** Plain RPC / A replicas leave this unset so journals are not flooded with FIRE lines. Firehose producers must set `--firehose.enabled` / `--firehose.enabled=true` or `RETH_FIREHOSE_ENABLED=true` or FIRE output dies.
+
+          [env: RETH_FIREHOSE_ENABLED=]
+          [default: false]
+          [possible values: true, false]
+
+      --firehose.output <FIREHOSE_OUTPUT>
+          Write FIRE protocol lines to this path instead of stdout.
+
+          Only used when `--firehose.enabled` is set. Producers can point this at a FIFO that fireeth reads; otherwise FIRE lines go to stdout.
+
+          [env: FIREHOSE_OUTPUT=]
+
+      --firehose.replica <FIREHOSE_REPLICA>
+          Replica letter stamped into firehose health.json (`a` / `b`).
+
+          Optional. When unset, the ExEx infers from hostname (`direct-b-evm-369`, `evm943b`) or `VALVE_REPLICA`.
+
+          [env: FIREHOSE_REPLICA=]
+
 Logging:
       --log.stdout.format <FORMAT>
           The format to use for logs written to stdout
