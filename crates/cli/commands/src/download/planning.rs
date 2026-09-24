@@ -153,9 +153,10 @@ pub(crate) struct DownloadStartupSummary {
 pub(crate) fn summarize_download_startup(
     all_downloads: &[PlannedArchive],
     target_dir: &Path,
+    static_files_dir: Option<&Path>,
 ) -> Result<DownloadStartupSummary> {
     let mut summary = DownloadStartupSummary::default();
-    let verifier = OutputVerifier::new(target_dir);
+    let verifier = OutputVerifier::new(target_dir, static_files_dir);
 
     for planned in all_downloads {
         if verifier.verify(&planned.archive.output_files)? {
@@ -303,7 +304,7 @@ mod tests {
             },
         ];
 
-        let summary = summarize_download_startup(&planned, target_dir).unwrap();
+        let summary = summarize_download_startup(&planned, target_dir, None).unwrap();
         assert_eq!(summary.reusable, 1);
         assert_eq!(summary.needs_download, 2);
     }
@@ -419,6 +420,7 @@ mod tests {
             base_url: Some("https://example.com".to_string()),
             reth_version: None,
             components,
+            extensions: Default::default(),
         };
 
         let selections = BTreeMap::from([
@@ -496,6 +498,7 @@ mod tests {
             base_url: Some("https://example.com/mainnet".to_string()),
             reth_version: None,
             components,
+            extensions: Default::default(),
         };
         let selections =
             BTreeMap::from([(SnapshotComponentType::Transactions, ComponentSelection::All)]);
@@ -542,6 +545,7 @@ mod tests {
             }),
         );
         let manifest = SnapshotManifest {
+            extensions: Default::default(),
             block: 150_000,
             chain_id: 1,
             storage_version: 2,

@@ -39,9 +39,10 @@ pub trait SpawnBlocking: EthApiTypes + Clone + Send + Sync + 'static {
 
     /// Returns handle to semaphore for blocking IO tasks.
     ///
-    /// This semaphore limits how many EVM-executing requests run concurrently. Exactly three
-    /// methods take a permit: `eth_call`, `eth_simulateV1` and `call_many`. `eth_estimateGas`
-    /// does NOT — it resolves through `EstimateCall::estimate_gas_at`, which never acquires.
+    /// This semaphore limits how many EVM-executing requests run concurrently. These take a
+    /// permit: `eth_call`, `eth_simulateV1`, `call_many`, `eth_getBlockAccessList` and the
+    /// `eth_getLogs` range scans. `eth_estimateGas` does NOT — it resolves through
+    /// `EstimateCall::estimate_gas_at`, which never acquires.
     fn blocking_io_task_guard(&self) -> &Arc<Semaphore>;
 
     /// Acquires a permit from the tracing task semaphore.

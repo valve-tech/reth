@@ -22,13 +22,15 @@ use reth_storage_api::{
     BlockIdReader, BlockReaderIdExt, StateProvider, StateProviderBox, StateProviderFactory,
 };
 use reth_transaction_pool::TransactionPool;
-use reth_trie_common::MultiProofTargets;
+use reth_trie_common::{MultiProofTargetsV2, ProofV2Target};
 use std::{collections::HashMap, sync::Arc};
 
 /// Helper methods for `eth_` methods relating to state (accounts).
 pub trait EthState: LoadState + SpawnBlocking {
     /// Returns the maximum number of blocks into the past for generating state proofs.
-    fn max_proof_window(&self) -> u64;
+    fn max_proof_window(&self) -> u64 {
+        self.eth_api_settings().eth_proof_window
+    }
 
     /// Validates that the given block is within the configured proof window.
     ///
@@ -161,7 +163,7 @@ pub trait EthState: LoadState + SpawnBlocking {
         Self: EthApiSpec,
     {
         Ok(async move {
-            let _permit = self
+            let permit = self
                 .acquire_owned_tracing()
                 .await
                 .map_err(RethError::other)
@@ -171,6 +173,7 @@ pub trait EthState: LoadState + SpawnBlocking {
             self.ensure_within_proof_window(block_id)?;
 
             self.spawn_blocking_with_state(Some(block_id), move |_, state| {
+                let _permit = permit;
                 let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
                 let proof = state
                     .proof(Default::default(), address, &storage_keys)
@@ -194,7 +197,7 @@ pub trait EthState: LoadState + SpawnBlocking {
         Self: EthApiSpec,
     {
         Ok(async move {
-            let _permit = self
+            let permit = self
                 .acquire_owned_tracing()
                 .await
                 .map_err(RethError::other)
@@ -204,16 +207,22 @@ pub trait EthState: LoadState + SpawnBlocking {
             self.ensure_within_proof_window(block_id)?;
 
             self.spawn_blocking_with_state(Some(block_id), move |_, state| {
-                let mut proof_targets = MultiProofTargets::with_capacity(targets.len());
+                let _permit = permit;
+                let mut proof_targets = MultiProofTargetsV2::default();
+                proof_targets.account_targets.reserve(targets.len());
+                proof_targets.storage_targets.reserve(targets.len());
                 for (address, slots) in &targets {
+                    let hashed_address = keccak256(address);
+                    proof_targets.account_targets.push(ProofV2Target::new(hashed_address));
                     proof_targets
-                        .entry(keccak256(address))
+                        .storage_targets
+                        .entry(hashed_address)
                         .or_default()
-                        .extend(slots.iter().map(keccak256));
+                        .extend(slots.iter().map(|slot| ProofV2Target::new(keccak256(slot))));
                 }
 
                 let multiproof = state
-                    .multiproof(Default::default(), proof_targets)
+                    .multiproof_v2(Default::default(), proof_targets)
                     .map_err(Self::Error::from_eth_err)?;
 
                 targets
