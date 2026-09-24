@@ -28,9 +28,8 @@ use reth_metrics::Metrics;
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
 use reth_provider::{
     AccountReader, BlockExecutionOutput, BlockNumReader, ChangeSetReader, DatabaseProviderFactory,
-    ProviderResult,
-    DatabaseProviderROFactory, HistoryReader, PruneCheckpointReader, StageCheckpointReader,
-    StateProviderBox, StorageChangeSetReader, StorageSettingsCache,
+    DatabaseProviderROFactory, HistoryReader, ProviderResult, PruneCheckpointReader,
+    StageCheckpointReader, StateProviderBox, StorageChangeSetReader, StorageSettingsCache,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_overlay::OverlayStateProviderFactory;
