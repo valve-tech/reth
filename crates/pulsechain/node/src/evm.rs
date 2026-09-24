@@ -347,6 +347,7 @@ where
     <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
     Spec: EthExecutorSpec,
     EvmF: EvmFactory<
+        Spec: Into<SpecId> + Clone,
         Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
         Precompiles = PrecompilesMap,
     >,
