@@ -5,13 +5,23 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   dependency-review:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: "Checkout Repository"
-        uses: actions/checkout@v7
+      # The action reads both dependency graphs through the API, so it needs no checkout.
       - name: "Dependency Review"
-        uses: actions/dependency-review-action@v5
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high # Fail on high, critical
+          # The graph snapshot for a new push can lag the workflow; wait for it instead of
+          # reviewing a stale graph.
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 120
+          # Name the fixed version in the summary, so a failure says what to bump to.
+          show-patched-versions: true
