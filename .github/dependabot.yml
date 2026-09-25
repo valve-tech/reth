@@ -13,8 +13,12 @@ updates:
       ci-weekly:
         patterns:
           - '*'
+  # Upstream reth owns every other crate. Its bumps arrive with each upstream merge, and bumping
+  # them here only makes Cargo.lock conflict on the next one. Watch only the crates the fork adds.
   - package-ecosystem: cargo
     directory: /
+    allow:
+      - dependency-name: firehose-tracer
     schedule:
       interval: weekly
       day: monday

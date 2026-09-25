@@ -85,6 +85,9 @@ where
         tx_dependency: None,
         // EIP-7843: Amsterdam slot number — not yet exposed by reth Header trait
         slot_number: None,
+        // EIP-7928: Amsterdam block access list — not yet emitted
+        block_access_list_hash: None,
+        block_access_list_rlp: None,
     }
 }
 
