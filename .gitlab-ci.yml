@@ -15,6 +15,8 @@ workflow:
 
 valve-ci:
   stage: test
+  # Dedicated 32-core runner; the shared runners take ~75 min cold.
+  tags: [reth]
   timeout: 2h
   cache:
     key: valve-ci-$CI_DEFAULT_BRANCH
