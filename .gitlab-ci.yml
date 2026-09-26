@@ -1,0 +1,31 @@
+# GitLab counterpart of .github/workflows/valve-ci.yml. Keep the two step lists identical.
+default:
+  image: rust:1-bookworm
+  interruptible: true
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  CARGO_INCREMENTAL: "0"
+  GIT_DEPTH: "50"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+valve-ci:
+  stage: test
+  timeout: 2h
+  cache:
+    key: valve-ci-$CI_DEFAULT_BRANCH
+    paths: [.cargo/registry, .cargo/git, target]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq clang libclang-dev pkg-config
+    - curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin
+    - rustup component add clippy rustfmt
+  script:
+    - cargo fmt --check -p reth-firehose -p reth-firehose-tests -p reth-pulsechain-node -p reth-pulsechain-forks || true
+    - cargo clippy --no-deps -p reth-firehose -p reth-firehose-tests -p reth-pulsechain-node -p reth-pulsechain-forks --all-targets
+    - cargo check -p reth --no-default-features --features "jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
+    - cargo nextest run --no-fail-fast -p reth-firehose -p reth-firehose-tests -p reth-msgboard -p reth-msgboard-types -p reth-pulsechain-node -p reth-pulsechain-forks -p reth-cli-commands
+    - cargo nextest run -p reth-node-ethereum --test e2e -E 'test(estimate::)' --no-tests=fail
