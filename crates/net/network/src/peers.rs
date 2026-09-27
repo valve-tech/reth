@@ -591,7 +591,6 @@ impl PeersManager {
             }
             ReputationChangeOutcome::Unban => self.unban_peer(*peer_id),
             ReputationChangeOutcome::DisconnectAndBan => {
-                warn!(target: "net::peers", ?peer_id, reputation=?rep, "DISCONNECT-DEBUG: reputation triggered DisconnectAndBan");
                 self.queued_actions.push_back(PeerAction::Disconnect {
                     peer_id: *peer_id,
                     reason: Some(DisconnectReason::DisconnectRequested),
@@ -927,7 +926,7 @@ impl PeersManager {
         self.queued_actions.push_back(PeerAction::PeerRemoved(peer_id));
 
         if peer.state.is_connected() {
-            warn!(target: "net::peers", ?peer_id, "DISCONNECT-DEBUG: disconnecting connected peer on remove_peer (discovery removal)");
+            trace!(target: "net::peers", ?peer_id, "disconnecting on remove from discovery");
             // we terminate the active session here, but only remove the peer after the session
             // was disconnected, this prevents the case where the session is scheduled for
             // disconnect but the node is immediately rediscovered, See also
