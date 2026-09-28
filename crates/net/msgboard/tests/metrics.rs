@@ -332,7 +332,7 @@ fn every_metric_is_instantiated_and_moves() {
         "suppressing a duplicate request must be counted, not just done",
     );
 
-    board.release_pending(&[id]);
+    board.release_pending(reth_network_api::PeerId::ZERO, &[id]);
     assert_eq!(
         board.filter_wanted(reth_network_api::PeerId::ZERO, &[id]).len(),
         1,

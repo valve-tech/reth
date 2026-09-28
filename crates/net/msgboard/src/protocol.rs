@@ -694,6 +694,10 @@ async fn run_connection<S>(
 /// Every ID in `wanted` must be claimed in the board's [`PendingRequests`]
 /// for this peer. Anything not requested is handed back.
 ///
+/// `retry` marks a request made because another peer withheld the message.
+/// Its reservations do not count as withholding if they expire; see
+/// [`WantList::reserve_retry`].
+///
 /// [`PendingRequests`]: crate::pending::PendingRequests
 async fn request_wanted(
     board: &Arc<MsgBoard>,
@@ -702,6 +706,7 @@ async fn request_wanted(
     wanted: &[MsgID],
     peer_id: PeerId,
     deadline: tokio::time::Instant,
+    retry: bool,
 ) -> Sent {
     let metrics = board.metrics();
     // Reserve before requesting. A message this peer is not authorised
@@ -710,12 +715,15 @@ async fn request_wanted(
     // claimed every ID it returned, so anything the want list refuses
     // goes straight back — otherwise the peers still announcing it stay
     // suppressed for the full claim TTL and nobody fetches it.
-    let now = Instant::now();
+    let now = tokio::time::Instant::now();
     wants.prune(now);
     let mut reserved = Vec::with_capacity(wanted.len());
     let mut refused = Vec::new();
     for &id in wanted {
-        if wants.reserve(id.message_hash(), now) {
+        let hash = id.message_hash();
+        let reserved_ok =
+            if retry { wants.reserve_retry(hash, now) } else { wants.reserve(hash, now) };
+        if reserved_ok {
             reserved.push(id);
         } else {
             refused.push(id);
@@ -723,7 +731,7 @@ async fn request_wanted(
     }
     if !refused.is_empty() {
         metrics.wants_refused.increment(refused.len() as u64);
-        board.release_pending(&refused);
+        board.release_pending(peer_id, &refused);
     }
     if reserved.is_empty() {
         return Sent::Ok;
@@ -775,12 +783,12 @@ async fn request_wanted(
             // we never asked it for. On `Closed` that also covers the
             // chunks this loop will now never send.
             Sent::Dropped => {
-                board.release_pending(chunk);
+                board.release_pending(peer_id, chunk);
                 wants.release(chunk.iter().map(MsgID::message_hash));
             }
             Sent::Closed => {
                 let unsent = &reserved[i * MAX_GET_BOARD_MESSAGES..];
-                board.release_pending(unsent);
+                board.release_pending(peer_id, unsent);
                 wants.release(unsent.iter().map(MsgID::message_hash));
                 return Sent::Closed;
             }
@@ -806,11 +814,15 @@ async fn service_pending(
     strikes: &mut WithholdStrikes,
     peer_id: PeerId,
 ) -> Sent {
-    let now = Instant::now();
+    let now = tokio::time::Instant::now();
     wants.prune(now);
     let withheld = wants.take_expired_unspent();
     if withheld > 0 {
+        // One strike per tick, however many IDs expired in it. A peer that
+        // withholds one full frame and a peer that withholds one message are
+        // one event each, so a single lost frame cannot ban an honest peer.
         let repeatedly = strikes.record(now);
+        board.note_withheld(peer_id);
         tracing::debug!(target: "msgboard", ?peer_id, withheld, repeatedly, "announced messages never delivered");
         if let Some(r) = reporter {
             r.report_withheld(peer_id, repeatedly);
@@ -825,7 +837,7 @@ async fn service_pending(
         return Sent::Ok;
     }
     tracing::debug!(target: "msgboard", ?peer_id, count = retries.len(), "requesting messages another peer withheld");
-    request_wanted(board, tx, wants, &retries, peer_id, frame_deadline()).await
+    request_wanted(board, tx, wants, &retries, peer_id, frame_deadline(), true).await
 }
 
 /// Borrow the trait object out of an `Option<Arc<dyn PeerReporter>>` without
@@ -927,7 +939,9 @@ async fn handle_incoming(
             if wanted.is_empty() {
                 return Sent::Ok;
             }
-            if request_wanted(board, tx, wants, &wanted, peer_id, deadline).await == Sent::Closed {
+            if request_wanted(board, tx, wants, &wanted, peer_id, deadline, false).await ==
+                Sent::Closed
+            {
                 return Sent::Closed;
             }
         }
@@ -998,7 +1012,7 @@ async fn handle_incoming(
             }
             metrics.bodies_received.increment(msgs.len() as u64);
             let delivered = msgs.len();
-            let now = Instant::now();
+            let now = tokio::time::Instant::now();
             let mut authorised = Vec::with_capacity(delivered.min(MAX_WANT_PER_PEER));
             for msg in msgs {
                 // Spent by hash, so an unsolicited message in the middle of
@@ -3042,7 +3056,7 @@ mod tests {
         // `filter_wanted` claims every ID it returns, so this precondition
         // check would otherwise suppress the request the handler makes below.
         // Hand the claims back to leave the board as a first-time peer finds it.
-        board.release_pending(&wanted);
+        board.release_pending(peer(), &wanted);
 
         let (tx, mut rx) = channel();
         handle_incoming(&board, None, &tx, &mut WantList::default(), raw, peer()).await;
@@ -3117,7 +3131,7 @@ mod tests {
         assert_eq!(wanted.len(), 3, "all must be wanted");
         assert!(board.filter_wanted(peer(), &announced).is_empty(), "and now claimed");
 
-        board.release_pending(&wanted);
+        board.release_pending(peer(), &wanted);
 
         let (tx, mut rx) = channel();
         handle_incoming(
@@ -3398,7 +3412,7 @@ mod tests {
         // The claim in `PendingRequests` expires after 10 s; the reservation
         // lasts 15 s. So a re-announcement past the claim TTL passes
         // `filter_wanted` again and is stopped here instead.
-        board.release_pending(&[want]);
+        board.release_pending(peer(), &[want]);
         handle_incoming(&board, None, &tx, &mut wants, announcement, peer()).await;
 
         assert!(drain(&mut rx).is_empty(), "the peer already owes us this message");
@@ -3501,36 +3515,40 @@ mod tests {
         );
     }
 
-    /// A peer that announces a message and then withholds it must not keep the
-    /// message from us.
-    ///
-    /// The first announcer holds the in-flight claim, and every later announcer
-    /// is suppressed. If the first one never answers, a later announcer must be
-    /// asked once the claim expires, and the withholding peer must pay for the
-    /// reservation it left unspent. Real timers: this runs for up to ~20 s.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_withholding_announcer_does_not_censor_the_message() {
-        let board = board_at(10);
-        let rep = Arc::new(RecordingReporter::default());
-        let peer_a = PeerId::repeat_byte(0xA1);
-        let peer_b = PeerId::repeat_byte(0xB2);
-        let announce = frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&wantable_ids(1)));
+    /// One peer connection driven by `run_connection`, for the withholding
+    /// tests. The peer never answers a request.
+    struct SilentPeer {
+        id: PeerId,
+        inbound: mpsc::Sender<BytesMut>,
+        outbound: Receiver<BytesMut>,
+        task: tokio::task::JoinHandle<()>,
+    }
 
-        let spawn_peer = |peer_id: PeerId| {
-            let (conn_tx, conn_rx) = mpsc::channel::<BytesMut>(8);
-            let (out_tx, out_rx) = mpsc::channel::<BytesMut>(64);
+    impl SilentPeer {
+        fn spawn(board: &Arc<MsgBoard>, rep: &Arc<RecordingReporter>, n: u8) -> Self {
+            let (inbound, conn_rx) = mpsc::channel::<BytesMut>(8);
+            let (out_tx, outbound) = mpsc::channel::<BytesMut>(64);
+            let id = PeerId::repeat_byte(n);
             let task = tokio::spawn(run_connection(
-                Arc::clone(&board),
-                Some(Arc::clone(&rep) as Arc<dyn PeerReporter>),
-                peer_id,
+                Arc::clone(board),
+                Some(Arc::clone(rep) as Arc<dyn PeerReporter>),
+                id,
                 ReceiverStream::new(conn_rx),
                 OutboundQueue::new(out_tx),
             ));
-            (conn_tx, out_rx, task)
-        };
-        async fn next_request(rx: &mut Receiver<BytesMut>, within: Duration) -> bool {
+            Self { id, inbound, outbound, task }
+        }
+
+        async fn announce(&self, ids: &[MsgID]) {
+            self.inbound.send(frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(ids))).await.unwrap();
+            // Let the connection task handle the frame before the next peer.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        /// Whether a `GetBoardMessages` reaches this peer within `within`.
+        async fn asked_within(&mut self, within: Duration) -> bool {
             tokio::time::timeout(within, async {
-                while let Some(f) = rx.recv().await {
+                while let Some(f) = self.outbound.recv().await {
                     if f[0] == GET_BOARD_MESSAGES {
                         return true;
                     }
@@ -3540,30 +3558,85 @@ mod tests {
             .await
             .unwrap_or(false)
         }
+    }
 
-        let (a_in, mut a_out, a_task) = spawn_peer(peer_a);
-        let (b_in, mut b_out, b_task) = spawn_peer(peer_b);
+    impl Drop for SilentPeer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
 
-        // A announces first and is asked. It never answers.
-        a_in.send(announce.clone()).await.unwrap();
-        assert!(next_request(&mut a_out, Duration::from_secs(2)).await, "A is asked first");
+    /// A peer that announces a message and then withholds it must not keep the
+    /// message from us.
+    ///
+    /// The first announcer holds the in-flight claim, and every later announcer
+    /// is suppressed. If the first one never answers, a later announcer must be
+    /// asked once the claim expires, and the withholding peer must pay for the
+    /// reservation it left unspent.
+    #[tokio::test(start_paused = true)]
+    async fn a_withholding_announcer_does_not_censor_the_message() {
+        let board = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let ids = wantable_ids(1);
+        let mut a = SilentPeer::spawn(&board, &rep, 0xA1);
+        let mut b = SilentPeer::spawn(&board, &rep, 0xB2);
 
-        // B announces the same message while A's claim is live.
-        b_in.send(announce).await.unwrap();
+        a.announce(&ids).await;
+        assert!(a.asked_within(Duration::from_secs(2)).await, "A is asked first");
+
+        b.announce(&ids).await;
         assert!(
-            next_request(&mut b_out, PENDING_REQUEST_TTL + Duration::from_secs(3)).await,
+            b.asked_within(PENDING_REQUEST_TTL + Duration::from_secs(3)).await,
             "B announced the withheld message but was never asked for it",
         );
 
-        // A's reservation runs out unspent.
-        let deadline = Instant::now() + WANT_TIMEOUT + Duration::from_secs(3);
-        while !rep.penalised(peer_a) && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(WANT_TIMEOUT).await;
+        assert!(rep.penalised(a.id), "A withheld a message it announced and paid nothing");
+    }
+
+    /// Sybils that announce first must not push an honest late announcer out of
+    /// the alternate list. Five withholding peers exceed the four alternates a
+    /// claim keeps; the honest sixth announcer must still be asked.
+    #[tokio::test(start_paused = true)]
+    async fn five_withholding_sybils_do_not_censor_an_honest_announcer() {
+        let board = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let ids = wantable_ids(1);
+        let sybils: Vec<SilentPeer> = (1..=5).map(|n| SilentPeer::spawn(&board, &rep, n)).collect();
+        let mut honest = SilentPeer::spawn(&board, &rep, 0x77);
+
+        for s in &sybils {
+            s.announce(&ids).await;
         }
-        a_task.abort();
-        b_task.abort();
-        assert!(rep.penalised(peer_a), "A withheld a message it announced and paid nothing");
-        assert!(!rep.penalised(peer_b), "B did nothing wrong");
+        honest.announce(&ids).await;
+
+        assert!(
+            honest.asked_within(PENDING_REQUEST_TTL * 6).await,
+            "five withholding sybils kept the message from the honest announcer",
+        );
+    }
+
+    /// A peer asked only because another peer withheld may no longer hold the
+    /// message: by the time the retry reaches it, it may have evicted or
+    /// pruned it, and a responder sends nothing for a hash it lacks. That is
+    /// not withholding, so it must not cost reputation.
+    #[tokio::test(start_paused = true)]
+    async fn an_alternate_that_no_longer_holds_the_message_is_not_penalised() {
+        let board = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let ids = wantable_ids(1);
+        let mut a = SilentPeer::spawn(&board, &rep, 0xA1);
+        let mut b = SilentPeer::spawn(&board, &rep, 0xB2);
+
+        a.announce(&ids).await;
+        assert!(a.asked_within(Duration::from_secs(2)).await);
+        b.announce(&ids).await;
+        assert!(b.asked_within(PENDING_REQUEST_TTL + Duration::from_secs(3)).await);
+
+        // Well past B's reservation expiry.
+        tokio::time::sleep(WANT_TIMEOUT * 2).await;
+        assert!(rep.penalised(a.id), "A withheld first-hand");
+        assert!(!rep.penalised(b.id), "B was struck for a retry it could not answer");
     }
 
     /// A board that becomes ready while the peer is silent must still announce.
@@ -3707,7 +3780,7 @@ mod tests {
     /// A want list authorising exactly these hashes.
     fn authorised_for_hashes(hashes: &[B256]) -> WantList {
         let mut wants = WantList::default();
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         for h in hashes {
             assert!(wants.reserve(*h, now), "reservation for {h} refused");
         }
