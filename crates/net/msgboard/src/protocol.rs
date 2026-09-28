@@ -840,11 +840,12 @@ fn reporter_as_deref(opt: Option<&Arc<dyn PeerReporter>>) -> Option<&dyn PeerRep
 ///
 /// While the board is not ready (initial sync still in progress) all opcodes
 /// short-circuit — mirroring erigon-pulse `handleInboundMessage`'s `Started()`
-/// guard. Same behaviour when `cfg.gossip_disabled` is set: a read-only
-/// observer must not request bodies, serve `GetBoardMessages` from a
-/// potentially-stale DB, or accept new messages. `BoardMessages` payloads
-/// continue to be drained off the wire so peers don't stall, but their
-/// contents are dropped.
+/// guard. When `cfg.gossip_disabled` is set, a read-only observer does not
+/// request bodies or accept new messages. `BoardMessages` payloads continue to
+/// be drained off the wire so peers don't stall, but their contents are
+/// dropped. It still serves `GetBoardMessages`, as erigon does: its
+/// `GET_BOARD_MESSAGES` arm checks only `Ready()`, and `NoGossip` gates only
+/// our own announcements (`msgboard/fetch.go`, `msgboard/board.go`).
 ///
 /// A `BoardMessages` frame is verified only as far as `wants` authorises. The
 /// authorisation is spent per message, not per frame, and a message that
@@ -1123,7 +1124,21 @@ async fn handle_incoming(
             if authorised.is_empty() {
                 return Sent::Ok;
             }
-            let (added, kickable) = board.add_remote_wire_msgs(authorised);
+            // Verification is a secp256k1 scalar multiplication per message,
+            // so it runs off the async worker. The board takes its lock only
+            // briefly around lookups and the insert, never across the check.
+            let verifier = Arc::clone(board);
+            let (added, kickable) = match tokio::task::spawn_blocking(move || {
+                verifier.add_remote_wire_msgs(authorised)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::error!(target: "msgboard", ?peer_id, %err, "msgboard ingest task failed");
+                    return Sent::Ok;
+                }
+            };
             report_ingest(reporter, &metrics, peer_id, added, kickable);
             return Sent::Ok;
         }
@@ -3474,10 +3489,11 @@ mod tests {
     ///
     /// `BAD_MESSAGE_REPUTATION_CHANGE` is 16 units and `BANNED_REPUTATION` is
     /// 50, so four hits ban a peer for 12 hours. The frame used to be worth
-    /// 1,190 of them. It is now worth as many as the peer was authorised for,
-    /// which is the number of messages it actually asked us to verify.
+    /// 1,190 of them. Verification now stops at the first kickable message,
+    /// as erigon's `AddRemoteWireMsgs` does, so a frame is worth one hit
+    /// however many messages it was authorised for.
     #[tokio::test]
-    async fn one_frame_earns_at_most_one_penalty_per_authorised_message() {
+    async fn one_frame_earns_at_most_one_penalty() {
         let board = board_with_cfg(MsgboardConfig::default(), 10);
         let rep = Arc::new(RecordingReporter::default());
         let (tx, _rx) = channel();
@@ -3489,8 +3505,8 @@ mod tests {
 
         assert_eq!(
             rep.bad_message(),
-            AUTHORISED,
-            "a {count}-message frame may only be penalised for what it was asked for",
+            1,
+            "a {count}-message frame with {AUTHORISED} authorised is penalised once",
         );
     }
 
