@@ -21,6 +21,7 @@
 //! `wantList.Take` (`msgboard/fetch.go`, `pulse-v3.4.4`).
 
 use std::{
+    collections::{HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -324,7 +325,55 @@ pub trait PeerReporter: std::fmt::Debug + Send + Sync {
     /// Peer delivered a wire-level malformed payload (unparseable RLP,
     /// `MsgID` list whose length is not a multiple of `MSG_ID_SIZE`, …).
     fn report_bad_protocol(&self, peer_id: PeerId);
+
+    /// Peer asked for more reply bytes than its budget holds. See
+    /// [`SERVE_BURST_BYTES`].
+    fn report_over_budget(&self, peer_id: PeerId);
+
+    /// Peer asked again for a message we served it inside
+    /// [`REPEAT_REQUEST_WINDOW`].
+    fn report_repeated_request(&self, peer_id: PeerId);
 }
+
+/// Reply bytes one peer may make us send at once.
+///
+/// A `GetBoardMessages` frame is at most 8 KiB but names up to 256 bodies,
+/// about 2.1 MB at the default 8 KiB `size_limit`, so one request is a ~260x
+/// amplifier. The burst holds one full reply with room to spare, and about
+/// half of the ~8.7 MB a peer can owe us at once under [`MAX_WANT_PER_PEER`].
+/// A peer that syncs a full board of maximum-size messages from us can meet
+/// the budget. It then gets a few requests refused and fetches those messages
+/// from another peer once its own reservation times out.
+const SERVE_BURST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Rate at which a peer's reply budget refills.
+///
+/// Gossip of new messages is a trickle next to this. At 1 MiB/s an honest
+/// peer still drains a full default board of maximum-size messages (~87 MB)
+/// from us in under two minutes, and one looping peer can make us upload at
+/// most 1 MiB/s.
+const SERVE_REFILL_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+/// How long a served message stays "recent" for the peer it went to.
+///
+/// Twice `WANT_TIMEOUT`: an honest peer asks again only after its own
+/// reservation for the message expires, and only if the reply was lost.
+const REPEAT_REQUEST_WINDOW: Duration = Duration::from_secs(30);
+
+/// Most served hashes remembered per connection for repeat detection.
+///
+/// 2048 x 32 bytes is 64 KiB per peer. Past it the oldest entries go first,
+/// which only weakens detection. The reply budget still bounds the cost.
+const MAX_RECENTLY_SERVED: usize = 2048;
+
+/// Reputation cost of a request refused for budget. One unit, because an
+/// honest peer that syncs a large board from us can meet the budget.
+const OVER_BUDGET_REPUTATION_CHANGE: i32 = -1024;
+
+/// Reputation cost of asking again for a message we just served. Four units,
+/// the weight of a timeout: an honest peer does it only after a lost reply,
+/// but a looping peer does it every time.
+const REPEATED_REQUEST_REPUTATION_CHANGE: i32 = -4 * 1024;
 
 /// `RLPx` sub-protocol handler for `msg/1`.
 ///
@@ -495,11 +544,18 @@ struct OutboundQueue {
     /// accepts anything again. Only ever touched from the connection task;
     /// atomic rather than [`std::cell::Cell`] so the task's future stays `Send`.
     stalled: AtomicBool,
+    /// What this peer may still make us send in replies. Only the connection
+    /// task locks it, and never across an `.await`.
+    serve: parking_lot::Mutex<ServeBudget>,
 }
 
 impl OutboundQueue {
-    const fn new(tx: mpsc::Sender<BytesMut>) -> Self {
-        Self { tx, stalled: AtomicBool::new(false) }
+    fn new(tx: mpsc::Sender<BytesMut>) -> Self {
+        Self {
+            tx,
+            stalled: AtomicBool::new(false),
+            serve: parking_lot::Mutex::new(ServeBudget::new(tokio::time::Instant::now())),
+        }
     }
 
     /// Queue one frame for the peer, waiting for room until `deadline`.
@@ -561,6 +617,69 @@ impl OutboundQueue {
     #[cfg(test)]
     fn capacity(&self) -> usize {
         self.tx.capacity()
+    }
+}
+
+/// A token bucket of reply bytes for one peer, plus the hashes it was served
+/// recently.
+///
+/// Time is `tokio`'s, so paused-clock tests control the refill.
+#[derive(Debug)]
+struct ServeBudget {
+    tokens: u64,
+    refilled_at: tokio::time::Instant,
+    /// Served hashes in serve order. Every entry shares one window, so the
+    /// front is always the oldest.
+    recent: VecDeque<(B256, tokio::time::Instant)>,
+    recent_set: HashSet<B256>,
+}
+
+impl ServeBudget {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            tokens: SERVE_BURST_BYTES,
+            refilled_at: now,
+            recent: VecDeque::new(),
+            recent_set: HashSet::new(),
+        }
+    }
+
+    /// Take `cost` bytes if the bucket holds them. Takes nothing otherwise.
+    fn try_spend(&mut self, cost: u64, now: tokio::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled_at);
+        let refill = (elapsed.as_micros() * u128::from(SERVE_REFILL_BYTES_PER_SEC) / 1_000_000)
+            .min(u128::from(SERVE_BURST_BYTES)) as u64;
+        self.tokens = (self.tokens + refill).min(SERVE_BURST_BYTES);
+        self.refilled_at = now;
+        if cost > self.tokens {
+            return false;
+        }
+        self.tokens -= cost;
+        true
+    }
+
+    /// Whether `hash` went to this peer inside [`REPEAT_REQUEST_WINDOW`].
+    fn is_recent(&mut self, hash: &B256, now: tokio::time::Instant) -> bool {
+        while let Some(&(old, at)) = self.recent.front() {
+            if now.saturating_duration_since(at) < REPEAT_REQUEST_WINDOW {
+                break;
+            }
+            self.recent.pop_front();
+            self.recent_set.remove(&old);
+        }
+        self.recent_set.contains(hash)
+    }
+
+    fn record(&mut self, hash: B256, now: tokio::time::Instant) {
+        if !self.recent_set.insert(hash) {
+            return;
+        }
+        if self.recent.len() == MAX_RECENTLY_SERVED &&
+            let Some((old, _)) = self.recent.pop_front()
+        {
+            self.recent_set.remove(&old);
+        }
+        self.recent.push_back((hash, now));
     }
 }
 
@@ -908,10 +1027,43 @@ async fn handle_incoming(
             if !ready {
                 return Sent::Ok;
             }
-            let msgs = board.get_wire_messages_for_hashes(&hashes);
-            if msgs.is_empty() {
-                return Sent::Ok;
-            }
+            let msgs = {
+                let now = tokio::time::Instant::now();
+                let mut serve = tx.serve.lock();
+                // A hash we just served is dropped from the request, not
+                // served again: re-sending it is exactly the loop that makes
+                // this opcode an amplifier.
+                let fresh: Vec<B256> =
+                    hashes.iter().copied().filter(|h| !serve.is_recent(h, now)).collect();
+                if fresh.len() < hashes.len() {
+                    metrics.requests_repeated.increment(1);
+                    if let Some(r) = reporter {
+                        r.report_repeated_request(peer_id);
+                    }
+                }
+                let msgs = board.get_wire_messages_for_hashes(&fresh);
+                if msgs.is_empty() {
+                    return Sent::Ok;
+                }
+                let cost: usize = msgs.iter().map(Encodable::length).sum();
+                if !serve.try_spend(cost as u64, now) {
+                    tracing::debug!(
+                        target: "msgboard",
+                        ?peer_id,
+                        cost,
+                        "GetBoardMessages reply exceeds the peer's budget",
+                    );
+                    metrics.requests_over_budget.increment(1);
+                    if let Some(r) = reporter {
+                        r.report_over_budget(peer_id);
+                    }
+                    return Sent::Ok;
+                }
+                for msg in &msgs {
+                    serve.record(msg.hash, now);
+                }
+                msgs
+            };
             metrics.bodies_served.increment(msgs.len() as u64);
             return send_packed_bodies(
                 &metrics,
@@ -1184,6 +1336,18 @@ where
     fn report_bad_protocol(&self, peer_id: PeerId) {
         self.network.reputation_change(peer_id, ReputationChangeKind::BadProtocol);
     }
+
+    fn report_over_budget(&self, peer_id: PeerId) {
+        self.network
+            .reputation_change(peer_id, ReputationChangeKind::Other(OVER_BUDGET_REPUTATION_CHANGE));
+    }
+
+    fn report_repeated_request(&self, peer_id: PeerId) {
+        self.network.reputation_change(
+            peer_id,
+            ReputationChangeKind::Other(REPEATED_REQUEST_REPUTATION_CHANGE),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1214,6 +1378,8 @@ mod tests {
     struct RecordingReporter {
         bad_message: Mutex<usize>,
         bad_protocol: Mutex<usize>,
+        over_budget: Mutex<usize>,
+        repeated: Mutex<usize>,
     }
 
     impl RecordingReporter {
@@ -1223,6 +1389,12 @@ mod tests {
         fn bad_protocol(&self) -> usize {
             *self.bad_protocol.lock().unwrap()
         }
+        fn over_budget(&self) -> usize {
+            *self.over_budget.lock().unwrap()
+        }
+        fn repeated(&self) -> usize {
+            *self.repeated.lock().unwrap()
+        }
     }
 
     impl PeerReporter for RecordingReporter {
@@ -1231,6 +1403,12 @@ mod tests {
         }
         fn report_bad_protocol(&self, _peer_id: PeerId) {
             *self.bad_protocol.lock().unwrap() += 1;
+        }
+        fn report_over_budget(&self, _peer_id: PeerId) {
+            *self.over_budget.lock().unwrap() += 1;
+        }
+        fn report_repeated_request(&self, _peer_id: PeerId) {
+            *self.repeated.lock().unwrap() += 1;
         }
     }
 
@@ -3931,6 +4109,82 @@ mod tests {
         assert_eq!(a.rep.bad_message() + a.rep.bad_protocol(), 0);
         assert_eq!(b.rep.bad_message() + b.rep.bad_protocol(), 0);
         assert!(deliver(&mut b, &mut a).await.is_empty(), "a converged link falls silent");
+    }
+
+    // ── reply budget ─────────────────────────────────────────────────────────
+
+    /// One 8 KiB `GetBoardMessages` can name ~2 MB of bodies, and a peer can
+    /// send it again as soon as the reply leaves. Looping one request must
+    /// stop costing us reply bytes once the peer's budget is spent.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_request_stops_at_the_reply_budget() {
+        let board = board_at(10);
+        let ids = seed_multi_frame_response(&board);
+        let request = frame(GET_BOARD_MESSAGES, &get_request(&ids));
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, mut rx) = channel();
+
+        let mut reply_bytes = 0;
+        let mut one_reply = 0;
+        for i in 0..40 {
+            handle_incoming(
+                &board,
+                Some(rep.as_ref()),
+                &tx,
+                &mut WantList::default(),
+                request.clone(),
+                peer(),
+            )
+            .await;
+            let bytes: usize = drain(&mut rx).iter().map(BytesMut::len).sum();
+            if i == 0 {
+                one_reply = bytes;
+            }
+            reply_bytes += bytes;
+        }
+
+        assert!(
+            reply_bytes <= SERVE_BURST_BYTES as usize + one_reply,
+            "40 copies of one request cost {reply_bytes} reply bytes; each reply is {one_reply}",
+        );
+        assert_eq!(rep.repeated(), 39, "every repeat after the first reply is penalised");
+    }
+
+    /// Distinct requests are bounded by the token bucket, which refills with
+    /// time.
+    #[tokio::test(start_paused = true)]
+    async fn the_reply_budget_refuses_past_the_burst_and_refills() {
+        let now = tokio::time::Instant::now();
+        let mut budget = ServeBudget::new(now);
+        assert!(budget.try_spend(SERVE_BURST_BYTES, now), "a full burst is allowed");
+        assert!(!budget.try_spend(1, now), "an empty bucket refuses");
+        let later = now + Duration::from_secs(1);
+        assert!(budget.try_spend(SERVE_REFILL_BYTES_PER_SEC, later), "one second refills");
+        assert!(!budget.try_spend(1, later));
+    }
+
+    /// A request over budget is refused whole and costs the peer reputation.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_over_budget_is_refused_and_penalised() {
+        let board = board_at(10);
+        let ids = seed_multi_frame_response(&board);
+        let rep = Arc::new(RecordingReporter::default());
+        let (tx, mut rx) = channel();
+        let drained = tx.serve.lock().try_spend(SERVE_BURST_BYTES, tokio::time::Instant::now());
+        assert!(drained);
+
+        handle_incoming(
+            &board,
+            Some(rep.as_ref()),
+            &tx,
+            &mut WantList::default(),
+            frame(GET_BOARD_MESSAGES, &get_request(&ids)),
+            peer(),
+        )
+        .await;
+
+        assert!(drain(&mut rx).is_empty(), "nothing is served over budget");
+        assert_eq!(rep.over_budget(), 1);
     }
 
     // ── inbound queue bound ──────────────────────────────────────────────────
