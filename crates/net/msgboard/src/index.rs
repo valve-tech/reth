@@ -90,6 +90,31 @@ impl MsgIndex {
         Some(msg)
     }
 
+    /// Remove every message anchored below block `lower`, in index order.
+    ///
+    /// The comparator orders by block first, so those messages form a prefix
+    /// of `msgs`. One `drain` removes it. Removing them one at a time costs a
+    /// shift of the whole vec per message, all under the board mutex.
+    pub fn remove_below_block(&mut self, lower: u64) -> Vec<Arc<CheckedPoWMsg>> {
+        debug_assert!(
+            self.msgs.windows(2).all(|w| w[0].block_number <= w[1].block_number),
+            "the index must be sorted by block",
+        );
+        let end = self.msgs.partition_point(|m| m.block_number < lower);
+        let removed: Vec<_> = self.msgs.drain(..end).collect();
+        for msg in &removed {
+            self.by_hash.remove(&msg.hash);
+            self.total_size = self.total_size.saturating_sub(msg.msg.data.len() as u64);
+            if let Some(cat_map) = self.categories.get_mut(&msg.msg.category) {
+                cat_map.remove(&msg.hash);
+                if cat_map.is_empty() {
+                    self.categories.remove(&msg.msg.category);
+                }
+            }
+        }
+        removed
+    }
+
     /// Remove and return the oldest message (smallest `block_number` / `difficulty_ratio`).
     pub fn evict_oldest(&mut self) -> Option<Arc<CheckedPoWMsg>> {
         let hash = self.msgs.first()?.hash;
@@ -895,5 +920,74 @@ mod tests {
             idx.insert(msg(block, data));
         }
         assert_eq!(order(&idx), vec![0, 5, 1, 6, 2, 7, 3, 8, 4, 9]);
+    }
+
+    /// Draining the stale prefix leaves the index exactly as removing the
+    /// stale messages one at a time does, on many random boards.
+    #[test]
+    fn remove_below_block_matches_removing_one_at_a_time() {
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for round in 0..500u64 {
+            let n = next() % 60;
+            let msgs: Vec<Arc<CheckedPoWMsg>> = (0..n)
+                .map(|i| {
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&round.to_be_bytes());
+                    hash[8..16].copy_from_slice(&i.to_be_bytes());
+                    Arc::new(CheckedPoWMsg {
+                        msg: PoWMsg {
+                            version: VERSION_V1,
+                            block_hash: block_hash_one(),
+                            nonce: 1,
+                            work_multiplier: 1 + next() % 5,
+                            work_divisor: 1_000_000,
+                            category: category((next() % 4) as u8),
+                            data: alloy_primitives::Bytes::from(vec![0u8; (next() % 9) as usize]),
+                        },
+                        block_number: next() % 20,
+                        timestamp: 0,
+                        hash: B256::from(hash),
+                    })
+                })
+                .collect();
+            let lower = next() % 22;
+
+            let mut old = MsgIndex::default();
+            let mut new = MsgIndex::default();
+            for msg in &msgs {
+                old.insert(Arc::clone(msg));
+                new.insert(Arc::clone(msg));
+            }
+
+            let stale: Vec<B256> =
+                old.all_msgs().iter().filter(|m| m.block_number < lower).map(|m| m.hash).collect();
+            let old_removed: Vec<B256> =
+                stale.iter().filter_map(|h| old.remove(h)).map(|m| m.hash).collect();
+            let new_removed: Vec<B256> =
+                new.remove_below_block(lower).iter().map(|m| m.hash).collect();
+
+            assert_eq!(new_removed, old_removed, "round {round}: removed set");
+            let hashes = |idx: &MsgIndex| idx.all_msgs().iter().map(|m| m.hash).collect::<Vec<_>>();
+            assert_eq!(hashes(&new), hashes(&old), "round {round}: remaining order");
+            assert_eq!(new.total_size(), old.total_size(), "round {round}: size");
+            let cats = |idx: &MsgIndex| {
+                let mut c: Vec<B256> = idx.categories().copied().collect();
+                c.sort();
+                c.into_iter()
+                    .map(|cat| (cat, idx.category_msgs(&cat).map(|m| m.hash).collect::<Vec<_>>()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(cats(&new), cats(&old), "round {round}: categories");
+            for h in &old_removed {
+                assert!(!new.has(h) && new.get(h).is_none(), "round {round}: hash lookup");
+            }
+        }
     }
 }
