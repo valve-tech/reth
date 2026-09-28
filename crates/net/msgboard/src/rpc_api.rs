@@ -3,6 +3,10 @@
 //! Exposes the `PulseChain` `msg/1` board over JSON-RPC. All methods are
 //! prefixed with `msgboard_` and the subscription fires on every new
 //! accepted message.
+//!
+//! The namespace is `msgboard`. `--http.api all` (and the `ws`/`ipc`
+//! equivalents) includes it, so it exposes `msgboard_addMessage` as well as
+//! the read methods.
 
 use std::collections::HashMap;
 
@@ -160,12 +164,18 @@ pub trait MsgboardApi {
     /// ascending difficulty ratio — *before* the messages are grouped by
     /// category. Grouping preserves that relative order inside each category,
     /// so a client that raises `offset` by `limit` each call walks the board
-    /// once, in order, with no gaps and no repeats.
+    /// once, in order, with no gaps and no repeats, provided it raises
+    /// `offset` by the count each page actually returned.
     ///
-    /// A response holding exactly `limit` messages may be truncated. That is
-    /// the only truncation signal: the result shape is fixed by erigon parity,
-    /// so there is nowhere to put a cursor. Page until a response comes back
-    /// short.
+    /// A page also stops once the `data` fields it holds pass
+    /// [`CONTENT_PAGE_DATA_BYTES`], so a page can hold fewer than `limit`
+    /// messages while more remain. It always holds at least one message if
+    /// any remain at `offset`.
+    ///
+    /// The result shape is fixed by erigon parity, so there is nowhere to put
+    /// a cursor. To walk the board, raise `offset` by the number of messages
+    /// the last page returned, and stop when a page comes back empty. A short
+    /// page does not mean the walk is done.
     #[method(name = "content")]
     async fn msgboard_content(
         &self,
@@ -218,8 +228,9 @@ pub trait MsgboardApi {
 /// of JSON built from 81,920,000 bytes of `data`, and building plus serialising
 /// it takes about 11 s on one runtime worker. That lands 0.26% under the
 /// 160 MiB `--rpc.max-response-size` default, so a board a little fuller pays
-/// the whole cost and jsonrpsee then refuses to send the result. At this cap
-/// the same board answers in 16,734,072 bytes.
+/// the whole cost and jsonrpsee then refuses to send the result. A 1,000-message
+/// page of that board is 16,734,072 bytes, but [`CONTENT_PAGE_DATA_BYTES`]
+/// stops it first, at 512 messages.
 /// `measure_content_on_a_full_board` reproduces both figures.
 ///
 /// Capping the page turns that into an answer a client can use, and paging
@@ -231,6 +242,16 @@ pub const CONTENT_DEFAULT_LIMIT: usize = 1_000;
 /// An explicit request for more is refused rather than clamped: a clamped page
 /// is short but looks complete, and the caller cannot tell.
 pub const CONTENT_MAX_LIMIT: usize = 5_000;
+
+/// Bytes of message `data` after which a
+/// [`MsgboardApiServer::msgboard_content`] page stops.
+///
+/// `limit` counts messages, not bytes: at [`CONTENT_MAX_LIMIT`] and an 8 KiB
+/// `size_limit`, one page would copy about 40 MB of `data` and serialise it to
+/// about 80 MB of hex. This cap holds one page to about 4 MiB of `data` (about
+/// 8 MiB of JSON) whatever `limit` says. The message that crosses the cap is
+/// left for the next page, except when it is the first message of the page.
+pub const CONTENT_PAGE_DATA_BYTES: usize = 4 * 1024 * 1024;
 
 #[cfg(test)]
 mod wire_shape_tests {

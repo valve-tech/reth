@@ -21,7 +21,7 @@ use crate::{
     metrics::MsgboardMetrics,
     rpc_api::{
         ContentFilter, MsgboardApiServer, MsgboardMsg, MsgboardStatus, NewMessagesFilter,
-        CONTENT_DEFAULT_LIMIT, CONTENT_MAX_LIMIT,
+        CONTENT_DEFAULT_LIMIT, CONTENT_MAX_LIMIT, CONTENT_PAGE_DATA_BYTES,
     },
 };
 
@@ -116,7 +116,15 @@ impl MsgboardApiServer for MsgboardApi {
         };
 
         let mut grouped: HashMap<String, Vec<MsgboardMsg>> = HashMap::new();
-        for m in msgs.iter().skip(offset).take(limit) {
+        let mut page_bytes = 0usize;
+        for (i, m) in msgs.iter().skip(offset).take(limit).enumerate() {
+            // The first message always goes in, so a page is never empty
+            // while messages remain and a caller paging by `offset` always
+            // advances.
+            page_bytes += m.msg.data.len();
+            if i > 0 && page_bytes > CONTENT_PAGE_DATA_BYTES {
+                break;
+            }
             let rpc = to_rpc_msg(m);
             // Lowercase 0x-hex matches alloy's Display impl and erigon-pulse output.
             let key = rpc.category.to_string();
@@ -267,7 +275,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::rpc_api::{CONTENT_DEFAULT_LIMIT, CONTENT_MAX_LIMIT};
+    use crate::rpc_api::{CONTENT_DEFAULT_LIMIT, CONTENT_MAX_LIMIT, CONTENT_PAGE_DATA_BYTES};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -802,6 +810,39 @@ mod tests {
 
         let v: Value = m.call("msgboard_content", rpc_params_none()).await.unwrap();
         assert_eq!(total_msgs(&v), 5);
+    }
+
+    /// `limit` counts messages, so a large limit on a board of full-size
+    /// messages would build a response tens of megabytes wide. The byte cap
+    /// stops the page first, and a walk that raises `offset` by the returned
+    /// count still covers the board once.
+    #[tokio::test]
+    async fn content_page_stops_at_the_data_byte_cap() {
+        const DATA_LEN: usize = 8 * 1024;
+        let per_page = CONTENT_PAGE_DATA_BYTES / DATA_LEN;
+        let total = per_page + 40;
+        let m = module(filled_board(total, DATA_LEN));
+
+        let v: Value =
+            m.call("msgboard_content", vec![json!({"limit": CONTENT_MAX_LIMIT})]).await.unwrap();
+        assert_eq!(total_msgs(&v), per_page, "the page must stop at the byte cap, not at limit");
+
+        let mut offset = 0;
+        loop {
+            let v: Value = m
+                .call(
+                    "msgboard_content",
+                    vec![json!({"limit": CONTENT_MAX_LIMIT, "offset": offset})],
+                )
+                .await
+                .unwrap();
+            let n = total_msgs(&v);
+            if n == 0 {
+                break;
+            }
+            offset += n;
+        }
+        assert_eq!(offset, total, "paging by the returned count must reach every message");
     }
 
     #[tokio::test]
