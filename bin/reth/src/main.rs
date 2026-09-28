@@ -198,6 +198,9 @@ fn run_ethereum_node() -> eyre::Result<()> {
                 sync_firehose_replica_env(replica);
             }
             let launcher = MsgboardLauncher::new(msgboard_args);
+            // A signal drops this future before the `final_flush` below runs.
+            // The guard flushes the board when that happens.
+            let _flush_guard = launcher.flush_guard();
 
             if firehose_enabled {
                 info!(target: "reth::cli", "Launching Ethereum node (firehose-instrumented)");
@@ -289,6 +292,9 @@ fn run_pulsechain_node() -> eyre::Result<()> {
             );
 
             let launcher = MsgboardLauncher::new(msgboard_args);
+            // A signal drops this future before the `final_flush` below runs.
+            // The guard flushes the board when that happens.
+            let _flush_guard = launcher.flush_guard();
             let launcher_for_rpc = launcher.clone();
 
             if firehose_enabled {

@@ -9,8 +9,8 @@
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Weak,
     },
     time::{Instant, SystemTime},
 };
@@ -40,13 +40,23 @@ use crate::{
 /// storm under sustained ingest, which degenerates with peer count.
 const BROADCAST_CAPACITY: usize = 1024;
 
+/// Consecutive failed flushes after which the periodic flush logs at ERROR.
+///
+/// At the default 15 s `commit_every` this is one minute of failed writes.
+/// A single failure is often transient. Four in a row means the board is not
+/// reaching disk, and a restart loses everything since the last success.
+const FLUSH_FAILURES_BEFORE_ERROR: u64 = 4;
+
 #[derive(Debug)]
 struct BoardState {
     index: MsgIndex,
     block_filter: BlockFilter,
-    /// Messages evicted from the index, waiting for the next flush to delete
-    /// their rows. Always empty when `persists` is false.
-    discarded: Vec<Arc<CheckedPoWMsg>>,
+    /// Hashes of messages that left the index, waiting for the next flush to
+    /// delete their rows. Always empty when `persists` is false.
+    ///
+    /// Only hashes are kept. A message body is up to 8 KiB, and nothing needs
+    /// it to delete a row.
+    discarded: HashSet<B256>,
     /// Hashes inserted since the last successful flush. A flush writes these
     /// rows and no others. Always empty when `persists` is false.
     dirty: HashSet<B256>,
@@ -69,9 +79,17 @@ impl BoardState {
     /// body alive with it. Dropping the message here bounds the list by
     /// construction rather than by how often a flush happens to run, and it
     /// costs nothing: there is no row on disk to delete.
+    ///
+    /// A message still in the write set never reached disk, so there is no row
+    /// to delete. It leaves the write set and does not enter the deletion set.
+    /// This keeps both sets bounded while flushes fail: the write set by the
+    /// index, and the deletion set by the rows on disk at the last success.
+    /// A message taken by an in-flight flush is no longer in the write set, so
+    /// it does enter the deletion set, which covers the case where that flush
+    /// commits it.
     fn discard(&mut self, msg: Arc<CheckedPoWMsg>) {
-        if self.persists {
-            self.discarded.push(msg);
+        if self.persists && !self.dirty.remove(&msg.hash) {
+            self.discarded.insert(msg.hash);
         }
     }
 
@@ -98,6 +116,15 @@ pub struct MsgBoard {
     new_msg_tx: broadcast::Sender<Arc<CheckedPoWMsg>>,
     /// Optional MDBX environment for persistent storage.
     db: Option<Environment>,
+    /// Held from taking a flush batch until its transaction commits or the
+    /// batch is handed back.
+    ///
+    /// Two flushes can run at once: the periodic one on a blocking thread and
+    /// the one at shutdown. Without this lock the later batch can commit first,
+    /// and the earlier one then writes back a row the later one deleted.
+    flush_lock: Mutex<()>,
+    /// Flushes that failed since the last one that succeeded.
+    consecutive_flush_failures: AtomicU64,
     /// Whether the node has finished initial sync and the board is accepting
     /// messages. Starts `false`; flips to `true` exactly once when the caller
     /// signals sync completion via [`MsgBoard::set_ready`].
@@ -123,7 +150,7 @@ impl MsgBoard {
         let state = BoardState {
             index: MsgIndex::default(),
             block_filter: BlockFilter::new(cfg.block_range),
-            discarded: Vec::new(),
+            discarded: HashSet::new(),
             dirty: HashSet::new(),
             pending: PendingRequests::default(),
             persists: db.is_some(),
@@ -133,6 +160,8 @@ impl MsgBoard {
             state: Mutex::new(state),
             new_msg_tx,
             db,
+            flush_lock: Mutex::new(()),
+            consecutive_flush_failures: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             metrics: MsgboardMetrics::default(),
         }
@@ -217,12 +246,28 @@ impl MsgBoard {
             // via the initial ID announcement on connect.
         }
 
+        // A database written under a larger `count_limit`, or by a node that
+        // lost its deletions, can hold more rows than the board may. Trim in
+        // the same order as a live insert does, so the survivors are the ones
+        // a board fed the same messages would keep.
+        let mut dropped_over_limit = 0u64;
+        {
+            let mut state = self.state.lock();
+            while state.index.len() > self.cfg.count_limit {
+                let Some(evicted) = state.index.evict_oldest() else { break };
+                state.discard(evicted);
+                dropped_over_limit += 1;
+            }
+        }
+        let loaded = loaded - dropped_over_limit;
+
         self.record_index_gauges();
         tracing::debug!(
             target: "msgboard",
             loaded,
             dropped_invalid,
             dropped_duplicate,
+            dropped_over_limit,
             "loaded messages from DB",
         );
         Ok(loaded)
@@ -240,9 +285,10 @@ impl MsgBoard {
     pub fn flush_to_db(&self) -> eyre::Result<u64> {
         let Some(ref env) = self.db else { return Ok(0) };
 
+        let _flushing = self.flush_lock.lock();
         let start = Instant::now();
         let batch = self.take_flush_batch();
-        let discarded_hashes: Vec<B256> = batch.discarded.iter().map(|m| m.hash).collect();
+        let discarded_hashes: Vec<B256> = batch.discarded.iter().copied().collect();
 
         let bytes = match db::db_flush(env, &batch.current, &discarded_hashes) {
             Ok(bytes) => bytes,
@@ -252,9 +298,12 @@ impl MsgBoard {
                 // happen and the writes never land: this is the only record
                 // that either is outstanding.
                 self.restore_flush_batch(batch);
+                self.consecutive_flush_failures.fetch_add(1, Ordering::Relaxed);
+                self.metrics.flush_failures.increment(1);
                 return Err(err);
             }
         };
+        self.consecutive_flush_failures.store(0, Ordering::Relaxed);
 
         self.metrics.write_to_db_duration_seconds.record(start.elapsed().as_secs_f64());
         self.metrics.write_to_db_bytes.set(bytes as f64);
@@ -283,21 +332,10 @@ impl MsgBoard {
             state.block_filter.set_head(height, hash);
             let lower = state.block_filter.lower();
 
-            // Collect stale hashes first to avoid borrowing issues.
-            let stale: Vec<B256> = state
-                .index
-                .all_msgs()
-                .iter()
-                .filter(|m| m.block_number < lower)
-                .map(|m| m.hash)
-                .collect();
-
-            let mut expired = 0u64;
-            for hash in stale {
-                if let Some(evicted) = state.index.remove(&hash) {
-                    state.discard(evicted);
-                    expired += 1;
-                }
+            let stale = state.index.remove_below_block(lower);
+            let expired = stale.len() as u64;
+            for evicted in stale {
+                state.discard(evicted);
             }
             self.metrics.expired.increment(expired);
             (state.index.len(), state.index.total_size())
@@ -699,9 +737,9 @@ impl MsgBoard {
     /// A board with no database queues none of them, so it always returns
     /// empty there. `flush_to_db` takes the same list as part of a whole
     /// batch, so that it can hand the batch back when the write fails.
-    pub fn take_discarded(&self) -> Vec<Arc<CheckedPoWMsg>> {
+    pub fn take_discarded(&self) -> Vec<B256> {
         let mut state = self.state.lock();
-        std::mem::take(&mut state.discarded)
+        std::mem::take(&mut state.discarded).into_iter().collect()
     }
 
     /// Snapshot of all currently indexed messages (for DB flush).
@@ -748,13 +786,15 @@ impl MsgBoard {
     /// have grown since [`take_flush_batch`](Self::take_flush_batch). The batch
     /// merges into what is there now; replacing it would drop every message
     /// inserted or discarded during the failed attempt.
+    ///
+    /// A hash whose message has left the index does not go back to the write
+    /// set. There is nothing to write, and the discard already put the hash in
+    /// the deletion set.
     fn restore_flush_batch(&self, batch: FlushBatch) {
         let mut state = self.state.lock();
-        state.dirty.extend(batch.dirty);
-        // Older discards go first, so the list keeps eviction order.
-        let mut discarded = batch.discarded;
-        discarded.append(&mut state.discarded);
-        state.discarded = discarded;
+        let state = &mut *state;
+        state.dirty.extend(batch.dirty.into_iter().filter(|hash| state.index.has(hash)));
+        state.discarded.extend(batch.discarded);
     }
 
     /// Insert a pre-verified `CheckedPoWMsg` into the index.
@@ -812,21 +852,39 @@ impl MsgBoard {
     ///
     /// Returns a `JoinHandle` that can be used to cancel the task. The handle
     /// is `'static` so it outlives the calling scope.
+    ///
+    /// The task holds a [`Weak`] handle and ends once the board is gone. A
+    /// strong one keeps the board alive for as long as the runtime runs, and
+    /// the flush in [`Drop`] never comes.
     pub fn spawn_flush_task(
         self: &Arc<Self>,
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
-        let board = Arc::clone(self);
+        let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
+                let Some(board) = weak.upgrade() else { break };
                 // `flush_to_db` writes every dirty row and fsyncs on commit.
                 // Run directly, that stalls a runtime worker for the whole
                 // transaction, and every task sharing the thread with it.
-                let board = Arc::clone(&board);
-                match tokio::task::spawn_blocking(move || board.flush_to_db()).await {
+                let flushing = Arc::clone(&board);
+                match tokio::task::spawn_blocking(move || flushing.flush_to_db()).await {
                     Ok(Ok(_)) => {}
-                    Ok(Err(e)) => tracing::warn!(target: "msgboard", %e, "DB flush failed"),
+                    Ok(Err(e)) => {
+                        let failures = board.consecutive_flush_failures.load(Ordering::Relaxed);
+                        if failures >= FLUSH_FAILURES_BEFORE_ERROR {
+                            tracing::error!(
+                                target: "msgboard",
+                                %e,
+                                failures,
+                                "DB flush keeps failing; a restart loses every message \
+                                 accepted since the last successful flush",
+                            );
+                        } else {
+                            tracing::warn!(target: "msgboard", %e, failures, "DB flush failed");
+                        }
+                    }
                     Err(e) => tracing::warn!(target: "msgboard", %e, "DB flush task failed"),
                 }
             }
@@ -841,10 +899,13 @@ impl MsgBoard {
         self: &Arc<Self>,
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
-        let board = Arc::clone(self);
+        // Weak for the same reason as the flush task: it must not keep the
+        // board alive past its last real owner.
+        let weak: Weak<Self> = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
+                let Some(board) = weak.upgrade() else { break };
                 let (ready, head, count, size, mult, div) = board.status();
                 tracing::info!(
                     target: "msgboard",
@@ -861,6 +922,23 @@ impl MsgBoard {
     }
 }
 
+impl Drop for MsgBoard {
+    /// Flush once more when the last handle goes.
+    ///
+    /// On SIGTERM or ctrl-c the CLI runner drops the node's future instead of
+    /// letting it return, so a final flush placed after the node exits never
+    /// runs. This flush covers that path. It blocks for one MDBX commit.
+    fn drop(&mut self) {
+        if self.db.is_none() {
+            return;
+        }
+        match self.flush_to_db() {
+            Ok(bytes) => tracing::debug!(target: "msgboard", bytes, "flushed msgboard on drop"),
+            Err(err) => tracing::warn!(target: "msgboard", %err, "msgboard flush on drop failed"),
+        }
+    }
+}
+
 /// One flush's worth of work, taken off the board under a single lock.
 ///
 /// Held apart from the board so a failed transaction can be handed back
@@ -873,8 +951,8 @@ struct FlushBatch {
     /// already left the index. Restoring them all is harmless: the next batch
     /// looks each one up again and drops the ones that are gone.
     dirty: HashSet<B256>,
-    /// Messages whose rows the transaction deletes.
-    discarded: Vec<Arc<CheckedPoWMsg>>,
+    /// Hashes of the rows the transaction deletes.
+    discarded: HashSet<B256>,
 }
 
 /// Current Unix timestamp in seconds.
@@ -1288,6 +1366,8 @@ mod tests {
         let nonce = find_nonce(&[8]);
         let msg = make_pow_msg(nonce, &[8]);
         board.add_local_msg(msg).expect("valid message");
+        // Store the row, so the prune has one to delete.
+        board.flush_to_db().expect("flush");
 
         let (_, _, count, _, _, _) = board.status();
         assert_eq!(count, 1);
@@ -1316,6 +1396,7 @@ mod tests {
         board.set_head(1, block_hash_one());
         let nonce = find_nonce(&[9]);
         board.add_local_msg(make_pow_msg(nonce, &[9])).expect("valid");
+        board.flush_to_db().expect("flush");
 
         let new_hash = {
             let mut b = [0u8; 32];
@@ -1541,6 +1622,8 @@ mod tests {
 
         board.add_local_msg(make_pow_msg(n0, &[30])).expect("msg 0");
         board.add_local_msg(make_pow_msg(n1, &[31])).expect("msg 1");
+        // Store both rows, so the eviction has one to delete.
+        board.flush_to_db().expect("flush");
 
         let (_, _, count, _, _, _) = board.status();
         assert_eq!(count, 2, "should have 2 messages before hitting limit");
@@ -1729,11 +1812,14 @@ mod tests {
         board.set_head(1, block_hash_one());
         let hash =
             board.add_local_msg(make_pow_msg(find_nonce(&[0x55]), &[0x55])).expect("valid").hash;
+        // Treat the message as stored by an earlier flush. A message that never
+        // reached disk has no row to delete, so its discard queues nothing.
+        board.state.lock().dirty.clear();
         board.set_head(4, hash_byte(0x04));
 
         let _ = board.flush_to_db().expect_err("the table is missing");
 
-        let kept: Vec<B256> = board.take_discarded().iter().map(|m| m.hash).collect();
+        let kept = board.take_discarded();
         assert_eq!(kept, vec![hash], "a failed flush must hand its deletion set back");
     }
 
@@ -1755,6 +1841,8 @@ mod tests {
             .add_local_msg(mine_for_block(hash_byte(0x02), 1_000_000, &[0x57]))
             .expect("valid")
             .hash;
+        // Both rows must be on disk, or their discards have nothing to delete.
+        board.flush_to_db().expect("flush");
 
         // Window [2, 4] drops the first message, and the flush takes it.
         board.set_head(4, hash_byte(0x04));
@@ -1767,8 +1855,8 @@ mod tests {
 
         board.restore_flush_batch(batch);
 
-        let kept: Vec<B256> = board.take_discarded().iter().map(|m| m.hash).collect();
-        assert_eq!(kept, vec![first, second], "both deletions survive, in eviction order");
+        let kept: HashSet<B256> = board.take_discarded().into_iter().collect();
+        assert_eq!(kept, HashSet::from([first, second]), "both deletions survive");
     }
 
     /// A flush writes what changed, not the whole board.
@@ -1855,6 +1943,81 @@ mod tests {
         assert_eq!(bad, 0);
         assert_eq!(loaded.len(), 1, "the message survived the failed flush and reached disk");
         assert_eq!(loaded[0].hash, small);
+    }
+
+    /// A database with more rows than `count_limit` loads a full board, not an
+    /// overfull one. The survivors are the ones live eviction keeps, and the
+    /// next flush deletes the rest from disk.
+    #[test]
+    fn loading_more_rows_than_the_count_limit_keeps_the_highest_precedence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MsgboardConfig { work_divisor: CHEAP_WORK_DIVISOR, ..easy_cfg() };
+        let block = |i: u64| B256::repeat_byte(i as u8);
+        let mut hashes = Vec::new();
+        {
+            let env = crate::db::open_msgboard_db(dir.path()).expect("open db");
+            let board = MsgBoard::with_db(cfg.clone(), env);
+            board.set_ready();
+            for i in 1..=5u64 {
+                board.set_head(i, block(i));
+                let msg = mine_for_block(block(i), CHEAP_WORK_DIVISOR, &[i as u8]);
+                hashes.push(board.add_local_msg(msg).expect("valid").hash);
+            }
+        }
+
+        let env = crate::db::open_msgboard_db(dir.path()).expect("reopen");
+        let board = MsgBoard::with_db(MsgboardConfig { count_limit: 3, ..cfg }, env);
+        assert_eq!(board.load_from_db().expect("load"), 3);
+        let kept: HashSet<B256> = board.all_messages().iter().map(|m| m.hash).collect();
+        assert_eq!(kept, hashes[2..].iter().copied().collect(), "the latest blocks survive");
+
+        board.flush_to_db().expect("flush");
+        let (rows, _) = crate::db::db_load_all(board.db.as_ref().unwrap()).expect("load");
+        assert_eq!(rows.len(), 3, "the flush deletes the trimmed rows");
+    }
+
+    /// A database that keeps failing must not make the flush backlog grow.
+    ///
+    /// Each failed flush hands its batch back. A message that is inserted and
+    /// then evicted while the database is down never reached disk, so neither
+    /// its write nor its deletion has anything left to do. Keeping them lets
+    /// the backlog grow with every eviction for as long as the outage lasts.
+    #[test]
+    fn a_failing_database_does_not_grow_the_flush_backlog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No `BoardMessage` table, so every flush fails when it opens the table.
+        let env = crate::db::open_env_without_table(dir.path()).expect("open env");
+        let count_limit = 10;
+        let cfg = MsgboardConfig {
+            count_limit,
+            block_range: 20_000,
+            work_divisor: CHEAP_WORK_DIVISOR,
+            ..easy_cfg()
+        };
+        let board = MsgBoard::with_db(cfg, env);
+        board.set_ready();
+
+        for i in 1..=10_000u64 {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&i.to_be_bytes());
+            let block = B256::from(b);
+            board.set_head(i, block);
+            board
+                .add_local_msg(mine_for_block(block, CHEAP_WORK_DIVISOR, &i.to_be_bytes()))
+                .expect("valid");
+            if i % 100 == 0 {
+                let _ = board.flush_to_db().expect_err("the table is missing");
+            }
+        }
+
+        assert_eq!(board.consecutive_flush_failures.load(Ordering::Relaxed), 100);
+        let state = board.state.lock();
+        assert!(
+            state.discarded.len() <= count_limit,
+            "the deletion backlog holds {} entries",
+            state.discarded.len(),
+        );
+        assert!(state.dirty.len() <= count_limit, "the write backlog holds {}", state.dirty.len());
     }
 
     /// The flush batch shares the index's messages instead of copying them.

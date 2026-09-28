@@ -37,7 +37,7 @@ pub mod rpc_api;
 
 pub use args::MsgboardArgs;
 pub use board::MsgBoard;
-pub use launch::MsgboardLauncher;
+pub use launch::{FinalFlushGuard, MsgboardLauncher};
 pub use protocol::{
     MsgboardConnectionHandler, MsgboardProtocolHandler, MSG_CAPABILITY, MSG_PROTOCOL,
 };
