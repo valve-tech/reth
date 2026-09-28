@@ -329,7 +329,7 @@ impl MsgBoard {
     /// The name still mirrors erigon's `FilterMessageIDs`, which does the same
     /// filtering minus the in-flight check.
     pub fn filter_wanted(&self, peer: PeerId, ids: &[MsgID]) -> Vec<MsgID> {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let mut state = self.state.lock();
         let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
 
@@ -394,12 +394,23 @@ impl MsgBoard {
     ///
     /// A claim that another peer also announced moves to that peer, which
     /// collects it through [`take_retries`](Self::take_retries).
-    pub fn release_pending(&self, ids: &[MsgID]) {
-        let now = Instant::now();
+    ///
+    /// `peer` is the peer the request was for. A claim that has since moved to
+    /// another peer is left alone.
+    pub fn release_pending(&self, peer: PeerId, ids: &[MsgID]) {
+        let now = tokio::time::Instant::now();
         let mut state = self.state.lock();
         for id in ids {
-            state.pending.release(id, now);
+            state.pending.release(id, peer, now);
         }
+    }
+
+    /// Record that `peer` let first-hand reservations expire unspent.
+    ///
+    /// Claims then replace `peer` first when their alternate list is full,
+    /// and ask it last.
+    pub fn note_withheld(&self, peer: PeerId) {
+        self.state.lock().pending.note_withheld(peer, tokio::time::Instant::now());
     }
 
     /// IDs whose request to another peer went unanswered, which `peer` also
@@ -409,7 +420,7 @@ impl MsgBoard {
     /// [`filter_wanted`](Self::filter_wanted): it must request them from
     /// `peer`, or hand them back via [`release_pending`](Self::release_pending).
     pub fn take_retries(&self, peer: PeerId) -> Vec<MsgID> {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let mut state = self.state.lock();
         let BoardState { index, pending, .. } = &mut *state;
         pending.maybe_sweep(now, |id| index.has(&id.message_hash()));
