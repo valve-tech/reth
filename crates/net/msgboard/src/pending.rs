@@ -20,12 +20,14 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use alloy_primitives::B256;
 use reth_msgboard_types::MsgID;
 use reth_network_api::PeerId;
+// The tokio clock, so tests can pause and advance time through these TTLs.
+use tokio::time::Instant;
 
 /// How long a claimed ID blocks further requests for the same message.
 ///
@@ -120,6 +122,10 @@ pub(crate) struct PendingRequests {
     capacity: usize,
     /// Earliest instant the next full sweep may run.
     next_sweep: Option<Instant>,
+    /// Peers that withheld first-hand, and when. Alternates with a strike
+    /// inside [`WITHHOLD_WINDOW`] are the first to be replaced and the last
+    /// to be asked.
+    struck: HashMap<PeerId, Instant>,
 }
 
 impl PendingRequests {
@@ -132,6 +138,7 @@ impl PendingRequests {
             ttl,
             capacity,
             next_sweep: None,
+            struck: HashMap::new(),
         }
     }
 
@@ -151,12 +158,23 @@ impl PendingRequests {
     pub(crate) fn claim(&mut self, id: MsgID, peer: PeerId, now: Instant) -> bool {
         match self.claims.get_mut(&id) {
             Some(claim) if now.duration_since(claim.claimed_at) < self.ttl => {
-                if claim.owner != peer &&
-                    !claim.alternates.contains(&peer) &&
-                    claim.alternates.len() < MAX_ALTERNATES
-                {
-                    claim.alternates.push(peer);
+                if claim.owner == peer || claim.alternates.contains(&peer) {
+                    return false;
                 }
+                if claim.alternates.len() == MAX_ALTERNATES {
+                    // Full. Sybils that announce first must not lock out an
+                    // honest late announcer, so the newcomer replaces a peer
+                    // with a live strike, or else the oldest alternate. A
+                    // later sybil can push the newcomer out again, but only by
+                    // spending a fresh identity per announcer it displaces.
+                    let evict = claim
+                        .alternates
+                        .iter()
+                        .position(|p| is_struck(&self.struck, p, now))
+                        .unwrap_or(0);
+                    claim.alternates.remove(evict);
+                }
+                claim.alternates.push(peer);
                 false
             }
             // An expired claim is re-taken rather than left to the sweep, so a
@@ -191,17 +209,30 @@ impl PendingRequests {
 
     /// Give up the claim on `id`.
     ///
-    /// Called when the request that a claim was taken for never reached the
-    /// peer. If an alternate announced the ID, the claim moves to it at once.
+    /// Called when the request that a claim was taken for never reached
+    /// `peer`. If an alternate announced the ID, the claim moves to it at once.
     /// Otherwise the claim is dropped, so the next announcement re-requests it
     /// instead of waiting out the TTL.
-    pub(crate) fn release(&mut self, id: &MsgID, now: Instant) {
+    ///
+    /// Does nothing unless `peer` still owns the claim. A request frame can
+    /// wait longer than the TTL before it is dropped, and by then the claim may
+    /// belong to another peer.
+    pub(crate) fn release(&mut self, id: &MsgID, peer: PeerId, now: Instant) {
         let Some(claim) = self.claims.get_mut(id) else { return };
+        if claim.owner != peer {
+            return;
+        }
         let previous = claim.owner;
         if claim.alternates.is_empty() {
             self.claims.remove(id);
         } else {
-            claim.hand_to_next_alternate(now, &mut self.owned, &mut self.retries, *id);
+            claim.hand_to_next_alternate(
+                now,
+                &self.struck,
+                &mut self.owned,
+                &mut self.retries,
+                *id,
+            );
         }
         decrement(&mut self.owned, previous);
     }
@@ -225,9 +256,13 @@ impl PendingRequests {
     /// The sweep drops a claim whose message `is_held`, or that has no
     /// alternate left. It moves any other expired claim to its next alternate
     /// and queues a retry for that peer.
+    ///
+    /// Dropping an exhausted claim re-arms its ID: the next peer to announce it
+    /// claims it at once and is asked.
     pub(crate) fn sweep(&mut self, now: Instant, is_held: impl Fn(&MsgID) -> bool) {
         let ttl = self.ttl;
-        let Self { claims, owned, retries, .. } = self;
+        self.struck.retain(|_, at| now.duration_since(*at) < WITHHOLD_WINDOW);
+        let Self { claims, owned, retries, struck, .. } = self;
         claims.retain(|id, claim| {
             if now.duration_since(claim.claimed_at) < ttl {
                 return true;
@@ -236,7 +271,7 @@ impl PendingRequests {
             if claim.alternates.is_empty() || is_held(id) {
                 return false;
             }
-            claim.hand_to_next_alternate(now, owned, retries, *id);
+            claim.hand_to_next_alternate(now, struck, owned, retries, *id);
             true
         });
         // A retry goes stale when its claim moves on, for example to a later
@@ -245,6 +280,11 @@ impl PendingRequests {
             ids.retain(|id| claims.get(id).is_some_and(|c| c.retry && c.owner == *peer));
             !ids.is_empty()
         });
+    }
+
+    /// Record that `peer` withheld a message it was asked for first-hand.
+    pub(crate) fn note_withheld(&mut self, peer: PeerId, now: Instant) {
+        self.struck.insert(peer, now);
     }
 
     /// Take the IDs the sweep moved to `peer`, and restart their TTL.
@@ -309,7 +349,7 @@ pub(crate) struct WantList {
     /// Unspent reservations and the expiry of each. A queue entry cancels a
     /// reservation only when its expiry matches, so the expiry of an old,
     /// released reservation cannot cancel a newer one for the same hash.
-    live: HashMap<B256, Instant>,
+    live: HashMap<B256, Live>,
     /// Reservations that expired unspent since the last
     /// [`take_expired_unspent`](Self::take_expired_unspent).
     expired_unspent: usize,
@@ -334,9 +374,11 @@ impl WantList {
                 break;
             }
             let expired = self.queue.pop_front().expect("front exists");
-            if self.live.get(&expired.hash) == Some(&expired.expires_at) {
-                self.live.remove(&expired.hash);
-                self.expired_unspent += 1;
+            if self.live.get(&expired.hash).is_some_and(|l| l.expires_at == expired.expires_at) {
+                let live = self.live.remove(&expired.hash).expect("checked above");
+                if live.first_hand {
+                    self.expired_unspent += 1;
+                }
             }
         }
     }
@@ -357,6 +399,22 @@ impl WantList {
     /// would waste the round trip. The caller must hand a refused ID back to
     /// [`PendingRequests`] rather than request it.
     pub(crate) fn reserve(&mut self, hash: B256, now: Instant) -> bool {
+        self.reserve_inner(hash, now, true)
+    }
+
+    /// Reserve `hash` for a retry: a request made because another peer
+    /// withheld the message.
+    ///
+    /// Behaves like [`reserve`](Self::reserve), but the reservation does not
+    /// count toward [`take_expired_unspent`](Self::take_expired_unspent). The
+    /// retry reaches this peer a TTL or more after it announced, when it may
+    /// have evicted or pruned the message, and a responder sends nothing for a
+    /// hash it lacks. That is not withholding.
+    pub(crate) fn reserve_retry(&mut self, hash: B256, now: Instant) -> bool {
+        self.reserve_inner(hash, now, false)
+    }
+
+    fn reserve_inner(&mut self, hash: B256, now: Instant, first_hand: bool) -> bool {
         if self.live.contains_key(&hash) || self.live.len() >= self.capacity {
             return false;
         }
@@ -366,11 +424,11 @@ impl WantList {
         // `capacity` entries, so its cost is amortised over them.
         if self.queue.len() >= 2 * self.capacity {
             let live = &self.live;
-            self.queue.retain(|w| live.get(&w.hash) == Some(&w.expires_at));
+            self.queue.retain(|w| live.get(&w.hash).is_some_and(|l| l.expires_at == w.expires_at));
         }
         let expires_at = now + self.ttl;
         self.queue.push_back(Want { hash, expires_at });
-        self.live.insert(hash, expires_at);
+        self.live.insert(hash, Live { expires_at, first_hand });
         true
     }
 
@@ -435,7 +493,13 @@ impl WithholdStrikes {
             self.recent.pop_front();
         }
         self.recent.push_back(now);
-        self.recent.len() >= WITHHOLD_STRIKES
+        if self.recent.len() < WITHHOLD_STRIKES {
+            return false;
+        }
+        // Start counting again, so the larger penalty fires once per
+        // `WITHHOLD_STRIKES` events, not on every event past the threshold.
+        self.recent.clear();
+        true
     }
 }
 
@@ -451,22 +515,30 @@ struct Claim {
 }
 
 impl Claim {
-    /// Make the first alternate the owner and queue a retry for it. The caller
+    /// Make the first alternate without a live strike the owner (or the first
+    /// alternate, if all have one) and queue a retry for it. The caller
     /// accounts for the previous owner.
     fn hand_to_next_alternate(
         &mut self,
         now: Instant,
+        struck: &HashMap<PeerId, Instant>,
         owned: &mut HashMap<PeerId, usize>,
         retries: &mut HashMap<PeerId, Vec<MsgID>>,
         id: MsgID,
     ) {
-        let next = self.alternates.remove(0);
+        let pick = self.alternates.iter().position(|p| !is_struck(struck, p, now)).unwrap_or(0);
+        let next = self.alternates.remove(pick);
         self.owner = next;
         self.claimed_at = now;
         self.retry = true;
         *owned.entry(next).or_default() += 1;
         retries.entry(next).or_default().push(id);
     }
+}
+
+/// Whether `peer` withheld first-hand inside [`WITHHOLD_WINDOW`] before `now`.
+fn is_struck(struck: &HashMap<PeerId, Instant>, peer: &PeerId, now: Instant) -> bool {
+    struck.get(peer).is_some_and(|at| now.duration_since(*at) < WITHHOLD_WINDOW)
 }
 
 /// Decrement a per-peer count. The entry goes at zero, so the map does not
@@ -478,6 +550,14 @@ fn decrement(owned: &mut HashMap<PeerId, usize>, peer: PeerId) {
             entry.remove();
         }
     }
+}
+
+/// An unspent reservation.
+#[derive(Debug)]
+struct Live {
+    expires_at: Instant,
+    /// Made for an announcement this peer sent, not for a retry.
+    first_hand: bool,
 }
 
 /// One reserved hash and the instant it stops authorising anything.
@@ -549,7 +629,7 @@ mod tests {
 
         pending.claim(id(1), p(1), now);
         pending.claim(id(1), p(2), now);
-        pending.release(&id(1), now);
+        pending.release(&id(1), p(1), now);
 
         assert_eq!(pending.take_retries(p(2), now), vec![id(1)]);
         assert!(!pending.claim(id(1), p(1), now), "the claim is live under p2");
@@ -600,6 +680,35 @@ mod tests {
         pending.claim(id(2), p(1), t0);
         pending.maybe_sweep(t0 + ttl + Duration::from_millis(1), |_| false);
         assert_eq!(pending.len(), 1, "a second sweep inside the interval is skipped");
+    }
+
+    /// A request frame can wait longer than the claim TTL before it is dropped.
+    /// Its late release must not free the claim another peer has taken since.
+    #[test]
+    fn a_stale_release_does_not_steal_a_newer_claim() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+
+        assert!(pending.claim(id(1), p(1), t0));
+        let later = t0 + ttl + Duration::from_secs(1);
+        assert!(pending.claim(id(1), p(2), later), "p2 re-takes the expired claim");
+
+        pending.release(&id(1), p(1), later);
+        assert!(!pending.claim(id(1), p(3), later), "p1's late release freed p2's live claim");
+    }
+
+    /// The larger penalty fires once per window, not on every event after the
+    /// threshold, so a steady trickle cannot turn into a stream of them.
+    #[test]
+    fn escalation_fires_once_per_window() {
+        let mut strikes = WithholdStrikes::default();
+        let t0 = Instant::now();
+
+        strikes.record(t0);
+        strikes.record(t0 + Duration::from_secs(1));
+        assert!(strikes.record(t0 + Duration::from_secs(2)), "third event escalates");
+        assert!(!strikes.record(t0 + Duration::from_secs(3)), "the fourth does not escalate again");
     }
 
     #[test]
@@ -667,7 +776,7 @@ mod tests {
         let now = Instant::now();
 
         assert!(pending.claim(id(1), p(1), now));
-        pending.release(&id(1), now);
+        pending.release(&id(1), p(1), now);
         assert_eq!(pending.len(), 0);
         assert!(pending.claim(id(1), p(1), now), "a released id should be requestable again");
     }
