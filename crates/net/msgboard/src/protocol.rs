@@ -33,7 +33,10 @@ use alloy_rlp::{length_of_length, Encodable};
 use bytes::BufMut;
 use futures::StreamExt;
 use reth_eth_wire::{
-    capability::SharedCapabilities, multiplex::ProtocolConnection, protocol::Protocol, Capability,
+    capability::SharedCapabilities,
+    multiplex::ProtocolConnection,
+    protocol::{Protocol, ProtocolIngressLimits},
+    Capability,
 };
 use reth_msgboard_types::{
     check_unique_hashes, decode_msg_hash_list, decode_wire_pow_msg_list, encode_msg_hash_list,
@@ -222,12 +225,13 @@ const MAX_QUEUED_OUTGOING_FRAMES: usize = 8;
 /// dropping what it will not take.
 ///
 /// Waiting on a full queue is the backpressure that bounds our own memory, but
-/// it also stops us draining [`ProtocolConnection`], and the multiplexer's
-/// inbound queue to a satellite protocol is an *unbounded* channel it keeps
-/// filling from the socket regardless
-/// (`reth_eth_wire::multiplex`, `install_protocol` / the `poll_next` read loop).
-/// Waiting indefinitely would therefore relocate unbounded growth upstream
-/// instead of removing it.
+/// it also stops us draining [`ProtocolConnection`]. The multiplexer keeps
+/// filling this protocol's inbound queue from the socket meanwhile, up to
+/// [`MAX_INBOUND_QUEUED_FRAMES`] frames or [`MAX_INBOUND_QUEUED_BYTES`], and a
+/// full queue ends the whole session with `SubprotocolInboundBufferFull`
+/// (`reth_eth_wire::multiplex`, `InboundSender::try_send`). Waiting
+/// indefinitely would therefore turn every slow reader into a disconnect,
+/// eth included.
 ///
 /// Two scopings of this budget were wrong before the current one, so the
 /// scoping matters more than the value:
@@ -237,8 +241,8 @@ const MAX_QUEUED_OUTGOING_FRAMES: usize = 8;
 ///    frame.
 ///  - Per *inbound frame* was worse: a flooding peer sends many, each getting a fresh budget
 ///    against a queue that never drains, so the read loop advanced one frame per 30 s while the
-///    multiplexer filled its unbounded inbound queue at line rate. Fixed by [`OutboundQueue`]'s
-///    stalled flag, which pays this cost once per episode rather than once per frame.
+///    multiplexer filled its inbound queue at line rate. Fixed by [`OutboundQueue`]'s stalled flag,
+///    which pays this cost once per episode rather than once per frame.
 ///
 /// 30 s is far longer than any healthy peer needs — the multiplexer accepts a
 /// frame as soon as it is polled with room in its own 32 MiB out-buffer — so
@@ -246,6 +250,40 @@ const MAX_QUEUED_OUTGOING_FRAMES: usize = 8;
 /// Note there is no *backpressure* lever short of ending the stream, which
 /// disconnects the whole session including eth; §15.5 records why we don't.
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Frames the multiplexer may hold for `msg/1` before our read loop takes them.
+///
+/// The multiplexer reads the socket whether or not we read from it, so this
+/// queue grows whenever the connection task is busy elsewhere: waiting on a
+/// peer that reads slowly (up to [`OUTBOUND_SEND_TIMEOUT`] per inbound frame),
+/// or verifying a delivery. When the queue is full the multiplexer ends the
+/// session with `SubprotocolInboundBufferFull`. That disconnects eth too, so
+/// the limit must sit above anything an honest peer sends.
+///
+/// The most an honest peer can have in flight to us is one bulk announce plus
+/// the replies to what we asked it for:
+///
+///  - a bulk announce of a full board is `count_limit / 846` frames, 12 at the default;
+///  - the replies are bounded by [`MAX_WANT_PER_PEER`] = 1024 reservations. At the default 8 KiB
+///    `size_limit` that is at most ~8.7 MB, ~87 full frames.
+///
+/// That is about 100 frames and 10 MB, which
+/// `the_ingress_limits_hold_an_honest_peers_worst_burst` checks. 256 frames
+/// leaves room for single-ID announcements that arrive in the same window.
+///
+/// A flooding peer gets far less than the multiplexer's default of 1024
+/// frames and 32 MiB. Full-size `GetBoardMessages` requests are 8 KiB each, so
+/// the frame count cuts that flood at ~2 MiB.
+const MAX_INBOUND_QUEUED_FRAMES: usize = 256;
+
+/// Bytes the multiplexer may hold for `msg/1` before our read loop takes them.
+///
+/// See [`MAX_INBOUND_QUEUED_FRAMES`] for the honest burst this must hold,
+/// about 10 MB at the default config. The frame count alone does not bound
+/// memory: frames up to [`MAX_INBOUND_FRAME_SIZE`] reach this queue before
+/// [`handle_incoming`] refuses them, so 256 of them are ~25 MiB. This caps a
+/// flood of oversized frames at 16 MiB instead.
+const MAX_INBOUND_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 
 /// How often a connection re-checks whether the board became ready.
 ///
@@ -357,6 +395,15 @@ impl ConnectionHandler for MsgboardConnectionHandler {
         MSG_PROTOCOL
     }
 
+    /// No frame-size limit here: [`handle_incoming`] refuses an oversized
+    /// frame itself and bans its sender, which is stronger than the session
+    /// error a multiplexer limit would raise.
+    fn inbound_limits(&self) -> ProtocolIngressLimits {
+        ProtocolIngressLimits::default()
+            .with_max_buffered_messages(MAX_INBOUND_QUEUED_FRAMES)
+            .with_max_buffered_bytes(MAX_INBOUND_QUEUED_BYTES)
+    }
+
     fn on_unsupported_by_peer(
         self,
         _supported: &SharedCapabilities,
@@ -439,7 +486,7 @@ fn outbound_channel() -> (OutboundQueue, mpsc::Receiver<BytesMut>) {
 /// paid once per inbound frame. Waiting is only useful against a peer that is
 /// *slow*; against one that has stopped reading it is pure cost, and the cost
 /// is paid in the one place we cannot afford it — the read loop, which is what
-/// keeps the multiplexer's unbounded inbound queue drained. So the wait happens
+/// keeps the multiplexer's inbound queue drained. So the wait happens
 /// once, and until the peer takes another frame we drop without waiting.
 #[derive(Debug)]
 struct OutboundQueue {
@@ -594,8 +641,8 @@ async fn run_connection<S>(
         }
 
         // Deliberately unbiased. `biased` polls the peer first every time, and
-        // the multiplexer's inbound queue to a satellite protocol is unbounded
-        // and filled from the socket at line rate — so a peer that floods keeps
+        // the multiplexer fills its inbound queue to a satellite protocol from
+        // the socket at line rate — so a peer that floods keeps
         // a frame ready at every poll and the announcement branch is never
         // reached. That peer then receives no gossip for as long as it floods,
         // and the board can pass `BROADCAST_CAPACITY` behind it, which costs a
@@ -1416,8 +1463,8 @@ mod tests {
         );
         // `a_peer_that_stops_reading_gets_frames_dropped_not_queued_forever`
         // passes for *any* finite timeout, so the magnitude is pinned here:
-        // the wait blocks our read loop, and the multiplexer's inbound queue
-        // is unbounded and filled from the socket meanwhile.
+        // the wait blocks our read loop, and the multiplexer fills its inbound
+        // queue from the socket meanwhile.
         assert!(
             OUTBOUND_SEND_TIMEOUT <= Duration::from_secs(60),
             "a peer that has stopped reading must be given up on in seconds, not minutes",
@@ -1467,7 +1514,7 @@ mod tests {
 
     /// Waiting bounds our own memory, but it also stops us draining
     /// [`ProtocolConnection`] — and the multiplexer's inbound queue to a
-    /// satellite protocol is unbounded and filled from the socket regardless.
+    /// satellite protocol fills from the socket regardless.
     /// Waiting forever would move the growth upstream, so the wait expires.
     ///
     /// Negative control: with a plain `tx.send(buf).await` in `send_frame` this
@@ -1529,7 +1576,7 @@ mod tests {
     /// The deadline bounds one inbound frame, but a peer that has stopped
     /// reading sends many. If each frame gets a fresh budget, the read loop
     /// drains one frame per `OUTBOUND_SEND_TIMEOUT` — ~3 KiB/s — while the
-    /// multiplexer keeps filling its *unbounded* inbound queue at the peer's
+    /// multiplexer keeps filling its inbound queue at the peer's
     /// line rate. Bounding our own queue would then buy nothing: the growth
     /// just moves upstream, which is the whole thing the deadline exists to
     /// prevent.
@@ -1554,7 +1601,7 @@ mod tests {
         assert!(
             start.elapsed() <= OUTBOUND_SEND_TIMEOUT * 2,
             "{FRAMES} frames from a peer that never reads cost {:?}; the read loop is being \
-             throttled to one frame per timeout while the mux's unbounded inbound queue fills",
+             throttled to one frame per timeout while the mux's inbound queue fills",
             start.elapsed(),
         );
     }
@@ -3330,7 +3377,7 @@ mod tests {
     /// The select must not be `biased`.
     ///
     /// `biased` polls the peer first every time, and the multiplexer's inbound
-    /// queue to a satellite protocol is unbounded and filled from the socket at
+    /// queue to a satellite protocol is filled from the socket at
     /// line rate — so a peer that floods keeps a frame ready at every poll and
     /// the broadcast branch is never reached. The peer receives no gossip for
     /// as long as it floods, and once the board has accepted
@@ -3884,5 +3931,173 @@ mod tests {
         assert_eq!(a.rep.bad_message() + a.rep.bad_protocol(), 0);
         assert_eq!(b.rep.bad_message() + b.rep.bad_protocol(), 0);
         assert!(deliver(&mut b, &mut a).await.is_empty(), "a converged link falls silent");
+    }
+
+    // ── inbound queue bound ──────────────────────────────────────────────────
+    //
+    // While the connection task waits on a full outbound queue it does not
+    // read, and the multiplexer keeps filling this protocol's inbound queue
+    // from the socket. These tests drive a real multiplexer over a loopback
+    // socket, because the multiplexer is the only thing that enforces the
+    // limits the handler declares.
+
+    mod ingress {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+
+        use alloy_primitives::bytes::Bytes;
+        use futures::{SinkExt, Stream};
+        use reth_eth_wire::{
+            errors::P2PStreamError,
+            multiplex::{ProtocolProxy, RlpxProtocolMultiplexer},
+            EthVersion, HelloMessageWithProtocols, ProtocolVersion, UnauthedP2PStream,
+        };
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_util::codec::{Decoder, LengthDelimitedCodec};
+
+        use super::*;
+
+        /// A `msg/1` connection whose read loop never runs. That is its state
+        /// while `OutboundQueue::send` waits out `OUTBOUND_SEND_TIMEOUT`.
+        struct StalledReadLoop {
+            _conn: ProtocolConnection,
+        }
+
+        impl Stream for StalledReadLoop {
+            type Item = BytesMut;
+            fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<BytesMut>> {
+                Poll::Pending
+            }
+        }
+
+        /// The eth primary, which has nothing to say here.
+        struct IdlePrimary {
+            _proxy: ProtocolProxy,
+        }
+
+        impl Stream for IdlePrimary {
+            type Item = Result<BytesMut, P2PStreamError>;
+            fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                Poll::Pending
+            }
+        }
+
+        fn hello() -> HelloMessageWithProtocols {
+            HelloMessageWithProtocols {
+                protocol_version: ProtocolVersion::V5,
+                client_version: "msgboard-test".to_string(),
+                protocols: vec![EthVersion::Eth68.into(), MSG_PROTOCOL],
+                port: 0,
+                id: PeerId::random(),
+            }
+        }
+
+        /// The largest `GetBoardMessages` a conforming peer may send: 256
+        /// hashes, 8 KiB of payload.
+        fn full_request() -> Vec<u8> {
+            let hashes: Vec<B256> = (0..MAX_GET_BOARD_MESSAGES as u64).map(claim).collect();
+            let mut raw = vec![GET_BOARD_MESSAGES];
+            raw.extend_from_slice(&encode_msg_hash_list(&hashes));
+            raw
+        }
+
+        /// Flood a node whose `msg/1` read loop is stalled with `flood_bytes`
+        /// of full-size `GetBoardMessages`, and return how the node's session
+        /// ended: `Some(err)` when the multiplexer cut it, `None` when it was
+        /// still open and holding the flood.
+        async fn flood_a_stalled_node(flood_bytes: usize) -> Option<P2PStreamError> {
+            let handler = MsgboardProtocolHandler::new(Arc::new(MsgBoard::new(easy_cfg())))
+                .on_incoming("127.0.0.1:0".parse().unwrap())
+                .unwrap();
+            let limits = handler.inbound_limits();
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let victim = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let framed = LengthDelimitedCodec::new().framed(socket);
+                let (p2p, _) = UnauthedP2PStream::new(framed).handshake(hello()).await.unwrap();
+                let mut mux = RlpxProtocolMultiplexer::new(p2p);
+                mux.install_protocol_with_limits(&MSG_CAPABILITY, limits, |conn| StalledReadLoop {
+                    _conn: conn,
+                })
+                .unwrap();
+                let mut session = mux
+                    .into_satellite_stream(&EthVersion::Eth68.into(), |proxy| IdlePrimary {
+                        _proxy: proxy,
+                    })
+                    .unwrap();
+                // Long enough for every flood frame to cross loopback.
+                match tokio::time::timeout(Duration::from_secs(5), session.next()).await {
+                    Ok(Some(Err(err))) => Some(err),
+                    Ok(other) => {
+                        panic!("unexpected session outcome: {:?}", other.map(|r| r.is_ok()))
+                    }
+                    Err(_) => None,
+                }
+            });
+
+            let socket = TcpStream::connect(addr).await.unwrap();
+            let framed = LengthDelimitedCodec::new().framed(socket);
+            let (mut attacker, _) =
+                UnauthedP2PStream::new(framed).handshake(hello()).await.unwrap();
+            let offset = attacker
+                .shared_capabilities()
+                .find(&MSG_CAPABILITY)
+                .expect("both sides speak msg/1")
+                .relative_message_id_offset();
+            let mut request = full_request();
+            request[0] += offset;
+            let request = Bytes::from(request);
+            let mut sent = 0;
+            while sent < flood_bytes {
+                // A cut session fails the send. The victim's result says why.
+                if attacker.send(request.clone()).await.is_err() {
+                    break;
+                }
+                sent += request.len();
+            }
+            let outcome = victim.await.unwrap();
+            drop(attacker);
+            outcome
+        }
+
+        /// The limits must hold the largest burst an honest peer can have in
+        /// flight to us, or a busy moment disconnects it and its eth session.
+        #[test]
+        fn the_ingress_limits_hold_an_honest_peers_worst_burst() {
+            let cfg = MsgboardConfig::default();
+
+            let announce_frames = cfg.count_limit.div_ceil(MAX_IDS_PER_FRAME);
+            let announce_bytes = announce_frames * MAX_INBOUND_FRAME_SIZE;
+
+            // A `WirePoWMsg` at the size limit, every header at its widest:
+            // `data`'s string header, the message's list header, then the
+            // claimed hash and the wire element's own list header.
+            let body = cfg.size_limit + 3 + MSG_FIXED_FIELDS_RLP_LEN + 3 + MSG_HASH_RLP_LEN + 3;
+            let reply_frames = MAX_WANT_PER_PEER.div_ceil(P2P_MSG_PACKET_LIMIT / body);
+            let reply_bytes = reply_frames * MAX_INBOUND_FRAME_SIZE;
+
+            let frames = announce_frames + reply_frames;
+            let bytes = announce_bytes + reply_bytes;
+            assert!(frames <= MAX_INBOUND_QUEUED_FRAMES, "{frames} honest frames do not fit");
+            assert!(bytes <= MAX_INBOUND_QUEUED_BYTES, "{bytes} honest bytes do not fit");
+        }
+
+        /// A peer that requests at line rate but reads slowly holds our read
+        /// loop in `OutboundQueue::send`. Everything it sends meanwhile waits
+        /// in the multiplexer. 5 MiB of full-size requests is 640 frames, which
+        /// fits the multiplexer's default allowance of 1024 frames and 32 MiB.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_flooding_peer_is_cut_at_the_ingress_limit() {
+            let flood = 5 * 1024 * 1024;
+            let outcome = flood_a_stalled_node(flood).await;
+            assert!(
+                matches!(outcome, Some(P2PStreamError::SubprotocolInboundBufferFull { .. })),
+                "the session held {flood} bytes of unread requests and stayed open: {outcome:?}",
+            );
+        }
     }
 }
