@@ -18,6 +18,7 @@ use std::{
 use alloy_primitives::B256;
 use parking_lot::Mutex;
 use reth_libmdbx::Environment;
+use reth_network_api::PeerId;
 use tokio::sync::broadcast;
 
 use reth_msgboard_types::{
@@ -321,19 +322,22 @@ impl MsgBoard {
     /// [`release_pending`](Self::release_pending), or nothing re-requests them
     /// until the claim expires.
     ///
+    /// `peer` is the announcer. An ID that another peer has already claimed is
+    /// not returned, but `peer` is remembered as an alternate to ask if that
+    /// claim expires undelivered — see [`take_retries`](Self::take_retries).
+    ///
     /// The name still mirrors erigon's `FilterMessageIDs`, which does the same
     /// filtering minus the in-flight check.
-    pub fn filter_wanted(&self, ids: &[MsgID]) -> Vec<MsgID> {
+    pub fn filter_wanted(&self, peer: PeerId, ids: &[MsgID]) -> Vec<MsgID> {
         let now = Instant::now();
         let mut state = self.state.lock();
         let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
 
-        // Sweeping here rather than on a timer keeps the map bounded without a
-        // background task: it can only grow on this path, so it can only need
-        // trimming on this path.
-        state.pending.sweep(now);
-
         let BoardState { index, block_filter, pending, .. } = &mut *state;
+        // The map can only grow on this path, so it is trimmed here without a
+        // background task. The sweep is rate-limited, so a flood of
+        // announcements does not scan the whole map each time.
+        pending.maybe_sweep(now, |id| index.has(&id.message_hash()));
         let mut suppressed = 0u64;
         let wanted: Vec<MsgID> = ids
             .iter()
@@ -364,7 +368,7 @@ impl MsgBoard {
                     return false;
                 }
                 // Claimed last, so an ID rejected above never occupies a slot.
-                if pending.claim(**id, now) {
+                if pending.claim(**id, peer, now) {
                     true
                 } else {
                     suppressed += 1;
@@ -387,11 +391,29 @@ impl MsgBoard {
     ///
     /// Without this a dropped frame would stall the message until the claim
     /// expired, because the peers still announcing it would all be suppressed.
+    ///
+    /// A claim that another peer also announced moves to that peer, which
+    /// collects it through [`take_retries`](Self::take_retries).
     pub fn release_pending(&self, ids: &[MsgID]) {
+        let now = Instant::now();
         let mut state = self.state.lock();
         for id in ids {
-            state.pending.release(id);
+            state.pending.release(id, now);
         }
+    }
+
+    /// IDs whose request to another peer went unanswered, which `peer` also
+    /// announced and should now be asked for.
+    ///
+    /// The caller owns the returned claims exactly as for
+    /// [`filter_wanted`](Self::filter_wanted): it must request them from
+    /// `peer`, or hand them back via [`release_pending`](Self::release_pending).
+    pub fn take_retries(&self, peer: PeerId) -> Vec<MsgID> {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        let BoardState { index, pending, .. } = &mut *state;
+        pending.maybe_sweep(now, |id| index.has(&id.message_hash()));
+        pending.take_retries(peer, now)
     }
 
     /// All current message IDs (for announcing to a newly connected peer).
@@ -1406,7 +1428,7 @@ mod tests {
 
         // The ID for the message we already have should be filtered out
         let id = checked.msg_id();
-        let wanted = board.filter_wanted(&[id]);
+        let wanted = board.filter_wanted(PeerId::ZERO, &[id]);
         assert!(wanted.is_empty(), "already-known message should not be wanted");
     }
 
@@ -1444,7 +1466,7 @@ mod tests {
             &msg_hash,
         );
 
-        let wanted = board.filter_wanted(&[id]);
+        let wanted = board.filter_wanted(PeerId::ZERO, &[id]);
         assert!(wanted.is_empty(), "stale message should be filtered out");
     }
 
@@ -1467,7 +1489,7 @@ mod tests {
             &category_hash(),
             &msg_hash,
         );
-        let wanted = board.filter_wanted(&[id]);
+        let wanted = board.filter_wanted(PeerId::ZERO, &[id]);
         assert!(wanted.is_empty(), "non-V1 announcements should never be requested");
     }
 
@@ -1493,7 +1515,7 @@ mod tests {
             &msg_hash,
         );
 
-        let wanted = board.filter_wanted(&[id]);
+        let wanted = board.filter_wanted(PeerId::ZERO, &[id]);
         assert!(wanted.is_empty(), "oversized message should be filtered out");
     }
 
