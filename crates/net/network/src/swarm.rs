@@ -301,9 +301,9 @@ impl<N: NetworkPrimitives> Swarm<N> {
         None
     }
 
-    /// Returns whether this node runs PulseChain mainnet (369) or testnet v4 (943).
+    /// Returns whether this node runs a `PulseChain` network.
     fn is_pulsechain(&self) -> bool {
-        matches!(self.sessions.status().chain.id(), 369 | 943)
+        reth_chainspec::is_pulsechain_chain_id(self.sessions.status().chain.id())
     }
 
     /// Set network connection state to `ShuttingDown`
