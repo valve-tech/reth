@@ -791,22 +791,18 @@ where
         let execution_result = if let Some(tracer) = fh_tracer.as_mut() {
             // Firehose live path: the inspector-instrumented executor is sequential and
             // incompatible with the parallel BAL path, so we always take the traced path while a
-            // tracer guard is active (PulseChain dispatch only). It produces no rebuilt BAL, so we
-            // append `None`; post-execution BAL validation is a no-op because the traced path is
-            // gated to chains without block access lists.
+            // tracer guard is active. Any node with the tracer installed takes this path, Ethereum
+            // included, so it builds the block access list sequentially, as `execute_block` does,
+            // and returns it for post-execution validation.
             match make_state_provider(false) {
-                Ok(state_provider) => self
-                    .execute_and_trace_block(
-                        state_provider,
-                        env,
-                        &input,
-                        tracer,
-                        &mut handle,
-                        execution_state_hook,
-                    )
-                    .map(|(output, senders, receipt_root_rx)| {
-                        (output, senders, receipt_root_rx, None)
-                    }),
+                Ok(state_provider) => self.execute_and_trace_block(
+                    state_provider,
+                    env,
+                    &input,
+                    tracer,
+                    &mut handle,
+                    execution_state_hook,
+                ),
                 Err(err) => Err(err.into()),
             }
         } else if parallel_bal_execution {
@@ -1361,6 +1357,7 @@ where
             BlockExecutionOutput<N::Receipt>,
             Vec<Address>,
             tokio::sync::oneshot::Receiver<(B256, alloy_primitives::Bloom)>,
+            Option<ExecutedBal>,
         ),
         InsertBlockErrorKind,
     >
@@ -1374,10 +1371,12 @@ where
     {
         debug!(target: "engine::tree::payload_validator", "Executing block (with Firehose tracing)");
 
+        let has_bal = input.has_block_access_list();
         let mut db = debug_span!(target: "engine::tree", "build_state_db").in_scope(|| {
             State::builder()
                 .with_database(StateProviderDatabase::new(state_provider))
                 .with_bundle_update()
+                .with_bal_builder_if(has_bal)
                 .build()
         });
 
@@ -1465,15 +1464,15 @@ where
 
         let execution_start = Instant::now();
 
-        // Execute all transactions and finalize. The Firehose traced path never builds a block
-        // access list (it is gated to pre-Amsterdam chains), so `has_bal` is always false.
+        // Execute all transactions and finalize. Like `execute_block`, this builds the block access
+        // list when the block carries one, so post-execution validation can check its hash.
         let (executor, senders) = self.execute_transactions(
             executor,
             transaction_count,
             handle.iter_transactions(),
             &receipt_tx,
             &executed_tx_index,
-            false,
+            has_bal,
         )?;
         drop(receipt_tx);
 
@@ -1488,6 +1487,11 @@ where
         debug_span!(target: "engine::tree", "merge_transitions")
             .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
 
+        // Same as `execute_block`: the builder exists only when the block declares a BAL.
+        let built_bal = db.take_built_bal().map(|revm_bal| ExecutedBal {
+            alloy: revm_bal.clone().into_alloy_bal(),
+            revm: Arc::new(revm_bal),
+        });
         let output = BlockExecutionOutput { result, state: db.take_bundle() };
 
         let execution_duration = execution_start.elapsed();
@@ -1495,7 +1499,7 @@ where
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block (with Firehose tracing)");
 
-        Ok((output, senders, result_rx))
+        Ok((output, senders, result_rx, built_bal))
     }
 
     /// Executes transactions and collects senders, streaming receipts to a background task.
