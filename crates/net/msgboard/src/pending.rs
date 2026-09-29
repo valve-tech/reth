@@ -65,8 +65,15 @@ pub(crate) const MAX_CLAIMS_PER_PEER: usize = 1024;
 ///
 /// When a claim expires with its message still missing, the next of these is
 /// asked. A peer that announces and then withholds can therefore delay a
-/// message by one TTL, not suppress it.
-pub(crate) const MAX_ALTERNATES: usize = 4;
+/// message by one TTL per withholding peer asked, not suppress it.
+///
+/// When the list is full, a newcomer replaces a random entry, so an attacker
+/// cannot pick which honest announcer to push out. Sixteen is large against
+/// the msgboard peer count (a subset of reth's default 100 outbound and 30
+/// inbound peers): to remove one honest announcer with even odds, an attacker
+/// must announce through about 11 further peers, and each extra peer costs it
+/// a connection slot. Memory is 16 x 64 bytes per claim at most.
+pub(crate) const MAX_ALTERNATES: usize = 16;
 
 /// Window in which repeated withholding counts as a pattern.
 pub(crate) const WITHHOLD_WINDOW: Duration = Duration::from_secs(60);
@@ -107,6 +114,11 @@ pub(crate) const MAX_WANT_PER_PEER: usize = 1024;
 /// erigon about *fetching*. It does not change which messages the board
 /// accepts.
 ///
+/// Residual risk: an attacker that controls most of our msgboard peers can
+/// still delay delivery, one TTL per withholding peer asked, and with enough
+/// peers it can push every honest announcer out of the list. Erigon has the
+/// same exposure.
+///
 /// Not thread-safe on its own — [`MsgBoard`](crate::MsgBoard) keeps it inside
 /// the state mutex that `filter_wanted` already holds.
 #[derive(Debug)]
@@ -122,10 +134,12 @@ pub(crate) struct PendingRequests {
     capacity: usize,
     /// Earliest instant the next full sweep may run.
     next_sweep: Option<Instant>,
-    /// Peers that withheld first-hand, and when. Alternates with a strike
+    /// Peers that withheld, and when. Alternates with a strike
     /// inside [`WITHHOLD_WINDOW`] are the first to be replaced and the last
     /// to be asked.
     struck: HashMap<PeerId, Instant>,
+    /// Xorshift state for picking which alternate a full list replaces.
+    rng: u64,
 }
 
 impl PendingRequests {
@@ -139,6 +153,12 @@ impl PendingRequests {
             capacity,
             next_sweep: None,
             struck: HashMap::new(),
+            // Seeded from the process's random hasher keys, so a remote peer
+            // cannot predict the sequence. `| 1` keeps xorshift off zero.
+            rng: {
+                use std::hash::{BuildHasher, Hasher};
+                std::collections::hash_map::RandomState::new().build_hasher().finish() | 1
+            },
         }
     }
 
@@ -162,17 +182,22 @@ impl PendingRequests {
                     return false;
                 }
                 if claim.alternates.len() == MAX_ALTERNATES {
-                    // Full. Sybils that announce first must not lock out an
-                    // honest late announcer, so the newcomer replaces a peer
-                    // with a live strike, or else the oldest alternate. A
-                    // later sybil can push the newcomer out again, but only by
-                    // spending a fresh identity per announcer it displaces.
-                    let evict = claim
-                        .alternates
-                        .iter()
-                        .position(|p| is_struck(&self.struck, p, now))
-                        .unwrap_or(0);
-                    claim.alternates.remove(evict);
+                    // Full. The newcomer replaces a peer with a live strike if
+                    // there is one, or else a random entry. A fixed choice,
+                    // such as the oldest, lets an attacker that controls the
+                    // announcement order push out a chosen honest peer.
+                    let evict =
+                        match claim.alternates.iter().position(|p| is_struck(&self.struck, p, now))
+                        {
+                            Some(i) => i,
+                            None => {
+                                self.rng ^= self.rng << 13;
+                                self.rng ^= self.rng >> 7;
+                                self.rng ^= self.rng << 17;
+                                (self.rng % MAX_ALTERNATES as u64) as usize
+                            }
+                        };
+                    claim.alternates.swap_remove(evict);
                 }
                 claim.alternates.push(peer);
                 false
@@ -282,7 +307,8 @@ impl PendingRequests {
         });
     }
 
-    /// Record that `peer` withheld a message it was asked for first-hand.
+    /// Record that `peer` withheld a message it was asked for, first-hand or
+    /// through a retry.
     pub(crate) fn note_withheld(&mut self, peer: PeerId, now: Instant) {
         self.struck.insert(peer, now);
     }
@@ -351,8 +377,14 @@ pub(crate) struct WantList {
     /// released reservation cannot cancel a newer one for the same hash.
     live: HashMap<B256, Live>,
     /// Reservations that expired unspent since the last
-    /// [`take_expired_unspent`](Self::take_expired_unspent).
-    expired_unspent: usize,
+    /// [`take_expired`](Self::take_expired).
+    expired: Expired,
+    /// The request that new reservations belong to. See
+    /// [`start_request`](Self::start_request).
+    request: u64,
+    /// Per request: reservations still unspent, and whether the peer answered
+    /// any of it.
+    requests: HashMap<u64, RequestState>,
     ttl: Duration,
     capacity: usize,
 }
@@ -360,7 +392,37 @@ pub(crate) struct WantList {
 impl WantList {
     /// Create a want list with the given expiry and entry cap.
     pub(crate) fn new(ttl: Duration, capacity: usize) -> Self {
-        Self { queue: VecDeque::new(), live: HashMap::new(), expired_unspent: 0, ttl, capacity }
+        Self {
+            queue: VecDeque::new(),
+            live: HashMap::new(),
+            expired: Expired::default(),
+            request: 0,
+            requests: HashMap::new(),
+            ttl,
+            capacity,
+        }
+    }
+
+    /// Start a new request. Reservations made after this belong to it.
+    ///
+    /// A request is everything asked for in response to one announcement,
+    /// which may span several frames. A peer that delivers any of it has
+    /// answered it; see [`Expired::silent`].
+    pub(crate) const fn start_request(&mut self) {
+        self.request += 1;
+    }
+
+    /// Forget one unspent reservation of `request`, noting whether it was
+    /// answered in part.
+    fn settle(&mut self, request: u64, answered: bool) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.requests.entry(request) {
+            let state = e.get_mut();
+            state.answered |= answered;
+            state.outstanding -= 1;
+            if state.outstanding == 0 {
+                e.remove();
+            }
+        }
     }
 
     /// Drop every reservation older than the TTL.
@@ -377,16 +439,20 @@ impl WantList {
             if self.live.get(&expired.hash).is_some_and(|l| l.expires_at == expired.expires_at) {
                 let live = self.live.remove(&expired.hash).expect("checked above");
                 if live.first_hand {
-                    self.expired_unspent += 1;
+                    self.expired.first_hand += 1;
+                    let answered = self.requests.get(&live.request).is_some_and(|r| r.answered);
+                    self.expired.silent |= !answered;
+                } else {
+                    self.expired.retries += 1;
                 }
+                self.settle(live.request, false);
             }
         }
     }
 
-    /// Return the number of reservations that expired unspent since the last
-    /// call, and reset it.
-    pub(crate) fn take_expired_unspent(&mut self) -> usize {
-        std::mem::take(&mut self.expired_unspent)
+    /// Return what expired unspent since the last call, and reset it.
+    pub(crate) fn take_expired(&mut self) -> Expired {
+        std::mem::take(&mut self.expired)
     }
 
     /// Reserve `hash`, authorising this peer to deliver one message.
@@ -406,7 +472,7 @@ impl WantList {
     /// withheld the message.
     ///
     /// Behaves like [`reserve`](Self::reserve), but the reservation does not
-    /// count toward [`take_expired_unspent`](Self::take_expired_unspent). The
+    /// count toward [`take_expired`](Self::take_expired). The
     /// retry reaches this peer a TTL or more after it announced, when it may
     /// have evicted or pruned the message, and a responder sends nothing for a
     /// hash it lacks. That is not withholding.
@@ -428,7 +494,8 @@ impl WantList {
         }
         let expires_at = now + self.ttl;
         self.queue.push_back(Want { hash, expires_at });
-        self.live.insert(hash, Live { expires_at, first_hand });
+        self.live.insert(hash, Live { expires_at, first_hand, request: self.request });
+        self.requests.entry(self.request).or_default().outstanding += 1;
         true
     }
 
@@ -438,7 +505,9 @@ impl WantList {
     /// stays O(1) per hash. Mirrors erigon's `Drop`.
     pub(crate) fn release(&mut self, hashes: impl IntoIterator<Item = B256>) {
         for hash in hashes {
-            self.live.remove(&hash);
+            if let Some(live) = self.live.remove(&hash) {
+                self.settle(live.request, false);
+            }
         }
     }
 
@@ -457,7 +526,9 @@ impl WantList {
     /// hold its own reservation for the same message.
     pub(crate) fn take(&mut self, hash: B256, now: Instant) -> bool {
         self.prune(now);
-        self.live.remove(&hash).is_some()
+        let Some(live) = self.live.remove(&hash) else { return false };
+        self.settle(live.request, true);
+        true
     }
 
     /// Number of live reservations, for tests.
@@ -558,6 +629,30 @@ struct Live {
     expires_at: Instant,
     /// Made for an announcement this peer sent, not for a retry.
     first_hand: bool,
+    /// The request this reservation belongs to.
+    request: u64,
+}
+
+/// What expired unspent in a peer's want list.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Expired {
+    /// First-hand reservations: the peer announced these and did not deliver.
+    pub(crate) first_hand: usize,
+    /// Retry reservations. These cost no reputation: the peer may have
+    /// evicted or pruned the message by the time the retry reached it.
+    pub(crate) retries: usize,
+    /// At least one expired first-hand reservation belongs to a request the
+    /// peer answered none of. Only this counts toward the larger penalty: an
+    /// honest peer that pruned part of a request at a block boundary still
+    /// answers the rest.
+    pub(crate) silent: bool,
+}
+
+/// Bookkeeping for one request in a [`WantList`].
+#[derive(Debug, Default)]
+struct RequestState {
+    outstanding: usize,
+    answered: bool,
 }
 
 /// One reserved hash and the instant it stops authorising anything.
@@ -633,6 +728,28 @@ mod tests {
 
         assert_eq!(pending.take_retries(p(2), now), vec![id(1)]);
         assert!(!pending.claim(id(1), p(1), now), "the claim is live under p2");
+    }
+
+    /// An attacker that controls the announcement order cannot choose which
+    /// alternate a full list drops. Over many fresh trackers, the honest
+    /// peer sometimes survives 16 more announcers and sometimes does not.
+    #[test]
+    fn a_full_alternate_list_drops_a_random_entry() {
+        let now = Instant::now();
+        let honest = p(0x77);
+        let survived = (0..200)
+            .filter(|_| {
+                let mut pending = PendingRequests::default();
+                pending.claim(id(1), p(0), now);
+                pending.claim(id(1), honest, now);
+                for n in 1..=u8::try_from(2 * MAX_ALTERNATES).unwrap() {
+                    pending.claim(id(1), p(n), now);
+                }
+                pending.claims[&id(1)].alternates.contains(&honest)
+            })
+            .count();
+        assert!(survived > 0, "the honest peer was evicted every time");
+        assert!(survived < 200, "the honest peer was never evicted; eviction is not random");
     }
 
     #[test]
@@ -735,8 +852,10 @@ mod tests {
         wants.release([hash(2)]);
         wants.prune(now + ttl);
 
-        assert_eq!(wants.take_expired_unspent(), 1, "only the unspent, unreleased one");
-        assert_eq!(wants.take_expired_unspent(), 0);
+        let expired = wants.take_expired();
+        assert_eq!(expired.first_hand, 1, "only the unspent, unreleased one");
+        assert!(!expired.silent, "hash(1) was delivered, so the request was answered");
+        assert_eq!(wants.take_expired(), Expired::default());
     }
 
     #[test]

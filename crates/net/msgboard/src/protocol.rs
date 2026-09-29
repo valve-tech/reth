@@ -717,6 +717,7 @@ async fn request_wanted(
     // suppressed for the full claim TTL and nobody fetches it.
     let now = tokio::time::Instant::now();
     wants.prune(now);
+    wants.start_request();
     let mut reserved = Vec::with_capacity(wanted.len());
     let mut refused = Vec::new();
     for &id in wanted {
@@ -816,14 +817,28 @@ async fn service_pending(
 ) -> Sent {
     let now = tokio::time::Instant::now();
     wants.prune(now);
-    let withheld = wants.take_expired_unspent();
-    if withheld > 0 {
-        // One strike per tick, however many IDs expired in it. A peer that
+    let expired = wants.take_expired();
+    if expired.first_hand > 0 || expired.retries > 0 {
+        // Replaced first and asked last on other claims, whichever kind
+        // expired. A peer asked only through retries must not withhold for
+        // free, even though a retry costs it no reputation.
+        board.note_withheld(peer_id);
+    }
+    if expired.first_hand > 0 {
+        // One event per tick, however many IDs expired in it. A peer that
         // withholds one full frame and a peer that withholds one message are
         // one event each, so a single lost frame cannot ban an honest peer.
-        let repeatedly = strikes.record(now);
-        board.note_withheld(peer_id);
-        tracing::debug!(target: "msgboard", ?peer_id, withheld, repeatedly, "announced messages never delivered");
+        // Only a request answered with nothing counts toward escalation; a
+        // partial answer earns the small penalty and never the larger one.
+        let repeatedly = expired.silent && strikes.record(now);
+        tracing::debug!(
+            target: "msgboard",
+            ?peer_id,
+            withheld = expired.first_hand,
+            silent = expired.silent,
+            repeatedly,
+            "announced messages never delivered",
+        );
         if let Some(r) = reporter {
             r.report_withheld(peer_id, repeatedly);
         }
@@ -1285,6 +1300,8 @@ mod tests {
         bad_protocol: Mutex<usize>,
         /// Every peer that earned any penalty, in order.
         penalised: Mutex<Vec<PeerId>>,
+        /// Every `report_withheld` call, with its `repeatedly` flag.
+        withheld: Mutex<Vec<(PeerId, bool)>>,
     }
 
     impl RecordingReporter {
@@ -1297,6 +1314,9 @@ mod tests {
         fn penalised(&self, peer_id: PeerId) -> bool {
             self.penalised.lock().unwrap().contains(&peer_id)
         }
+        fn escalated(&self, peer_id: PeerId) -> bool {
+            self.withheld.lock().unwrap().contains(&(peer_id, true))
+        }
     }
 
     impl PeerReporter for RecordingReporter {
@@ -1308,8 +1328,9 @@ mod tests {
             *self.bad_protocol.lock().unwrap() += 1;
             self.penalised.lock().unwrap().push(peer_id);
         }
-        fn report_withheld(&self, peer_id: PeerId, _repeatedly: bool) {
+        fn report_withheld(&self, peer_id: PeerId, repeatedly: bool) {
             self.penalised.lock().unwrap().push(peer_id);
+            self.withheld.lock().unwrap().push((peer_id, repeatedly));
         }
     }
 
@@ -3545,6 +3566,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
+        /// Every hash requested from this peer so far.
+        fn requested(&mut self) -> Vec<B256> {
+            drain(&mut self.outbound)
+                .into_iter()
+                .filter(|f| f[0] == GET_BOARD_MESSAGES)
+                .flat_map(|f| decode_msg_hash_list(&f[1..]).expect("valid hash list"))
+                .collect()
+        }
+
         /// Whether a `GetBoardMessages` reaches this peer within `within`.
         async fn asked_within(&mut self, within: Duration) -> bool {
             tokio::time::timeout(within, async {
@@ -3614,6 +3644,93 @@ mod tests {
             honest.asked_within(PENDING_REQUEST_TTL * 6).await,
             "five withholding sybils kept the message from the honest announcer",
         );
+    }
+
+    /// The announcement order is the attacker's to choose. One withholding
+    /// sybil claims first, the honest peer announces next, and the rest of the
+    /// sybils follow to push it out of the alternate list. The honest peer must
+    /// still be asked.
+    #[tokio::test(start_paused = true)]
+    async fn sybils_announcing_after_the_honest_peer_do_not_evict_it() {
+        let board = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let ids = wantable_ids(1);
+        let first = SilentPeer::spawn(&board, &rep, 0x01);
+        let mut honest = SilentPeer::spawn(&board, &rep, 0x77);
+        let rest: Vec<SilentPeer> = (2..=16).map(|n| SilentPeer::spawn(&board, &rep, n)).collect();
+
+        first.announce(&ids).await;
+        honest.announce(&ids).await;
+        for s in &rest {
+            s.announce(&ids).await;
+        }
+
+        assert!(
+            honest.asked_within(PENDING_REQUEST_TTL * 20).await,
+            "sybils announcing after the honest peer evicted it",
+        );
+    }
+
+    /// A peer asked only through retries must not withhold for free. Its
+    /// expired retry costs no reputation, but it is asked last next time.
+    #[tokio::test(start_paused = true)]
+    async fn an_alternate_that_withholds_is_asked_last_next_time() {
+        let board = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let ids = wantable_ids(2);
+        let (x, y) = (&ids[..1], &ids[1..]);
+        let a = SilentPeer::spawn(&board, &rep, 0xA1);
+        let mut b = SilentPeer::spawn(&board, &rep, 0xB2);
+        let mut c = SilentPeer::spawn(&board, &rep, 0xC3);
+        let d = SilentPeer::spawn(&board, &rep, 0xD4);
+
+        // X: A owns, B is asked on the first hand-off and withholds.
+        a.announce(x).await;
+        b.announce(x).await;
+        c.announce(x).await;
+        tokio::time::sleep(PENDING_REQUEST_TTL * 2 + Duration::from_secs(1)).await;
+
+        // Y: D owns, then B and C announce in that order. By Y's hand-off, B's
+        // retry reservation for X has expired.
+        d.announce(y).await;
+        b.announce(y).await;
+        c.announce(y).await;
+        tokio::time::sleep(PENDING_REQUEST_TTL + Duration::from_secs(3)).await;
+
+        let y_hash = y[0].message_hash();
+        assert!(!b.requested().contains(&y_hash), "B withheld a retry and was asked first again");
+        assert!(c.requested().contains(&y_hash), "C should be asked for Y");
+        assert!(!rep.penalised(b.id), "a withheld retry costs no reputation");
+    }
+
+    /// Only a peer that answers none of a request escalates. A peer that
+    /// answers part of each request, as an honest peer does when it pruned the
+    /// rest at a block boundary, is never escalated however often it happens.
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_answer_never_escalates() {
+        let board = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let fakes = wantable_ids(6);
+        let mut partial = SilentPeer::spawn(&board, &rep, 0x9A);
+        let silent = SilentPeer::spawn(&board, &rep, 0x9B);
+
+        for round in 0..3u8 {
+            let real = checked(&[0xE0, round], 10);
+            partial.announce(&[real.msg_id(), fakes[round as usize]]).await;
+            silent.announce(&fakes[3 + round as usize..4 + round as usize]).await;
+            assert!(partial.asked_within(Duration::from_secs(2)).await);
+            let wire = [WirePoWMsg::new(real.msg.clone(), real.hash)];
+            partial
+                .inbound
+                .send(frame(BOARD_MESSAGES, &encode_wire_pow_msg_list(&wire)))
+                .await
+                .unwrap();
+            tokio::time::sleep(WANT_TIMEOUT + Duration::from_secs(2)).await;
+        }
+
+        assert!(rep.penalised(partial.id), "each unanswered hash still costs a little");
+        assert!(!rep.escalated(partial.id), "a partial answer must never escalate");
+        assert!(rep.escalated(silent.id), "three silent requests in a minute escalate");
     }
 
     /// A peer asked only because another peer withheld may no longer hold the
