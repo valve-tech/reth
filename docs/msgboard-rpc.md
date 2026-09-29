@@ -115,9 +115,9 @@ Omitting the filter (or any field) means "no constraint." Pass `null` or `[]` fo
 
 #### Response size and `--rpc.max-response-size`
 
-A full default board (10,000 messages of 8 KiB) makes a response of about 167.3 MB, and at most 168,600,045 bytes. Reth's default `--rpc.max-response-size` is 160 MiB (167,772,160 bytes), which is less. On a nearly full board, a no-limit call then fails with a response-too-large error. It never returns part of the board.
+A full default board (10,000 messages of 8 KiB) makes a response of about 167.3 MB, and at most 168,600,045 bytes. Stock reth's default `--rpc.max-response-size` is 160 MiB (167,772,160 bytes), which is less. On a nearly full board, a no-limit call then fails with a response-too-large error. It never returns part of the board.
 
-**If your node serves `msgboard_content`, start it with `--rpc.max-response-size 200`** (the value is in MiB). If you raise `--msgboard.count-limit` or `--msgboard.size-limit`, scale this up too: the response is about 2 × `count-limit` × `size-limit` bytes, plus up to about 500 bytes per message.
+This build of reth sets the `--rpc.max-response-size` default to 200 MiB, so a full default board fits and you need no flag. An explicit `--rpc.max-response-size` still overrides it; do not set it below 200 on a node that serves `msgboard_content`. A stock reth, or any node on the 160 MiB default, needs `--rpc.max-response-size 200` (the value is in MiB). If you raise `--msgboard.count-limit` or `--msgboard.size-limit`, scale this up too: the response is about 2 × `count-limit` × `size-limit` bytes, plus up to about 500 bytes per message.
 
 The node builds the response on a blocking thread, not on the async runtime. Building a full board takes seconds.
 
