@@ -1350,7 +1350,7 @@ where
     #[expect(clippy::type_complexity)]
     fn execute_and_trace_block<Err, T>(
         &mut self,
-        state_provider: StateProviderBox,
+        state_provider: EvmStateProviderBox,
         env: ExecutionEnv<Evm>,
         input: &BlockOrPayload<T>,
         tracer: &mut reth_firehose::FirehoseBlockTracer,
