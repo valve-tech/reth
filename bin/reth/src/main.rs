@@ -24,6 +24,7 @@ use reth_pulsechain_node::{
     launch::inject_pulsechain_bootnodes_if_unset, spec::PulsechainChainSpec,
     PulsechainChainSpecParser, PulsechainNode,
 };
+use reth_rpc_builder::install_txpool_page_rpc;
 use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection, RpcModuleValidator};
 use tracing::info;
 
@@ -222,6 +223,9 @@ fn run_ethereum_node() -> eyre::Result<()> {
                     .with_add_ons(EthereumAddOns::default())
                     .extend_rpc_modules(move |ctx| {
                         launcher_for_rpc.install_rpc(ctx.modules)?;
+                        let pool = ctx.pool().clone();
+                        let converter = ctx.registry.eth_api().converter().clone();
+                        install_txpool_page_rpc(ctx.modules, pool, converter)?;
                         Ok(())
                     })
                     .install_exex("firehose", |ctx| async move {
@@ -250,6 +254,9 @@ fn run_ethereum_node() -> eyre::Result<()> {
                     .with_add_ons(EthereumAddOns::default())
                     .extend_rpc_modules(move |ctx| {
                         launcher_for_rpc.install_rpc(ctx.modules)?;
+                        let pool = ctx.pool().clone();
+                        let converter = ctx.registry.eth_api().converter().clone();
+                        install_txpool_page_rpc(ctx.modules, pool, converter)?;
                         Ok(())
                     })
                     .launch()
@@ -316,6 +323,9 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                     .with_add_ons(EthereumAddOns::default())
                     .extend_rpc_modules(move |ctx| {
                         launcher_for_rpc.install_rpc(ctx.modules)?;
+                        let pool = ctx.pool().clone();
+                        let converter = ctx.registry.eth_api().converter().clone();
+                        install_txpool_page_rpc(ctx.modules, pool, converter)?;
 
                         let eth_api = ctx.registry.eth_api().clone();
                         install_gas_estimation_margin(ctx.modules, eth_api)?;
@@ -347,6 +357,9 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                     .with_add_ons(EthereumAddOns::default())
                     .extend_rpc_modules(move |ctx| {
                         launcher_for_rpc.install_rpc(ctx.modules)?;
+                        let pool = ctx.pool().clone();
+                        let converter = ctx.registry.eth_api().converter().clone();
+                        install_txpool_page_rpc(ctx.modules, pool, converter)?;
 
                         let eth_api = ctx.registry.eth_api().clone();
                         install_gas_estimation_margin(ctx.modules, eth_api)?;
