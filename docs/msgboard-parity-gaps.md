@@ -2556,3 +2556,44 @@ and then refuse each other's frames. On reth that is worse than on erigon,
 because `BadProtocol` scores against the peer rather than the sub-protocol, so
 one msgboard mismatch removes that peer from block sync too. Whoever runs the
 upgrade should keep the window short.
+
+## 27. Intentional divergences recorded 2026-09-28
+
+These two differences are deliberate. They are here so a later audit does not
+read them as parity bugs. The erigon references are to
+`~/go/src/gitlab.com/pulsechaincom/erigon-pulse` at `v3.0.0-RC8`
+(`48cdb29e35`), package `msgboard/`.
+
+### 27.1 A zero difficulty rejects the whole frame, not one message
+
+`D = (2^24 + 10_000 × size) × M / Div` floors to 0 when `Div` is large enough
+against `M`. Reth rejects that message in `PoWMsg::validate`
+(`crates/net/msgboard-types/src/pow.rs`, the `difficulty().is_none_or(..)`
+check). `decode_wire_pow_msg_list` (`wire.rs`) runs `validate` on every message
+of a `BoardMessages` frame, so one such message fails the whole frame at decode,
+and the sender takes the decode-failure penalty.
+
+Erigon's `Validate` (`pow_message.go:156-174`) checks only that `M` and `Div`
+are non-zero. It catches `D == 0` later, in `toCheckedMsg`
+(`pow_message.go:253-256`), which returns `ErrPoWMsgInvalidWork` for that one
+message. The other messages in the frame still go through.
+
+Reth is stricter on purpose. Only a hostile sender can produce this message: an
+honest client mines against a ratio `M / Div` at or above the network minimum,
+and at the default minimum (`10_000 / 1_000_000`) `D` is at least `2^24 / 100`.
+An honest node never builds or relays a `D == 0` message, so the stricter rule
+cannot split honest nodes. Rejecting at decode also skips the secp256k1 work
+that a `PoW` check on the message would cost.
+
+### 27.2 The on-disk `CheckedPoWMsg` record carries a timestamp
+
+Erigon's `CheckedPoWMsg` (`pow_message.go:56-63`) is the embedded `PoWMsg`,
+`BlockNumber` and `Hash`. Reth's (`pow.rs`, `struct CheckedPoWMsg`) adds
+`timestamp` between `block_number` and `hash`, so its RLP differs.
+
+The difference is disk-only. The wire carries `PoWMsg` and the claimed hash
+(`WirePoWMsg`), never `CheckedPoWMsg`, and RPC omits `timestamp`
+(`rpc_api.rs`, `MsgboardMsg`). Each client reads only its own database, so a
+reth node and an erigon node never exchange this record. The one consequence:
+a reth msgboard database cannot be copied into an erigon node, or the other
+way round.
