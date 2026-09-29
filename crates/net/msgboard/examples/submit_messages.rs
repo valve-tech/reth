@@ -1,6 +1,6 @@
 //! Submit test messages to a running msgboard via `msgboard_addMessage`.
 //!
-//! Mines valid PoW for the chain head returned by the target node's JSON-RPC,
+//! Mines valid `PoW` for the chain head returned by the target node's JSON-RPC,
 //! RLP-encodes the resulting `PoWMsg`, and submits it. Useful as an operator
 //! smoke test after a deploy, or to seed a quiet board during testing.
 //!
@@ -36,7 +36,7 @@ struct Args {
 
 impl Args {
     fn parse() -> Self {
-        let mut args = std::env::args().skip(1).peekable();
+        let mut args = std::env::args().skip(1);
         let mut url = "http://127.0.0.1:8545".to_string();
         let mut count = 3usize;
         let mut category = {
