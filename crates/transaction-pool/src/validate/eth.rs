@@ -26,7 +26,7 @@ use alloy_eips::{
 };
 use alloy_primitives::U256;
 use alloy_rlp::Encodable;
-use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
+use reth_chainspec::{is_pulsechain_chain_id, ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{
     transaction::error::InvalidTransactionError, Account, BlockTy, GotExpected, HeaderTy,
@@ -595,7 +595,7 @@ where
         if let Some(chain_id) = transaction.chain_id() &&
             chain_id != self.chain_id()
         {
-            let is_pulsechain = matches!(self.chain_id(), 369 | 943);
+            let is_pulsechain = is_pulsechain_chain_id(self.chain_id());
             if !(is_pulsechain && chain_id == 1) {
                 return Err(InvalidTransactionError::ChainIdMismatch.into())
             }
