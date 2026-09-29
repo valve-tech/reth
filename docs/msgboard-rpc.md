@@ -2,7 +2,7 @@
 
 A practical guide to talking to a reth node's `msgboard_*` namespace. For protocol/wire-level details (P2P codes, RLP layouts, gRPC), see [`specs/02-msgboard.md`](../specs/02-msgboard.md). This document is the reference for **client-side request/response** shapes — the surface that users and AIs need to construct valid calls and parse replies.
 
-> **Implementation note:** This describes the **reth** msgboard implementation on the `extension-model` branch. Method signatures match the `erigon-pulse` JSON-RPC surface (so existing erigon-pulse RPC clients work unchanged) `msgboard_addMessage` takes the same hex-encoded RLP `PoWMsg` that erigon-pulse takes. `msgboard_content`'s grouped-by-category map and `msgboard_subscribe`'s `["newMessages", filter?]` shape are bit-for-bit compatible. The one difference: `msgboard_content` returns one page at a time (see [Paging](#paging)), where erigon-pulse returns the whole board.
+> **Implementation note:** This describes the **reth** msgboard implementation on the `extension-model` branch. Method signatures match the `erigon-pulse` JSON-RPC surface, so existing erigon-pulse RPC clients work unchanged. `msgboard_addMessage` takes the same hex-encoded RLP `PoWMsg` that erigon-pulse takes. `msgboard_content` returns the whole board in the same grouped-by-category map, and `msgboard_subscribe` takes the same `["newMessages", filter?]` shape. Reth adds two optional `msgboard_content` filter fields, `limit` and `offset`, for clients that want pages (see [Paging](#paging-reth-extension)).
 
 ---
 
@@ -108,23 +108,30 @@ Optional filter. Returns matching live messages **grouped by category**.
 | `category` | B256 hex | yes | Restrict to one category |
 | `fromBlock` | uint64 | yes | Inclusive lower bound on `blockNumber` |
 | `toBlock` | uint64 | yes | Inclusive upper bound on `blockNumber` |
-| `limit` | number | yes | Maximum messages in the page, counted across all categories. Default `1000`, maximum `5000`; a larger value returns `-32602`. |
-| `offset` | number | yes | Messages to skip before the page starts. Default `0`. |
+| `limit` | number | yes | **Reth extension.** Maximum messages in the response, counted across all categories. Omitted: no limit. |
+| `offset` | number | yes | **Reth extension.** Messages to skip before the response starts. Default `0`. |
 
-Omitting the filter (or any field) means "no constraint" for `category`, `fromBlock` and `toBlock`, and the defaults above for `limit` and `offset`. Pass `null` or `[]` for no filter.
+Omitting the filter (or any field) means "no constraint." Pass `null` or `[]` for no filter. **With no `limit`, the response holds every matching message, the same as erigon-pulse.**
+
+#### Response size and `--rpc.max-response-size`
+
+A full default board (10,000 messages of 8 KiB) makes a response of about 167.3 MB, and at most 168,600,045 bytes. Reth's default `--rpc.max-response-size` is 160 MiB (167,772,160 bytes), which is less. On a nearly full board, a no-limit call then fails with a response-too-large error. It never returns part of the board.
+
+**If your node serves `msgboard_content`, start it with `--rpc.max-response-size 200`** (the value is in MiB). If you raise `--msgboard.count-limit` or `--msgboard.size-limit`, scale this up too: the response is about 2 × `count-limit` × `size-limit` bytes, plus up to about 500 bytes per message.
+
+The node builds the response on a blocking thread, not on the async runtime. Building a full board takes seconds.
+
+#### Paging (reth extension)
 
 #### Paging
 
-`msgboard_content` returns one page, not the whole board. A call with no `limit` returns at most 1000 messages. A page also stops once the `data` of its messages passes 4 MiB (4,194,304 bytes), so a page can hold fewer than `limit` messages while more remain. A page always holds at least one message when any remain at `offset`.
+Use `limit` and `offset` if you do not want the whole board in one response. They apply to the flat list of matching messages in board order (ascending block number, then ascending difficulty ratio), before the node groups them by category. A response holds exactly `limit` messages unless the list runs out. To read every matching message:
 
-`limit` and `offset` apply to the flat list of matching messages in board order (ascending block number, then ascending difficulty ratio), before the node groups them by category. To read every matching message:
+1. Call with `limit: N, offset: 0`.
+2. Call again with `offset` raised by `N`.
+3. Stop when a response holds fewer than `N` messages.
 
-1. Call with `offset: 0`.
-2. Count the messages in the page, across all categories.
-3. Call again with `offset` raised by that count.
-4. Stop when a page comes back empty (`{}`).
-
-Do not stop on a short page, and do not raise `offset` by `limit`: the byte cap can make a page short while messages remain. The board changes between calls, so a walk is not a snapshot.
+The board changes between calls, so a walk is not a snapshot.
 
 **Response:** `{ [categoryHex: string]: MsgboardMsg[] }` — a JSON object whose keys are lowercase `0x…` 32-byte category ids and whose values are arrays of [`MsgboardMsg`](#message-shape). If a `category` filter is supplied, the map contains at most one entry; if no messages match, the map is empty (`{}`).
 
@@ -430,13 +437,13 @@ curl -s http://localhost:8545 -H 'content-type: application/json' \
 curl -s http://localhost:8545 -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"msgboard_categories","params":[]}' | jq
 
-# 3. Pull the first page of live messages (at most 1000; see Paging)
+# 3. Pull every live message and count them (see Response size)
 curl -s http://localhost:8545 -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"msgboard_content","params":[]}' | jq '[.result[] | length] | add'
 
-# 4. Pull the next page: raise offset by the count step 3 printed
+# 4. Or pull the first 500 only (reth extension)
 curl -s http://localhost:8545 -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"msgboard_content","params":[{"offset":1000}]}' | jq '[.result[] | length] | add'
+  -d '{"jsonrpc":"2.0","id":1,"method":"msgboard_content","params":[{"limit":500}]}' | jq '[.result[] | length] | add'
 ```
 
 If `msgboard_status` returns `method not found`, the namespace isn't on `--http.api`. If it returns `enabled: false`, the node is still syncing or has no peers yet. The board enables itself when both clear; no flag controls it.
