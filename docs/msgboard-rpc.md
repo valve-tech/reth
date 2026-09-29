@@ -108,7 +108,7 @@ Optional filter. Returns matching live messages **grouped by category**.
 | `category` | B256 hex | yes | Restrict to one category |
 | `fromBlock` | uint64 | yes | Inclusive lower bound on `blockNumber` |
 | `toBlock` | uint64 | yes | Inclusive upper bound on `blockNumber` |
-| `limit` | number | yes | **Reth extension.** Maximum messages in the response, counted across all categories. Omitted: no limit. |
+| `limit` | number | yes | **Reth extension.** Maximum messages in the response, counted across all categories. Omitted: no limit. `0` returns `{}`. |
 | `offset` | number | yes | **Reth extension.** Messages to skip before the response starts. Default `0`. |
 
 Omitting the filter (or any field) means "no constraint." Pass `null` or `[]` for no filter. **With no `limit`, the response holds every matching message, the same as erigon-pulse.**
@@ -117,9 +117,9 @@ Omitting the filter (or any field) means "no constraint." Pass `null` or `[]` fo
 
 A full default board (10,000 messages of 8 KiB) makes a response of about 167.3 MB, and at most 168,600,045 bytes. Stock reth's default `--rpc.max-response-size` is 160 MiB (167,772,160 bytes), which is less. On a nearly full board, a no-limit call then fails with a response-too-large error. It never returns part of the board.
 
-This build of reth sets the `--rpc.max-response-size` default to 200 MiB, so a full default board fits and you need no flag. An explicit `--rpc.max-response-size` still overrides it; do not set it below 200 on a node that serves `msgboard_content`. A stock reth, or any node on the 160 MiB default, needs `--rpc.max-response-size 200` (the value is in MiB). If you raise `--msgboard.count-limit` or `--msgboard.size-limit`, scale this up too: the response is about 2 × `count-limit` × `size-limit` bytes, plus up to about 500 bytes per message.
+This build of reth sets the `--rpc.max-response-size` default to 200 MiB, so a full default board fits and you need no flag. The default applies to every RPC method, not only `msgboard_*`: any response up to 200 MiB now goes out where stock reth refuses it above 160 MiB. An explicit `--rpc.max-response-size` still overrides it; do not set it below 200 on a node that serves `msgboard_content`. A stock reth, or any node on the 160 MiB default, needs `--rpc.max-response-size 200` (the value is in MiB). If you raise `--msgboard.count-limit` or `--msgboard.size-limit`, scale this up too: the response is about 2 × `count-limit` × `size-limit` bytes, plus up to about 500 bytes per message.
 
-The node builds the response on a blocking thread, not on the async runtime. Building a full board takes seconds.
+The node builds the response on a blocking thread, not on the async runtime. Building a full board takes seconds. The node builds at most two `msgboard_content` responses at once; a further call waits its turn, and a caller that disconnects while it waits costs nothing.
 
 #### Paging (reth extension)
 
