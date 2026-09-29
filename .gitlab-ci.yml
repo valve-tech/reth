@@ -28,6 +28,39 @@ valve-ci:
   script:
     - cargo fmt --check -p reth-firehose -p reth-firehose-tests -p reth-pulsechain-node -p reth-pulsechain-forks || true
     - cargo clippy --no-deps -p reth-firehose -p reth-firehose-tests -p reth-pulsechain-node -p reth-pulsechain-forks --all-targets
+    - cargo clippy --no-deps -p reth-msgboard -p reth-msgboard-types --all-targets -- -D warnings
     - cargo check -p reth --no-default-features --features "jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
     - cargo nextest run --no-fail-fast -p reth-firehose -p reth-firehose-tests -p reth-msgboard -p reth-msgboard-types -p reth-pulsechain-node -p reth-pulsechain-forks -p reth-cli-commands
     - cargo nextest run -p reth-node-ethereum --test e2e -E 'test(estimate::)' --no-tests=fail
+
+# Unit tests of the upstream crates the fork modifies. The filter mirrors
+# upstream's unit.yml: library and binary tests, no integration tests.
+upstream-unit:
+  stage: test
+  tags: [reth]
+  timeout: 2h
+  cache:
+    key: upstream-unit-$CI_DEFAULT_BRANCH
+    paths: [.cargo/registry, .cargo/git, target]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq clang libclang-dev pkg-config
+    - curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin
+  script:
+    - cargo nextest run --no-fail-fast --locked -p reth-rpc -p reth-rpc-eth-api -p reth-rpc-eth-types -p reth-rpc-builder -p reth-network -p reth-engine-tree -p reth-provider -p reth-transaction-pool -p reth-eth-wire --no-tests=fail -E '!kind(test) and not binary(e2e_testsuite)'
+
+# The CLI reference pages must match the help output of the binary the fleet
+# builds. docs/cli/help.rs is a nightly cargo script.
+cli-docs:
+  stage: test
+  tags: [reth]
+  timeout: 2h
+  cache:
+    key: cli-docs-$CI_DEFAULT_BRANCH
+    paths: [.cargo/registry, .cargo/git, target]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq clang libclang-dev pkg-config
+    - rustup toolchain install nightly --profile minimal
+  script:
+    - cargo build -p reth --no-default-features --features "jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
+    - ./docs/cli/update.sh target/debug/reth
+    - git diff --exit-code docs/vocs/docs/pages/cli
