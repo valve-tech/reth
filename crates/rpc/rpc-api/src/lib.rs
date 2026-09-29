@@ -29,11 +29,16 @@ mod rpc;
 mod testing;
 mod trace;
 mod txpool;
+mod txpool_page;
 mod validation;
 mod web3;
 
 pub use reth::RethJitAction;
 pub use testing::{TestingBuildBlockRequestV1, TESTING_BUILD_BLOCK_V1, TESTING_COMMIT_BLOCK_V1};
+pub use txpool_page::{
+    TxpoolContentPage, TxpoolInspectPage, TxpoolPageRequest, TXPOOL_PAGE_MAX_BYTES,
+    TXPOOL_PAGE_MAX_SENDERS,
+};
 
 /// re-export of all server traits
 pub use servers::*;
@@ -56,6 +61,7 @@ pub mod servers {
         testing::TestingApiServer,
         trace::TraceApiServer,
         txpool::TxPoolApiServer,
+        txpool_page::TxPoolPageApiServer,
         validation::BlockSubmissionValidationApiServer,
         web3::Web3ApiServer,
     };
@@ -88,6 +94,7 @@ pub mod clients {
         testing::TestingApiClient,
         trace::TraceApiClient,
         txpool::TxPoolApiClient,
+        txpool_page::TxPoolPageApiClient,
         validation::BlockSubmissionValidationApiClient,
         web3::Web3ApiClient,
     };
