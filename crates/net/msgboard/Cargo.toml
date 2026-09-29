@@ -42,6 +42,7 @@ jsonrpsee = { workspace = true, features = ["server", "macros"] }
 metrics = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std", "raw_value"] }
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

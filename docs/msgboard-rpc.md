@@ -2,19 +2,22 @@
 
 A practical guide to talking to a reth node's `msgboard_*` namespace. For protocol/wire-level details (P2P codes, RLP layouts, gRPC), see [`specs/02-msgboard.md`](../specs/02-msgboard.md). This document is the reference for **client-side request/response** shapes — the surface that users and AIs need to construct valid calls and parse replies.
 
-> **Implementation note:** This describes the **reth** msgboard implementation on the `extension-model` branch. Method signatures match the `erigon-pulse` JSON-RPC surface (so existing erigon-pulse RPC clients work unchanged) with one ergonomic improvement: `msgboard_addMessage` accepts a structured JSON object instead of hex-encoded RLP. All other methods — including `msgboard_content`'s grouped-by-category map and `msgboard_subscribe`'s `["newMessages", filter?]` shape — are bit-for-bit compatible.
+> **Implementation note:** This describes the **reth** msgboard implementation on the `extension-model` branch. Method signatures match the `erigon-pulse` JSON-RPC surface, so existing erigon-pulse RPC clients work unchanged. `msgboard_addMessage` takes the same hex-encoded RLP `PoWMsg` that erigon-pulse takes. `msgboard_content` returns the whole board in the same grouped-by-category map, and `msgboard_subscribe` takes the same `["newMessages", filter?]` shape. Reth adds two optional `msgboard_content` filter fields, `limit` and `offset`, for clients that want pages (see [Paging](#paging-reth-extension)).
 
 ---
 
 ## Enabling the namespace
 
-Two CLI flags are required:
+The msgboard sub-protocol is always on. There is no `--msgboard.enabled` flag. The board starts to accept messages by itself once the node has finished syncing and has at least one peer; `msgboard_status` then reports `enabled: true`.
+
+To expose the RPC methods, name the `msgboard` namespace on each transport you want:
 
 ```
---msgboard.enabled                 # turn on the P2P sub-protocol and RPC handler
 --http.api eth,net,web3,msgboard   # expose msgboard_* over HTTP
 --ws.api  eth,net,web3,msgboard    # expose msgboard_* over WebSocket (for subscriptions)
 ```
+
+> **`--http.api all` (and `--ws.api all`, `--ipc.api all`) also exposes `msgboard_*`, including `msgboard_addMessage`.** "all" selects every namespace the node registers, and that includes this one. `addMessage` lets any caller that can reach the port submit messages that this node stores and gossips to its peers. Each message needs a solved proof of work, and `--msgboard.count-limit` bounds the board, but if you do not want a public submission endpoint, list the namespaces you want instead of `all`.
 
 The board persists to `<datadir>/msgboard/` (override with `--msgboard.db-dir`). On first start the directory is created automatically.
 
@@ -28,8 +31,8 @@ Other tunables (defaults shown):
 | `--msgboard.count-limit` | `10000` | Max live messages on the board |
 | `--msgboard.block-range` | `120` | Blocks before a message expires |
 | `--msgboard.stale-block-buffer` | `3` | Reject peer-announced messages within this many blocks of the lower bound |
-| `--msgboard.commit-every` | `15s` | How often to flush in-memory messages to MDBX. Accepts `humantime` (`15s`, `2m`, `500ms`) |
-| `--msgboard.log-every` | `30s` | How often to emit a periodic stats line at INFO level. Set very large to effectively disable. |
+| `--msgboard.commit-every` | `15s` | How often to flush in-memory messages to MDBX. Accepts `humantime` (`15s`, `2m`, `500ms`). Minimum `100ms`; the node refuses to start below it. |
+| `--msgboard.log-every` | `30s` | How often to emit a periodic stats line at INFO level. Set very large to effectively disable. Minimum `1s`; the node refuses to start below it. |
 | `--msgboard.gossip-disable` | `false` | Skip outbound P2P announcements (read-only / observer node). Inbound message acceptance is unaffected. |
 
 ---
@@ -105,8 +108,30 @@ Optional filter. Returns matching live messages **grouped by category**.
 | `category` | B256 hex | yes | Restrict to one category |
 | `fromBlock` | uint64 | yes | Inclusive lower bound on `blockNumber` |
 | `toBlock` | uint64 | yes | Inclusive upper bound on `blockNumber` |
+| `limit` | number | yes | **Reth extension.** Maximum messages in the response, counted across all categories. Omitted: no limit. `0` returns `{}`. |
+| `offset` | number | yes | **Reth extension.** Messages to skip before the response starts. Default `0`. |
 
-Omitting the filter (or any field) means "no constraint." Pass `null` or `[]` for no filter.
+Omitting the filter (or any field) means "no constraint." Pass `null` or `[]` for no filter. **With no `limit`, the response holds every matching message, the same as erigon-pulse.**
+
+#### Response size and `--rpc.max-response-size`
+
+A full default board (10,000 messages of 8 KiB) makes a response of about 167.3 MB, and at most 168,600,045 bytes. Stock reth's default `--rpc.max-response-size` is 160 MiB (167,772,160 bytes), which is less. On a nearly full board, a no-limit call then fails with a response-too-large error. It never returns part of the board.
+
+This build of reth sets the `--rpc.max-response-size` default to 200 MiB, so a full default board fits and you need no flag. The default applies to every RPC method, not only `msgboard_*`: any response up to 200 MiB now goes out where stock reth refuses it above 160 MiB. An explicit `--rpc.max-response-size` still overrides it; do not set it below 200 on a node that serves `msgboard_content`. A stock reth, or any node on the 160 MiB default, needs `--rpc.max-response-size 200` (the value is in MiB). If you raise `--msgboard.count-limit` or `--msgboard.size-limit`, scale this up too: the response is about 2 × `count-limit` × `size-limit` bytes, plus up to about 500 bytes per message.
+
+The node builds the response on a blocking thread, not on the async runtime. Building a full board takes seconds. The node builds at most two `msgboard_content` responses at once; a further call waits its turn, and a caller that disconnects while it waits costs nothing.
+
+#### Paging (reth extension)
+
+#### Paging
+
+Use `limit` and `offset` if you do not want the whole board in one response. They apply to the flat list of matching messages in board order (ascending block number, then ascending difficulty ratio), before the node groups them by category. A response holds exactly `limit` messages unless the list runs out. To read every matching message:
+
+1. Call with `limit: N, offset: 0`.
+2. Call again with `offset` raised by `N`.
+3. Stop when a response holds fewer than `N` messages.
+
+The board changes between calls, so a walk is not a snapshot.
 
 **Response:** `{ [categoryHex: string]: MsgboardMsg[] }` — a JSON object whose keys are lowercase `0x…` 32-byte category ids and whose values are arrays of [`MsgboardMsg`](#message-shape). If a `category` filter is supplied, the map contains at most one entry; if no messages match, the map is empty (`{}`).
 
@@ -412,9 +437,13 @@ curl -s http://localhost:8545 -H 'content-type: application/json' \
 curl -s http://localhost:8545 -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"msgboard_categories","params":[]}' | jq
 
-# 3. Pull all live messages (use cautiously on a busy board)
+# 3. Pull every live message and count them (see Response size)
 curl -s http://localhost:8545 -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"msgboard_content","params":[]}' | jq '.result | length'
+  -d '{"jsonrpc":"2.0","id":1,"method":"msgboard_content","params":[]}' | jq '[.result[] | length] | add'
+
+# 4. Or pull the first 500 only (reth extension)
+curl -s http://localhost:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"msgboard_content","params":[{"limit":500}]}' | jq '[.result[] | length] | add'
 ```
 
-If `msgboard_status` returns `method not found`, the namespace isn't on `--http.api`. If it returns `enabled: false`, the `--msgboard.enabled` flag is missing.
+If `msgboard_status` returns `method not found`, the namespace isn't on `--http.api`. If it returns `enabled: false`, the node is still syncing or has no peers yet. The board enables itself when both clear; no flag controls it.
