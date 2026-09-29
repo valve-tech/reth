@@ -6,7 +6,7 @@
 use alloy_primitives::{map::B256Set, B256, KECCAK256_EMPTY};
 use futures::Future;
 use reth_eth_wire_types::snap::{
-    AccountRangeMessage, GetAccountRangeMessage, GetStorageRangesMessage,
+    AccountData, AccountRangeMessage, GetAccountRangeMessage, GetStorageRangesMessage,
 };
 use reth_network_p2p::{
     error::RequestError,
@@ -298,17 +298,8 @@ fn verify_account_range(
         return Err(RequestError::BadResponse)
     }
 
-    // Decode first so malformed account values are attributed to the responder.
-    let mut accounts = response
-        .accounts
-        .into_iter()
-        .map(|data| {
-            data.into_trie_entry().map_err(|error| {
-                debug!(target: "downloaders::snap", %error, "Invalid account data");
-                RequestError::BadResponse
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut accounts =
+        response.accounts.into_iter().map(AccountData::into_trie_entry).collect::<Vec<_>>();
     let next = verify_proof(request, &accounts, &response.proof)?;
 
     // Authenticate the boundary account before removing it from the requested range. Once
@@ -342,10 +333,11 @@ fn verify_proof(
 }
 
 #[cfg(test)]
+#[allow(clippy::clone_on_copy)]
 mod tests {
     use super::{request::MAX_RETRIES, test_utils::TestSnapClient, *};
-    use alloy_primitives::{Bytes, KECCAK256_EMPTY, U256};
-    use reth_eth_wire_types::snap::{AccountData, ByteCodesMessage};
+    use alloy_primitives::{Bytes, U256};
+    use reth_eth_wire_types::snap::ByteCodesMessage;
     use reth_network_p2p::{error::PeerRequestResult, priority::Priority};
     use reth_network_peers::WithPeerId;
     use reth_trie_common::{proof::ProofRetainer, HashBuilder, Nibbles};
@@ -358,12 +350,7 @@ mod tests {
     }
 
     fn account(nonce: u64) -> TrieAccount {
-        TrieAccount {
-            nonce,
-            balance: U256::from(1),
-            storage_root: EMPTY_ROOT_HASH,
-            code_hash: KECCAK256_EMPTY,
-        }
+        TrieAccount { nonce, balance: U256::from(1), ..Default::default() }
     }
 
     fn root(accounts: &[(B256, TrieAccount)]) -> B256 {
@@ -601,7 +588,7 @@ mod tests {
             AccountRangeOutcome::Verified(VerifiedAccountRange {
                 state_root: root_hash,
                 origin: B256::ZERO,
-                accounts: vec![accounts[0]],
+                accounts: vec![accounts[0].clone()],
                 has_more: false,
                 next: Some(key(3)),
             })
@@ -746,7 +733,7 @@ mod tests {
             AccountRangeOutcome::Verified(VerifiedAccountRange {
                 state_root: root_hash,
                 origin: B256::ZERO,
-                accounts: vec![accounts[0]],
+                accounts: vec![accounts[0].clone()],
                 has_more: false,
                 next: Some(key(9)),
             })
@@ -774,7 +761,7 @@ mod tests {
             AccountRangeOutcome::Verified(VerifiedAccountRange {
                 state_root: root_hash,
                 origin: B256::ZERO,
-                accounts: vec![accounts[0]],
+                accounts: vec![accounts[0].clone()],
                 has_more: true,
                 next: Some(key(3)),
             })
