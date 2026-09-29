@@ -54,7 +54,7 @@ use reth_evm::{
 use reth_execution_types::BlockExecutionResult;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredBlock, TxTy};
-use reth_provider::StateProviderBox;
+use reth_provider::EvmStateProviderBox;
 use reth_revm::{
     database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
     revm::context::Block as RevmBlock, Database as _, State,
@@ -595,7 +595,7 @@ where
 /// EVM type the live engine-API path executes Firehose-traced blocks with.
 pub type LiveTracedEvm<'db, 'tracer, Evm> = EvmFor<
     Evm,
-    &'db mut State<StateProviderDatabase<StateProviderBox>>,
+    &'db mut State<StateProviderDatabase<EvmStateProviderBox>>,
     FirehoseInspector<'tracer>,
 >;
 

@@ -187,7 +187,13 @@ impl MsgboardLauncher {
     pub fn install_post_launch_tasks<Net, Provider>(&self, network: Net, provider: Provider)
     where
         Net: NetworkInfo + PeersInfo + Clone + Send + Sync + 'static,
-        Provider: CanonStateSubscriptions + BlockNumReader + Clone + Send + Sync + 'static,
+        Provider: CanonStateSubscriptions
+            + NodePrimitivesProvider
+            + BlockNumReader
+            + Clone
+            + Send
+            + Sync
+            + 'static,
         <<Provider as NodePrimitivesProvider>::Primitives as NodePrimitives>::BlockHeader:
             AlloyBlockHeader,
     {
