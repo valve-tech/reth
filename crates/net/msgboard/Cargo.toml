@@ -42,6 +42,7 @@ jsonrpsee = { workspace = true, features = ["server", "macros"] }
 metrics = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std", "raw_value"] }
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
@@ -60,4 +61,9 @@ serde_json = { workspace = true, features = ["std"] }
 tempfile = { workspace = true }
 # `test-util` gives `#[tokio::test(start_paused = true)]`, which drives the
 # outbound-send timeout without the test sleeping for it.
-tokio = { workspace = true, features = ["test-util"] }
+#
+# `net` and `tokio-util`'s codec carry a real `RLPx` multiplexer over a
+# loopback socket. The multiplexer is the only thing that enforces the
+# per-protocol ingress limits.
+tokio = { workspace = true, features = ["test-util", "net"] }
+tokio-util = { workspace = true, features = ["codec"] }

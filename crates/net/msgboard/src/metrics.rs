@@ -80,6 +80,11 @@ pub struct MsgboardMetrics {
     pub evicted: Counter,
     /// Messages dropped because their anchor block left the live window.
     pub expired: Counter,
+    /// `flush_to_db` calls whose write transaction failed.
+    ///
+    /// Any rise means the board is ahead of its database. A restart in that
+    /// state loses every message accepted since the last successful flush.
+    pub flush_failures: Counter,
 
     // ── peer sessions ────────────────────────────────────────────────────────
     /// Peers with a live `msg/1` session right now.
@@ -177,4 +182,12 @@ pub struct MsgboardMetrics {
     /// Stays at zero against a conforming peer, which cannot announce more than
     /// one frame's worth at a time.
     pub wants_refused: Counter,
+    /// `GetBoardMessages` replies cut short because the peer's reply budget
+    /// ran out (`serve_burst_bytes`, refilled at `SERVE_REFILL_BYTES_PER_SEC`).
+    /// The peer is not penalised; it asks again later.
+    pub requests_over_budget: Counter,
+    /// `GetBoardMessages` frames that named a message we served to the same
+    /// peer inside `REPEAT_REQUEST_WINDOW`. Those messages are skipped, with
+    /// no penalty.
+    pub requests_repeated: Counter,
 }

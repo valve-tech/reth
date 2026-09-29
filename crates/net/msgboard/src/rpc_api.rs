@@ -3,12 +3,15 @@
 //! Exposes the `PulseChain` `msg/1` board over JSON-RPC. All methods are
 //! prefixed with `msgboard_` and the subscription fires on every new
 //! accepted message.
-
-use std::collections::HashMap;
+//!
+//! The namespace is `msgboard`. `--http.api all` (and the `ws`/`ipc`
+//! equivalents) includes it, so it exposes `msgboard_addMessage` as well as
+//! the read methods.
 
 use alloy_primitives::{Bytes, B256};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 /// JSON-serializable representation of a validated msgboard message.
 ///
@@ -99,11 +102,12 @@ pub struct ContentFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_block: Option<u64>,
     /// Maximum number of messages in the response, counted across every
-    /// category it holds. Defaults to [`CONTENT_DEFAULT_LIMIT`]. A value above
-    /// [`CONTENT_MAX_LIMIT`] is rejected.
+    /// category it holds. **Reth extension.** Omitted, the response holds
+    /// every matching message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     /// Number of messages to skip before the page starts. Defaults to `0`.
+    /// **Reth extension.**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<usize>,
 }
@@ -147,30 +151,32 @@ pub trait MsgboardApi {
     /// shape. If a `category` filter is supplied, the map contains at most
     /// one entry; if no messages match, the map is empty.
     ///
-    /// # Paging
+    /// The result is pre-serialised JSON in exactly that shape; the node
+    /// builds it on the blocking pool, off the async runtime.
     ///
-    /// A response holds at most `limit` messages, defaulting to
-    /// [`CONTENT_DEFAULT_LIMIT`]. **A call that names no limit is truncated on
-    /// a larger board.** This diverges from erigon-pulse, which returns the
-    /// whole board however big it is; see [`CONTENT_DEFAULT_LIMIT`] for the
-    /// measured cost of doing that.
+    /// # Size
     ///
-    /// `offset` skips messages before the page starts. Both apply to the flat
-    /// message list in board precedence order — ascending block number, then
-    /// ascending difficulty ratio — *before* the messages are grouped by
-    /// category. Grouping preserves that relative order inside each category,
-    /// so a client that raises `offset` by `limit` each call walks the board
-    /// once, in order, with no gaps and no repeats.
+    /// With no `limit`, the response holds every matching message, as erigon
+    /// does. A full default board (10,000 messages of 8 KiB) is about
+    /// 167.3 MB of JSON, and at most 168,600,045 bytes with the widest
+    /// field encodings (`worst_case_full_board_response_size`). That is over
+    /// stock reth's default `--rpc.max-response-size` of 160 MiB. This fork's
+    /// `reth` binary raises that default to 200 MiB; any other node that
+    /// serves this method must run with `--rpc.max-response-size 200` or more.
+    /// Below that, a call on a nearly full board fails with a
+    /// response-too-large error; it never returns part of the board.
     ///
-    /// A response holding exactly `limit` messages may be truncated. That is
-    /// the only truncation signal: the result shape is fixed by erigon parity,
-    /// so there is nowhere to put a cursor. Page until a response comes back
-    /// short.
+    /// # Paging (reth extension)
+    ///
+    /// `limit` and `offset` apply to the flat message list in board precedence
+    /// order — ascending block number, then ascending difficulty ratio —
+    /// *before* the messages are grouped by category. A page holds exactly
+    /// `limit` messages unless the list runs out, so a client that raises
+    /// `offset` by `limit` each call walks the board once, in order, and stops
+    /// on the first page shorter than `limit`. The board changes between
+    /// calls, so a walk is not a snapshot.
     #[method(name = "content")]
-    async fn msgboard_content(
-        &self,
-        filter: Option<ContentFilter>,
-    ) -> RpcResult<HashMap<String, Vec<MsgboardMsg>>>;
+    async fn msgboard_content(&self, filter: Option<ContentFilter>) -> RpcResult<Box<RawValue>>;
 
     /// Look up a single message by its SHA-256 `PoW` hash.
     #[method(name = "getMessage")]
@@ -205,32 +211,6 @@ pub trait MsgboardApi {
         filter: Option<NewMessagesFilter>,
     ) -> jsonrpsee::core::SubscriptionResult;
 }
-
-/// Messages [`MsgboardApiServer::msgboard_content`] returns when the caller
-/// names no `limit`.
-///
-/// The board holds up to `count_limit` messages whose `data` runs to
-/// `size_limit` bytes each — 10,000 × 8 KiB by default. Serialising all of
-/// them deep-copies every `data` field and then hex-expands it, so the copy and
-/// the JSON are alive together.
-///
-/// Measured on a full default board: the uncapped response is 167,340,072 bytes
-/// of JSON built from 81,920,000 bytes of `data`, and building plus serialising
-/// it takes about 11 s on one runtime worker. That lands 0.26% under the
-/// 160 MiB `--rpc.max-response-size` default, so a board a little fuller pays
-/// the whole cost and jsonrpsee then refuses to send the result. At this cap
-/// the same board answers in 16,734,072 bytes.
-/// `measure_content_on_a_full_board` reproduces both figures.
-///
-/// Capping the page turns that into an answer a client can use, and paging
-/// gets the rest.
-pub const CONTENT_DEFAULT_LIMIT: usize = 1_000;
-
-/// Largest `limit` [`MsgboardApiServer::msgboard_content`] accepts.
-///
-/// An explicit request for more is refused rather than clamped: a clamped page
-/// is short but looks complete, and the caller cannot tell.
-pub const CONTENT_MAX_LIMIT: usize = 5_000;
 
 #[cfg(test)]
 mod wire_shape_tests {

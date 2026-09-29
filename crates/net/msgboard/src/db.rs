@@ -125,12 +125,18 @@ pub(crate) fn open_env_with_map_size(path: &Path, map_size: usize) -> eyre::Resu
 ///
 /// Undecodable rows are logged here rather than at the call site, because only
 /// this function still holds the bytes that explain them.
+///
+/// A row whose key is not the hash of the message it holds is moved to the
+/// right key. Left in place, a flush that deletes the message deletes the key
+/// the message names, and the misfiled row comes back on every restart.
 pub fn db_load_all(env: &Environment) -> eyre::Result<(Vec<CheckedPoWMsg>, u64)> {
     let tx = env.begin_ro_txn()?;
     let db = tx.open_db(Some(TABLE_NAME))?;
     let cursor = tx.cursor(db.dbi())?;
 
     let mut msgs = Vec::new();
+    // Row key and position in `msgs` of each row stored under the wrong key.
+    let mut misfiled: Vec<(Vec<u8>, usize)> = Vec::new();
     let mut rows = 0u64;
     let mut read_failures = 0u64;
     let mut decode_failures = 0u64;
@@ -153,7 +159,12 @@ pub fn db_load_all(env: &Environment) -> eyre::Result<(Vec<CheckedPoWMsg>, u64)>
         };
 
         match CheckedPoWMsg::decode(&mut &*value) {
-            Ok(checked) => msgs.push(checked),
+            Ok(checked) => {
+                if *key != *checked.hash.as_slice() {
+                    misfiled.push((key.to_vec(), msgs.len()));
+                }
+                msgs.push(checked);
+            }
             Err(err) => {
                 decode_failures += 1;
                 let elements = rlp_top_level_element_count(&value);
@@ -212,7 +223,57 @@ pub fn db_load_all(env: &Environment) -> eyre::Result<(Vec<CheckedPoWMsg>, u64)>
         );
     }
 
+    drop(tx);
+    // A failed move leaves the rows where they are. The messages still load,
+    // and the next start tries the move again.
+    if !misfiled.is_empty() &&
+        let Err(err) = rekey_misfiled_rows(env, &msgs, &misfiled)
+    {
+        tracing::warn!(
+            target: "msgboard",
+            %err,
+            rows = misfiled.len(),
+            "could not move msgboard DB rows stored under a key other than their message hash",
+        );
+    }
+
     Ok((msgs, read_failures + decode_failures))
+}
+
+// Makes `rekey_misfiled_rows` fail on this thread, as a full map or a
+// read-only environment would.
+#[cfg(test)]
+thread_local! {
+    static FAIL_REKEY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Move each misfiled row to the key its message hash names, in one transaction.
+fn rekey_misfiled_rows(
+    env: &Environment,
+    msgs: &[CheckedPoWMsg],
+    misfiled: &[(Vec<u8>, usize)],
+) -> eyre::Result<()> {
+    #[cfg(test)]
+    if FAIL_REKEY.with(std::cell::Cell::get) {
+        eyre::bail!("injected rekey failure");
+    }
+    let tx = env.begin_rw_txn()?;
+    let db = tx.open_db(Some(TABLE_NAME))?;
+    let mut rlp_buf = Vec::new();
+    for (key, pos) in misfiled {
+        let msg = &msgs[*pos];
+        let _ = tx.del(db.dbi(), key.as_slice(), None);
+        rlp_buf.clear();
+        msg.encode(&mut rlp_buf);
+        tx.put(db.dbi(), msg.hash.as_slice(), &rlp_buf, WriteFlags::empty())?;
+    }
+    tx.commit()?;
+    tracing::warn!(
+        target: "msgboard",
+        rows = misfiled.len(),
+        "moved msgboard DB rows stored under a key other than their message hash",
+    );
+    Ok(())
 }
 
 /// Batch flush: write the given messages and delete discarded ones.
@@ -349,6 +410,58 @@ mod tests {
         let (loaded, bad) = db_load_all(&env).expect("load");
         assert_eq!(bad, 0);
         assert_eq!(loaded.len(), 3);
+    }
+
+    /// A row stored under the wrong key loads, and moves to its hash.
+    ///
+    /// If it stayed put, deleting the message would delete the key its hash
+    /// names, miss this row, and load it again on every restart.
+    #[test]
+    fn a_misfiled_row_moves_to_its_hash_on_load() {
+        let dir = TempDir::new().expect("tempdir");
+        let env = open_msgboard_db(dir.path()).expect("open");
+        let msg = sample_msg(7);
+        let wrong_key = B256::repeat_byte(0xEE);
+        {
+            let tx = env.begin_rw_txn().expect("rw");
+            let db = tx.open_db(Some(TABLE_NAME)).expect("table");
+            let mut row = Vec::new();
+            msg.encode(&mut row);
+            tx.put(db.dbi(), wrong_key.as_slice(), &row, WriteFlags::empty()).expect("put");
+            tx.commit().expect("commit");
+        }
+
+        let (loaded, bad) = db_load_all(&env).expect("load");
+        assert_eq!((loaded.len(), bad), (1, 0), "the misfiled row still loads");
+
+        db_flush::<CheckedPoWMsg>(&env, &[], &[msg.hash]).expect("delete by hash");
+        let (loaded, _) = db_load_all(&env).expect("reload");
+        assert!(loaded.is_empty(), "deleting the hash removes the row: {} left", loaded.len());
+    }
+
+    /// A failed move must not fail the load. The rows decoded fine, and an
+    /// error here starts the node with an empty board.
+    #[test]
+    fn a_failed_rekey_still_loads_the_messages() {
+        let dir = TempDir::new().expect("tempdir");
+        let env = open_msgboard_db(dir.path()).expect("open");
+        let msg = sample_msg(8);
+        {
+            let tx = env.begin_rw_txn().expect("rw");
+            let db = tx.open_db(Some(TABLE_NAME)).expect("table");
+            let mut row = Vec::new();
+            msg.encode(&mut row);
+            tx.put(db.dbi(), B256::repeat_byte(0xEF).as_slice(), &row, WriteFlags::empty())
+                .expect("put");
+            tx.commit().expect("commit");
+        }
+
+        FAIL_REKEY.with(|f| f.set(true));
+        let result = db_load_all(&env);
+        FAIL_REKEY.with(|f| f.set(false));
+
+        let (loaded, _) = result.expect("a failed rekey does not fail the load");
+        assert_eq!(loaded.len(), 1, "the misfiled message still loads");
     }
 
     /// The MDBX geometry is an erigon-pulse parity contract, not a tuning
