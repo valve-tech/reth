@@ -9293,6 +9293,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
  "base64 0.22.1",
  "eyre",
  "firehose-tracer",
