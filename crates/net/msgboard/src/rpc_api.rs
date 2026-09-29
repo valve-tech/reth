@@ -107,9 +107,15 @@ pub struct ContentFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     /// Number of messages to skip before the page starts. Defaults to `0`.
-    /// **Reth extension.**
+    /// **Reth extension.** Unstable when the board changes between pages, and
+    /// between replicas; use [`Self::after`] to page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<usize>,
+    /// Hash cursor. **Reth extension.** When set, the response holds the
+    /// matching messages whose hash is above this one, in ascending hash
+    /// order, up to `limit`. Cannot be used with `offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<B256>,
 }
 
 /// Optional filter for `msgboard_subscribe`. Only one option for now.
@@ -168,13 +174,22 @@ pub trait MsgboardApi {
     ///
     /// # Paging (reth extension)
     ///
-    /// `limit` and `offset` apply to the flat message list in board precedence
-    /// order — ascending block number, then ascending difficulty ratio —
-    /// *before* the messages are grouped by category. A page holds exactly
-    /// `limit` messages unless the list runs out, so a client that raises
-    /// `offset` by `limit` each call walks the board once, in order, and stops
-    /// on the first page shorter than `limit`. The board changes between
-    /// calls, so a walk is not a snapshot.
+    /// Page with `limit` and `after`. With `after`, the node orders the
+    /// matching messages by hash, ascending, and returns those above `after`,
+    /// up to `limit`. The first call passes the zero hash. Without `after`,
+    /// the first page comes in precedence order, not hash order, so a walk
+    /// that starts there can skip messages. The client passes the largest
+    /// hash in the page as the next `after`, and stops on an empty page or a
+    /// page shorter than `limit`. A message on the board for the whole walk is returned exactly
+    /// once, on any replica, whatever the board does between pages. `after`
+    /// with `offset` is `-32602`.
+    ///
+    /// `limit` and `offset` still work, for older clients. They apply to the
+    /// flat message list in board precedence order — ascending block number,
+    /// then ascending difficulty ratio — *before* the messages are grouped by
+    /// category. An insert or eviction between pages shifts that list, so an
+    /// offset walk can repeat or skip messages, and two replicas can order
+    /// the list differently.
     #[method(name = "content")]
     async fn msgboard_content(&self, filter: Option<ContentFilter>) -> RpcResult<Box<RawValue>>;
 

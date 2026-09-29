@@ -75,7 +75,7 @@ jsonrpsee-types.workspace = true
 
 # async
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 tokio-stream.workspace = true
 pin-project.workspace = true
 parking_lot.workspace = true
