@@ -283,6 +283,13 @@ const MIN_INBOUND_QUEUED_FRAMES: usize = 256;
 /// a flood of oversized frames at 16 MiB instead.
 const MIN_INBOUND_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 
+/// The multiplexer's byte budget for all inbound protocol queues on one
+/// connection. It mirrors `MAX_MUX_IN_BUFFER_BYTES` in
+/// `reth_eth_wire::multiplex`, which is private. `InboundSender::try_send`
+/// reserves from that budget before our protocol budget, so a larger msg/1
+/// byte limit never takes effect.
+const MUX_CONNECTION_IN_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
 /// The largest burst an honest peer can have in flight to us, as
 /// `(frames, bytes)`: one bulk announce of a full board plus the replies to
 /// every reservation we may hold with it.
@@ -303,18 +310,25 @@ fn honest_inbound_burst(cfg: &MsgboardConfig) -> (usize, usize) {
 }
 
 /// The ingress limits for a board with `cfg`: the honest burst, or the
-/// minimums if they are larger.
+/// minimums if they are larger, with bytes capped at the multiplexer's
+/// per-connection budget.
 ///
 /// The minimums leave room for single-ID announcements that arrive in the
 /// same window as a full burst. At the default config the burst is ~99
-/// frames and ~10 MB, so the minimums apply. At the largest `size_limit` the
-/// burst is ~1036 frames and ~107 MB, and the limits follow it: a node that
-/// accepts 100 KiB messages accepts the memory cost of receiving them.
+/// frames and ~10 MB, so the minimums apply.
+///
+/// At the largest `size_limit` the burst is ~1036 frames and ~107 MB, but no
+/// protocol can buffer more than [`MUX_CONNECTION_IN_BUFFER_BYTES`] = 32 MiB
+/// on one connection. The real ceiling there is about 330 full frames: an
+/// honest peer that has that many replies in flight while our read loop is
+/// stalled is cut, eth included. We cannot raise it without changing
+/// eth-wire.
 fn inbound_limits_for(cfg: &MsgboardConfig) -> ProtocolIngressLimits {
     let (frames, bytes) = honest_inbound_burst(cfg);
+    let bytes = bytes.clamp(MIN_INBOUND_QUEUED_BYTES, MUX_CONNECTION_IN_BUFFER_BYTES);
     ProtocolIngressLimits::default()
         .with_max_buffered_messages(frames.max(MIN_INBOUND_QUEUED_FRAMES))
-        .with_max_buffered_bytes(bytes.max(MIN_INBOUND_QUEUED_BYTES))
+        .with_max_buffered_bytes(bytes)
 }
 
 /// How often a connection re-checks whether the board became ready.
@@ -381,11 +395,15 @@ const SERVE_REFILL_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 /// How long a served message stays "recent" for the peer it went to.
 ///
+/// Equal to `WANT_TIMEOUT` (erigon's `WantTimeout`, 15 s). A peer re-asks
+/// only after its own reservation expires, so a longer window would skip an
+/// honest retry.
+///
 /// A message is recorded only once its frame is queued for the peer, so a
 /// reply we dropped is never recent. A repeat inside the window is skipped
 /// without penalty: a peer that retries or hands a request off may ask again
 /// honestly, and the reply budget already bounds what a loop can cost.
-const REPEAT_REQUEST_WINDOW: Duration = Duration::from_secs(30);
+const REPEAT_REQUEST_WINDOW: Duration = crate::pending::WANT_TIMEOUT;
 
 /// Most served hashes remembered per connection for repeat detection.
 ///
@@ -699,6 +717,13 @@ impl ServeBudget {
             self.recent_set.remove(&old);
         }
         self.recent_set.contains(hash)
+    }
+
+    /// Give back `bytes` spent on a frame that never reached the peer.
+    fn refund(&mut self, bytes: u64, burst: u64) {
+        if let Some(tokens) = self.tokens.as_mut() {
+            *tokens = tokens.saturating_add(bytes).min(burst);
+        }
     }
 
     fn record(&mut self, hash: B256, now: tokio::time::Instant) {
@@ -1093,12 +1118,19 @@ async fn handle_incoming(
             }
             metrics.bodies_served.increment(msgs.len() as u64);
             // Recorded only once queued, so a peer that asks again for a reply
-            // we dropped is served rather than skipped.
-            let mut record = |chunk: &[reth_msgboard_types::WirePoWMsg]| {
-                let now = tokio::time::Instant::now();
+            // we dropped is served rather than skipped. A dropped frame is our
+            // stall, not the peer's cost, so its bytes go back to the budget.
+            let burst = serve_burst_bytes(board.config().size_limit);
+            let mut record = |chunk: &[reth_msgboard_types::WirePoWMsg], queued: bool| {
                 let mut serve = tx.serve.lock();
-                for msg in chunk {
-                    serve.record(msg.hash, now);
+                if queued {
+                    let now = tokio::time::Instant::now();
+                    for msg in chunk {
+                        serve.record(msg.hash, now);
+                    }
+                } else {
+                    let bytes: usize = chunk.iter().map(Encodable::length).sum();
+                    serve.refund(bytes as u64, burst);
                 }
             };
             return send_packed_bodies(
@@ -1271,7 +1303,7 @@ async fn send_packed_bodies<T: Encodable + Clone>(
     deadline: tokio::time::Instant,
     msgs: &[T],
     encode: fn(&[T]) -> Vec<u8>,
-    on_queued: &mut (dyn FnMut(&[T]) + Send),
+    on_outcome: &mut (dyn FnMut(&[T], bool) + Send),
 ) -> Sent {
     let mut chunk: Vec<T> = Vec::new();
     let mut chunk_size = 0usize;
@@ -1280,8 +1312,8 @@ async fn send_packed_bodies<T: Encodable + Clone>(
         if !chunk.is_empty() && encoded_list_len(chunk_size + msg_size) > P2P_MSG_PACKET_LIMIT {
             match send_bodies_frame(metrics, tx, peer_id, deadline, &chunk, encode).await {
                 Sent::Closed => return Sent::Closed,
-                Sent::Ok => on_queued(&chunk),
-                Sent::Dropped => {}
+                Sent::Ok => on_outcome(&chunk, true),
+                Sent::Dropped => on_outcome(&chunk, false),
             }
             chunk.clear();
             chunk_size = 0;
@@ -1292,8 +1324,8 @@ async fn send_packed_bodies<T: Encodable + Clone>(
     if !chunk.is_empty() {
         match send_bodies_frame(metrics, tx, peer_id, deadline, &chunk, encode).await {
             Sent::Closed => return Sent::Closed,
-            Sent::Ok => on_queued(&chunk),
-            Sent::Dropped => {}
+            Sent::Ok => on_outcome(&chunk, true),
+            Sent::Dropped => on_outcome(&chunk, false),
         }
     }
     Sent::Ok
@@ -4259,6 +4291,26 @@ mod tests {
         assert_eq!(rep.penalties(), 0, "the peer is not charged for our drop");
     }
 
+    /// A frame our queue dropped costs the peer no budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_reply_is_refunded_to_the_budget() {
+        let board = board_at(10);
+        let ids = seed_multi_frame_response(&board);
+        let rep = RecordingReporter::default();
+        let (raw_tx, mut rx) = mpsc::channel::<BytesMut>(1);
+        raw_tx.try_send(BytesMut::from(&[BOARD_MESSAGES, 0xc0][..])).unwrap();
+        let tx = OutboundQueue::new(raw_tx);
+        tx.stalled.store(true, Ordering::Relaxed);
+
+        let hashes: Vec<B256> = ids.iter().map(MsgID::message_hash).collect();
+        let (served, _) = request_hashes(&board, &rep, &tx, &mut rx, &hashes).await;
+        assert!(served.is_empty(), "the harness must drop the whole reply");
+
+        let burst = serve_burst_bytes(board.config().size_limit);
+        let now = tokio::time::Instant::now();
+        assert!(tx.serve.lock().try_spend(burst, burst, now), "the full burst must remain");
+    }
+
     /// Many distinct requests draw on one bucket: bytes served stop at the
     /// burst, then grow by the refill rate.
     #[tokio::test(start_paused = true)]
@@ -4529,8 +4581,10 @@ mod tests {
                     frames <= limits.max_buffered_messages(),
                     "size_limit {size_limit}: {frames} honest frames do not fit",
                 );
+                // The multiplexer's 32 MiB per-connection budget caps what we
+                // can ask for; above it an honest burst can be cut.
                 assert!(
-                    bytes <= limits.max_buffered_bytes(),
+                    bytes.min(MUX_CONNECTION_IN_BUFFER_BYTES) <= limits.max_buffered_bytes(),
                     "size_limit {size_limit}: {bytes} honest bytes do not fit",
                 );
             }
@@ -4548,7 +4602,11 @@ mod tests {
             let cfg = MsgboardConfig { size_limit: MAX_SAFE_SIZE_LIMIT, ..Default::default() };
             let largest = inbound_limits_for(&cfg);
             assert_eq!(largest.max_buffered_messages(), 12 + 1024);
-            assert_eq!(largest.max_buffered_bytes(), (12 + 1024) * MAX_INBOUND_FRAME_SIZE);
+            assert_eq!(
+                largest.max_buffered_bytes(),
+                MUX_CONNECTION_IN_BUFFER_BYTES,
+                "no protocol can buffer past the multiplexer's per-connection budget",
+            );
         }
 
         /// A peer that requests at line rate but reads slowly holds our read
