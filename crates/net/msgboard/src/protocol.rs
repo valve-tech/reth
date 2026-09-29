@@ -41,9 +41,9 @@ use reth_eth_wire::{
 };
 use reth_msgboard_types::{
     check_unique_hashes, decode_msg_hash_list, decode_wire_pow_msg_list, encode_msg_hash_list,
-    encode_wire_pow_msg_list, MsgID, MsgboardError, BOARD_MESSAGES, BOARD_MESSAGE_IDS,
-    GET_BOARD_MESSAGES, MAX_GET_BOARD_MESSAGES, MSG_HASH_SIZE, MSG_ID_SIZE, PROTOCOL_LENGTH,
-    PROTOCOL_NAME, PROTOCOL_VERSION,
+    encode_wire_pow_msg_list, MsgID, MsgboardConfig, MsgboardError, BOARD_MESSAGES,
+    BOARD_MESSAGE_IDS, GET_BOARD_MESSAGES, MAX_GET_BOARD_MESSAGES, MSG_HASH_SIZE, MSG_ID_SIZE,
+    PROTOCOL_LENGTH, PROTOCOL_NAME, PROTOCOL_VERSION,
 };
 use reth_network::protocol::{ConnectionHandler, OnNotSupported, ProtocolHandler};
 use reth_network_api::{Direction, PeerId, ReputationChangeKind};
@@ -228,7 +228,7 @@ const MAX_QUEUED_OUTGOING_FRAMES: usize = 8;
 /// Waiting on a full queue is the backpressure that bounds our own memory, but
 /// it also stops us draining [`ProtocolConnection`]. The multiplexer keeps
 /// filling this protocol's inbound queue from the socket meanwhile, up to
-/// [`MAX_INBOUND_QUEUED_FRAMES`] frames or [`MAX_INBOUND_QUEUED_BYTES`], and a
+/// the limits [`inbound_limits_for`] sets, and a
 /// full queue ends the whole session with `SubprotocolInboundBufferFull`
 /// (`reth_eth_wire::multiplex`, `InboundSender::try_send`). Waiting
 /// indefinitely would therefore turn every slow reader into a disconnect,
@@ -252,7 +252,8 @@ const MAX_QUEUED_OUTGOING_FRAMES: usize = 8;
 /// disconnects the whole session including eth; §15.5 records why we don't.
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Frames the multiplexer may hold for `msg/1` before our read loop takes them.
+/// Least number of frames the multiplexer may hold for `msg/1` before our
+/// read loop takes them. The limit in force is [`inbound_limits_for`].
 ///
 /// The multiplexer reads the socket whether or not we read from it, so this
 /// queue grows whenever the connection task is busy elsewhere: waiting on a
@@ -261,37 +262,60 @@ const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// session with `SubprotocolInboundBufferFull`. That disconnects eth too, so
 /// the limit must sit above anything an honest peer sends.
 ///
-/// The most an honest peer can have in flight to us is one bulk announce plus
-/// the replies to what we asked it for:
-///
-///  - a bulk announce of a full board is `count_limit / 846` frames, 12 at the default;
-///  - the replies are bounded by [`MAX_WANT_PER_PEER`] = 1024 reservations. At the default 8 KiB
-///    `size_limit` that is at most ~8.7 MB, ~87 full frames.
-///
-/// That is about 100 frames and 10 MB, which
-/// `the_ingress_limits_hold_an_honest_peers_worst_burst` checks. 256 frames
-/// leaves room for single-ID announcements that arrive in the same window.
-///
 /// A peer that reads us slowly on a busy board is cut too. While one send
 /// waits out [`OUTBOUND_SEND_TIMEOUT`], the peer's gossip keeps arriving; at
-/// ~130 bytes per single-ID announcement, more than about 250 of them in one
-/// 30 s stall (fewer if a bulk announce or a reply shares the window) fill the
-/// queue and end the session, eth included. eth-wire counts each cut in
+/// the default config more than about 150 single-ID announcements in one 30 s
+/// stall, on top of an honest in-flight burst, fill the queue and end the
+/// session, eth included. eth-wire counts each cut in
 /// `p2pstream.subprotocol_inbound_buffer_full`.
 ///
 /// A flooding peer gets far less than the multiplexer's default of 1024
-/// frames and 32 MiB. Full-size `GetBoardMessages` requests are 8 KiB each, so
-/// the frame count cuts that flood at ~2 MiB.
-const MAX_INBOUND_QUEUED_FRAMES: usize = 256;
+/// frames and 32 MiB at the default config. Full-size `GetBoardMessages`
+/// requests are 8 KiB each, so the frame count cuts that flood at ~2 MiB.
+const MIN_INBOUND_QUEUED_FRAMES: usize = 256;
 
-/// Bytes the multiplexer may hold for `msg/1` before our read loop takes them.
+/// Least number of bytes the multiplexer may hold for `msg/1` before our read
+/// loop takes them. The limit in force is [`inbound_limits_for`].
 ///
-/// See [`MAX_INBOUND_QUEUED_FRAMES`] for the honest burst this must hold,
-/// about 10 MB at the default config. The frame count alone does not bound
-/// memory: frames up to [`MAX_INBOUND_FRAME_SIZE`] reach this queue before
-/// [`handle_incoming`] refuses them, so 256 of them are ~25 MiB. This caps a
-/// flood of oversized frames at 16 MiB instead.
-const MAX_INBOUND_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+/// The frame count alone does not bound memory: frames up to
+/// [`MAX_INBOUND_FRAME_SIZE`] reach this queue before [`handle_incoming`]
+/// refuses them, so 256 of them are ~25 MiB. At the default config this caps
+/// a flood of oversized frames at 16 MiB instead.
+const MIN_INBOUND_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+
+/// The largest burst an honest peer can have in flight to us, as
+/// `(frames, bytes)`: one bulk announce of a full board plus the replies to
+/// every reservation we may hold with it.
+///
+///  - The announce is `count_limit / 846` frames, 12 at the default.
+///  - The replies are bounded by [`MAX_WANT_PER_PEER`] = 1024 reservations, packed into frames of
+///    at most [`P2P_MSG_PACKET_LIMIT`]. At the default 8 KiB `size_limit` that is ~87 frames; at
+///    [`MAX_SAFE_SIZE_LIMIT`] only one body fits a frame, so it is 1024 frames.
+///
+/// Every frame is counted at [`MAX_INBOUND_FRAME_SIZE`], so the byte figure
+/// is an upper bound: ~10 MB at the default, ~107 MB at the largest limit.
+fn honest_inbound_burst(cfg: &MsgboardConfig) -> (usize, usize) {
+    let announce_frames = cfg.count_limit.div_ceil(MAX_IDS_PER_FRAME);
+    let bodies_per_frame = (P2P_MSG_PACKET_LIMIT / max_wire_body_len(cfg.size_limit)).max(1);
+    let reply_frames = MAX_WANT_PER_PEER.div_ceil(bodies_per_frame);
+    let frames = announce_frames + reply_frames;
+    (frames, frames * MAX_INBOUND_FRAME_SIZE)
+}
+
+/// The ingress limits for a board with `cfg`: the honest burst, or the
+/// minimums if they are larger.
+///
+/// The minimums leave room for single-ID announcements that arrive in the
+/// same window as a full burst. At the default config the burst is ~99
+/// frames and ~10 MB, so the minimums apply. At the largest `size_limit` the
+/// burst is ~1036 frames and ~107 MB, and the limits follow it: a node that
+/// accepts 100 KiB messages accepts the memory cost of receiving them.
+fn inbound_limits_for(cfg: &MsgboardConfig) -> ProtocolIngressLimits {
+    let (frames, bytes) = honest_inbound_burst(cfg);
+    ProtocolIngressLimits::default()
+        .with_max_buffered_messages(frames.max(MIN_INBOUND_QUEUED_FRAMES))
+        .with_max_buffered_bytes(bytes.max(MIN_INBOUND_QUEUED_BYTES))
+}
 
 /// How often a connection re-checks whether the board became ready.
 ///
@@ -458,9 +482,7 @@ impl ConnectionHandler for MsgboardConnectionHandler {
     /// frame itself and bans its sender, which is stronger than the session
     /// error a multiplexer limit would raise.
     fn inbound_limits(&self) -> ProtocolIngressLimits {
-        ProtocolIngressLimits::default()
-            .with_max_buffered_messages(MAX_INBOUND_QUEUED_FRAMES)
-            .with_max_buffered_bytes(MAX_INBOUND_QUEUED_BYTES)
+        inbound_limits_for(self.board.config())
     }
 
     fn on_unsupported_by_peer(
@@ -4492,19 +4514,41 @@ mod tests {
         /// flight to us, or a busy moment disconnects it and its eth session.
         #[test]
         fn the_ingress_limits_hold_an_honest_peers_worst_burst() {
-            let cfg = MsgboardConfig::default();
+            for size_limit in [8 * 1024, MAX_SAFE_SIZE_LIMIT] {
+                let cfg = MsgboardConfig { size_limit, ..MsgboardConfig::default() };
+                let limits = inbound_limits_for(&cfg);
 
-            let announce_frames = cfg.count_limit.div_ceil(MAX_IDS_PER_FRAME);
-            let announce_bytes = announce_frames * MAX_INBOUND_FRAME_SIZE;
+                // Worked by hand rather than through `honest_inbound_burst`,
+                // so an error there cannot hide here.
+                let announce_frames = 10_000usize.div_ceil(846);
+                let per_frame = (102_400 / max_wire_body_len(size_limit)).max(1);
+                let frames = announce_frames + 1024usize.div_ceil(per_frame);
+                let bytes = frames * MAX_INBOUND_FRAME_SIZE;
 
-            let body = max_wire_body_len(cfg.size_limit);
-            let reply_frames = MAX_WANT_PER_PEER.div_ceil(P2P_MSG_PACKET_LIMIT / body);
-            let reply_bytes = reply_frames * MAX_INBOUND_FRAME_SIZE;
+                assert!(
+                    frames <= limits.max_buffered_messages(),
+                    "size_limit {size_limit}: {frames} honest frames do not fit",
+                );
+                assert!(
+                    bytes <= limits.max_buffered_bytes(),
+                    "size_limit {size_limit}: {bytes} honest bytes do not fit",
+                );
+            }
+        }
 
-            let frames = announce_frames + reply_frames;
-            let bytes = announce_bytes + reply_bytes;
-            assert!(frames <= MAX_INBOUND_QUEUED_FRAMES, "{frames} honest frames do not fit");
-            assert!(bytes <= MAX_INBOUND_QUEUED_BYTES, "{bytes} honest bytes do not fit");
+        /// At the default config the minimums apply, and they stay well under
+        /// the multiplexer's defaults. At the largest size limit the limits
+        /// follow the honest burst: one body per frame, 1024 of them.
+        #[test]
+        fn the_ingress_limits_scale_with_the_size_limit() {
+            let default = inbound_limits_for(&MsgboardConfig::default());
+            assert_eq!(default.max_buffered_messages(), MIN_INBOUND_QUEUED_FRAMES);
+            assert_eq!(default.max_buffered_bytes(), MIN_INBOUND_QUEUED_BYTES);
+
+            let cfg = MsgboardConfig { size_limit: MAX_SAFE_SIZE_LIMIT, ..Default::default() };
+            let largest = inbound_limits_for(&cfg);
+            assert_eq!(largest.max_buffered_messages(), 12 + 1024);
+            assert_eq!(largest.max_buffered_bytes(), (12 + 1024) * MAX_INBOUND_FRAME_SIZE);
         }
 
         /// A peer that requests at line rate but reads slowly holds our read
