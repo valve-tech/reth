@@ -309,7 +309,11 @@ fn every_metric_is_instantiated_and_moves() {
     let board = board_at(10);
     let id = mined(&[9], 10).to_checked(10, 0).expect("valid pow").msg_id();
 
-    assert_eq!(board.filter_wanted(&[id]).len(), 1, "the first announcement is wanted");
+    assert_eq!(
+        board.filter_wanted(reth_network_api::PeerId::ZERO, &[id]).len(),
+        1,
+        "the first announcement is wanted"
+    );
     let snap = Snap::take(&snapshotter);
     assert_eq!(
         snap.gauge("msgboard.pending_requests"),
@@ -318,7 +322,10 @@ fn every_metric_is_instantiated_and_moves() {
     );
     assert_eq!(snap.counter("msgboard.requests_suppressed"), 0, "nothing suppressed yet");
 
-    assert!(board.filter_wanted(&[id]).is_empty(), "the second announcement is suppressed");
+    assert!(
+        board.filter_wanted(reth_network_api::PeerId::ZERO, &[id]).is_empty(),
+        "the second announcement is suppressed"
+    );
     let snap = Snap::take(&snapshotter);
     assert_eq!(
         snap.counter("msgboard.requests_suppressed"),
@@ -326,8 +333,12 @@ fn every_metric_is_instantiated_and_moves() {
         "suppressing a duplicate request must be counted, not just done",
     );
 
-    board.release_pending(&[id]);
-    assert_eq!(board.filter_wanted(&[id]).len(), 1, "a released id is wanted again");
+    board.release_pending(reth_network_api::PeerId::ZERO, &[id]);
+    assert_eq!(
+        board.filter_wanted(reth_network_api::PeerId::ZERO, &[id]).len(),
+        1,
+        "a released id is wanted again"
+    );
 
     // ── phase 7: the oversized-frame rejection is observable ─────────────────
     //
