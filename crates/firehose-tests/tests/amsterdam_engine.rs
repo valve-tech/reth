@@ -8,6 +8,9 @@
 //! It lives in its own integration-test binary because it installs the process-wide tracer.
 
 use alloy_rpc_types_engine::PayloadStatusEnum;
+use base64::{engine::general_purpose, Engine as _};
+use firehose_tracer::pb::sf::ethereum::r#type::v2::Block as FirehoseBlock;
+use prost::Message as _;
 use reth_chainspec::EthereumHardfork;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, E2ETestSetupExt};
 use reth_firehose::init_tracer;
@@ -45,7 +48,9 @@ async fn traced_engine_path_accepts_amsterdam_block() -> eyre::Result<()> {
     let status =
         validator.inner.add_ons_handle.beacon_engine_handle.new_payload(payload.into()).await?;
     assert_eq!(status.status, PayloadStatusEnum::Valid, "traced path rejected the block");
-    assert_eq!(fire_blocks(&buffer.get_bytes()), 1, "traced path did not emit the block");
+    let output = buffer.get_bytes();
+    assert_eq!(fire_blocks(&output), 1, "traced path did not emit the block");
+    assert!(emitted_bal_hash(&output), "emitted block has no block access list hash");
 
     Ok(())
 }
@@ -53,4 +58,14 @@ async fn traced_engine_path_accepts_amsterdam_block() -> eyre::Result<()> {
 /// Counts the `FIRE BLOCK` lines in the tracer output.
 fn fire_blocks(output: &[u8]) -> usize {
     String::from_utf8_lossy(output).lines().filter(|line| line.starts_with("FIRE BLOCK ")).count()
+}
+
+/// Returns whether the emitted block carries a block access list hash.
+fn emitted_bal_hash(output: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(output);
+    let line = text.lines().find(|line| line.starts_with("FIRE BLOCK ")).expect("no FIRE BLOCK");
+    let payload = line.rsplit(' ').next().expect("FIRE BLOCK line has no payload");
+    let bytes = general_purpose::STANDARD.decode(payload).expect("base64 payload");
+    let block = FirehoseBlock::decode(bytes.as_slice()).expect("protobuf block");
+    block.header.and_then(|header| header.block_access_list_hash).is_some()
 }
