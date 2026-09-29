@@ -1,7 +1,9 @@
 //! Loads a pending block from database. Helper trait for `eth_` block, transaction, call and trace
 //! RPC methods.
 
-use super::{EthApiSpec, LoadBlock, LoadPendingBlock, SpawnBlocking};
+use super::{
+    pending_block::PendingStateSource, EthApiSpec, LoadBlock, LoadPendingBlock, SpawnBlocking,
+};
 use crate::{EthApiTypes, FromEthApiError, RpcNodeCore, RpcNodeCoreExt};
 use alloy_consensus::{constants::KECCAK_EMPTY, BlockHeader};
 use alloy_eips::BlockId;
@@ -9,7 +11,6 @@ use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rpc_types_eth::{Account, AccountInfo, EIP1186AccountProofResponse};
 use alloy_serde::JsonStorageKey;
 use futures::Future;
-use reth_chain_state::BlockState;
 use reth_errors::RethError;
 use reth_evm::{ConfigureEvm, EvmEnvFor};
 use reth_primitives_traits::{BlockTy, RecoveredBlock, SealedHeaderFor};
@@ -326,8 +327,8 @@ pub trait LoadState:
     /// <https://github.com/paradigmxyz/reth/issues/4515>.
     ///
     /// Pending block construction may spawn blocking work, so await this outside a blocking task.
-    /// Provider access in this method is synchronous on the calling task; RPC handlers should use
-    /// [`Self::spawn_blocking_io_with_state`] to keep those reads on the blocking pool.
+    /// The fallback provider lookup is synchronous on the calling task; RPC handlers should use
+    /// [`Self::spawn_blocking_io_with_state`] to keep that read on the blocking pool.
     fn state_at_block_id(
         &self,
         at: BlockId,
@@ -372,8 +373,8 @@ pub trait LoadState:
 
     /// Executes `f` with the state at the given [`BlockId`] on a blocking IO task.
     ///
-    /// Pending block construction may spawn blocking work, so it must finish before this task
-    /// occupies a blocking thread.
+    /// Resolves the chain's pending-state source before occupying a blocking thread, since
+    /// building a pending block may need a blocking thread of its own.
     fn spawn_blocking_io_with_state<F, R>(
         &self,
         at: BlockId,
@@ -385,20 +386,23 @@ pub trait LoadState:
         R: Send + 'static,
     {
         async move {
-            let pending =
-                if at.is_pending() { self.pool_pending_block().await.ok().flatten() } else { None };
+            let pending = if at.is_pending() {
+                self.local_pending_block_or_state().await.ok().flatten()
+            } else {
+                None
+            };
 
             self.spawn_blocking_io(move |this| {
                 let state = match pending {
-                    Some(pending) => this
+                    Some(PendingStateSource::Block(pending)) => this
                         .provider()
-                        .history_by_block_hash(pending.block().parent_hash())
-                        .map(|parent| {
-                            Box::new(BlockState::from(pending).state_provider(parent))
-                                as StateProviderBox
-                        })
+                        .state_with_block_appended(
+                            pending.block().parent_hash(),
+                            pending.executed_block,
+                        )
                         .or_else(|_| this.provider().state_by_block_id(BlockId::pending()))
                         .map_err(Self::Error::from_eth_err)?,
+                    Some(PendingStateSource::State(state)) => state,
                     None if at.is_latest() => this.latest_state()?,
                     None => {
                         this.provider().state_by_block_id(at).map_err(Self::Error::from_eth_err)?
