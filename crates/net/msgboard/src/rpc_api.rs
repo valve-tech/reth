@@ -160,7 +160,8 @@ pub trait MsgboardApi {
     /// does. A full default board (10,000 messages of 8 KiB) is about
     /// 167.3 MB of JSON, and at most 168,600,045 bytes with the widest
     /// field encodings (`worst_case_full_board_response_size`). That is over
-    /// reth's default `--rpc.max-response-size` of 160 MiB, so a node that
+    /// stock reth's default `--rpc.max-response-size` of 160 MiB. This fork's
+    /// `reth` binary raises that default to 200 MiB; any other node that
     /// serves this method must run with `--rpc.max-response-size 200` or more.
     /// Below that, a call on a nearly full board fails with a
     /// response-too-large error; it never returns part of the board.

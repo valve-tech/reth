@@ -65,3 +65,47 @@ where
         Ok(handle)
     }
 }
+
+/// Default `--rpc.max-response-size`, in MiB, for this node.
+///
+/// A full default board makes a `msgboard_content` response of up to about
+/// 168.6 MB (`worst_case_full_board_response_size` in `reth-msgboard`), which
+/// is over reth's stock 160 MiB default. At the stock value the call fails on a
+/// nearly full board. An explicit `--rpc.max-response-size` still overrides.
+pub(crate) const MSGBOARD_RPC_MAX_RESPONSE_SIZE_MB: u32 = 200;
+
+/// Set this node's RPC server defaults. Call once, before the CLI parses:
+/// clap reads the defaults when it builds the parser.
+pub fn init_rpc_defaults() {
+    let _ = reth_node_core::args::DefaultRpcServerArgs::default()
+        .with_rpc_max_response_size(MSGBOARD_RPC_MAX_RESPONSE_SIZE_MB.into())
+        .try_init();
+}
+
+#[cfg(test)]
+mod rpc_default_tests {
+    use clap::Parser;
+    use reth_node_core::args::RpcServerArgs;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct CommandParser {
+        #[command(flatten)]
+        args: RpcServerArgs,
+    }
+
+    /// The raised default must reach the parsed args, and an explicit flag
+    /// must still win. Both run in one test because the defaults are a
+    /// process-wide `OnceLock`.
+    #[test]
+    fn max_response_size_defaults_to_200_and_the_flag_overrides() {
+        init_rpc_defaults();
+
+        let args = CommandParser::parse_from(["reth"]).args;
+        assert_eq!(args.rpc_max_response_size.get(), MSGBOARD_RPC_MAX_RESPONSE_SIZE_MB);
+
+        let args = CommandParser::parse_from(["reth", "--rpc.max-response-size", "50"]).args;
+        assert_eq!(args.rpc_max_response_size.get(), 50);
+    }
+}
