@@ -186,6 +186,16 @@ impl MsgBoard {
         }
     }
 
+    /// Stop accepting messages, as before sync completed.
+    ///
+    /// Shutdown calls this before its final flush, so a message cannot be
+    /// accepted after the flush and then lost. A message whose insert already
+    /// passed the ready check can still land after the flush; the board's
+    /// `Drop` flush writes it if the last handle drops in time.
+    pub fn stop_accepting(&self) {
+        self.ready.store(false, Ordering::Relaxed);
+    }
+
     /// Load persisted messages from the database into the index.
     ///
     /// Should be called once after construction and before the board starts
@@ -927,7 +937,11 @@ impl Drop for MsgBoard {
     ///
     /// On SIGTERM or ctrl-c the CLI runner drops the node's future instead of
     /// letting it return, so a final flush placed after the node exits never
-    /// runs. This flush covers that path. It blocks for one MDBX commit.
+    /// runs. This flush covers that path.
+    ///
+    /// It blocks for one MDBX commit, and the last handle can drop on a runtime
+    /// worker. That stalls the worker once, at teardown, which is accepted:
+    /// the alternative is losing the messages.
     fn drop(&mut self) {
         if self.db.is_none() {
             return;
@@ -1974,6 +1988,30 @@ mod tests {
         board.flush_to_db().expect("flush");
         let (rows, _) = crate::db::db_load_all(board.db.as_ref().unwrap()).expect("load");
         assert_eq!(rows.len(), 3, "the flush deletes the trimmed rows");
+    }
+
+    /// A flush waits for one already in flight before it takes its batch.
+    ///
+    /// If it took the batch first, it could commit before the earlier flush
+    /// and have the earlier one write back a row it just deleted.
+    #[test]
+    fn a_flush_does_not_take_its_batch_while_another_is_in_flight() {
+        let (_dir, board) = board_with_db(easy_cfg());
+        let board = Arc::new(board);
+        board.set_ready();
+        board.set_head(100, block_hash_one());
+        board.add_local_msg(make_pow_msg(find_nonce(&[0x60]), &[0x60])).expect("valid");
+
+        let in_flight = board.flush_lock.lock();
+        let second = {
+            let board = Arc::clone(&board);
+            std::thread::spawn(move || board.flush_to_db())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(board.state.lock().dirty.len(), 1, "the second flush must wait for the first");
+        drop(in_flight);
+
+        assert!(second.join().expect("join").expect("flush") > 0, "then it writes the message");
     }
 
     /// A database that keeps failing must not make the flush backlog grow.

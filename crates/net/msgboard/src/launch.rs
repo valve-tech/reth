@@ -274,6 +274,9 @@ pub struct FinalFlushGuard {
 
 impl Drop for FinalFlushGuard {
     fn drop(&mut self) {
+        if let Some(board) = self.launcher.board.get() {
+            board.stop_accepting();
+        }
         self.launcher.final_flush();
     }
 }
@@ -671,6 +674,10 @@ mod tests {
         drop(guard);
 
         assert_eq!(board.flush_to_db().expect("flush"), 0, "the guard already wrote the message");
+        assert!(
+            board.add_local_msg(mine(B256::repeat_byte(0x01), &[0x44])).is_err(),
+            "after the guard flush the board accepts nothing it would then lose",
+        );
     }
 
     /// Shutdown runs on nodes that never got as far as installing msgboard —

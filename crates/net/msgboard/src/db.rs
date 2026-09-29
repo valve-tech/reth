@@ -224,11 +224,27 @@ pub fn db_load_all(env: &Environment) -> eyre::Result<(Vec<CheckedPoWMsg>, u64)>
     }
 
     drop(tx);
-    if !misfiled.is_empty() {
-        rekey_misfiled_rows(env, &msgs, &misfiled)?;
+    // A failed move leaves the rows where they are. The messages still load,
+    // and the next start tries the move again.
+    if !misfiled.is_empty() &&
+        let Err(err) = rekey_misfiled_rows(env, &msgs, &misfiled)
+    {
+        tracing::warn!(
+            target: "msgboard",
+            %err,
+            rows = misfiled.len(),
+            "could not move msgboard DB rows stored under a key other than their message hash",
+        );
     }
 
     Ok((msgs, read_failures + decode_failures))
+}
+
+// Makes `rekey_misfiled_rows` fail on this thread, as a full map or a
+// read-only environment would.
+#[cfg(test)]
+thread_local! {
+    static FAIL_REKEY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Move each misfiled row to the key its message hash names, in one transaction.
@@ -237,6 +253,10 @@ fn rekey_misfiled_rows(
     msgs: &[CheckedPoWMsg],
     misfiled: &[(Vec<u8>, usize)],
 ) -> eyre::Result<()> {
+    #[cfg(test)]
+    if FAIL_REKEY.with(std::cell::Cell::get) {
+        eyre::bail!("injected rekey failure");
+    }
     let tx = env.begin_rw_txn()?;
     let db = tx.open_db(Some(TABLE_NAME))?;
     let mut rlp_buf = Vec::new();
@@ -417,6 +437,31 @@ mod tests {
         db_flush::<CheckedPoWMsg>(&env, &[], &[msg.hash]).expect("delete by hash");
         let (loaded, _) = db_load_all(&env).expect("reload");
         assert!(loaded.is_empty(), "deleting the hash removes the row: {} left", loaded.len());
+    }
+
+    /// A failed move must not fail the load. The rows decoded fine, and an
+    /// error here starts the node with an empty board.
+    #[test]
+    fn a_failed_rekey_still_loads_the_messages() {
+        let dir = TempDir::new().expect("tempdir");
+        let env = open_msgboard_db(dir.path()).expect("open");
+        let msg = sample_msg(8);
+        {
+            let tx = env.begin_rw_txn().expect("rw");
+            let db = tx.open_db(Some(TABLE_NAME)).expect("table");
+            let mut row = Vec::new();
+            msg.encode(&mut row);
+            tx.put(db.dbi(), B256::repeat_byte(0xEF).as_slice(), &row, WriteFlags::empty())
+                .expect("put");
+            tx.commit().expect("commit");
+        }
+
+        FAIL_REKEY.with(|f| f.set(true));
+        let result = db_load_all(&env);
+        FAIL_REKEY.with(|f| f.set(false));
+
+        let (loaded, _) = result.expect("a failed rekey does not fail the load");
+        assert_eq!(loaded.len(), 1, "the misfiled message still loads");
     }
 
     /// The MDBX geometry is an erigon-pulse parity contract, not a tuning
