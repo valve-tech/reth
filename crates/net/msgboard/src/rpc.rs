@@ -5,7 +5,7 @@
 //! `tokio::sync::broadcast` channel into a `Stream` via `BroadcastStream`,
 //! silently dropping lagged notifications.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use alloy_primitives::{Bytes, B256};
 use async_trait::async_trait;
@@ -15,6 +15,7 @@ use jsonrpsee::{
 };
 use reth_msgboard_types::{decode_validated_pow_msg, CheckedPoWMsg, MsgboardError};
 use serde_json::value::RawValue;
+use tokio::sync::Semaphore;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
@@ -58,14 +59,34 @@ impl Drop for SubscriptionGuard {
 #[derive(Debug, Clone)]
 pub struct MsgboardApi {
     board: Arc<MsgBoard>,
+    /// Bounds concurrent `msgboard_content` builds; see
+    /// [`CONTENT_CONCURRENT_BUILDS`].
+    content_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    probe: Arc<tests::BuildProbe>,
 }
 
 impl MsgboardApi {
     /// Create a new instance backed by the given shared board.
-    pub const fn new(board: Arc<MsgBoard>) -> Self {
-        Self { board }
+    pub fn new(board: Arc<MsgBoard>) -> Self {
+        Self {
+            board,
+            content_permits: Arc::new(Semaphore::new(CONTENT_CONCURRENT_BUILDS)),
+            #[cfg(test)]
+            probe: Default::default(),
+        }
     }
 }
+
+/// Most `msgboard_content` responses the node builds at once.
+///
+/// One full default board holds about 80 MB of copied `data` and 167 MB of
+/// JSON while it is built, so unbounded callers could hold gigabytes. A call
+/// past this bound waits for a permit. A caller that disconnects while it
+/// waits drops the handler future, and with it the wait, so nothing is built.
+/// The permit moves into the blocking task, so a build that outlives its
+/// caller still holds its permit until it ends.
+pub const CONTENT_CONCURRENT_BUILDS: usize = 2;
 
 #[async_trait]
 impl MsgboardApiServer for MsgboardApi {
@@ -90,6 +111,13 @@ impl MsgboardApiServer for MsgboardApi {
         let offset = filter.offset.unwrap_or(0);
         let limit = filter.limit.unwrap_or(usize::MAX);
 
+        let permit = Arc::clone(&self.content_permits)
+            .acquire_owned()
+            .await
+            .map_err(|err| internal_error(format!("msgboard_content permit: {err}")))?;
+        #[cfg(test)]
+        let probe = Arc::clone(&self.probe);
+
         // The board hands back `Arc`s, so its lock covers pointer copies only.
         let msgs = match filter.category {
             Some(cat) => {
@@ -104,7 +132,12 @@ impl MsgboardApiServer for MsgboardApi {
         // JSON, so jsonrpsee has nothing left to serialise on the runtime
         // worker.
         tokio::task::spawn_blocking(move || {
-            let mut grouped: HashMap<String, Vec<MsgboardMsg>> = HashMap::new();
+            let _permit = permit;
+            #[cfg(test)]
+            let _guard = probe.enter();
+            // `BTreeMap` sorts the category keys, as Go's `encoding/json` does
+            // for erigon's map.
+            let mut grouped: BTreeMap<String, Vec<MsgboardMsg>> = BTreeMap::new();
             for m in msgs.iter().skip(offset).take(limit) {
                 let rpc = to_rpc_msg(m);
                 // Lowercase 0x-hex matches alloy's Display impl and erigon-pulse output.
@@ -209,11 +242,6 @@ impl MsgboardApiServer for MsgboardApi {
 /// decision. Reth reports every failure of one `decode_validated_pow_msg` call
 /// as `InvalidParams`, because a caller cannot be told that a truncated
 /// payload is a bad parameter while a padded one is a server fault.
-/// JSON-RPC internal error (`-32603`) with `msg` as its message.
-fn internal_error(msg: String) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(-32603, msg, None::<()>)
-}
-
 fn msgboard_error_to_rpc(err: MsgboardError) -> ErrorObjectOwned {
     let code = match &err {
         // Malformed input from the caller → InvalidParams.
@@ -231,6 +259,11 @@ fn msgboard_error_to_rpc(err: MsgboardError) -> ErrorObjectOwned {
         _ => -32000,
     };
     ErrorObjectOwned::owned(code, err.to_string(), None::<()>)
+}
+
+/// JSON-RPC internal error (`-32603`) with `msg` as its message.
+fn internal_error(msg: String) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32603, msg, None::<()>)
 }
 
 /// Convert a [`CheckedPoWMsg`] to the JSON-RPC response type.
@@ -265,6 +298,79 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+
+    /// Counts `msgboard_content` builds in flight and records the peak.
+    /// Each build also sleeps briefly so concurrent calls overlap.
+    #[derive(Debug, Default)]
+    pub(super) struct BuildProbe {
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BuildProbe {
+        pub(super) fn enter(self: &Arc<Self>) -> BuildGuard {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            BuildGuard(Arc::clone(self))
+        }
+    }
+
+    pub(super) struct BuildGuard(Arc<BuildProbe>);
+
+    impl Drop for BuildGuard {
+        fn drop(&mut self) {
+            self.0.in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Each full-board build holds hundreds of megabytes, so the node must
+    /// not run more than [`CONTENT_CONCURRENT_BUILDS`] at once however many
+    /// callers arrive. Every caller must still get its answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn content_builds_are_bounded_by_the_permit_count() {
+        let api = MsgboardApi::new(filled_board(4, 8));
+        let probe = Arc::clone(&api.probe);
+        let m = api.into_rpc();
+
+        let calls = (0..12).map(|_| m.call::<_, Value>("msgboard_content", rpc_params_none()));
+        for v in futures::future::join_all(calls).await {
+            assert_eq!(total_msgs(&v.unwrap()), 4);
+        }
+
+        let peak = probe.peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= CONTENT_CONCURRENT_BUILDS,
+            "{peak} builds ran at once; the bound is {CONTENT_CONCURRENT_BUILDS}",
+        );
+        assert!(peak >= 1);
+    }
+
+    /// Erigon's map goes through Go's `encoding/json`, which writes map keys
+    /// sorted. The raw response text must list categories the same way.
+    #[tokio::test]
+    async fn content_lists_categories_in_sorted_order() {
+        let board = ready_board(10);
+        for b in [0xC0u8, 0x10, 0xF0, 0x55, 0x01, 0xAA] {
+            board.add_local_msg(mined(&[b], category(b), 10)).unwrap();
+        }
+        let m = module(board);
+
+        let (resp, _) = m
+            .raw_json_request(
+                r#"{"jsonrpc":"2.0","id":1,"method":"msgboard_content","params":[]}"#,
+                1,
+            )
+            .await
+            .unwrap();
+        let text = resp.get();
+        let positions: Vec<usize> = [0x01u8, 0x10, 0x55, 0xAA, 0xC0, 0xF0]
+            .iter()
+            .map(|b| text.find(&format!("\"{}\":", category(*b))).unwrap())
+            .collect();
+        assert!(positions.is_sorted(), "category keys out of order in {positions:?}");
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
