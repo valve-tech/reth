@@ -555,7 +555,7 @@ impl MsgBoard {
         // `B256::ZERO` is erigon's absent-claim sentinel (`addMsgLocked`'s
         // `claimedHash != (common.Hash{})` guards), and a real work hash is
         // never zero.
-        self.add_remote(msgs.into_iter().map(|msg| (msg, B256::ZERO)))
+        self.add_remote(msgs.into_iter().map(|msg| (msg, B256::ZERO)), false)
     }
 
     /// Add messages delivered with the hash their sender claims for them.
@@ -564,8 +564,12 @@ impl MsgBoard {
     /// [`add_remote_msgs`](Self::add_remote_msgs), plus the two checks the
     /// claim buys — see [`add_remote`](Self::add_remote). Mirrors erigon's
     /// `AddRemoteWireMsgs` (`msgboard/board.go:271-292`).
+    ///
+    /// Like erigon, it stops at the first kickable message, so `kickable` is
+    /// 0 or 1. The rest of the frame is not verified: the peer is penalised
+    /// anyway, and each further message would cost a scalar multiplication.
     pub fn add_remote_wire_msgs(&self, msgs: Vec<WirePoWMsg>) -> (usize, usize) {
-        self.add_remote(msgs.into_iter().map(|m| (m.msg, m.hash)))
+        self.add_remote(msgs.into_iter().map(|m| (m.msg, m.hash)), true)
     }
 
     /// The shared body of both remote-ingest entry points.
@@ -586,7 +590,13 @@ impl MsgBoard {
     /// With no claim both checks are skipped and the duplicate is caught later,
     /// by `insert_checked` returning `MessageExists` — same outcome, paid for
     /// with a verification.
-    fn add_remote(&self, msgs: impl IntoIterator<Item = (PoWMsg, B256)>) -> (usize, usize) {
+    ///
+    /// `stop_at_kickable` ends the batch at the first kickable message.
+    fn add_remote(
+        &self,
+        msgs: impl IntoIterator<Item = (PoWMsg, B256)>,
+        stop_at_kickable: bool,
+    ) -> (usize, usize) {
         if self.cfg.gossip_disabled {
             return (0, 0);
         }
@@ -598,6 +608,9 @@ impl MsgBoard {
         let mut added = 0;
         let mut kickable = 0;
         for (msg, claimed) in msgs {
+            if stop_at_kickable && kickable > 0 {
+                break;
+            }
             if !self.cfg.is_size_acceptable(msg.data.len()) {
                 self.metrics.rejected_oversized.increment(1);
                 kickable += 1;
@@ -1504,6 +1517,34 @@ mod tests {
         let (accepted, kickable) = board.add_remote_msgs(vec![valid_msg, oversized]);
         assert_eq!(accepted, 1, "only the valid message should be accepted");
         assert_eq!(kickable, 1, "the oversized message should be flagged kickable");
+    }
+
+    /// The wire path stops at the first kickable message, as erigon's
+    /// `AddRemoteWireMsgs` returns on its first error. Nothing after it is
+    /// verified or inserted.
+    #[test]
+    fn add_remote_wire_msgs_stops_at_the_first_kickable_message() {
+        let cfg = MsgboardConfig { size_limit: 10, ..easy_cfg() };
+        let board = MsgBoard::new(cfg);
+        board.set_ready();
+        board.set_head(100, block_hash_one());
+
+        let oversized = PoWMsg {
+            version: VERSION_V1,
+            block_hash: block_hash_one(),
+            nonce: 1,
+            work_multiplier: 1,
+            work_divisor: 1_000_000,
+            category: category_hash(),
+            data: Bytes::copy_from_slice(&[0u8; 100]),
+        };
+        let valid = make_pow_msg(find_nonce(&[10]), &[10]);
+        let wire = |m: PoWMsg| reth_msgboard_types::WirePoWMsg::new(m, B256::ZERO);
+
+        let (accepted, kickable) =
+            board.add_remote_wire_msgs(vec![wire(oversized.clone()), wire(oversized), wire(valid)]);
+        assert_eq!(kickable, 1, "processing ends at the first kickable message");
+        assert_eq!(accepted, 0, "the valid message after it is not reached");
     }
 
     #[test]
