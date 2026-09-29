@@ -23,23 +23,23 @@ Severity is after verification. Finding 1 was reported as high; the reviewer ass
 
 | # | Severity | Finding | Where | Branch | Status |
 |---|---|---|---|---|---|
-| 1 | Medium | A peer that reads just under the 30 s send deadline never gets marked stalled, so it can hold up to 32 MiB of inbound frames per connection. The comment calls the queue unbounded. | `protocol.rs:468-505`, `:224-229` | `msgboard/peer-limits` | review approved; waiting for merge (test proves the attack; see R2) |
-| 2 | Medium | The first announcer holds a 10 s claim. If it withholds, no other announcer is asked, and it gets no penalty. An attacker can censor msgboard traffic to a node. | `board.rs:332-395`, `pending.rs:98-115` | `msgboard/pending-requests` | review approved after three rounds; waiting for merge (tests prove the attacks; see R1, R1a, R1b) |
-| 3 | Medium | `GetBoardMessages`: an 8 KiB request returns about 2.1 MB, repeatable with no rate limit. | `protocol.rs:846-878` | `msgboard/peer-limits` | review approved; waiting for merge (tests prove the attack; see R3) |
-| 4 | Medium | SIGTERM or Ctrl-C skips the final flush; up to 15 s of accepted messages are lost per restart. | `bin/reth/src/main.rs:233,258,328,356` | `msgboard/storage` | review approved; waiting for merge (test proves the attack) |
-| 5 | Medium | While DB writes fail, the retry batch keeps message bodies with no bound (about 2.8 GB an hour under load). | `board.rs:245-255`, `:751-758` | `msgboard/storage` | review approved; waiting for merge (test proves the attack) |
-| 6 | Medium | The want list counts spent entries against its cap (about 68 msg/s per peer, erigon has no such limit), and `prune` can end a newer reservation early. | `pending.rs:187-240` | `msgboard/pending-requests` | review approved; waiting for merge (test proves the attack) |
-| 7 | Low | Expiry is O(k·n) under the board mutex. | `board.rs:280-305`, `index.rs:73-81` | `msgboard/storage` | review approved; waiting for merge |
-| 8 | Low | secp256k1 verification runs on the async connection task, about 800 checks per hostile frame. | `protocol.rs:927` | `msgboard/peer-limits` | review approved; waiting for merge |
-| 9 | Low | A zero `--msgboard.commit-every` or `--msgboard.log-every` starts a hot loop. | `args.rs:391-407` | `msgboard/rpc-cli-docs` | review approved; waiting for merge |
-| 10 | Low | About 8192 fake announcements (no PoW) fill the claim map; suppression then fails open, and each call sweeps the map under the lock. | `board.rs:332-395`, `pending.rs` | `msgboard/pending-requests` | review approved; waiting for merge |
-| 11 | Low | Two flushes can overlap and commit out of order, so an evicted row stays on disk. | `launch.rs:123`, `board.rs:734-743` | `msgboard/storage` | review approved; waiting for merge |
-| 12 | Low | Loading from disk ignores `count_limit` and does not check that a row key matches its message hash. | `board.rs:178-218`, `db.rs:128-176` | `msgboard/storage` | review approved; waiting for merge |
+| 1 | Medium | A peer that reads just under the 30 s send deadline never gets marked stalled, so it can hold up to 32 MiB of inbound frames per connection. The comment calls the queue unbounded. | `protocol.rs:468-505`, `:224-229` | `msgboard/peer-limits` | fixed in !3 (9423eb56b3) (test proves the attack; see R2) |
+| 2 | Medium | The first announcer holds a 10 s claim. If it withholds, no other announcer is asked, and it gets no penalty. An attacker can censor msgboard traffic to a node. | `board.rs:332-395`, `pending.rs:98-115` | `msgboard/pending-requests` | fixed in !3 (9423eb56b3) after three review rounds (tests prove the attacks; see R1, R1a, R1b) |
+| 3 | Medium | `GetBoardMessages`: an 8 KiB request returns about 2.1 MB, repeatable with no rate limit. | `protocol.rs:846-878` | `msgboard/peer-limits` | fixed in !3 (9423eb56b3) (tests prove the attack; see R3) |
+| 4 | Medium | SIGTERM or Ctrl-C skips the final flush; up to 15 s of accepted messages are lost per restart. | `bin/reth/src/main.rs:233,258,328,356` | `msgboard/storage` | fixed in !3 (9423eb56b3) (test proves the attack) |
+| 5 | Medium | While DB writes fail, the retry batch keeps message bodies with no bound (about 2.8 GB an hour under load). | `board.rs:245-255`, `:751-758` | `msgboard/storage` | fixed in !3 (9423eb56b3) (test proves the attack) |
+| 6 | Medium | The want list counts spent entries against its cap (about 68 msg/s per peer, erigon has no such limit), and `prune` can end a newer reservation early. | `pending.rs:187-240` | `msgboard/pending-requests` | fixed in !3 (9423eb56b3) (test proves the attack) |
+| 7 | Low | Expiry is O(k·n) under the board mutex. | `board.rs:280-305`, `index.rs:73-81` | `msgboard/storage` | fixed in !3 (9423eb56b3) |
+| 8 | Low | secp256k1 verification runs on the async connection task, about 800 checks per hostile frame. | `protocol.rs:927` | `msgboard/peer-limits` | fixed in !3 (9423eb56b3) |
+| 9 | Low | A zero `--msgboard.commit-every` or `--msgboard.log-every` starts a hot loop. | `args.rs:391-407` | `msgboard/rpc-cli-docs` | fixed in !3 (9423eb56b3) |
+| 10 | Low | About 8192 fake announcements (no PoW) fill the claim map; suppression then fails open, and each call sweeps the map under the lock. | `board.rs:332-395`, `pending.rs` | `msgboard/pending-requests` | fixed in !3 (9423eb56b3) |
+| 11 | Low | Two flushes can overlap and commit out of order, so an evicted row stays on disk. | `launch.rs:123`, `board.rs:734-743` | `msgboard/storage` | fixed in !3 (9423eb56b3) |
+| 12 | Low | Loading from disk ignores `count_limit` and does not check that a row key matches its message hash. | `board.rs:178-218`, `db.rs:128-176` | `msgboard/storage` | fixed in !3 (9423eb56b3) |
 | 13 | Low | `--http.api all` exposes `msgboard_addMessage`. | `launch.rs:302` | `msgboard/rpc-cli-docs` | accepted and documented |
-| 14 | Low | One content call can build about 80 MB. Decision 2026-09-28: serve the whole board, as erigon and `txpool_content` do; build it off the RPC worker. No byte cap. | `rpc.rs:90-126` | `msgboard/rpc-cli-docs` | review approved; waiting for merge (see R5, R6) |
-| 15 | Info | `docs/msgboard-rpc.md` has the wrong input format, names a flag that does not exist, and omits paging. | `docs/msgboard-rpc.md` | `msgboard/rpc-cli-docs` | review approved; waiting for merge |
-| 16 | Info | The `handle_incoming` comment and code disagree on serving when gossip is disabled. | `protocol.rs:677-680`, `:861` | `msgboard/peer-limits` | review approved; waiting for merge (code was right; comment fixed to match erigon) |
-| 17 | Info | Stale comments describe the old work hash. | `pending.rs:10`, `:163-164` | `msgboard/pending-requests` | review approved; waiting for merge |
+| 14 | Low | One content call can build about 80 MB. Decision 2026-09-28: serve the whole board, as erigon and `txpool_content` do; build it off the RPC worker. No byte cap. | `rpc.rs:90-126` | `msgboard/rpc-cli-docs` | fixed in !3 (9423eb56b3) (see R5, R6) |
+| 15 | Info | `docs/msgboard-rpc.md` has the wrong input format, names a flag that does not exist, and omits paging. | `docs/msgboard-rpc.md` | `msgboard/rpc-cli-docs` | fixed in !3 (9423eb56b3) |
+| 16 | Info | The `handle_incoming` comment and code disagree on serving when gossip is disabled. | `protocol.rs:677-680`, `:861` | `msgboard/peer-limits` | fixed in !3 (9423eb56b3) (code was right; comment fixed to match erigon) |
+| 17 | Info | Stale comments describe the old work hash. | `pending.rs:10`, `:163-164` | `msgboard/pending-requests` | fixed in !3 (9423eb56b3) |
 | 18 | Info | Reth rejects a whole frame for a message with D = 0; erigon rejects only that message. Stricter, cannot split honest nodes. | `pow.rs:155`, `wire.rs:74` | `msgboard/rpc-cli-docs` | accepted and documented in `docs/msgboard-parity-gaps.md` §27.1 |
 | 19 | Info | `CheckedPoWMsg` DB encoding has a timestamp field erigon lacks. Disk only. | `pow.rs:121-131` | `msgboard/rpc-cli-docs` | accepted and documented in `docs/msgboard-parity-gaps.md` §27.2 |
 
@@ -77,3 +77,4 @@ The reviewers verified these. The auditor can use this list to see what we cover
 | 2026-09-27 | Review done. Findings 1-19 recorded. Remediation started on four branches. |
 | 2026-09-28 | Branches reviewed. Recorded residual risks R1-R5. Finding 14: decided to serve the whole board. Finding 1: limits set at 256 frames and 16 MiB per peer. |
 | 2026-09-28 | All four branches approved and merged into `msgboard/security-review`. Local CI: 672 + 7 tests pass. |
+| 2026-09-28 | MR !3 merged to GitLab `main` as 9423eb56b3. Pipeline 2835 passed. Findings 1-12 and 14-17 fixed; 13, 18 and 19 accepted and documented. |
