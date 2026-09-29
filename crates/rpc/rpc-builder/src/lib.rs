@@ -111,6 +111,10 @@ use reth_chain_state::{
 };
 use reth_rpc::eth::sim_bundle::EthSimBundle;
 
+// Valve keyset-paged txpool methods
+mod txpool_page;
+pub use txpool_page::install_txpool_page_rpc;
+
 // Rpc rate limiter
 pub mod rate_limiter;
 
