@@ -249,6 +249,36 @@ impl MsgboardLauncher {
             ),
         }
     }
+
+    /// A guard that runs [`Self::final_flush`] when it drops.
+    ///
+    /// Hold it in the node's future. On SIGTERM or ctrl-c the CLI runner drops
+    /// that future, so the `final_flush` call after `wait_for_node_exit` never
+    /// runs, but the guard still drops. The board's own `Drop` flush is not
+    /// enough there: network and RPC tasks can hold the board until the
+    /// runtime shuts down, and the runner gives that only a few seconds.
+    ///
+    /// Take the guard before the board exists; it reads the board at drop time.
+    pub fn flush_guard(&self) -> FinalFlushGuard {
+        FinalFlushGuard { launcher: self.clone() }
+    }
+}
+
+/// Runs [`MsgboardLauncher::final_flush`] on drop. See
+/// [`MsgboardLauncher::flush_guard`].
+#[derive(Debug)]
+#[must_use = "the flush runs when the guard drops; bind it to a named variable"]
+pub struct FinalFlushGuard {
+    launcher: MsgboardLauncher,
+}
+
+impl Drop for FinalFlushGuard {
+    fn drop(&mut self) {
+        if let Some(board) = self.launcher.board.get() {
+            board.stop_accepting();
+        }
+        self.launcher.final_flush();
+    }
 }
 
 /// Push each canonical tip into [`MsgBoard::set_head`].
@@ -290,6 +320,13 @@ where
 /// [`RethRpcModule`] has no msgboard variant, so this rides its `Other`
 /// catch-all. That is enough for the allowlist check and keeps the change out
 /// of the shared RPC types.
+///
+/// `RpcModuleSelection::All` contains every module, `Other` ones included, so
+/// `--http.api all` exposes `msgboard_addMessage` to anyone who can reach the
+/// port. That is deliberate: an operator who asks for all namespaces gets this
+/// one too. Proof of work and `--msgboard.count-limit` bound what a caller can
+/// do with it; an operator who wants no public submission endpoint lists
+/// namespaces instead of `all`.
 pub const MSGBOARD_RPC_NAMESPACE: &str = "msgboard";
 
 /// The [`RethRpcModule`] the msgboard methods register under.
@@ -308,10 +345,10 @@ fn install_msgboard_rpc(modules: &mut TransportRpcModules, api: MsgboardApi) -> 
 mod tests {
     use std::collections::BTreeMap;
 
-    use alloy_primitives::B256;
+    use alloy_primitives::{Bytes, B256};
     use reth_chain_state::{test_utils::TestBlockBuilder, CanonStateNotification};
     use reth_execution_types::Chain;
-    use reth_msgboard_types::MsgboardConfig;
+    use reth_msgboard_types::{MsgboardConfig, PoWMsg, VERSION_V1};
     use reth_rpc_builder::{RpcModuleSelection, TransportRpcModuleConfig};
 
     use super::*;
@@ -574,6 +611,79 @@ mod tests {
         assert!(
             launcher.board().is_some_and(|b| Arc::ptr_eq(&b, &first)),
             "the published board is the one both calls returned",
+        );
+    }
+
+    /// A work divisor that makes mining cost one or two hashes.
+    const CHEAP_WORK_DIVISOR: u64 = 1 << 24;
+
+    fn cheap_launcher() -> MsgboardLauncher {
+        MsgboardLauncher::new(MsgboardArgs {
+            msgboard_work_multiplier: 1,
+            msgboard_work_divisor: CHEAP_WORK_DIVISOR,
+            ..Default::default()
+        })
+    }
+
+    fn mine(block_hash: B256, data: &[u8]) -> PoWMsg {
+        (1u64..=1_000_000)
+            .map(|nonce| PoWMsg {
+                version: VERSION_V1,
+                block_hash,
+                nonce,
+                work_multiplier: 1,
+                work_divisor: CHEAP_WORK_DIVISOR,
+                category: B256::repeat_byte(0xCA),
+                data: Bytes::copy_from_slice(data),
+            })
+            .find(|msg| msg.verify().is_ok())
+            .expect("a valid nonce")
+    }
+
+    /// A signal drops the node's future instead of letting it return, so the
+    /// `final_flush` after `wait_for_node_exit` never runs. Dropping the last
+    /// handle to the board must still write what it accepted.
+    #[tokio::test]
+    async fn dropping_the_board_without_a_final_flush_keeps_accepted_messages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = cheap_launcher();
+        let board = launcher.init_board(dir.path().to_path_buf());
+        board.set_ready();
+        board.set_head(1, B256::repeat_byte(0x01));
+        let hash = board.add_local_msg(mine(B256::repeat_byte(0x01), &[0x42])).expect("valid").hash;
+
+        drop(board);
+        drop(launcher);
+
+        let env = open_msgboard_db(&dir.path().join("msgboard")).expect("reopen");
+        let (loaded, _) = crate::db::db_load_all(&env).expect("load");
+        assert!(
+            loaded.iter().any(|m| m.hash == hash),
+            "the accepted message is on disk after shutdown: {} rows",
+            loaded.len(),
+        );
+    }
+
+    /// Network and RPC tasks can still hold the board when the node's future is
+    /// dropped, so the board's own drop flush can come too late. The guard in
+    /// the node's future flushes when that future goes, whoever else holds the
+    /// board.
+    #[tokio::test]
+    async fn the_flush_guard_flushes_when_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = cheap_launcher();
+        let guard = launcher.flush_guard();
+        let board = launcher.init_board(dir.path().to_path_buf());
+        board.set_ready();
+        board.set_head(1, B256::repeat_byte(0x01));
+        board.add_local_msg(mine(B256::repeat_byte(0x01), &[0x43])).expect("valid");
+
+        drop(guard);
+
+        assert_eq!(board.flush_to_db().expect("flush"), 0, "the guard already wrote the message");
+        assert!(
+            board.add_local_msg(mine(B256::repeat_byte(0x01), &[0x44])).is_err(),
+            "after the guard flush the board accepts nothing it would then lose",
         );
     }
 

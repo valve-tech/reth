@@ -15,6 +15,34 @@ const DEFAULT_COMMIT_EVERY: &str = "15s";
 /// `private-erigon-pulse/msgboardcfg/config.go`.
 const DEFAULT_LOG_EVERY: &str = "30s";
 
+/// Shortest accepted `--msgboard.commit-every`. The flush task sleeps this
+/// long between DB writes, so `0s` would spin a hot loop of MDBX commits.
+const MIN_COMMIT_EVERY: Duration = Duration::from_millis(100);
+
+/// Shortest accepted `--msgboard.log-every`. The stats task sleeps this long
+/// between INFO lines, so `0s` would flood the journal.
+const MIN_LOG_EVERY: Duration = Duration::from_secs(1);
+
+/// Parse a humantime duration and refuse one below `min`.
+fn parse_min_duration(raw: &str, flag: &str, min: Duration) -> Result<Duration, String> {
+    let d = humantime::parse_duration(raw).map_err(|e| format!("`{raw}`: {e}"))?;
+    if d < min {
+        return Err(format!(
+            "{flag} must be at least {}; `{raw}` would make the task run in a tight loop",
+            humantime::format_duration(min)
+        ));
+    }
+    Ok(d)
+}
+
+fn parse_commit_every(raw: &str) -> Result<Duration, String> {
+    parse_min_duration(raw, "--msgboard.commit-every", MIN_COMMIT_EVERY)
+}
+
+fn parse_log_every(raw: &str) -> Result<Duration, String> {
+    parse_min_duration(raw, "--msgboard.log-every", MIN_LOG_EVERY)
+}
+
 /// Parse `--msgboard.size-limit`, refusing a value that would make us emit a
 /// `BoardMessages` packet our peers ban us for.
 ///
@@ -95,9 +123,10 @@ pub struct MsgboardArgs {
     ///
     /// Accepts humantime durations: `15s`, `2m`, `500ms`. Lower values bound
     /// in-flight loss on crash; higher values reduce write amplification.
+    /// Minimum `100ms`.
     #[arg(
         long = "msgboard.commit-every",
-        value_parser = humantime::parse_duration,
+        value_parser = parse_commit_every,
         default_value = DEFAULT_COMMIT_EVERY,
     )]
     pub msgboard_commit_every: Duration,
@@ -105,10 +134,10 @@ pub struct MsgboardArgs {
     /// How often to emit a periodic msgboard stats line at INFO level.
     ///
     /// Useful for log-scraped observability. Set to a very large duration to
-    /// effectively disable.
+    /// effectively disable. Minimum `1s`.
     #[arg(
         long = "msgboard.log-every",
-        value_parser = humantime::parse_duration,
+        value_parser = parse_log_every,
         default_value = DEFAULT_LOG_EVERY,
     )]
     pub msgboard_log_every: Duration,
@@ -306,14 +335,41 @@ mod tests {
     /// rather than silently parsed as something else.
     #[test]
     fn duration_flags_parse_humantime_units() {
-        let args = parse(&["reth", "--msgboard.commit-every=2m", "--msgboard.log-every=500ms"]);
+        let args = parse(&["reth", "--msgboard.commit-every=2m", "--msgboard.log-every=1500ms"]);
         assert_eq!(args.msgboard_commit_every, Duration::from_secs(120));
-        assert_eq!(args.msgboard_log_every, Duration::from_millis(500));
+        assert_eq!(args.msgboard_log_every, Duration::from_millis(1500));
 
         assert!(
             CommandParser::<MsgboardArgs>::try_parse_from(["reth", "--msgboard.commit-every=15"])
                 .is_err(),
             "a unitless duration should be rejected, not silently reinterpreted",
         );
+    }
+
+    /// Both duration flags drive a `sleep` loop, so a zero interval is a hot
+    /// loop: MDBX commits back to back, or an INFO line per scheduler tick.
+    /// The minimum itself must still parse, or the guard is just too strict.
+    #[test]
+    fn duration_flags_refuse_values_below_their_minimum() {
+        for (flag, zero, below, min, expected) in [
+            ("commit-every", "0s", "99ms", "100ms", MIN_COMMIT_EVERY),
+            ("log-every", "0s", "999ms", "1s", MIN_LOG_EVERY),
+        ] {
+            for bad in [zero, below] {
+                let arg = format!("--msgboard.{flag}={bad}");
+                let Err(err) = CommandParser::<MsgboardArgs>::try_parse_from(["reth", &arg]) else {
+                    panic!("{arg} must be rejected");
+                };
+                assert!(err.to_string().contains("must be at least"), "{arg}: {err}");
+            }
+            let arg = format!("--msgboard.{flag}={min}");
+            let args = parse(&["reth", &arg]);
+            let got = if flag == "commit-every" {
+                args.msgboard_commit_every
+            } else {
+                args.msgboard_log_every
+            };
+            assert_eq!(got, expected, "{arg} is the minimum and must be accepted");
+        }
     }
 }
