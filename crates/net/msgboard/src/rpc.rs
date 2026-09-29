@@ -14,15 +14,13 @@ use jsonrpsee::{
     core::RpcResult, types::ErrorObjectOwned, PendingSubscriptionSink, SubscriptionMessage,
 };
 use reth_msgboard_types::{decode_validated_pow_msg, CheckedPoWMsg, MsgboardError};
+use serde_json::value::RawValue;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
     board::MsgBoard,
     metrics::MsgboardMetrics,
-    rpc_api::{
-        ContentFilter, MsgboardApiServer, MsgboardMsg, MsgboardStatus, NewMessagesFilter,
-        CONTENT_DEFAULT_LIMIT, CONTENT_MAX_LIMIT, CONTENT_PAGE_DATA_BYTES,
-    },
+    rpc_api::{ContentFilter, MsgboardApiServer, MsgboardMsg, MsgboardStatus, NewMessagesFilter},
 };
 
 /// Subscription kind discriminator. Matches erigon-pulse's
@@ -87,27 +85,12 @@ impl MsgboardApiServer for MsgboardApi {
         Ok(self.board.categories())
     }
 
-    async fn msgboard_content(
-        &self,
-        filter: Option<ContentFilter>,
-    ) -> RpcResult<HashMap<String, Vec<MsgboardMsg>>> {
+    async fn msgboard_content(&self, filter: Option<ContentFilter>) -> RpcResult<Box<RawValue>> {
         let filter = filter.unwrap_or_default();
-        let limit = filter.limit.unwrap_or(CONTENT_DEFAULT_LIMIT);
-        if limit > CONTENT_MAX_LIMIT {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                format!("limit {limit} exceeds the maximum of {CONTENT_MAX_LIMIT}"),
-                None::<()>,
-            ));
-        }
         let offset = filter.offset.unwrap_or(0);
+        let limit = filter.limit.unwrap_or(usize::MAX);
 
         // The board hands back `Arc`s, so its lock covers pointer copies only.
-        // Everything expensive happens below and outside the lock: `to_rpc_msg`
-        // deep-copies each `data` field, and serde hex-expands it on the way
-        // out. `limit` is what bounds both — a `spawn_blocking` here would
-        // cover only the loop, not the serialisation jsonrpsee runs after the
-        // handler returns.
         let msgs = match filter.category {
             Some(cat) => {
                 self.board.category_msgs_filtered(&cat, filter.from_block, filter.to_block)
@@ -115,22 +98,24 @@ impl MsgboardApiServer for MsgboardApi {
             None => self.board.all_msgs_filtered(filter.from_block, filter.to_block),
         };
 
-        let mut grouped: HashMap<String, Vec<MsgboardMsg>> = HashMap::new();
-        let mut page_bytes = 0usize;
-        for (i, m) in msgs.iter().skip(offset).take(limit).enumerate() {
-            // The first message always goes in, so a page is never empty
-            // while messages remain and a caller paging by `offset` always
-            // advances.
-            page_bytes += m.msg.data.len();
-            if i > 0 && page_bytes > CONTENT_PAGE_DATA_BYTES {
-                break;
+        // A full default board is about 80 MB of `data` and 167 MB of JSON,
+        // and building it takes seconds. The blocking pool does the deep copy
+        // and the hex serialisation both: the handler returns pre-serialised
+        // JSON, so jsonrpsee has nothing left to serialise on the runtime
+        // worker.
+        tokio::task::spawn_blocking(move || {
+            let mut grouped: HashMap<String, Vec<MsgboardMsg>> = HashMap::new();
+            for m in msgs.iter().skip(offset).take(limit) {
+                let rpc = to_rpc_msg(m);
+                // Lowercase 0x-hex matches alloy's Display impl and erigon-pulse output.
+                let key = rpc.category.to_string();
+                grouped.entry(key).or_default().push(rpc);
             }
-            let rpc = to_rpc_msg(m);
-            // Lowercase 0x-hex matches alloy's Display impl and erigon-pulse output.
-            let key = rpc.category.to_string();
-            grouped.entry(key).or_default().push(rpc);
-        }
-        Ok(grouped)
+            serde_json::value::to_raw_value(&grouped)
+        })
+        .await
+        .map_err(|err| internal_error(format!("msgboard_content task failed: {err}")))?
+        .map_err(|err| internal_error(format!("msgboard_content serialisation failed: {err}")))
     }
 
     async fn msgboard_get_message(&self, hash: B256) -> RpcResult<Option<MsgboardMsg>> {
@@ -224,6 +209,11 @@ impl MsgboardApiServer for MsgboardApi {
 /// decision. Reth reports every failure of one `decode_validated_pow_msg` call
 /// as `InvalidParams`, because a caller cannot be told that a truncated
 /// payload is a bad parameter while a padded one is a server fault.
+/// JSON-RPC internal error (`-32603`) with `msg` as its message.
+fn internal_error(msg: String) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32603, msg, None::<()>)
+}
+
 fn msgboard_error_to_rpc(err: MsgboardError) -> ErrorObjectOwned {
     let code = match &err {
         // Malformed input from the caller → InvalidParams.
@@ -275,7 +265,6 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::rpc_api::{CONTENT_DEFAULT_LIMIT, CONTENT_MAX_LIMIT, CONTENT_PAGE_DATA_BYTES};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -786,80 +775,30 @@ mod tests {
 
     // ── content paging ───────────────────────────────────────────────────────
 
-    /// A no-argument call is the shape erigon clients use, and it used to
-    /// return the whole board — a deep copy of every `data` field plus serde's
-    /// hex expansion, both alive at once. The cap has to bite on exactly that
-    /// call, not only on one that names a limit.
+    /// A no-argument call is the shape erigon clients use, and erigon answers
+    /// it with the whole board (`rpc/jsonrpc/msgboard_api.go`). A board past
+    /// any old page size must come back whole, so a client never mistakes a
+    /// partial answer for the full board.
     #[tokio::test]
-    async fn content_without_a_limit_stops_at_the_default_page_size() {
-        let m = module(filled_board(CONTENT_DEFAULT_LIMIT + 8, 8));
+    async fn content_without_a_limit_returns_the_whole_board() {
+        let count = 1_000 + 8;
+        let m = module(filled_board(count, 8));
 
         let v: Value = m.call("msgboard_content", rpc_params_none()).await.unwrap();
-        assert_eq!(total_msgs(&v), CONTENT_DEFAULT_LIMIT);
+        assert_eq!(total_msgs(&v), count);
+
+        let v: Value = m.call("msgboard_content", vec![json!({})]).await.unwrap();
+        assert_eq!(total_msgs(&v), count, "an empty filter is the same call");
     }
 
-    /// A board smaller than the cap comes back whole, so the cap does not
-    /// change the answer an ordinary node gives.
+    /// `limit` has no ceiling: a client can already get everything by leaving
+    /// it out, so refusing a large one would protect nothing.
     #[tokio::test]
-    async fn content_returns_a_small_board_whole() {
-        let board = ready_board(10);
-        for i in 0..5u8 {
-            board.add_local_msg(mined(&[i], category(0xAA), 10)).unwrap();
-        }
-        let m = module(board);
-
-        let v: Value = m.call("msgboard_content", rpc_params_none()).await.unwrap();
+    async fn content_accepts_any_explicit_limit() {
+        let m = module(filled_board(5, 8));
+        let v: Value =
+            m.call("msgboard_content", vec![json!({"limit": usize::MAX})]).await.unwrap();
         assert_eq!(total_msgs(&v), 5);
-    }
-
-    /// `limit` counts messages, so a large limit on a board of full-size
-    /// messages would build a response tens of megabytes wide. The byte cap
-    /// stops the page first, and a walk that raises `offset` by the returned
-    /// count still covers the board once.
-    #[tokio::test]
-    async fn content_page_stops_at_the_data_byte_cap() {
-        const DATA_LEN: usize = 8 * 1024;
-        let per_page = CONTENT_PAGE_DATA_BYTES / DATA_LEN;
-        let total = per_page + 40;
-        let m = module(filled_board(total, DATA_LEN));
-
-        let v: Value =
-            m.call("msgboard_content", vec![json!({"limit": CONTENT_MAX_LIMIT})]).await.unwrap();
-        assert_eq!(total_msgs(&v), per_page, "the page must stop at the byte cap, not at limit");
-
-        let mut offset = 0;
-        loop {
-            let v: Value = m
-                .call(
-                    "msgboard_content",
-                    vec![json!({"limit": CONTENT_MAX_LIMIT, "offset": offset})],
-                )
-                .await
-                .unwrap();
-            let n = total_msgs(&v);
-            if n == 0 {
-                break;
-            }
-            offset += n;
-        }
-        assert_eq!(offset, total, "paging by the returned count must reach every message");
-    }
-
-    #[tokio::test]
-    async fn content_rejects_a_limit_above_the_maximum() {
-        let m = module(ready_board(10));
-        let code =
-            call_err_code(&m, "msgboard_content", vec![json!({"limit": CONTENT_MAX_LIMIT + 1})])
-                .await;
-        assert_eq!(code, -32602);
-    }
-
-    #[tokio::test]
-    async fn content_accepts_a_limit_at_the_maximum() {
-        let m = module(ready_board(10));
-        let v: Value =
-            m.call("msgboard_content", vec![json!({"limit": CONTENT_MAX_LIMIT})]).await.unwrap();
-        assert!(v.as_object().unwrap().is_empty());
     }
 
     /// Paging must walk the board exactly once. Asserting only "no duplicates"
@@ -1016,50 +955,75 @@ mod tests {
 
     // ── measurement ──────────────────────────────────────────────────────────
 
-    /// Records what `msgboard_content` costs on a full default board, with and
-    /// without the page cap. It backs the figures quoted on
-    /// [`CONTENT_DEFAULT_LIMIT`]; rerun it if the cap or the wire shape moves.
+    /// Largest `msgboard_content` response a default board can produce:
+    /// 10,000 messages of 8 KiB, every integer field at its widest hex form,
+    /// and every message in a category of its own so each pays for a map key.
     ///
-    /// Ignored by default: it holds 10,000 × 8 KiB of messages and the uncapped
-    /// leg builds a response twice that size, which runs well past nextest's
-    /// slow-test timeout. Run it on its own with
+    /// This is the number an operator has to fit under
+    /// `--rpc.max-response-size`. `docs/msgboard-rpc.md` and
+    /// [`MsgboardApiServer::msgboard_content`] quote it. It is computed from one
+    /// serialised message rather than by building the board, so it runs fast.
+    #[test]
+    fn worst_case_full_board_response_size() {
+        let cfg = MsgboardConfig::default();
+        let msg = MsgboardMsg {
+            version: u8::MAX,
+            block_hash: B256::repeat_byte(0xff),
+            block_number: u64::MAX,
+            nonce: u64::MAX,
+            work_multiplier: u64::MAX,
+            work_divisor: u64::MAX,
+            category: B256::repeat_byte(0xff),
+            data: Bytes::from(vec![0xff; cfg.size_limit]),
+            hash: B256::repeat_byte(0xff),
+        };
+        let one = serde_json::to_string(&msg).unwrap().len();
+        // `"0x<64 hex>":[<msg>]` plus the comma between map entries.
+        let per_msg = 68 + 1 + 2 + one + 1;
+        let result = 2 + cfg.count_limit * per_msg;
+        let envelope = r#"{"jsonrpc":"2.0","id":4294967295,"result":}"#.len();
+        let total = result + envelope;
+        println!("worst-case msgboard_content response: {total} bytes");
+
+        const DEFAULT_MAX_RESPONSE: usize = 160 * 1024 * 1024;
+        const DOCUMENTED_MAX_RESPONSE: usize = 200 * 1024 * 1024;
+        assert!(
+            total > DEFAULT_MAX_RESPONSE,
+            "the docs tell operators to raise --rpc.max-response-size; a full board now \
+             fits the default, so update them: {total}",
+        );
+        assert!(
+            total < DOCUMENTED_MAX_RESPONSE,
+            "the documented --rpc.max-response-size=200 no longer fits a full board: {total}",
+        );
+    }
+
+    /// Records what the no-argument `msgboard_content` call costs on a full
+    /// default board through the RPC module.
+    ///
+    /// Ignored by default: it holds 10,000 x 8 KiB of messages and builds a
+    /// response of about 167 MB, which runs past the slow-test timeout. Run it
+    /// on its own with
     /// `cargo nextest run -p reth-msgboard --run-ignored ignored-only \
     ///  -E 'test(measure_content)' --no-capture`.
     #[ignore]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn measure_content_on_a_full_board() {
         let cfg = trivial_pow_cfg(8 * 1024);
-        let board = filled_board(cfg.count_limit, cfg.size_limit);
+        let m = module(filled_board(cfg.count_limit, cfg.size_limit));
 
-        // The uncapped leg runs the work the handler used to do — every message
-        // through `to_rpc_msg`, then grouped, then serialised — without going
-        // through jsonrpsee, so the cost is attributable to the response and not
-        // to the transport.
         let t = std::time::Instant::now();
-        let all = board.all_msgs_filtered(None, None);
-        let mut grouped: HashMap<String, Vec<MsgboardMsg>> = HashMap::new();
-        for m in &all {
-            let rpc = to_rpc_msg(m);
-            grouped.entry(rpc.category.to_string()).or_default().push(rpc);
-        }
-        let uncapped = serde_json::to_string(&grouped).unwrap();
+        let (resp, _) = m
+            .raw_json_request(
+                r#"{"jsonrpc":"2.0","id":1,"method":"msgboard_content","params":[]}"#,
+                1,
+            )
+            .await
+            .unwrap();
         println!(
-            "uncapped: {} messages -> {} bytes of JSON in {:?} ({} bytes of raw data)",
-            all.len(),
-            uncapped.len(),
-            t.elapsed(),
-            cfg.count_limit * cfg.size_limit,
-        );
-        drop((grouped, uncapped));
-
-        let m = module(Arc::clone(&board));
-        let t = std::time::Instant::now();
-        let v: Value = m.call("msgboard_content", rpc_params_none()).await.unwrap();
-        println!(
-            "capped:   {} messages -> {} bytes of JSON in {:?}",
-            total_msgs(&v),
-            serde_json::to_string(&v).unwrap().len(),
-            t.elapsed(),
+            "full board: {} bytes of JSON-RPC response in {:?}",
+            resp.get().len(),
+            t.elapsed()
         );
     }
 
