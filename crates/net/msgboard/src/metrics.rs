@@ -182,4 +182,12 @@ pub struct MsgboardMetrics {
     /// Stays at zero against a conforming peer, which cannot announce more than
     /// one frame's worth at a time.
     pub wants_refused: Counter,
+    /// `GetBoardMessages` replies cut short because the peer's reply budget
+    /// ran out (`serve_burst_bytes`, refilled at `SERVE_REFILL_BYTES_PER_SEC`).
+    /// The peer is not penalised; it asks again later.
+    pub requests_over_budget: Counter,
+    /// `GetBoardMessages` frames that named a message we served to the same
+    /// peer inside `REPEAT_REQUEST_WINDOW`. Those messages are skipped, with
+    /// no penalty.
+    pub requests_repeated: Counter,
 }
