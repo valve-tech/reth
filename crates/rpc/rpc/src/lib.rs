@@ -39,6 +39,7 @@ mod rpc;
 mod testing;
 mod trace;
 mod txpool;
+mod txpool_page;
 mod validation;
 mod web3;
 
@@ -56,5 +57,6 @@ pub use rpc::RPCApi;
 pub use testing::TestingApi;
 pub use trace::TraceApi;
 pub use txpool::TxPoolApi;
+pub use txpool_page::TxPoolPageApi;
 pub use validation::{ValidationApi, ValidationApiConfig};
 pub use web3::Web3Api;
