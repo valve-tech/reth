@@ -80,6 +80,11 @@ pub struct MsgboardMetrics {
     pub evicted: Counter,
     /// Messages dropped because their anchor block left the live window.
     pub expired: Counter,
+    /// `flush_to_db` calls whose write transaction failed.
+    ///
+    /// Any rise means the board is ahead of its database. A restart in that
+    /// state loses every message accepted since the last successful flush.
+    pub flush_failures: Counter,
 
     // ── peer sessions ────────────────────────────────────────────────────────
     /// Peers with a live `msg/1` session right now.

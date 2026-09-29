@@ -169,6 +169,7 @@ fn every_metric_is_instantiated_and_moves() {
             "msgboard.change_block_duration_seconds",
             "msgboard.evicted",
             "msgboard.expired",
+            "msgboard.flush_failures",
             "msgboard.msg_count",
             "msgboard.msg_size",
             "msgboard.outbound_dropped",
