@@ -108,6 +108,23 @@ impl MsgboardApiServer for MsgboardApi {
 
     async fn msgboard_content(&self, filter: Option<ContentFilter>) -> RpcResult<Box<RawValue>> {
         let filter = filter.unwrap_or_default();
+        if filter.after.is_some() && filter.offset.is_some() {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                "msgboard_content: `after` and `offset` cannot be used together",
+                None::<()>,
+            ));
+        }
+        // Matches `txpool_contentPage`. An empty page ends a cursor walk, so a
+        // page that is empty by request would read as the end of the board.
+        if filter.limit == Some(0) {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                "msgboard_content: `limit` must be at least 1",
+                None::<()>,
+            ));
+        }
+        let after = filter.after;
         let offset = filter.offset.unwrap_or(0);
         let limit = filter.limit.unwrap_or(usize::MAX);
 
@@ -119,7 +136,7 @@ impl MsgboardApiServer for MsgboardApi {
         let probe = Arc::clone(&self.probe);
 
         // The board hands back `Arc`s, so its lock covers pointer copies only.
-        let msgs = match filter.category {
+        let mut msgs = match filter.category {
             Some(cat) => {
                 self.board.category_msgs_filtered(&cat, filter.from_block, filter.to_block)
             }
@@ -135,6 +152,18 @@ impl MsgboardApiServer for MsgboardApi {
             let _permit = permit;
             #[cfg(test)]
             let _guard = probe.enter();
+            // The cursor walk orders by hash, not by board precedence. A
+            // hash never changes and every replica computes the same one, so
+            // inserts and evictions cannot shift a message across the cursor.
+            if let Some(after) = after {
+                msgs.retain(|m| m.hash > after);
+                // Select the `limit` lowest hashes in O(N), then sort only those.
+                if msgs.len() > limit {
+                    msgs.select_nth_unstable_by_key(limit, |m| m.hash);
+                    msgs.truncate(limit);
+                }
+                msgs.sort_unstable_by_key(|m| m.hash);
+            }
             // `BTreeMap` sorts the category keys, as Go's `encoding/json` does
             // for erigon's map.
             let mut grouped: BTreeMap<String, Vec<MsgboardMsg>> = BTreeMap::new();
@@ -291,6 +320,8 @@ mod tests {
     //! methods directly, so method names, parameter deserialization, result
     //! serialization, and error codes are all exercised — the same path a real
     //! client takes, minus the socket.
+
+    use std::collections::HashSet;
 
     use alloy_primitives::Bytes;
     use jsonrpsee::{core::server::MethodsError, RpcModule};
@@ -1000,6 +1031,136 @@ mod tests {
         assert_eq!(total_msgs(&in_range), 3);
     }
 
+    // ── content: hash cursor ─────────────────────────────────────────────────
+
+    /// A cursor walk returns every message exactly once, in ascending hash
+    /// order, across every category.
+    #[tokio::test]
+    async fn content_cursor_walk_returns_every_message_once() {
+        let board = ready_board(10);
+        for i in 0..11u8 {
+            board.add_local_msg(mined(&[i], category(0xA0 + i % 3), 10)).unwrap();
+        }
+        let mut expected: Vec<B256> = board.all_messages().iter().map(|m| m.hash).collect();
+        expected.sort_unstable();
+        let m = module(board);
+
+        let walked = walk_by_cursor(&m, json!({}), 3, || {}).await;
+        assert_eq!(walked, expected, "the walk must cover the board once, in hash order");
+    }
+
+    /// The cursor composes with the category filter: the walk covers that
+    /// category only.
+    #[tokio::test]
+    async fn content_cursor_walk_respects_the_category_filter() {
+        let board = ready_board(10);
+        for i in 0..9u8 {
+            board.add_local_msg(mined(&[i], category(0xA0 + i % 2), 10)).unwrap();
+        }
+        let mut expected: Vec<B256> = board
+            .all_messages()
+            .iter()
+            .filter(|m| m.msg.category == category(0xA0))
+            .map(|m| m.hash)
+            .collect();
+        expected.sort_unstable();
+        let m = module(board);
+
+        let walked = walk_by_cursor(&m, json!({"category": category(0xA0)}), 2, || {}).await;
+        assert_eq!(walked, expected);
+    }
+
+    /// Inserts and evictions between pages must not make the walk repeat a
+    /// message, or skip one that stayed on the board for the whole walk.
+    /// An `offset` walk fails this: an eviction ahead of the offset shifts
+    /// every later message back by one.
+    #[tokio::test]
+    async fn content_cursor_walk_is_stable_while_the_board_changes() {
+        let data_len = 8;
+        let cfg = MsgboardConfig { count_limit: 24, ..trivial_pow_cfg(data_len) };
+        let board = Arc::new(MsgBoard::new(cfg.clone()));
+        board.set_ready();
+        board.set_head(10, block_hash_one());
+
+        // Work multiplier 1 is the lowest precedence. Later messages use a
+        // higher one, so a full board evicts the original messages first.
+        let make = |i: u64, multiplier: u64| {
+            let mut data = vec![0u8; data_len];
+            data[..8].copy_from_slice(&i.to_be_bytes());
+            (1u64..)
+                .map(|nonce| PoWMsg {
+                    version: VERSION_V1,
+                    block_hash: block_hash_one(),
+                    nonce,
+                    work_multiplier: multiplier,
+                    work_divisor: cfg.work_divisor,
+                    category: category(0xA0 + (i % 3) as u8),
+                    data: Bytes::from(data.clone()),
+                })
+                .find(|msg| msg.clone().to_checked(10, 0).is_ok())
+                .unwrap()
+        };
+        for i in 0..24 {
+            board.add_local_msg(make(i, 1)).unwrap();
+        }
+        let before: HashSet<B256> = board.all_messages().iter().map(|m| m.hash).collect();
+        let m = module(Arc::clone(&board));
+
+        let mut next = 1_000u64;
+        let walked = walk_by_cursor(&m, json!({}), 4, || {
+            for _ in 0..2 {
+                board.add_local_msg(make(next, 2)).unwrap();
+                next += 1;
+            }
+        })
+        .await;
+
+        let after: HashSet<B256> = board.all_messages().iter().map(|m| m.hash).collect();
+        assert!(before.difference(&after).count() > 0, "the test must evict messages");
+        assert!(after.difference(&before).count() > 0, "the test must insert messages");
+
+        let seen: HashSet<B256> = walked.iter().copied().collect();
+        assert_eq!(seen.len(), walked.len(), "the walk repeated a message");
+        for h in before.intersection(&after) {
+            assert!(seen.contains(h), "the walk skipped {h}, present for the whole walk");
+        }
+    }
+
+    /// `after` and `offset` are two paging modes. Together they are a client
+    /// error, not a silent pick of one.
+    #[tokio::test]
+    async fn content_rejects_after_with_offset() {
+        let m = module(filled_board(3, 8));
+        let code = call_err_code(
+            &m,
+            "msgboard_content",
+            vec![json!({"after": B256::ZERO, "offset": 1, "limit": 2})],
+        )
+        .await;
+        assert_eq!(code, -32602);
+    }
+
+    /// `limit` 0 is a client error, as in `txpool_contentPage`, with or
+    /// without a cursor.
+    #[tokio::test]
+    async fn content_rejects_a_zero_limit() {
+        let m = module(filled_board(3, 8));
+        for filter in [json!({"limit": 0}), json!({"limit": 0, "after": B256::ZERO})] {
+            assert_eq!(call_err_code(&m, "msgboard_content", vec![filter]).await, -32602);
+        }
+    }
+
+    /// A cursor past every hash is the normal end of a walk.
+    #[tokio::test]
+    async fn content_cursor_past_the_end_returns_an_empty_map() {
+        let m = module(filled_board(3, 8));
+        let v: Value = m
+            .call("msgboard_content", vec![json!({"after": B256::repeat_byte(0xFF)})])
+            .await
+            .unwrap();
+        assert!(v.as_object().unwrap().is_empty());
+    }
+
     // ── subscribe: the server's own cap ──────────────────────────────────────
 
     /// `msgboard_subscribe` spawns a task per subscriber, which looked
@@ -1136,6 +1297,45 @@ mod tests {
     /// Total messages across every category in a `msgboard_content` response.
     fn total_msgs(v: &Value) -> usize {
         v.as_object().unwrap().values().map(|a| a.as_array().unwrap().len()).sum()
+    }
+
+    /// Walk the board with `after` and `limit`, and feed the largest hash of
+    /// each page back as the cursor. `between` runs before every page after
+    /// the first. Returns every hash the walk saw, in walk order.
+    async fn walk_by_cursor(
+        m: &RpcModule<MsgboardApi>,
+        base: Value,
+        limit: usize,
+        mut between: impl FnMut(),
+    ) -> Vec<B256> {
+        let mut walked = Vec::new();
+        // The zero hash starts the walk. Without `after`, the first page would
+        // come in board precedence order, not hash order.
+        let mut after = B256::ZERO;
+        for page_number in 0..1_000 {
+            if page_number > 0 {
+                between();
+            }
+            let mut filter = base.clone();
+            filter["limit"] = json!(limit);
+            filter["after"] = json!(after);
+            let v: Value = m.call("msgboard_content", vec![filter]).await.unwrap();
+            let mut page: Vec<B256> = v
+                .as_object()
+                .unwrap()
+                .values()
+                .flat_map(|a| a.as_array().unwrap().iter())
+                .map(|msg| serde_json::from_value(msg["hash"].clone()).unwrap())
+                .collect();
+            assert!(page.len() <= limit, "a page must hold at most `limit` messages");
+            if page.is_empty() {
+                return walked;
+            }
+            page.sort_unstable();
+            after = *page.last().unwrap();
+            walked.extend(page);
+        }
+        panic!("the cursor walk never reached an empty page");
     }
 
     /// `jsonrpsee` needs a concrete type for a no-params call; `Vec<Value>`

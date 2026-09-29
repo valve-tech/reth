@@ -2,7 +2,7 @@
 
 A practical guide to talking to a reth node's `msgboard_*` namespace. For protocol/wire-level details (P2P codes, RLP layouts, gRPC), see [`specs/02-msgboard.md`](../specs/02-msgboard.md). This document is the reference for **client-side request/response** shapes — the surface that users and AIs need to construct valid calls and parse replies.
 
-> **Implementation note:** This describes the **reth** msgboard implementation on the `extension-model` branch. Method signatures match the `erigon-pulse` JSON-RPC surface, so existing erigon-pulse RPC clients work unchanged. `msgboard_addMessage` takes the same hex-encoded RLP `PoWMsg` that erigon-pulse takes. `msgboard_content` returns the whole board in the same grouped-by-category map, and `msgboard_subscribe` takes the same `["newMessages", filter?]` shape. Reth adds two optional `msgboard_content` filter fields, `limit` and `offset`, for clients that want pages (see [Paging](#paging-reth-extension)).
+> **Implementation note:** This describes the **reth** msgboard implementation on the `extension-model` branch. Method signatures match the `erigon-pulse` JSON-RPC surface, so existing erigon-pulse RPC clients work unchanged. `msgboard_addMessage` takes the same hex-encoded RLP `PoWMsg` that erigon-pulse takes. `msgboard_content` returns the whole board in the same grouped-by-category map, and `msgboard_subscribe` takes the same `["newMessages", filter?]` shape. Reth adds optional `msgboard_content` filter fields, `limit` and `after` (and the older `offset`), for clients that want pages (see [Paging](#paging-reth-extension)).
 
 ---
 
@@ -108,8 +108,9 @@ Optional filter. Returns matching live messages **grouped by category**.
 | `category` | B256 hex | yes | Restrict to one category |
 | `fromBlock` | uint64 | yes | Inclusive lower bound on `blockNumber` |
 | `toBlock` | uint64 | yes | Inclusive upper bound on `blockNumber` |
-| `limit` | number | yes | **Reth extension.** Maximum messages in the response, counted across all categories. Omitted: no limit. `0` returns `{}`. |
-| `offset` | number | yes | **Reth extension.** Messages to skip before the response starts. Default `0`. |
+| `limit` | number | yes | **Reth extension.** Maximum messages in the response, counted across all categories. Omitted: no limit. `0` gives `-32602`. |
+| `after` | B256 hex | yes | **Reth extension.** Hash cursor. The response holds the matching messages whose `hash` is above `after`, in ascending hash order. Use it with `limit` to page. Cannot be used with `offset` (`-32602`). |
+| `offset` | number | yes | **Reth extension.** Messages to skip before the response starts. Default `0`. Unstable: see [Paging](#paging-reth-extension). |
 
 Omitting the filter (or any field) means "no constraint." Pass `null` or `[]` for no filter. **With no `limit`, the response holds every matching message, the same as erigon-pulse.**
 
@@ -123,15 +124,31 @@ The node builds the response on a blocking thread, not on the async runtime. Bui
 
 #### Paging (reth extension)
 
-#### Paging
+Use `limit` and `after` if you do not want the whole board in one response. With `after`, the node orders the matching messages by `hash`, ascending, and returns those above `after`, up to `limit`. The response keeps the same category map. To read every matching message:
 
-Use `limit` and `offset` if you do not want the whole board in one response. They apply to the flat list of matching messages in board order (ascending block number, then ascending difficulty ratio), before the node groups them by category. A response holds exactly `limit` messages unless the list runs out. To read every matching message:
+1. Call with `limit: N` and `after` set to the zero hash, `0x` followed by 64 zeros. Without `after`, the first page comes in board precedence order, not hash order, and the walk can skip messages.
+2. Take the largest `hash` in the response, across all categories. Call again with that hash as `after`.
+3. Stop when a response is empty or holds fewer than `N` messages.
 
-1. Call with `limit: N, offset: 0`.
-2. Call again with `offset` raised by `N`.
-3. Stop when a response holds fewer than `N` messages.
+Start the walk like this:
 
-The board changes between calls, so a walk is not a snapshot.
+```json
+{"jsonrpc":"2.0","id":1,"method":"msgboard_content",
+ "params":[{"limit":500,"after":"0x0000000000000000000000000000000000000000000000000000000000000000"}]}
+```
+
+Do not take the first page from a `limit`-only call and then switch to `after`. The `limit`-only page holds the first 500 messages in precedence order. Its largest hash can be far up the hash range, so the next `after` page starts above it and skips every message with a lower hash that was not in the first page.
+
+A message that stays on the board for the whole walk comes back exactly once. This holds when messages arrive or leave between pages, and when the calls go to different replicas behind a load balancer, because a message hash never changes and every node computes the same one. A message that arrives during the walk comes back only if its hash is above the cursor at that time.
+
+```bash
+curl -s http://localhost:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"msgboard_content",
+       "params":[{"limit":500,"after":"0x3f1c…"}]}' \
+  | jq '[.result[][] | .hash] | max'   # the next `after`
+```
+
+`limit` with `offset` still works, for older clients, but it is unstable. `offset` counts through the board in precedence order (ascending block number, then ascending difficulty ratio). A message that arrives or leaves between two calls shifts every later message, so an offset walk can repeat or skip messages. Two replicas can also hold the board in a different order. The node rejects `after` together with `offset` with `-32602`.
 
 **Response:** `{ [categoryHex: string]: MsgboardMsg[] }` — a JSON object whose keys are lowercase `0x…` 32-byte category ids and whose values are arrays of [`MsgboardMsg`](#message-shape). If a `category` filter is supplied, the map contains at most one entry; if no messages match, the map is empty (`{}`).
 
