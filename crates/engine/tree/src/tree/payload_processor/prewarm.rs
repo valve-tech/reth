@@ -27,9 +27,10 @@ use reth_evm::{execute::ExecutableTxFor, ConfigureEvm, Evm, EvmFor, RecoveredTx,
 use reth_metrics::Metrics;
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
 use reth_provider::{
-    AccountReader, BlockExecutionOutput, BlockNumReader, ChangeSetReader, DatabaseProviderFactory,
-    DatabaseProviderROFactory, HistoryReader, ProviderResult, PruneCheckpointReader,
-    StageCheckpointReader, StateProviderBox, StorageChangeSetReader, StorageSettingsCache,
+    BlockExecutionOutput, BlockNumReader, ChangeSetReader, DatabaseProviderFactory,
+    DatabaseProviderROFactory, EvmStateProvider, EvmStateProviderBox, HistoryReader,
+    ProviderResult, PruneCheckpointReader, StageCheckpointReader, StateProvider,
+    StorageChangeSetReader, StorageSettingsCache,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_overlay::OverlayStateProviderFactory;
@@ -414,8 +415,7 @@ where
                         return;
                     }
                     WorkerPool::with_worker_mut(|worker| {
-                        let provider =
-                            worker.get_or_init::<Option<Box<dyn AccountReader>>>(|| None);
+                        let provider = worker.get_or_init::<Option<EvmStateProviderBox>>(|| None);
                         if let Err(err) = ctx.send_bal_hashed_state(
                             &parent_span,
                             provider,
@@ -456,18 +456,17 @@ where
             // - dispatch_bal_batch_io is false
             // - execution cache is not disabled
             //
-            // we launch prewarming sequence of the BAL read set here. The BAL read-set consists
-            // of the accounts, their code if present, and declared storages (both storage_reads
-            // and storage_changes).
+            // we launch prewarming of the BAL accounts and declared storages (both storage_reads
+            // and storage_changes). Bytecode is loaded on demand during execution.
             //
             // This runs side-by-side with the parallel transaction execution reducing the time it
             // spends blocking on the data.
             let caches = saved_cache.cache().clone();
             let state_provider_factory = ctx.provider.clone();
             let build = Arc::new(move || {
-                state_provider_factory
-                    .database_provider_ro()
-                    .map(|provider| Box::new(provider) as _)
+                state_provider_factory.database_provider_ro().map(|provider| {
+                    Box::new(provider.into_evm_state_provider()) as EvmStateProviderBox
+                })
             });
 
             let block = pool.begin_block(
@@ -649,8 +648,7 @@ where
 
 /// Per-thread EVM state initialised by [`PrewarmContext::evm_for_ctx`] and stored in
 /// [`WorkerPool`] workers via [`Worker::get_or_init`](reth_tasks::pool::Worker::get_or_init).
-type PrewarmEvmState<Evm> =
-    Option<EvmFor<Evm, StateProviderDatabase<reth_provider::StateProviderBox>>>;
+type PrewarmEvmState<Evm> = Option<EvmFor<Evm, StateProviderDatabase<EvmStateProviderBox>>>;
 
 impl<N, P, Evm> PrewarmContext<N, P, Evm>
 where
@@ -669,8 +667,8 @@ where
     /// Creates a per-thread EVM for prewarming.
     #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
     fn evm_for_ctx(&self) -> PrewarmEvmState<Evm> {
-        let mut state_provider: StateProviderBox = match self.provider.database_provider_ro() {
-            Ok(provider) => Box::new(provider),
+        let mut state_provider = match self.provider.database_provider_ro() {
+            Ok(provider) => Box::new(provider.into_evm_state_provider()) as EvmStateProviderBox,
             Err(err) => {
                 trace!(
                     target: "engine::tree::payload_processor::prewarm",
@@ -761,7 +759,7 @@ where
     fn send_bal_hashed_state(
         &self,
         parent_span: &Span,
-        provider: &mut Option<Box<dyn AccountReader>>,
+        provider: &mut Option<EvmStateProviderBox>,
         account_changes: &alloy_eip7928::AccountChanges,
         hashed_update_stream: &StateRootUpdateStream,
     ) -> ProviderResult<()> {
@@ -804,8 +802,8 @@ where
                 )
                 .entered();
 
-                let inner = self.provider.database_provider_ro()?;
-                let boxed: Box<dyn AccountReader> =
+                let inner = self.provider.database_provider_ro()?.into_evm_state_provider();
+                let boxed: EvmStateProviderBox =
                     match (self.disable_bal_batch_io, &self.saved_cache) {
                         (false, Some(saved)) => {
                             let caches = saved.cache().clone();
@@ -1390,6 +1388,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_update)]
     fn bal_account_uses_existing_fields_only_when_missing() {
         let changes = AccountChanges::new(address!("0000000000000000000000000000000000000001"))
             .with_balance_change(BalanceChange::new(BlockAccessIndex::new(1), U256::from(10)));
@@ -1400,6 +1399,7 @@ mod tests {
             balance: U256::from(1),
             nonce: 3,
             bytecode_hash: Some(B256::repeat_byte(0xaa)),
+            ..Default::default()
         };
         account.apply_bal_info(info);
 

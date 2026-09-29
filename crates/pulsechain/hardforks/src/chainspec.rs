@@ -17,11 +17,7 @@ use crate::hardfork::{
     PULSECHAIN_PARIS_TTD, SHANGHAI_MAINNET_TIMESTAMP, SHANGHAI_TESTNET_V4_TIMESTAMP,
 };
 
-/// `PulseChain` mainnet chain ID.
-pub const PULSECHAIN_MAINNET_CHAIN_ID: u64 = 369;
-
-/// `PulseChain` testnet v4 chain ID.
-pub const PULSECHAIN_TESTNET_V4_CHAIN_ID: u64 = 943;
+pub use reth_chainspec::{PULSECHAIN_MAINNET_CHAIN_ID, PULSECHAIN_TESTNET_V4_CHAIN_ID};
 
 /// `PulseChain` mainnet deposit contract address.
 /// Deployed during `PrimordialPulse` at block 17,233,000.
