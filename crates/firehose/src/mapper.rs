@@ -85,8 +85,9 @@ where
         tx_dependency: None,
         // EIP-7843: Amsterdam slot number — not yet exposed by reth Header trait
         slot_number: None,
-        // EIP-7928: Amsterdam block access list — not yet emitted
-        block_access_list_hash: None,
+        // EIP-7928: the hash the header commits to. The full list is known only after
+        // execution, but the block starts before it, so the RLP is not emitted.
+        block_access_list_hash: header.block_access_list_hash(),
         block_access_list_rlp: None,
     }
 }
