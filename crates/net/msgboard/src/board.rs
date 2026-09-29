@@ -129,6 +129,9 @@ pub struct MsgBoard {
     /// messages. Starts `false`; flips to `true` exactly once when the caller
     /// signals sync completion via [`MsgBoard::set_ready`].
     ready: AtomicBool,
+    /// Set once by [`MsgBoard::stop_accepting`]. After that, `set_ready` does
+    /// nothing, so a late sync watcher cannot reopen the board at shutdown.
+    shutting_down: AtomicBool,
     /// Prometheus metrics. Cloned out of the struct via `metrics()` for
     /// outside-the-lock observation (e.g. by the protocol handler).
     metrics: MsgboardMetrics,
@@ -163,6 +166,7 @@ impl MsgBoard {
             flush_lock: Mutex::new(()),
             consecutive_flush_failures: AtomicU64::new(0),
             ready: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
             metrics: MsgboardMetrics::default(),
         }
     }
@@ -181,7 +185,17 @@ impl MsgBoard {
     /// Signal that the node has finished initial sync. Logs the state change
     /// exactly once. Subsequent calls are no-ops.
     pub fn set_ready(&self) {
-        if !self.ready.swap(true, Ordering::Relaxed) {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let was_ready = self.ready.swap(true, Ordering::SeqCst);
+        // `stop_accepting` can run between the check above and the swap.
+        // Checking again after the swap undoes the swap in that case.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            self.ready.store(false, Ordering::SeqCst);
+            return;
+        }
+        if !was_ready {
             tracing::info!(target: "msgboard", "node synced — msgboard is now accepting messages");
         }
     }
@@ -192,8 +206,12 @@ impl MsgBoard {
     /// accepted after the flush and then lost. A message whose insert already
     /// passed the ready check can still land after the flush; the board's
     /// `Drop` flush writes it if the last handle drops in time.
+    ///
+    /// Final: a later [`set_ready`](Self::set_ready) does nothing.
     pub fn stop_accepting(&self) {
-        self.ready.store(false, Ordering::Relaxed);
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.ready.store(false, Ordering::SeqCst);
+        tracing::debug!(target: "msgboard", "msgboard stopped accepting messages for shutdown");
     }
 
     /// Load persisted messages from the database into the index.
