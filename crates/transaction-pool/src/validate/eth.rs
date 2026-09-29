@@ -22,11 +22,11 @@ use alloy_consensus::{
 };
 use alloy_eips::{
     eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M, eip4844::env_settings::EnvKzgSettings,
-    eip7840::BlobParams, BlockId,
+    eip7840::BlobParams, merge::SLOT_DURATION_SECS, BlockId,
 };
 use alloy_primitives::U256;
 use alloy_rlp::Encodable;
-use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
+use reth_chainspec::{is_pulsechain_chain_id, ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{
     transaction::error::InvalidTransactionError, Account, BlockTy, GotExpected, HeaderTy,
@@ -504,6 +504,7 @@ where
                     .unwrap_or_default(),
             );
             if tx_size > self.max_tx_input_bytes {
+                self.validation_metrics.rejected_oversized_data.increment(1);
                 return Err(InvalidPoolTransactionError::OversizedData {
                     size: tx_size,
                     limit: self.max_tx_input_bytes,
@@ -513,6 +514,7 @@ where
             // ensure the size of the non-blob transaction
             let tx_size = transaction.encoded_length();
             if tx_size > self.max_tx_input_bytes {
+                self.validation_metrics.rejected_oversized_data.increment(1);
                 return Err(InvalidPoolTransactionError::OversizedData {
                     size: tx_size,
                     limit: self.max_tx_input_bytes,
@@ -549,6 +551,7 @@ where
 
         // Ensure max_priority_fee_per_gas (if EIP1559) is less than max_fee_per_gas if any.
         if transaction.max_priority_fee_per_gas() > Some(transaction.max_fee_per_gas()) {
+            self.validation_metrics.rejected_tip_above_fee_cap.increment(1);
             return Err(InvalidTransactionError::TipAboveFeeCap.into())
         }
 
@@ -563,6 +566,7 @@ where
                 Some(tx_fee_cap_wei) => {
                     let max_tx_fee_wei = transaction.cost().saturating_sub(transaction.value());
                     if max_tx_fee_wei > tx_fee_cap_wei {
+                        self.validation_metrics.rejected_exceeds_fee_cap.increment(1);
                         return Err(InvalidPoolTransactionError::ExceedsFeeCap {
                             max_tx_fee_wei: max_tx_fee_wei.saturating_to(),
                             tx_fee_cap_wei,
@@ -577,6 +581,7 @@ where
         if transaction.is_dynamic_fee() &&
             transaction.max_priority_fee_per_gas() < self.minimum_priority_fee
         {
+            self.validation_metrics.rejected_priority_fee_below_minimum.increment(1);
             return Err(InvalidPoolTransactionError::PriorityFeeBelowMinimum {
                 minimum_priority_fee: self
                     .minimum_priority_fee
@@ -590,7 +595,7 @@ where
         if let Some(chain_id) = transaction.chain_id() &&
             chain_id != self.chain_id()
         {
-            let is_pulsechain = matches!(self.chain_id(), 369 | 943);
+            let is_pulsechain = is_pulsechain_chain_id(self.chain_id());
             if !(is_pulsechain && chain_id == 1) {
                 return Err(InvalidTransactionError::ChainIdMismatch.into())
             }
@@ -607,7 +612,9 @@ where
             }
         }
 
-        ensure_intrinsic_gas(transaction, &self.fork_tracker)?;
+        ensure_intrinsic_gas(transaction, &self.fork_tracker).inspect_err(|_| {
+            self.validation_metrics.rejected_intrinsic_gas_too_low.increment(1);
+        })?;
 
         // light blob tx pre-checks
         if transaction.is_eip4844() {
@@ -619,6 +626,7 @@ where
             let blob_count = transaction.blob_count().unwrap_or(0);
             if blob_count == 0 {
                 // no blobs
+                self.validation_metrics.invalid_4844.increment(1);
                 return Err(InvalidPoolTransactionError::Eip4844(
                     Eip4844PoolTransactionError::NoEip4844Blobs,
                 ))
@@ -626,6 +634,7 @@ where
 
             let max_blob_count = self.fork_tracker.max_blob_count();
             if blob_count > max_blob_count {
+                self.validation_metrics.invalid_4844.increment(1);
                 return Err(InvalidPoolTransactionError::Eip4844(
                     Eip4844PoolTransactionError::TooManyEip4844Blobs {
                         have: blob_count,
@@ -740,7 +749,7 @@ where
         {
             let is_eip7702 = if self.fork_tracker.is_prague_activated() {
                 match state.bytecode_by_hash(code_hash) {
-                    Ok(bytecode) => bytecode.unwrap_or_default().is_eip7702(),
+                    Ok(bytecode) => bytecode.is_some_and(|b| b.is_eip7702()),
                     Err(err) => {
                         return Err(TransactionValidationOutcome::Error(
                             *transaction.hash(),
@@ -808,6 +817,7 @@ where
             match transaction.take_blob() {
                 EthBlobTransactionSidecar::None => {
                     // this should not happen
+                    self.validation_metrics.invalid_4844.increment(1);
                     return Err(InvalidTransactionError::TxTypeNotSupported.into())
                 }
                 EthBlobTransactionSidecar::Missing => {
@@ -818,6 +828,7 @@ where
                     if self.blob_store.contains(*transaction.hash()).is_ok_and(|c| c) {
                         // validated transaction is already in the store
                     } else {
+                        self.validation_metrics.invalid_4844.increment(1);
                         return Err(InvalidPoolTransactionError::Eip4844(
                             Eip4844PoolTransactionError::MissingEip4844BlobSidecar,
                         ))
@@ -831,11 +842,13 @@ where
                         // Standard Ethereum behavior
                         if self.fork_tracker.is_osaka_activated() {
                             if sidecar.is_eip4844() {
+                                self.validation_metrics.invalid_4844.increment(1);
                                 return Err(InvalidPoolTransactionError::Eip4844(
                                     Eip4844PoolTransactionError::UnexpectedEip4844SidecarAfterOsaka,
                                 ))
                             }
                         } else if sidecar.is_eip7594() && !self.allow_7594_sidecars() {
+                            self.validation_metrics.invalid_4844.increment(1);
                             return Err(InvalidPoolTransactionError::Eip4844(
                                 Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka,
                             ))
@@ -843,6 +856,7 @@ where
                     } else {
                         // EIP-7594 disabled: always reject v1 sidecars, accept v0
                         if sidecar.is_eip7594() {
+                            self.validation_metrics.invalid_4844.increment(1);
                             return Err(InvalidPoolTransactionError::Eip4844(
                                 Eip4844PoolTransactionError::Eip7594SidecarDisallowed,
                             ))
@@ -851,6 +865,7 @@ where
 
                     // validate the blob
                     if let Err(err) = transaction.validate_blob(&sidecar, self.kzg_settings.get()) {
+                        self.validation_metrics.invalid_4844.increment(1);
                         return Err(InvalidPoolTransactionError::Eip4844(
                             Eip4844PoolTransactionError::InvalidEip4844Blob(err),
                         ))
@@ -968,9 +983,15 @@ where
         let tip_timestamp = self.fork_tracker.tip_timestamp();
 
         // If next block is Osaka, allow 7594 sidecars
-        if self.chain_spec().is_osaka_active_at_timestamp(tip_timestamp.saturating_add(12)) {
+        if self
+            .chain_spec()
+            .is_osaka_active_at_timestamp(tip_timestamp.saturating_add(SLOT_DURATION_SECS))
+        {
             true
-        } else if self.chain_spec().is_osaka_active_at_timestamp(tip_timestamp.saturating_add(24)) {
+        } else if self
+            .chain_spec()
+            .is_osaka_active_at_timestamp(tip_timestamp.saturating_add(2 * SLOT_DURATION_SECS))
+        {
             let current_timestamp =
                 SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
@@ -1529,16 +1550,13 @@ pub fn ensure_intrinsic_gas<T: EthPoolTransaction>(
         transaction.input(),
         transaction.is_create(),
         transaction.access_list().map(|l| l.len()).unwrap_or_default() as u64,
-        transaction
-            .access_list()
-            .map(|l| l.iter().map(|i| i.storage_keys.len()).sum::<usize>())
-            .unwrap_or_default() as u64,
-        transaction.authorization_list().map(|l| l.len()).unwrap_or_default() as u64,
+        transaction.access_list().map(|l| l.storage_keys_count()).unwrap_or_default() as u64,
+        transaction.authorization_count().unwrap_or_default(),
         eip2780,
     );
 
     let gas_limit = transaction.gas_limit();
-    if gas_limit < gas.initial_total_gas() || gas_limit < gas.floor_gas {
+    if gas_limit < gas.initial_total_gas() || gas_limit < gas.floor_gas() {
         Err(InvalidPoolTransactionError::IntrinsicGasTooLow)
     } else {
         Ok(())
