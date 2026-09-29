@@ -320,6 +320,13 @@ where
 /// [`RethRpcModule`] has no msgboard variant, so this rides its `Other`
 /// catch-all. That is enough for the allowlist check and keeps the change out
 /// of the shared RPC types.
+///
+/// `RpcModuleSelection::All` contains every module, `Other` ones included, so
+/// `--http.api all` exposes `msgboard_addMessage` to anyone who can reach the
+/// port. That is deliberate: an operator who asks for all namespaces gets this
+/// one too. Proof of work and `--msgboard.count-limit` bound what a caller can
+/// do with it; an operator who wants no public submission endpoint lists
+/// namespaces instead of `all`.
 pub const MSGBOARD_RPC_NAMESPACE: &str = "msgboard";
 
 /// The [`RethRpcModule`] the msgboard methods register under.
