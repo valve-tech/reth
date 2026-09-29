@@ -272,6 +272,13 @@ const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// `the_ingress_limits_hold_an_honest_peers_worst_burst` checks. 256 frames
 /// leaves room for single-ID announcements that arrive in the same window.
 ///
+/// A peer that reads us slowly on a busy board is cut too. While one send
+/// waits out [`OUTBOUND_SEND_TIMEOUT`], the peer's gossip keeps arriving; at
+/// ~130 bytes per single-ID announcement, more than about 250 of them in one
+/// 30 s stall (fewer if a bulk announce or a reply shares the window) fill the
+/// queue and end the session, eth included. eth-wire counts each cut in
+/// `p2pstream.subprotocol_inbound_buffer_full`.
+///
 /// A flooding peer gets far less than the multiplexer's default of 1024
 /// frames and 32 MiB. Full-size `GetBoardMessages` requests are 8 KiB each, so
 /// the frame count cuts that flood at ~2 MiB.
@@ -325,26 +332,20 @@ pub trait PeerReporter: std::fmt::Debug + Send + Sync {
     /// Peer delivered a wire-level malformed payload (unparseable RLP,
     /// `MsgID` list whose length is not a multiple of `MSG_ID_SIZE`, …).
     fn report_bad_protocol(&self, peer_id: PeerId);
-
-    /// Peer asked for more reply bytes than its budget holds. See
-    /// [`SERVE_BURST_BYTES`].
-    fn report_over_budget(&self, peer_id: PeerId);
-
-    /// Peer asked again for a message we served it inside
-    /// [`REPEAT_REQUEST_WINDOW`].
-    fn report_repeated_request(&self, peer_id: PeerId);
 }
 
-/// Reply bytes one peer may make us send at once.
+/// Smallest reply burst one peer may make us send at once.
 ///
 /// A `GetBoardMessages` frame is at most 8 KiB but names up to 256 bodies,
 /// about 2.1 MB at the default 8 KiB `size_limit`, so one request is a ~260x
-/// amplifier. The burst holds one full reply with room to spare, and about
-/// half of the ~8.7 MB a peer can owe us at once under [`MAX_WANT_PER_PEER`].
-/// A peer that syncs a full board of maximum-size messages from us can meet
-/// the budget. It then gets a few requests refused and fetches those messages
-/// from another peer once its own reservation times out.
-const SERVE_BURST_BYTES: u64 = 4 * 1024 * 1024;
+/// amplifier. The rate limit is the whole defence against it: an honest peer
+/// cannot tell our budget from its side, so running out costs it nothing. We
+/// serve the prefix of the reply that fits and drop the rest, and the peer
+/// asks again once its reservation times out.
+///
+/// The burst in force is [`serve_burst_bytes`], which is never less than one
+/// full reply at the configured `size_limit`.
+const SERVE_MIN_BURST_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Rate at which a peer's reply budget refills.
 ///
@@ -356,8 +357,10 @@ const SERVE_REFILL_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 /// How long a served message stays "recent" for the peer it went to.
 ///
-/// Twice `WANT_TIMEOUT`: an honest peer asks again only after its own
-/// reservation for the message expires, and only if the reply was lost.
+/// A message is recorded only once its frame is queued for the peer, so a
+/// reply we dropped is never recent. A repeat inside the window is skipped
+/// without penalty: a peer that retries or hands a request off may ask again
+/// honestly, and the reply budget already bounds what a loop can cost.
 const REPEAT_REQUEST_WINDOW: Duration = Duration::from_secs(30);
 
 /// Most served hashes remembered per connection for repeat detection.
@@ -366,14 +369,21 @@ const REPEAT_REQUEST_WINDOW: Duration = Duration::from_secs(30);
 /// which only weakens detection. The reply budget still bounds the cost.
 const MAX_RECENTLY_SERVED: usize = 2048;
 
-/// Reputation cost of a request refused for budget. One unit, because an
-/// honest peer that syncs a large board from us can meet the budget.
-const OVER_BUDGET_REPUTATION_CHANGE: i32 = -1024;
+/// Widest encoding of one `WirePoWMsg` whose `data` is `size_limit` bytes:
+/// `data`'s string header, the message's list header, the claimed hash and
+/// the wire element's own list header, each at its widest.
+const fn max_wire_body_len(size_limit: usize) -> usize {
+    size_limit + 3 + MSG_FIXED_FIELDS_RLP_LEN + 3 + MSG_HASH_RLP_LEN + 3
+}
 
-/// Reputation cost of asking again for a message we just served. Four units,
-/// the weight of a timeout: an honest peer does it only after a lost reply,
-/// but a looping peer does it every time.
-const REPEATED_REQUEST_REPUTATION_CHANGE: i32 = -4 * 1024;
+/// The reply burst for a board configured with `size_limit`: one full
+/// `GetBoardMessages` reply, or [`SERVE_MIN_BURST_BYTES`] if that is larger.
+/// A burst smaller than one reply would serve a legal request only in part,
+/// forever.
+fn serve_burst_bytes(size_limit: usize) -> u64 {
+    let full_reply = (MAX_GET_BOARD_MESSAGES * max_wire_body_len(size_limit)) as u64;
+    full_reply.max(SERVE_MIN_BURST_BYTES)
+}
 
 /// `RLPx` sub-protocol handler for `msg/1`.
 ///
@@ -626,7 +636,9 @@ impl OutboundQueue {
 /// Time is `tokio`'s, so paused-clock tests control the refill.
 #[derive(Debug)]
 struct ServeBudget {
-    tokens: u64,
+    /// `None` until first use, when the burst is known and the bucket starts
+    /// full.
+    tokens: Option<u64>,
     refilled_at: tokio::time::Instant,
     /// Served hashes in serve order. Every entry shares one window, so the
     /// front is always the oldest.
@@ -636,25 +648,22 @@ struct ServeBudget {
 
 impl ServeBudget {
     fn new(now: tokio::time::Instant) -> Self {
-        Self {
-            tokens: SERVE_BURST_BYTES,
-            refilled_at: now,
-            recent: VecDeque::new(),
-            recent_set: HashSet::new(),
-        }
+        Self { tokens: None, refilled_at: now, recent: VecDeque::new(), recent_set: HashSet::new() }
     }
 
-    /// Take `cost` bytes if the bucket holds them. Takes nothing otherwise.
-    fn try_spend(&mut self, cost: u64, now: tokio::time::Instant) -> bool {
+    /// Take `cost` bytes from a bucket of `burst` if it holds them. Takes
+    /// nothing otherwise.
+    fn try_spend(&mut self, cost: u64, burst: u64, now: tokio::time::Instant) -> bool {
         let elapsed = now.saturating_duration_since(self.refilled_at);
         let refill = (elapsed.as_micros() * u128::from(SERVE_REFILL_BYTES_PER_SEC) / 1_000_000)
-            .min(u128::from(SERVE_BURST_BYTES)) as u64;
-        self.tokens = (self.tokens + refill).min(SERVE_BURST_BYTES);
+            .min(u128::from(burst)) as u64;
+        let tokens = self.tokens.map_or(burst, |t| t.saturating_add(refill).min(burst));
         self.refilled_at = now;
-        if cost > self.tokens {
+        if cost > tokens {
+            self.tokens = Some(tokens);
             return false;
         }
-        self.tokens -= cost;
+        self.tokens = Some(tokens - cost);
         true
     }
 
@@ -1028,44 +1037,48 @@ async fn handle_incoming(
             if !ready {
                 return Sent::Ok;
             }
+            // Neither a repeat nor a short budget costs the peer reputation:
+            // an honest peer meets both, and the budget alone bounds the cost.
             let msgs = {
                 let now = tokio::time::Instant::now();
+                let burst = serve_burst_bytes(board.config().size_limit);
                 let mut serve = tx.serve.lock();
-                // A hash we just served is dropped from the request, not
-                // served again: re-sending it is exactly the loop that makes
-                // this opcode an amplifier.
                 let fresh: Vec<B256> =
                     hashes.iter().copied().filter(|h| !serve.is_recent(h, now)).collect();
                 if fresh.len() < hashes.len() {
                     metrics.requests_repeated.increment(1);
-                    if let Some(r) = reporter {
-                        r.report_repeated_request(peer_id);
-                    }
                 }
-                let msgs = board.get_wire_messages_for_hashes(&fresh);
-                if msgs.is_empty() {
-                    return Sent::Ok;
-                }
-                let cost: usize = msgs.iter().map(Encodable::length).sum();
-                if !serve.try_spend(cost as u64, now) {
+                let mut msgs = board.get_wire_messages_for_hashes(&fresh);
+                let fits = msgs
+                    .iter()
+                    .take_while(|m| serve.try_spend(m.length() as u64, burst, now))
+                    .count();
+                if fits < msgs.len() {
                     tracing::debug!(
                         target: "msgboard",
                         ?peer_id,
-                        cost,
-                        "GetBoardMessages reply exceeds the peer's budget",
+                        served = fits,
+                        requested = msgs.len(),
+                        "GetBoardMessages reply cut at the peer's budget",
                     );
                     metrics.requests_over_budget.increment(1);
-                    if let Some(r) = reporter {
-                        r.report_over_budget(peer_id);
-                    }
-                    return Sent::Ok;
-                }
-                for msg in &msgs {
-                    serve.record(msg.hash, now);
+                    msgs.truncate(fits);
                 }
                 msgs
             };
+            if msgs.is_empty() {
+                return Sent::Ok;
+            }
             metrics.bodies_served.increment(msgs.len() as u64);
+            // Recorded only once queued, so a peer that asks again for a reply
+            // we dropped is served rather than skipped.
+            let mut record = |chunk: &[reth_msgboard_types::WirePoWMsg]| {
+                let now = tokio::time::Instant::now();
+                let mut serve = tx.serve.lock();
+                for msg in chunk {
+                    serve.record(msg.hash, now);
+                }
+            };
             return send_packed_bodies(
                 &metrics,
                 tx,
@@ -1073,6 +1086,7 @@ async fn handle_incoming(
                 deadline,
                 &msgs,
                 encode_wire_pow_msg_list,
+                &mut record,
             )
             .await;
         }
@@ -1235,16 +1249,17 @@ async fn send_packed_bodies<T: Encodable + Clone>(
     deadline: tokio::time::Instant,
     msgs: &[T],
     encode: fn(&[T]) -> Vec<u8>,
+    on_queued: &mut (dyn FnMut(&[T]) + Send),
 ) -> Sent {
     let mut chunk: Vec<T> = Vec::new();
     let mut chunk_size = 0usize;
     for msg in msgs {
         let msg_size = msg.length();
         if !chunk.is_empty() && encoded_list_len(chunk_size + msg_size) > P2P_MSG_PACKET_LIMIT {
-            if send_bodies_frame(metrics, tx, peer_id, deadline, &chunk, encode).await ==
-                Sent::Closed
-            {
-                return Sent::Closed;
+            match send_bodies_frame(metrics, tx, peer_id, deadline, &chunk, encode).await {
+                Sent::Closed => return Sent::Closed,
+                Sent::Ok => on_queued(&chunk),
+                Sent::Dropped => {}
             }
             chunk.clear();
             chunk_size = 0;
@@ -1252,10 +1267,12 @@ async fn send_packed_bodies<T: Encodable + Clone>(
         chunk.push(msg.clone());
         chunk_size += msg_size;
     }
-    if !chunk.is_empty() &&
-        send_bodies_frame(metrics, tx, peer_id, deadline, &chunk, encode).await == Sent::Closed
-    {
-        return Sent::Closed;
+    if !chunk.is_empty() {
+        match send_bodies_frame(metrics, tx, peer_id, deadline, &chunk, encode).await {
+            Sent::Closed => return Sent::Closed,
+            Sent::Ok => on_queued(&chunk),
+            Sent::Dropped => {}
+        }
     }
     Sent::Ok
 }
@@ -1351,18 +1368,6 @@ where
     fn report_bad_protocol(&self, peer_id: PeerId) {
         self.network.reputation_change(peer_id, ReputationChangeKind::BadProtocol);
     }
-
-    fn report_over_budget(&self, peer_id: PeerId) {
-        self.network
-            .reputation_change(peer_id, ReputationChangeKind::Other(OVER_BUDGET_REPUTATION_CHANGE));
-    }
-
-    fn report_repeated_request(&self, peer_id: PeerId) {
-        self.network.reputation_change(
-            peer_id,
-            ReputationChangeKind::Other(REPEATED_REQUEST_REPUTATION_CHANGE),
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1393,8 +1398,6 @@ mod tests {
     struct RecordingReporter {
         bad_message: Mutex<usize>,
         bad_protocol: Mutex<usize>,
-        over_budget: Mutex<usize>,
-        repeated: Mutex<usize>,
     }
 
     impl RecordingReporter {
@@ -1404,11 +1407,9 @@ mod tests {
         fn bad_protocol(&self) -> usize {
             *self.bad_protocol.lock().unwrap()
         }
-        fn over_budget(&self) -> usize {
-            *self.over_budget.lock().unwrap()
-        }
-        fn repeated(&self) -> usize {
-            *self.repeated.lock().unwrap()
+        /// Every reputation call of any kind.
+        fn penalties(&self) -> usize {
+            self.bad_message() + self.bad_protocol()
         }
     }
 
@@ -1418,12 +1419,6 @@ mod tests {
         }
         fn report_bad_protocol(&self, _peer_id: PeerId) {
             *self.bad_protocol.lock().unwrap() += 1;
-        }
-        fn report_over_budget(&self, _peer_id: PeerId) {
-            *self.over_budget.lock().unwrap() += 1;
-        }
-        fn report_repeated_request(&self, _peer_id: PeerId) {
-            *self.repeated.lock().unwrap() += 1;
         }
     }
 
@@ -4129,11 +4124,158 @@ mod tests {
 
     // ── reply budget ─────────────────────────────────────────────────────────
 
+    /// Mine `count` distinct messages of `data_len` bytes onto `board` and
+    /// return their work hashes.
+    ///
+    /// Mining is spread over threads: it dominates these tests' run time.
+    fn seed_distinct(board: &Arc<MsgBoard>, count: usize, data_len: usize) -> Vec<B256> {
+        let mine = |i: u64| {
+            let mut data = vec![0u8; data_len];
+            data[..8].copy_from_slice(&i.to_be_bytes());
+            (1u64..=1_000_000)
+                .find_map(|n| {
+                    let m = pow_msg(n, &data);
+                    m.clone().to_checked(10, 0).is_ok().then_some(m)
+                })
+                .expect("nonce")
+        };
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()) as u64;
+        let msgs: Vec<PoWMsg> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|t| {
+                    scope.spawn(move || {
+                        (0..count as u64).filter(|i| i % threads == t).map(mine).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+        });
+        msgs.into_iter().map(|m| board.add_local_msg(m).unwrap().hash).collect()
+    }
+
+    /// Ask for `hashes` in one `GetBoardMessages`; return the hashes served
+    /// and the frame bytes they took.
+    async fn request_hashes(
+        board: &Arc<MsgBoard>,
+        rep: &RecordingReporter,
+        tx: &OutboundQueue,
+        rx: &mut Receiver<BytesMut>,
+        hashes: &[B256],
+    ) -> (Vec<B256>, usize) {
+        let raw = frame(GET_BOARD_MESSAGES, &encode_msg_hash_list(hashes));
+        handle_incoming(board, Some(rep), tx, &mut WantList::default(), raw, peer()).await;
+        let frames = drain(rx);
+        let bytes = frames.iter().map(BytesMut::len).sum();
+        let served = frames
+            .iter()
+            .flat_map(|f| decode_wire_pow_msg_list(&f[1..]).expect("valid response"))
+            .map(|m| m.hash)
+            .collect();
+        (served, bytes)
+    }
+
+    /// An honest peer syncs a full board from us the way our own requester
+    /// does: 256-hash chunks back to back, then a retry of whatever did not
+    /// arrive once its reservation times out. It must get everything and
+    /// never lose reputation.
+    async fn honest_full_sync(size_limit: usize, count: usize, data_len: usize) {
+        let board = board_with_cfg(MsgboardConfig { size_limit, ..easy_cfg() }, 10);
+        let mut pending = seed_distinct(&board, count, data_len);
+        let rep = RecordingReporter::default();
+        let (tx, mut rx) = channel();
+
+        for _ in 0..20 {
+            let mut served = Vec::new();
+            for chunk in pending.chunks(MAX_GET_BOARD_MESSAGES) {
+                served.extend(request_hashes(&board, &rep, &tx, &mut rx, chunk).await.0);
+            }
+            pending.retain(|h| !served.contains(h));
+            if pending.is_empty() {
+                break;
+            }
+            tokio::time::advance(crate::pending::WANT_TIMEOUT).await;
+        }
+
+        assert!(pending.is_empty(), "{} messages were never served", pending.len());
+        assert_eq!(rep.penalties(), 0, "an honest sync must cost no reputation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_honest_full_sync_is_never_penalised() {
+        // Three chunks, 5 MB: past the minimum burst, as a full 846-ID sync is.
+        honest_full_sync(8 * 1024, 600, 8 * 1024).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_honest_full_sync_at_the_largest_size_limit_is_never_penalised() {
+        // One chunk of 200 x 24 KiB is ~4.9 MB, past the minimum burst. The
+        // messages are smaller than the limit allows only because mining
+        // full-size ones makes the test slow; the burst follows the limit.
+        honest_full_sync(MAX_SAFE_SIZE_LIMIT, 200, 24 * 1024).await;
+    }
+
+    /// A reply our own queue dropped never reached the peer, so asking again
+    /// is not a repeat. It must be served, and free.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_we_dropped_is_served_again_without_penalty() {
+        let board = board_at(10);
+        let ids = seed_multi_frame_response(&board);
+        let hashes: Vec<B256> = ids.iter().map(MsgID::message_hash).collect();
+        let rep = RecordingReporter::default();
+        // A full one-frame queue on a peer already marked as not reading: the
+        // whole reply is dropped at once, with no wait to age the repeat window.
+        let (raw_tx, mut rx) = mpsc::channel::<BytesMut>(1);
+        raw_tx.try_send(BytesMut::from(&[BOARD_MESSAGES, 0xc0][..])).unwrap();
+        let tx = OutboundQueue::new(raw_tx);
+        tx.stalled.store(true, Ordering::Relaxed);
+
+        let (first, _) = request_hashes(&board, &rep, &tx, &mut rx, &hashes).await;
+        assert!(first.is_empty(), "the harness must drop the whole first reply");
+
+        let (second, _) = request_hashes(&board, &rep, &tx, &mut rx, &hashes).await;
+        assert!(!second.is_empty(), "what we dropped must be served when asked again");
+        assert_eq!(rep.penalties(), 0, "the peer is not charged for our drop");
+    }
+
+    /// Many distinct requests draw on one bucket: bytes served stop at the
+    /// burst, then grow by the refill rate.
+    #[tokio::test(start_paused = true)]
+    async fn distinct_requests_stop_at_the_reply_budget() {
+        const BURST: usize = 4 * 1024 * 1024;
+        const REFILL: usize = 1024 * 1024;
+        // Frame headers and opcodes ride on top of the bodies the bucket counts.
+        const SLACK: usize = 64 * 1024;
+
+        let board = board_at(10);
+        let hashes = seed_distinct(&board, 700, 8 * 1024);
+        let rep = RecordingReporter::default();
+        let (tx, mut rx) = channel();
+
+        let mut got = Vec::new();
+        let mut served = 0;
+        for chunk in hashes.chunks(32) {
+            let (hashes, bytes) = request_hashes(&board, &rep, &tx, &mut rx, chunk).await;
+            got.extend(hashes);
+            served += bytes;
+        }
+        assert!(served <= BURST + SLACK, "{served} bytes served from a {BURST}-byte burst");
+        assert!(served >= BURST - SLACK, "the burst itself must be served, got {served}");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let unserved: Vec<B256> = hashes.iter().copied().filter(|h| !got.contains(h)).collect();
+        let mut later = 0;
+        for chunk in unserved.chunks(32) {
+            later += request_hashes(&board, &rep, &tx, &mut rx, chunk).await.1;
+        }
+        assert!(later <= REFILL + SLACK, "{later} bytes served after one second of refill");
+        assert!(later >= REFILL - SLACK, "the refill must be served, got {later}");
+    }
+
     /// One 8 KiB `GetBoardMessages` can name ~2 MB of bodies, and a peer can
     /// send it again as soon as the reply leaves. Looping one request must
     /// stop costing us reply bytes once the peer's budget is spent.
     #[tokio::test(start_paused = true)]
-    async fn a_repeated_request_stops_at_the_reply_budget() {
+    async fn a_repeated_request_is_served_once() {
         let board = board_at(10);
         let ids = seed_multi_frame_response(&board);
         let request = frame(GET_BOARD_MESSAGES, &get_request(&ids));
@@ -4160,10 +4302,10 @@ mod tests {
         }
 
         assert!(
-            reply_bytes <= SERVE_BURST_BYTES as usize + one_reply,
+            reply_bytes <= one_reply,
             "40 copies of one request cost {reply_bytes} reply bytes; each reply is {one_reply}",
         );
-        assert_eq!(rep.repeated(), 39, "every repeat after the first reply is penalised");
+        assert_eq!(rep.penalties(), 0, "a repeat is skipped, not penalised");
     }
 
     /// Distinct requests are bounded by the token bucket, which refills with
@@ -4172,21 +4314,33 @@ mod tests {
     async fn the_reply_budget_refuses_past_the_burst_and_refills() {
         let now = tokio::time::Instant::now();
         let mut budget = ServeBudget::new(now);
-        assert!(budget.try_spend(SERVE_BURST_BYTES, now), "a full burst is allowed");
-        assert!(!budget.try_spend(1, now), "an empty bucket refuses");
+        let burst = SERVE_MIN_BURST_BYTES;
+        assert!(budget.try_spend(burst, burst, now), "a full burst is allowed");
+        assert!(!budget.try_spend(1, burst, now), "an empty bucket refuses");
         let later = now + Duration::from_secs(1);
-        assert!(budget.try_spend(SERVE_REFILL_BYTES_PER_SEC, later), "one second refills");
-        assert!(!budget.try_spend(1, later));
+        assert!(budget.try_spend(SERVE_REFILL_BYTES_PER_SEC, burst, later), "one second refills");
+        assert!(!budget.try_spend(1, burst, later));
     }
 
-    /// A request over budget is refused whole and costs the peer reputation.
+    /// The burst always holds one full reply at the configured size limit.
+    #[test]
+    fn the_reply_burst_holds_one_full_reply_at_any_size_limit() {
+        for size_limit in [8 * 1024, MAX_SAFE_SIZE_LIMIT] {
+            let full = (MAX_GET_BOARD_MESSAGES * max_wire_body_len(size_limit)) as u64;
+            assert!(serve_burst_bytes(size_limit) >= full, "size_limit {size_limit}");
+        }
+    }
+
+    /// A request against an empty budget is not served, and costs the peer
+    /// nothing.
     #[tokio::test(start_paused = true)]
-    async fn a_request_over_budget_is_refused_and_penalised() {
+    async fn a_request_over_budget_is_refused_without_penalty() {
         let board = board_at(10);
         let ids = seed_multi_frame_response(&board);
         let rep = Arc::new(RecordingReporter::default());
         let (tx, mut rx) = channel();
-        let drained = tx.serve.lock().try_spend(SERVE_BURST_BYTES, tokio::time::Instant::now());
+        let burst = serve_burst_bytes(board.config().size_limit);
+        let drained = tx.serve.lock().try_spend(burst, burst, tokio::time::Instant::now());
         assert!(drained);
 
         handle_incoming(
@@ -4200,7 +4354,7 @@ mod tests {
         .await;
 
         assert!(drain(&mut rx).is_empty(), "nothing is served over budget");
-        assert_eq!(rep.over_budget(), 1);
+        assert_eq!(rep.penalties(), 0);
     }
 
     // ── inbound queue bound ──────────────────────────────────────────────────
@@ -4343,10 +4497,7 @@ mod tests {
             let announce_frames = cfg.count_limit.div_ceil(MAX_IDS_PER_FRAME);
             let announce_bytes = announce_frames * MAX_INBOUND_FRAME_SIZE;
 
-            // A `WirePoWMsg` at the size limit, every header at its widest:
-            // `data`'s string header, the message's list header, then the
-            // claimed hash and the wire element's own list header.
-            let body = cfg.size_limit + 3 + MSG_FIXED_FIELDS_RLP_LEN + 3 + MSG_HASH_RLP_LEN + 3;
+            let body = max_wire_body_len(cfg.size_limit);
             let reply_frames = MAX_WANT_PER_PEER.div_ceil(P2P_MSG_PACKET_LIMIT / body);
             let reply_bytes = reply_frames * MAX_INBOUND_FRAME_SIZE;
 
