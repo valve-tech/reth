@@ -405,10 +405,9 @@ impl MsgBoard {
         }
     }
 
-    /// Record that `peer` let first-hand reservations expire unspent.
+    /// Record that `peer` let reservations expire unspent, first-hand or retry.
     ///
-    /// Claims then replace `peer` first when their alternate list is full,
-    /// and ask it last.
+    /// Claims then ask `peer` last among their alternates.
     pub fn note_withheld(&self, peer: PeerId) {
         self.state.lock().pending.note_withheld(peer, tokio::time::Instant::now());
     }

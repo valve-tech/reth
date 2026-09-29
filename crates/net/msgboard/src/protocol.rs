@@ -819,7 +819,7 @@ async fn service_pending(
     wants.prune(now);
     let expired = wants.take_expired();
     if expired.first_hand > 0 || expired.retries > 0 {
-        // Replaced first and asked last on other claims, whichever kind
+        // Asked last on other claims, whichever kind
         // expired. A peer asked only through retries must not withhold for
         // free, even though a retry costs it no reputation.
         board.note_withheld(peer_id);
@@ -3648,8 +3648,13 @@ mod tests {
 
     /// The announcement order is the attacker's to choose. One withholding
     /// sybil claims first, the honest peer announces next, and the rest of the
-    /// sybils follow to push it out of the alternate list. The honest peer must
-    /// still be asked.
+    /// sybils follow. The honest peer must still be asked.
+    ///
+    /// This is the end-to-end ordering test and stays within the alternate
+    /// limit, so it is deterministic. Overflow, where the honest peer survives
+    /// only by chance, is covered statistically by
+    /// `pending::tests::a_full_alternate_list_drops_a_random_entry` and
+    /// `a_struck_alternate_is_not_evicted_first`.
     #[tokio::test(start_paused = true)]
     async fn sybils_announcing_after_the_honest_peer_do_not_evict_it() {
         let board = board_at(10);

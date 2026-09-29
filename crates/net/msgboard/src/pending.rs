@@ -115,9 +115,11 @@ pub(crate) const MAX_WANT_PER_PEER: usize = 1024;
 /// accepts.
 ///
 /// Residual risk: an attacker that controls most of our msgboard peers can
-/// still delay delivery, one TTL per withholding peer asked, and with enough
-/// peers it can push every honest announcer out of the list. Erigon has the
-/// same exposure.
+/// still delay delivery, one TTL per withholding peer asked, or cause its loss
+/// for this node if every alternate withholds. Honest peers announce once, so
+/// an exhausted claim is not re-claimed until a new peer announces the ID.
+/// With enough peers the attacker can push every honest announcer out of the
+/// list. Erigon has the same exposure.
 ///
 /// Not thread-safe on its own — [`MsgBoard`](crate::MsgBoard) keeps it inside
 /// the state mutex that `filter_wanted` already holds.
@@ -134,9 +136,8 @@ pub(crate) struct PendingRequests {
     capacity: usize,
     /// Earliest instant the next full sweep may run.
     next_sweep: Option<Instant>,
-    /// Peers that withheld, and when. Alternates with a strike
-    /// inside [`WITHHOLD_WINDOW`] are the first to be replaced and the last
-    /// to be asked.
+    /// Peers that withheld, and when. Alternates with a strike inside
+    /// [`WITHHOLD_WINDOW`] are asked last. A strike never decides eviction.
     struck: HashMap<PeerId, Instant>,
     /// Xorshift state for picking which alternate a full list replaces.
     rng: u64,
@@ -182,21 +183,15 @@ impl PendingRequests {
                     return false;
                 }
                 if claim.alternates.len() == MAX_ALTERNATES {
-                    // Full. The newcomer replaces a peer with a live strike if
-                    // there is one, or else a random entry. A fixed choice,
-                    // such as the oldest, lets an attacker that controls the
-                    // announcement order push out a chosen honest peer.
-                    let evict =
-                        match claim.alternates.iter().position(|p| is_struck(&self.struck, p, now))
-                        {
-                            Some(i) => i,
-                            None => {
-                                self.rng ^= self.rng << 13;
-                                self.rng ^= self.rng >> 7;
-                                self.rng ^= self.rng << 17;
-                                (self.rng % MAX_ALTERNATES as u64) as usize
-                            }
-                        };
+                    // Full. The newcomer replaces a random entry. A fixed
+                    // choice, such as the oldest or a struck peer, lets an
+                    // attacker push out a chosen honest peer: it controls the
+                    // announcement order, and it can steer a soft strike onto
+                    // an honest peer. Strikes only order who is asked.
+                    self.rng ^= self.rng << 13;
+                    self.rng ^= self.rng >> 7;
+                    self.rng ^= self.rng << 17;
+                    let evict = (self.rng % MAX_ALTERNATES as u64) as usize;
                     claim.alternates.swap_remove(evict);
                 }
                 claim.alternates.push(peer);
@@ -750,6 +745,28 @@ mod tests {
             .count();
         assert!(survived > 0, "the honest peer was evicted every time");
         assert!(survived < 200, "the honest peer was never evicted; eviction is not random");
+    }
+
+    /// A strike must not make an announcer the certain victim of eviction.
+    /// Honest peers collect soft strikes routinely, and an attacker can steer
+    /// one onto a chosen peer, so a full list still drops a random entry.
+    #[test]
+    fn a_struck_alternate_is_not_evicted_first() {
+        let now = Instant::now();
+        let honest = p(0x77);
+        let survived = (0..200)
+            .filter(|_| {
+                let mut pending = PendingRequests::default();
+                pending.note_withheld(honest, now);
+                pending.claim(id(1), p(0), now);
+                pending.claim(id(1), honest, now);
+                for n in 1..=u8::try_from(2 * MAX_ALTERNATES).unwrap() {
+                    pending.claim(id(1), p(n), now);
+                }
+                pending.claims[&id(1)].alternates.contains(&honest)
+            })
+            .count();
+        assert!(survived > 0, "a soft-struck honest peer was evicted every time");
     }
 
     #[test]
