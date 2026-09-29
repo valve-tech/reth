@@ -1222,8 +1222,10 @@ mod tests {
             .await
             .unwrap_err(),
         ] {
-            assert_eq!(error.code(), -32603);
-            assert_eq!(error.message(), "unimplemented");
+            // The fork implements the history search, so an unknown address is a parameter
+            // error, not an unimplemented method.
+            assert_eq!(error.code(), -32602);
+            assert_eq!(error.message(), "invalid parameter: address does not exist");
         }
     }
 
