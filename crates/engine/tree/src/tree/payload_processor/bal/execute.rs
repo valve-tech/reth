@@ -54,6 +54,9 @@ use crate::tree::payload_processor::receipt_root_task::IndexedReceipt;
 ///
 /// The ordered commit loop applies Ethereum block-level gas admission. Executors with different
 /// admission rules, such as segment-scoped gas budgets, must align those checks before using it.
+///
+/// Returns the execution output, the recovered senders, the BAL rebuilt from this execution, and
+/// the received BAL in the revm representation the workers consumed.
 #[expect(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn execute_block<'a, Evm, Tx, Err, DB, MakeDb>(
     runtime: &Runtime,
@@ -66,7 +69,7 @@ pub fn execute_block<'a, Evm, Tx, Err, DB, MakeDb>(
     txs: Receiver<(usize, Result<Tx, Err>)>,
     receipt_tx: Sender<IndexedReceipt<ReceiptTy<Evm::Primitives>>>,
 ) -> Result<
-    (BlockExecutionOutput<ReceiptTy<Evm::Primitives>>, Vec<Address>, BlockAccessList),
+    (BlockExecutionOutput<ReceiptTy<Evm::Primitives>>, Vec<Address>, BlockAccessList, Arc<RevmBal>),
     BalExecutionError,
 >
 where
@@ -109,7 +112,7 @@ fn execute_block_inner<'scope, Evm, Tx, Err, DB, MakeDb>(
     receipt_tx: Sender<IndexedReceipt<ReceiptTy<Evm::Primitives>>>,
     worker_count: usize,
 ) -> Result<
-    (BlockExecutionOutput<ReceiptTy<Evm::Primitives>>, Vec<Address>, BlockAccessList),
+    (BlockExecutionOutput<ReceiptTy<Evm::Primitives>>, Vec<Address>, BlockAccessList, Arc<RevmBal>),
     BalExecutionError,
 >
 where
@@ -221,6 +224,7 @@ where
         BlockExecutionOutput { state: canonical_state.take_bundle(), result: block_result },
         senders,
         built_bal,
+        input_bal_revm,
     ))
 }
 
@@ -406,31 +410,28 @@ mod tests {
         db.insert_account_info(
             BEACON_ROOTS_ADDRESS,
             AccountInfo {
-                balance: U256::ZERO,
                 nonce: 1,
                 code_hash: keccak256(BEACON_ROOTS_CODE.clone()),
                 code: Some(Bytecode::new_raw(BEACON_ROOTS_CODE.clone())),
-                account_id: None,
+                ..Default::default()
             },
         );
         db.insert_account_info(
             WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS,
             AccountInfo {
-                balance: U256::ZERO,
                 nonce: 1,
                 code_hash: keccak256(WITHDRAWAL_REQUEST_PREDEPLOY_CODE.clone()),
                 code: Some(Bytecode::new_raw(WITHDRAWAL_REQUEST_PREDEPLOY_CODE.clone())),
-                account_id: None,
+                ..Default::default()
             },
         );
         db.insert_account_info(
             HISTORY_STORAGE_ADDRESS,
             AccountInfo {
-                balance: U256::ZERO,
                 nonce: 1,
                 code_hash: keccak256(HISTORY_STORAGE_CODE.clone()),
                 code: Some(Bytecode::new_raw(HISTORY_STORAGE_CODE.clone())),
-                account_id: None,
+                ..Default::default()
             },
         );
         db
@@ -608,14 +609,14 @@ mod tests {
             tx_stream(txs),
             receipt_tx,
         )
-        .map(|(output, _, built_bal)| (output, built_bal))
+        .map(|(output, _, built_bal, _)| (output, built_bal))
     }
 
     /// Inserts `AccountInfo { nonce: 0, balance }` for `addr` into the canonical DB.
     fn insert_funded(db: &mut CacheDB<EmptyDB>, addr: alloy_primitives::Address, balance: U256) {
         db.insert_account_info(
             addr,
-            AccountInfo { nonce: 0, balance, code_hash: B256::ZERO, code: None, account_id: None },
+            AccountInfo { balance, code_hash: B256::ZERO, code: None, ..Default::default() },
         );
     }
 
@@ -725,21 +726,19 @@ mod tests {
                 db.insert_account_info(
                     alice,
                     AccountInfo {
-                        nonce: 0,
                         balance: sender_balance,
                         code_hash: B256::ZERO,
                         code: None,
-                        account_id: None,
+                        ..Default::default()
                     },
                 );
                 db.insert_account_info(
                     bob,
                     AccountInfo {
-                        nonce: 0,
                         balance: sender_balance,
                         code_hash: B256::ZERO,
                         code: None,
-                        account_id: None,
+                        ..Default::default()
                     },
                 );
                 db
@@ -1306,10 +1305,9 @@ mod tests {
             revert_contract,
             AccountInfo {
                 nonce: 1,
-                balance: U256::ZERO,
                 code_hash,
                 code: Some(Bytecode::new_raw(revert_code)),
-                account_id: None,
+                ..Default::default()
             },
         );
 
@@ -1363,10 +1361,9 @@ mod tests {
             sstore_contract,
             AccountInfo {
                 nonce: 1,
-                balance: U256::ZERO,
                 code_hash,
                 code: Some(Bytecode::new_raw(sstore_code)),
-                account_id: None,
+                ..Default::default()
             },
         );
 
