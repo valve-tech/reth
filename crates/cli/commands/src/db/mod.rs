@@ -64,7 +64,7 @@ pub enum Subcommands {
     /// Verifies trie consistency and outputs any inconsistencies
     RepairTrie(repair_trie::Command),
     /// Finds all-zero `HashedAccounts` rows that EIP-161 deleted from `PlainAccountState`
-    /// (read-only, safe on a running node)
+    /// (read-only, safe on a running node; v1 checks PlainAccountState, v2 the AccountsTrie)
     ScanEmptyHashedAccounts(scan_empty_hashed_accounts::Command),
     /// Reads and displays the static file segment header
     StaticFileHeader(static_file_header::Command),
@@ -193,7 +193,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
             }
             Subcommands::ScanEmptyHashedAccounts(command) => {
                 // Skip the static file consistency check: a live node is mid-write, and the scan
-                // reads only two MDBX tables.
+                // reads only MDBX tables and, in v2 mode, one header.
                 db_exec!(self.env, tool, N, AccessRights::RoInconsistent, {
                     command.execute(&tool)?;
                 });
