@@ -1009,7 +1009,18 @@ where
         // if we don't reach this line (state-root mismatch, post-execution error, etc.) the
         // guard's `Drop` fires `on_block_end(Some(err))` and the block is discarded from the
         // firehose stream. See Bug 6 in the project memory for full context.
-        if let Some(guard) = fh_tracer.take() {
+        if let Some(mut guard) = fh_tracer.take() {
+            // EIP-7928: patch in the block access list RLP bytes carried by the payload sidecar
+            // (already hash-verified above via `bal_path_eligible`/execution). Unlike the rest of
+            // the header, this isn't known at `FirehoseBlockTracer::start` time, so it has to be
+            // patched into the already-buffered block via `Tracer::block_mut` before flush.
+            if let Some(bal_bytes) =
+                decoded_bal.as_ref().map(|bal| bal.as_raw_bal().as_raw().to_vec()) &&
+                let Some(header) =
+                    guard.tracer_mut().block_mut().and_then(|block| block.header.as_mut())
+            {
+                header.block_access_list_rlp = Some(bal_bytes);
+            }
             guard.mark_verified();
         }
 
