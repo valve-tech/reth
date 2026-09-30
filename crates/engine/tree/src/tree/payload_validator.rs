@@ -886,6 +886,17 @@ where
                 .ok()
         };
 
+        // Firehose live path: the EIP-7928 block access list RLP for the emitted header. The
+        // payload sidecar gives the exact bytes the header hash commits to. A downloaded block
+        // without a sidecar falls back to the list this execution built, which
+        // `validate_post_execution` below checks against the header hash before the flush.
+        let fh_bal_rlp = fh_tracer.is_some().then(|| {
+            decoded_bal
+                .as_ref()
+                .map(|bal| bal.as_raw_bal().as_raw().to_vec())
+                .or_else(|| built_bal.as_ref().map(alloy_rlp::encode))
+        });
+
         ensure_ok_post_block!(
             self.validate_post_execution(
                 &block,
@@ -1009,7 +1020,15 @@ where
         // if we don't reach this line (state-root mismatch, post-execution error, etc.) the
         // guard's `Drop` fires `on_block_end(Some(err))` and the block is discarded from the
         // firehose stream. See Bug 6 in the project memory for full context.
-        if let Some(guard) = fh_tracer.take() {
+        if let Some(mut guard) = fh_tracer.take() {
+            // The RLP is not known when `FirehoseBlockTracer::start` builds the header, so it is
+            // patched into the buffered block here, before the flush.
+            if let Some(bal_rlp) = fh_bal_rlp.flatten() &&
+                let Some(header) =
+                    guard.tracer_mut().block_mut().and_then(|block| block.header.as_mut())
+            {
+                header.block_access_list_rlp = Some(bal_rlp);
+            }
             guard.mark_verified();
         }
 

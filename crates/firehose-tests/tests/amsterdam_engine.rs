@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 
 use alloy_eips::eip4895::Withdrawal;
-use alloy_primitives::{address, hex, Address, Bytes, TxKind, U256};
+use alloy_primitives::{address, hex, keccak256, Address, Bytes, TxKind, U256};
 use alloy_rpc_types_engine::PayloadStatusEnum;
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use base64::{engine::general_purpose, Engine as _};
@@ -173,7 +173,15 @@ impl Chain {
         let emitted = emitted.last().unwrap();
         assert_eq!(emitted.hash, hash.to_vec(), "{case}: emitted another block");
         let header = emitted.header.as_ref().expect("emitted block has a header");
-        assert!(header.block_access_list_hash.is_some(), "{case}: emitted no BAL hash");
+        let bal_hash = block.header().block_access_list_hash.expect("checked above");
+        assert_eq!(
+            header.block_access_list_hash.as_deref(),
+            Some(bal_hash.as_slice()),
+            "{case}: emitted the wrong BAL hash"
+        );
+        let bal_rlp = header.block_access_list_rlp.as_deref().expect("emitted no BAL RLP");
+        assert_eq!(keccak256(bal_rlp), bal_hash, "{case}: BAL RLP does not hash to the header's");
+        assert_eq!(header.slot_number, block.header().slot_number, "{case}: wrong slot number");
 
         self.validator.update_forkchoice(hash, hash).await?;
         self.builder.submit_payload(payload).await?;

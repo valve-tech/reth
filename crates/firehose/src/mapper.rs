@@ -83,10 +83,11 @@ where
         parent_beacon_root: header.parent_beacon_block_root(),
         requests_hash: header.requests_hash(),
         tx_dependency: None,
-        // EIP-7843: Amsterdam slot number — not yet exposed by reth Header trait
-        slot_number: None,
+        slot_number: header.slot_number(),
         // EIP-7928: the hash the header commits to. The full list is known only after
-        // execution, but the block starts before it, so the RLP is not emitted.
+        // execution, so the RLP is patched into the buffered block later through
+        // `Tracer::block_mut`: from the payload sidecar on the live engine path
+        // (`payload_validator.rs`), and from re-execution in `run_wrapped_block`.
         block_access_list_hash: header.block_access_list_hash(),
         block_access_list_rlp: None,
     }
