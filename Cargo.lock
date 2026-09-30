@@ -9288,12 +9288,15 @@ name = "reth-firehose-tests"
 version = "2.7.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eip7928",
  "alloy-eips",
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
+ "alloy-signer",
+ "alloy-signer-local",
  "base64 0.22.1",
  "eyre",
  "firehose-tracer",
