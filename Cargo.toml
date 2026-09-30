@@ -675,7 +675,7 @@ vergen-git2 = "10.0.1"
 ipnet = "2.11"
 
 ## Firehose Additions
-firehose-tracer = "=5.4.4"
+firehose-tracer = "=5.5.0"
 reth-firehose = { path = "crates/firehose" }
 reth-firehose-tests = { path = "crates/firehose-tests" }
 
