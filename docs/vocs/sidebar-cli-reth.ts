@@ -116,6 +116,10 @@ export const rethCliSidebar: SidebarItem = {
                     link: "/cli/reth/db/repair-trie"
                 },
                 {
+                    text: "reth db scan-empty-hashed-accounts",
+                    link: "/cli/reth/db/scan-empty-hashed-accounts"
+                },
+                {
                     text: "reth db static-file-header",
                     link: "/cli/reth/db/static-file-header",
                     collapsed: true,
