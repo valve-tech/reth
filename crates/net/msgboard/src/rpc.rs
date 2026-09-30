@@ -14,6 +14,7 @@ use jsonrpsee::{
     core::RpcResult, types::ErrorObjectOwned, PendingSubscriptionSink, SubscriptionMessage,
 };
 use reth_msgboard_types::{decode_validated_pow_msg, CheckedPoWMsg, MsgboardError};
+use serde::Serialize;
 use serde_json::value::RawValue;
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::BroadcastStream;
@@ -21,7 +22,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::{
     board::MsgBoard,
     metrics::MsgboardMetrics,
-    rpc_api::{ContentFilter, MsgboardApiServer, MsgboardMsg, MsgboardStatus, NewMessagesFilter},
+    rpc_api::{
+        ContentFilter, ContentPage, ContentPageRequest, MsgboardApiServer, MsgboardMsg,
+        MsgboardStatus, NewMessagesFilter, MSGBOARD_CONTENT_PAGE_MAX_LIMIT,
+    },
 };
 
 /// Subscription kind discriminator. Matches erigon-pulse's
@@ -76,6 +80,39 @@ impl MsgboardApi {
             probe: Default::default(),
         }
     }
+
+    /// Waits for a content permit, then runs `f` on the blocking pool and
+    /// serialises its result there. `msgboard_content` and
+    /// `msgboard_contentPage` share the permits.
+    ///
+    /// A full default board is about 80 MB of `data` and 167 MB of JSON, and
+    /// building it takes seconds. The blocking pool does the snapshot, the
+    /// deep copy and the hex serialisation: the handler returns
+    /// pre-serialised JSON, so jsonrpsee has nothing left to serialise on the
+    /// runtime worker.
+    async fn build<T: Serialize>(
+        &self,
+        method: &'static str,
+        f: impl FnOnce(&MsgBoard) -> T + Send + 'static,
+    ) -> RpcResult<Box<RawValue>> {
+        let permit = Arc::clone(&self.content_permits)
+            .acquire_owned()
+            .await
+            .map_err(|err| internal_error(format!("{method} permit: {err}")))?;
+        #[cfg(test)]
+        let probe = Arc::clone(&self.probe);
+        let board = Arc::clone(&self.board);
+
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            let _guard = probe.enter();
+            serde_json::value::to_raw_value(&f(&board))
+        })
+        .await
+        .map_err(|err| internal_error(format!("{method} task failed: {err}")))?
+        .map_err(|err| internal_error(format!("{method} serialisation failed: {err}")))
+    }
 }
 
 /// Most `msgboard_content` responses the node builds at once.
@@ -108,76 +145,54 @@ impl MsgboardApiServer for MsgboardApi {
 
     async fn msgboard_content(&self, filter: Option<ContentFilter>) -> RpcResult<Box<RawValue>> {
         let filter = filter.unwrap_or_default();
-        if filter.after.is_some() && filter.offset.is_some() {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                "msgboard_content: `after` and `offset` cannot be used together",
-                None::<()>,
+        if filter.after.is_some() {
+            return Err(invalid_params(
+                "msgboard_content has no `after` cursor; page with msgboard_contentPage",
             ));
         }
-        // Matches `txpool_contentPage`. An empty page ends a cursor walk, so a
-        // page that is empty by request would read as the end of the board.
         if filter.limit == Some(0) {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                "msgboard_content: `limit` must be at least 1",
-                None::<()>,
-            ));
+            return Err(invalid_params("msgboard_content: `limit` must be at least 1"));
         }
-        let after = filter.after;
         let offset = filter.offset.unwrap_or(0);
         let limit = filter.limit.unwrap_or(usize::MAX);
-
-        let permit = Arc::clone(&self.content_permits)
-            .acquire_owned()
-            .await
-            .map_err(|err| internal_error(format!("msgboard_content permit: {err}")))?;
-        #[cfg(test)]
-        let probe = Arc::clone(&self.probe);
-
-        // The board hands back `Arc`s, so its lock covers pointer copies only.
-        let mut msgs = match filter.category {
-            Some(cat) => {
-                self.board.category_msgs_filtered(&cat, filter.from_block, filter.to_block)
-            }
-            None => self.board.all_msgs_filtered(filter.from_block, filter.to_block),
-        };
-
-        // A full default board is about 80 MB of `data` and 167 MB of JSON,
-        // and building it takes seconds. The blocking pool does the deep copy
-        // and the hex serialisation both: the handler returns pre-serialised
-        // JSON, so jsonrpsee has nothing left to serialise on the runtime
-        // worker.
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            #[cfg(test)]
-            let _guard = probe.enter();
-            // The cursor walk orders by hash, not by board precedence. A
-            // hash never changes and every replica computes the same one, so
-            // inserts and evictions cannot shift a message across the cursor.
-            if let Some(after) = after {
-                msgs.retain(|m| m.hash > after);
-                // Select the `limit` lowest hashes in O(N), then sort only those.
-                if msgs.len() > limit {
-                    msgs.select_nth_unstable_by_key(limit, |m| m.hash);
-                    msgs.truncate(limit);
-                }
-                msgs.sort_unstable_by_key(|m| m.hash);
-            }
-            // `BTreeMap` sorts the category keys, as Go's `encoding/json` does
-            // for erigon's map.
-            let mut grouped: BTreeMap<String, Vec<MsgboardMsg>> = BTreeMap::new();
-            for m in msgs.iter().skip(offset).take(limit) {
-                let rpc = to_rpc_msg(m);
-                // Lowercase 0x-hex matches alloy's Display impl and erigon-pulse output.
-                let key = rpc.category.to_string();
-                grouped.entry(key).or_default().push(rpc);
-            }
-            serde_json::value::to_raw_value(&grouped)
+        let ContentFilter { category, from_block, to_block, .. } = filter;
+        self.build("msgboard_content", move |board| {
+            let msgs = matching(board, category, from_block, to_block);
+            group_by_category(msgs.iter().skip(offset).take(limit))
         })
         .await
-        .map_err(|err| internal_error(format!("msgboard_content task failed: {err}")))?
-        .map_err(|err| internal_error(format!("msgboard_content serialisation failed: {err}")))
+    }
+
+    async fn msgboard_content_page(&self, request: ContentPageRequest) -> RpcResult<Box<RawValue>> {
+        let ContentPageRequest { limit, after, category, from_block, to_block } = request;
+        if limit == 0 || limit > MSGBOARD_CONTENT_PAGE_MAX_LIMIT {
+            return Err(invalid_params(format!(
+                "msgboard_contentPage: `limit` must be from 1 to \
+                 {MSGBOARD_CONTENT_PAGE_MAX_LIMIT}, got {limit}"
+            )));
+        }
+
+        self.build("msgboard_contentPage", move |board| {
+            let mut msgs = matching(board, category, from_block, to_block);
+            // A hash never changes and every replica computes the same one,
+            // so inserts and evictions cannot shift a message across the
+            // cursor.
+            if let Some(after) = after {
+                msgs.retain(|m| m.hash > after);
+            }
+            // More than `limit` left means a message remains after the page,
+            // so `next` must not be null.
+            let more = msgs.len() > limit;
+            if more {
+                // Select the `limit` lowest hashes in O(N), then sort only those.
+                msgs.select_nth_unstable_by_key(limit, |m| m.hash);
+                msgs.truncate(limit);
+            }
+            msgs.sort_unstable_by_key(|m| m.hash);
+            let next = if more { msgs.last().map(|m| m.hash) } else { None };
+            ContentPage { content: group_by_category(msgs.iter()), next }
+        })
+        .await
     }
 
     async fn msgboard_get_message(&self, hash: B256) -> RpcResult<Option<MsgboardMsg>> {
@@ -295,6 +310,40 @@ fn internal_error(msg: String) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(-32603, msg, None::<()>)
 }
 
+/// JSON-RPC invalid params error (`-32602`) with `msg` as its message.
+fn invalid_params(msg: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32602, msg.into(), None::<()>)
+}
+
+/// The board's messages that match the category and block filters, in board
+/// precedence order. The board hands back `Arc`s, so its lock covers pointer
+/// copies only.
+fn matching(
+    board: &MsgBoard,
+    category: Option<B256>,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+) -> Vec<Arc<CheckedPoWMsg>> {
+    match category {
+        Some(cat) => board.category_msgs_filtered(&cat, from_block, to_block),
+        None => board.all_msgs_filtered(from_block, to_block),
+    }
+}
+
+/// Groups messages into erigon's category map. `BTreeMap` sorts the category
+/// keys, as Go's `encoding/json` does for erigon's map.
+fn group_by_category<'a>(
+    msgs: impl Iterator<Item = &'a Arc<CheckedPoWMsg>>,
+) -> BTreeMap<String, Vec<MsgboardMsg>> {
+    let mut grouped = BTreeMap::<String, Vec<MsgboardMsg>>::new();
+    for m in msgs {
+        let rpc = to_rpc_msg(m);
+        // Lowercase 0x-hex matches alloy's Display impl and erigon-pulse output.
+        grouped.entry(rpc.category.to_string()).or_default().push(rpc);
+    }
+    grouped
+}
+
 /// Convert a [`CheckedPoWMsg`] to the JSON-RPC response type.
 ///
 /// The server-side `timestamp` is intentionally omitted — erigon-pulse's
@@ -365,9 +414,19 @@ mod tests {
         let probe = Arc::clone(&api.probe);
         let m = api.into_rpc();
 
-        let calls = (0..12).map(|_| m.call::<_, Value>("msgboard_content", rpc_params_none()));
+        // `msgboard_contentPage` shares the same permits.
+        let m = &m;
+        let calls = (0..12).map(|i| async move {
+            if i % 2 == 0 {
+                m.call::<_, Value>("msgboard_content", rpc_params_none()).await.unwrap()
+            } else {
+                let page: Value =
+                    m.call("msgboard_contentPage", vec![json!({"limit": 10})]).await.unwrap();
+                page["content"].clone()
+            }
+        });
         for v in futures::future::join_all(calls).await {
-            assert_eq!(total_msgs(&v.unwrap()), 4);
+            assert_eq!(total_msgs(&v), 4);
         }
 
         let peak = probe.peak.load(std::sync::atomic::Ordering::SeqCst);
@@ -1031,51 +1090,44 @@ mod tests {
         assert_eq!(total_msgs(&in_range), 3);
     }
 
-    // ── content: hash cursor ─────────────────────────────────────────────────
+    // ── contentPage: hash cursor ─────────────────────────────────────────────
 
-    /// A cursor walk returns every message exactly once, in ascending hash
+    /// A full walk returns every message exactly once, in ascending hash
     /// order, across every category.
     #[tokio::test]
-    async fn content_cursor_walk_returns_every_message_once() {
+    async fn content_page_walk_returns_every_message_once() {
         let board = ready_board(10);
         for i in 0..11u8 {
             board.add_local_msg(mined(&[i], category(0xA0 + i % 3), 10)).unwrap();
         }
-        let mut expected: Vec<B256> = board.all_messages().iter().map(|m| m.hash).collect();
-        expected.sort_unstable();
+        let expected = sorted_hashes(&board, |_| true);
         let m = module(board);
 
-        let walked = walk_by_cursor(&m, json!({}), 3, || {}).await;
+        let walked = walk_pages(&m, json!({}), 3, || {}).await;
         assert_eq!(walked, expected, "the walk must cover the board once, in hash order");
     }
 
-    /// The cursor composes with the category filter: the walk covers that
-    /// category only.
+    /// The cursor composes with the category and block filters.
     #[tokio::test]
-    async fn content_cursor_walk_respects_the_category_filter() {
+    async fn content_page_walk_combines_with_the_filters() {
         let board = ready_board(10);
         for i in 0..9u8 {
             board.add_local_msg(mined(&[i], category(0xA0 + i % 2), 10)).unwrap();
         }
-        let mut expected: Vec<B256> = board
-            .all_messages()
-            .iter()
-            .filter(|m| m.msg.category == category(0xA0))
-            .map(|m| m.hash)
-            .collect();
-        expected.sort_unstable();
+        let expected = sorted_hashes(&board, |m| m.msg.category == category(0xA0));
         let m = module(board);
 
-        let walked = walk_by_cursor(&m, json!({"category": category(0xA0)}), 2, || {}).await;
-        assert_eq!(walked, expected);
+        let base = json!({"category": category(0xA0), "fromBlock": 10, "toBlock": 10});
+        assert_eq!(walk_pages(&m, base, 2, || {}).await, expected);
+
+        let out_of_range = json!({"category": category(0xA0), "fromBlock": 11});
+        assert!(walk_pages(&m, out_of_range, 2, || {}).await.is_empty());
     }
 
     /// Inserts and evictions between pages must not make the walk repeat a
     /// message, or skip one that stayed on the board for the whole walk.
-    /// An `offset` walk fails this: an eviction ahead of the offset shifts
-    /// every later message back by one.
     #[tokio::test]
-    async fn content_cursor_walk_is_stable_while_the_board_changes() {
+    async fn content_page_walk_is_stable_while_the_board_changes() {
         let data_len = 8;
         let cfg = MsgboardConfig { count_limit: 24, ..trivial_pow_cfg(data_len) };
         let board = Arc::new(MsgBoard::new(cfg.clone()));
@@ -1107,7 +1159,7 @@ mod tests {
         let m = module(Arc::clone(&board));
 
         let mut next = 1_000u64;
-        let walked = walk_by_cursor(&m, json!({}), 4, || {
+        let walked = walk_pages(&m, json!({}), 4, || {
             for _ in 0..2 {
                 board.add_local_msg(make(next, 2)).unwrap();
                 next += 1;
@@ -1126,39 +1178,72 @@ mod tests {
         }
     }
 
-    /// `after` and `offset` are two paging modes. Together they are a client
-    /// error, not a silent pick of one.
+    /// `next` is the last hash of the page while messages remain, and null
+    /// exactly at the end, also when the last page is exactly `limit` long.
     #[tokio::test]
-    async fn content_rejects_after_with_offset() {
-        let m = module(filled_board(3, 8));
-        let code = call_err_code(
-            &m,
-            "msgboard_content",
-            vec![json!({"after": B256::ZERO, "offset": 1, "limit": 2})],
-        )
-        .await;
-        assert_eq!(code, -32602);
+    async fn content_page_next_is_null_exactly_at_the_end() {
+        let board = filled_board(6, 8);
+        let hashes = sorted_hashes(&board, |_| true);
+        let m = module(board);
+
+        let page = |limit: usize, after: Option<B256>| {
+            let mut request = json!({"limit": limit});
+            if let Some(a) = after {
+                request["after"] = json!(a);
+            }
+            let m = &m;
+            async move { m.call::<_, Value>("msgboard_contentPage", vec![request]).await.unwrap() }
+        };
+
+        let first = page(3, None).await;
+        assert_eq!(first["next"], json!(hashes[2]), "`next` is the last hash of the page");
+        let second = page(3, Some(hashes[2])).await;
+        assert_eq!(total_msgs(&second["content"]), 3);
+        assert!(second["next"].is_null(), "a full last page must still end the walk");
+
+        assert!(page(6, None).await["next"].is_null());
+        assert_eq!(page(5, None).await["next"], json!(hashes[4]));
+
+        let past = page(3, Some(B256::repeat_byte(0xFF))).await;
+        assert_eq!(past, json!({"content": {}, "next": null}));
     }
 
-    /// `limit` 0 is a client error, as in `txpool_contentPage`, with or
-    /// without a cursor.
+    /// `limit` is required and must be from 1 to the cap.
     #[tokio::test]
-    async fn content_rejects_a_zero_limit() {
+    async fn content_page_limit_bounds() {
         let m = module(filled_board(3, 8));
-        for filter in [json!({"limit": 0}), json!({"limit": 0, "after": B256::ZERO})] {
-            assert_eq!(call_err_code(&m, "msgboard_content", vec![filter]).await, -32602);
+        for request in [json!({}), json!({"limit": 0}), json!({"limit": 1_001})] {
+            assert_eq!(call_err_code(&m, "msgboard_contentPage", vec![request]).await, -32602);
+        }
+        let v: Value =
+            m.call("msgboard_contentPage", vec![json!({"limit": 1_000})]).await.unwrap();
+        assert_eq!(total_msgs(&v["content"]), 3);
+    }
+
+    /// `msgboard_content` has no cursor. An `after` sent to it is an error
+    /// that names the method to use, never silently ignored.
+    #[tokio::test]
+    async fn content_rejects_after() {
+        let m = module(filled_board(3, 8));
+        for filter in [json!({"after": B256::ZERO}), json!({"after": B256::ZERO, "limit": 2})] {
+            match m.call::<_, Value>("msgboard_content", vec![filter]).await {
+                Err(MethodsError::JsonRpc(e)) => {
+                    assert_eq!(e.code(), -32602);
+                    assert!(e.message().contains("msgboard_contentPage"), "{}", e.message());
+                }
+                other => panic!("expected -32602, got {other:?}"),
+            }
         }
     }
 
-    /// A cursor past every hash is the normal end of a walk.
+    /// `limit` 0 is a client error on `msgboard_content` too.
     #[tokio::test]
-    async fn content_cursor_past_the_end_returns_an_empty_map() {
+    async fn content_rejects_a_zero_limit() {
         let m = module(filled_board(3, 8));
-        let v: Value = m
-            .call("msgboard_content", vec![json!({"after": B256::repeat_byte(0xFF)})])
-            .await
-            .unwrap();
-        assert!(v.as_object().unwrap().is_empty());
+        assert_eq!(
+            call_err_code(&m, "msgboard_content", vec![json!({"limit": 0})]).await,
+            -32602
+        );
     }
 
     // ── subscribe: the server's own cap ──────────────────────────────────────
@@ -1299,28 +1384,26 @@ mod tests {
         v.as_object().unwrap().values().map(|a| a.as_array().unwrap().len()).sum()
     }
 
-    /// Walk the board with `after` and `limit`, and feed the largest hash of
-    /// each page back as the cursor. `between` runs before every page after
-    /// the first. Returns every hash the walk saw, in walk order.
-    async fn walk_by_cursor(
+    /// Walk `msgboard_contentPage` with `limit`, passing `next` back as
+    /// `after` until it is null. `between` runs before every page after the
+    /// first. Returns every hash the walk saw, in walk order.
+    async fn walk_pages(
         m: &RpcModule<MsgboardApi>,
         base: Value,
         limit: usize,
         mut between: impl FnMut(),
     ) -> Vec<B256> {
         let mut walked = Vec::new();
-        // The zero hash starts the walk. Without `after`, the first page would
-        // come in board precedence order, not hash order.
-        let mut after = B256::ZERO;
+        let mut after = Value::Null;
         for page_number in 0..1_000 {
+            let mut request = base.clone();
+            request["limit"] = json!(limit);
             if page_number > 0 {
                 between();
+                request["after"] = after.clone();
             }
-            let mut filter = base.clone();
-            filter["limit"] = json!(limit);
-            filter["after"] = json!(after);
-            let v: Value = m.call("msgboard_content", vec![filter]).await.unwrap();
-            let mut page: Vec<B256> = v
+            let v: Value = m.call("msgboard_contentPage", vec![request]).await.unwrap();
+            let page: Vec<B256> = v["content"]
                 .as_object()
                 .unwrap()
                 .values()
@@ -1328,14 +1411,26 @@ mod tests {
                 .map(|msg| serde_json::from_value(msg["hash"].clone()).unwrap())
                 .collect();
             assert!(page.len() <= limit, "a page must hold at most `limit` messages");
-            if page.is_empty() {
+            let mut sorted = page.clone();
+            sorted.sort_unstable();
+            if !v["next"].is_null() {
+                assert_eq!(v["next"], json!(sorted.last().unwrap()), "`next` is the last hash");
+            }
+            walked.extend(sorted);
+            after = v["next"].clone();
+            if after.is_null() {
                 return walked;
             }
-            page.sort_unstable();
-            after = *page.last().unwrap();
-            walked.extend(page);
         }
-        panic!("the cursor walk never reached an empty page");
+        panic!("the page walk never returned a null `next`");
+    }
+
+    /// Hashes of the board's messages that pass `keep`, ascending.
+    fn sorted_hashes(board: &MsgBoard, keep: impl Fn(&CheckedPoWMsg) -> bool) -> Vec<B256> {
+        let mut hashes: Vec<B256> =
+            board.all_messages().iter().filter(|m| keep(m)).map(|m| m.hash).collect();
+        hashes.sort_unstable();
+        hashes
     }
 
     /// `jsonrpsee` needs a concrete type for a no-params call; `Vec<Value>`
