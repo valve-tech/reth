@@ -8,9 +8,11 @@
 //! equivalents) includes it, so it exposes `msgboard_addMessage` as well as
 //! the read methods.
 
+use std::collections::BTreeMap;
+
 use alloy_primitives::{Bytes, B256};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use serde::{Deserialize, Serialize};
+use serde::{de::IgnoredAny, Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 /// JSON-serializable representation of a validated msgboard message.
@@ -107,16 +109,52 @@ pub struct ContentFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     /// Number of messages to skip before the page starts. Defaults to `0`.
-    /// **Reth extension.** Unstable when the board changes between pages, and
-    /// between replicas; use [`Self::after`] to page.
+    /// **Reth extension. Deprecated:** unstable when the board changes between
+    /// pages, and between replicas. Page with `msgboard_contentPage` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<usize>,
-    /// Hash cursor. **Reth extension.** When set, the response holds the
-    /// matching messages whose hash is above this one, in ascending hash
-    /// order, up to `limit`. Cannot be used with `offset`.
+    /// Catches an `after` field so that the node can reject it. The cursor is
+    /// on `msgboard_contentPage`; without this field serde would drop
+    /// `after` in silence and return an unpaged answer.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
+    pub after: Option<IgnoredAny>,
+}
+
+/// Request for `msgboard_contentPage`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentPageRequest {
+    /// Most messages in the page, from 1 to [`MSGBOARD_CONTENT_PAGE_MAX_LIMIT`].
+    /// Required.
+    pub limit: usize,
+    /// The page holds the messages whose hash is above this one. Omitted:
+    /// the page starts at the lowest hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<B256>,
+    /// Category to filter by. If `None`, pages all categories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<B256>,
+    /// Minimum block number (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_block: Option<u64>,
+    /// Maximum block number (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_block: Option<u64>,
 }
+
+/// Response of `msgboard_contentPage`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContentPage {
+    /// The page's messages, in the same category map as `msgboard_content`.
+    pub content: BTreeMap<String, Vec<MsgboardMsg>>,
+    /// The last hash in this page, to pass back unchanged as `after`. `None`
+    /// when no matching message is above it.
+    pub next: Option<B256>,
+}
+
+/// Largest `limit` that `msgboard_contentPage` accepts.
+pub const MSGBOARD_CONTENT_PAGE_MAX_LIMIT: usize = 1_000;
 
 /// Optional filter for `msgboard_subscribe`. Only one option for now.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -174,24 +212,34 @@ pub trait MsgboardApi {
     ///
     /// # Paging (reth extension)
     ///
-    /// Page with `limit` and `after`. With `after`, the node orders the
-    /// matching messages by hash, ascending, and returns those above `after`,
-    /// up to `limit`. The first call passes the zero hash. Without `after`,
-    /// the first page comes in precedence order, not hash order, so a walk
-    /// that starts there can skip messages. The client passes the largest
-    /// hash in the page as the next `after`, and stops on an empty page or a
-    /// page shorter than `limit`. A message on the board for the whole walk is returned exactly
-    /// once, on any replica, whatever the board does between pages. `after`
-    /// with `offset` is `-32602`.
+    /// To page, use [`Self::msgboard_content_page`]. An `after` field here is
+    /// rejected with `-32602`, and `limit` 0 too.
     ///
-    /// `limit` and `offset` still work, for older clients. They apply to the
-    /// flat message list in board precedence order — ascending block number,
-    /// then ascending difficulty ratio — *before* the messages are grouped by
-    /// category. An insert or eviction between pages shifts that list, so an
-    /// offset walk can repeat or skip messages, and two replicas can order
-    /// the list differently.
+    /// `limit` and `offset` still work here, for older clients, but `offset`
+    /// is deprecated. They apply to the flat message list in board precedence
+    /// order — ascending block number, then ascending difficulty ratio —
+    /// *before* the messages are grouped by category. An insert or eviction
+    /// between pages shifts that list, so an offset walk can repeat or skip
+    /// messages, and two replicas can order the list differently.
     #[method(name = "content")]
     async fn msgboard_content(&self, filter: Option<ContentFilter>) -> RpcResult<Box<RawValue>>;
+
+    /// Return one page of live messages, in ascending hash order. **Reth
+    /// extension.**
+    ///
+    /// The page holds up to `limit` matching messages whose hash is above
+    /// `after`. The response is [`ContentPage`]: the page in the
+    /// `msgboard_content` category map, and `next`, the last hash in the
+    /// page. The client passes `next` back unchanged as `after`, and stops
+    /// only when `next` is `null`. A page can be empty or short only at the
+    /// end.
+    ///
+    /// A hash never changes and every replica computes the same one, so a
+    /// message on the board for the whole walk comes back exactly once,
+    /// whatever the board does between pages and whichever replica serves
+    /// each call.
+    #[method(name = "contentPage")]
+    async fn msgboard_content_page(&self, request: ContentPageRequest) -> RpcResult<Box<RawValue>>;
 
     /// Look up a single message by its SHA-256 `PoW` hash.
     #[method(name = "getMessage")]
