@@ -20,7 +20,7 @@ use futures::{FutureExt, StreamExt};
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_primitives_traits::{BlockBody, BlockHeader};
-use reth_rpc_api::TraceApiServer;
+use reth_rpc_api::{ParityLocalizedTrace, TraceApiServer};
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
     helpers::{Call, LoadPendingBlock, LoadTransaction, Trace, TraceExt},
@@ -769,12 +769,9 @@ where
     }
 
     /// Handler for `trace_block`
-    async fn trace_block(
-        &self,
-        block_id: BlockId,
-    ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
+    async fn trace_block(&self, block_id: BlockId) -> RpcResult<Option<Vec<ParityLocalizedTrace>>> {
         let _permit = self.acquire_trace_permit().await;
-        Ok(Self::trace_block(self, block_id).await.map_err(Into::into)?)
+        Ok(Self::trace_block(self, block_id).await.map_err(Into::into)?.map(into_parity))
     }
 
     /// Handler for `trace_filter`
@@ -783,8 +780,8 @@ where
     ///
     /// # Limitations
     /// This currently requires block filter fields, since reth does not have address indices yet.
-    async fn trace_filter(&self, filter: TraceFilter) -> RpcResult<Vec<LocalizedTransactionTrace>> {
-        Ok(Self::trace_filter(self, filter).await.map_err(Into::into)?)
+    async fn trace_filter(&self, filter: TraceFilter) -> RpcResult<Vec<ParityLocalizedTrace>> {
+        Ok(into_parity(Self::trace_filter(self, filter).await.map_err(Into::into)?))
     }
 
     /// Returns transaction trace at given index.
@@ -793,20 +790,18 @@ where
         &self,
         hash: B256,
         indices: Vec<Index>,
-    ) -> RpcResult<Option<LocalizedTransactionTrace>> {
+    ) -> RpcResult<Option<ParityLocalizedTrace>> {
         let _permit = self.acquire_trace_permit().await;
         Ok(Self::trace_get(self, hash, indices.into_iter().map(Into::into).collect())
             .await
-            .map_err(Into::into)?)
+            .map_err(Into::into)?
+            .map(Into::into))
     }
 
     /// Handler for `trace_transaction`
-    async fn trace_transaction(
-        &self,
-        hash: B256,
-    ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
+    async fn trace_transaction(&self, hash: B256) -> RpcResult<Option<Vec<ParityLocalizedTrace>>> {
         let _permit = self.acquire_trace_permit().await;
-        Ok(Self::trace_transaction(self, hash).await.map_err(Into::into)?)
+        Ok(Self::trace_transaction(self, hash).await.map_err(Into::into)?.map(into_parity))
     }
 
     /// Handler for `trace_transactionOpcodeGas`
@@ -892,6 +887,11 @@ fn reward_trace<H: BlockHeader>(
             result: None,
         },
     }
+}
+
+/// Wraps traces for the RPC response, so they serialize in erigon's wire shape.
+fn into_parity(traces: Vec<LocalizedTransactionTrace>) -> Vec<ParityLocalizedTrace> {
+    traces.into_iter().map(ParityLocalizedTrace).collect()
 }
 
 #[cfg(test)]
@@ -1226,7 +1226,9 @@ mod tests {
             body: BlockBody::default(),
         };
         let provider_rw = factory.provider_rw().unwrap();
-        provider_rw.insert_block(&block.seal_slow().try_recover().unwrap()).unwrap();
+        let block = block.seal_slow();
+        let block_hash = block.hash();
+        provider_rw.insert_block(&block.try_recover().unwrap()).unwrap();
         provider_rw.update_pipeline_stages(1, false).unwrap();
         provider_rw.commit().unwrap();
 
@@ -1249,6 +1251,26 @@ mod tests {
             let filter =
                 TraceFilter { from_block: Some(0), to_block: Some(to_block), ..Default::default() };
             assert_eq!(trace_order(&api.trace_filter(filter).await.unwrap()), expected);
+        }
+
+        // Erigon omits `transactionHash` and `transactionPosition` on reward traces. The wire
+        // bytes must match, not only the decoded value, because clients hash the response.
+        let reward = format!(
+            r#"[{{"action":{{"author":"{coinbase:#x}","rewardType":"block","value":"0x4563918244f40000"}},"blockHash":"{block_hash:#x}","blockNumber":1,"result":null,"subtraces":0,"traceAddress":[],"type":"reward"}}]"#
+        );
+        let module = api.into_rpc();
+        for (method, params) in [
+            ("trace_block", serde_json::json!(["0x1"])),
+            ("trace_filter", serde_json::json!([{"fromBlock": "0x1", "toBlock": "0x1"}])),
+        ] {
+            let request =
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+            let (response, _) = module.raw_json_request(&request.to_string(), 1).await.unwrap();
+            assert_eq!(
+                response.get(),
+                format!(r#"{{"jsonrpc":"2.0","id":1,"result":{reward}}}"#),
+                "{method}"
+            );
         }
     }
 
