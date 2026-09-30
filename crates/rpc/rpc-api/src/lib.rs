@@ -35,6 +35,7 @@ mod web3;
 
 pub use reth::RethJitAction;
 pub use testing::{TestingBuildBlockRequestV1, TESTING_BUILD_BLOCK_V1, TESTING_COMMIT_BLOCK_V1};
+pub use trace::ParityLocalizedTrace;
 pub use txpool_page::{
     TxpoolContentPage, TxpoolInspectPage, TxpoolPageRequest, TXPOOL_PAGE_MAX_BYTES,
     TXPOOL_PAGE_MAX_SENDERS,
