@@ -46,7 +46,7 @@ upstream-unit:
     - apt-get update -qq && apt-get install -y -qq clang libclang-dev pkg-config
     - curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin
   script:
-    - cargo nextest run --no-fail-fast --locked -p reth-rpc -p reth-rpc-eth-api -p reth-rpc-eth-types -p reth-rpc-builder -p reth-network -p reth-engine-tree -p reth-provider -p reth-transaction-pool -p reth-eth-wire --no-tests=fail -E '!kind(test) and not binary(e2e_testsuite)'
+    - cargo nextest run --no-fail-fast --locked -p reth-rpc -p reth-rpc-api -p reth-rpc-eth-api -p reth-rpc-eth-types -p reth-rpc-builder -p reth-network -p reth-engine-tree -p reth-provider -p reth-transaction-pool -p reth-eth-wire --no-tests=fail -E '!kind(test) and not binary(e2e_testsuite)'
 
 # The CLI reference pages must match the help output of the binary the fleet
 # builds. docs/cli/help.rs is a nightly cargo script.
