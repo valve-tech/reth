@@ -19,6 +19,7 @@ mod list;
 mod migrate_v2;
 mod prune_checkpoints;
 mod repair_trie;
+mod scan_empty_hashed_accounts;
 mod settings;
 mod stage_checkpoints;
 mod state;
@@ -62,6 +63,9 @@ pub enum Subcommands {
     Clear(clear::Command),
     /// Verifies trie consistency and outputs any inconsistencies
     RepairTrie(repair_trie::Command),
+    /// Finds all-zero `HashedAccounts` rows that EIP-161 deleted from `PlainAccountState`
+    /// (read-only, safe on a running node)
+    ScanEmptyHashedAccounts(scan_empty_hashed_accounts::Command),
     /// Reads and displays the static file segment header
     StaticFileHeader(static_file_header::Command),
     /// Lists current and local database versions
@@ -185,6 +189,13 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                     if command.dry_run { AccessRights::RO } else { AccessRights::RW };
                 db_exec!(self.env, tool, N, access_rights, {
                     command.execute(&tool, ctx.task_executor, &data_dir)?;
+                });
+            }
+            Subcommands::ScanEmptyHashedAccounts(command) => {
+                // Skip the static file consistency check: a live node is mid-write, and the scan
+                // reads only two MDBX tables.
+                db_exec!(self.env, tool, N, AccessRights::RoInconsistent, {
+                    command.execute(&tool)?;
                 });
             }
             Subcommands::StaticFileHeader(command) => {
