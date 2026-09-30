@@ -18,7 +18,7 @@ Commands:
   drop                        Deletes all database entries
   clear                       Deletes all table entries
   repair-trie                 Verifies trie consistency and outputs any inconsistencies
-  scan-empty-hashed-accounts  Finds all-zero `HashedAccounts` rows that EIP-161 deleted from `PlainAccountState` (read-only, safe on a running node)
+  scan-empty-hashed-accounts  Finds all-zero `HashedAccounts` rows that EIP-161 deleted from `PlainAccountState` (read-only, safe on a running node; v1 checks PlainAccountState, v2 the AccountsTrie)
   static-file-header          Reads and displays the static file segment header
   version                     Lists current and local database versions
   path                        Returns the full database path
