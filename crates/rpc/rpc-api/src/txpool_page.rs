@@ -4,10 +4,12 @@
 //! [`TxPoolApi`](crate::TxPoolApiServer) stays unchanged.
 //!
 //! A page lists senders in ascending address order and never splits one
-//! sender's transactions across pages. `next` in the response is the `after`
-//! value for the following page, and it is `null` when no sender is left.
-//! This follows geth's `debug_storageRangeAt` (`nextKey`) and
-//! `debug_accountRange` (`next`).
+//! sender's transactions across pages. `next` in the response is the last
+//! sender of this page, used as an exclusive `after` for the following page,
+//! and it is `null` when no sender is left. Clients pass it back unchanged
+//! and stop only on `null`. This is the rule of Stripe's `starting_after`,
+//! Relay's `endCursor` and NEAR's `last_key`, not geth's `nextKey`, which is
+//! the first key of the next page.
 
 use alloy_json_rpc::RpcObject;
 use alloy_primitives::Address;
