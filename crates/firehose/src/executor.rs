@@ -847,8 +847,14 @@ where
     let exec_ctx =
         evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
 
+    // EIP-7928: this path (pipeline/backfill) has no payload sidecar to read the block access
+    // list from, so it rebuilds the list during execution, as `BasicBlockExecutor::execute_one`
+    // does. The built list stays in `db` so `Executor::take_bal` still hands it to the stage.
+    let bal_hash = block.header().block_access_list_hash();
+    db.bal_state.bal_builder = bal_hash.map(|_| reth_revm::revm::state::bal::Bal::new());
+
     let inspector = tracer_guard.inspector();
-    let evm = evm_config.evm_with_env_and_inspector(db, evm_env, inspector);
+    let evm = evm_config.evm_with_env_and_inspector(&mut *db, evm_env, inspector);
     let inner = evm_config.create_executor(evm, exec_ctx);
 
     let withdrawals = block.body().withdrawals().cloned();
@@ -857,7 +863,7 @@ where
         .ommers()
         .map(|o| o.iter().map(|h| h.beneficiary()).collect())
         .unwrap_or_default();
-    let wrapped = FirehoseWrappedExecutor::with_hooks(
+    let mut wrapped = FirehoseWrappedExecutor::with_hooks(
         inner,
         withdrawals,
         ommer_beneficiaries,
@@ -865,7 +871,40 @@ where
         extras,
     );
 
-    wrapped.execute_block(block.transactions_recovered())
+    // The steps of `BlockExecutor::execute_block`, with the BAL index advanced after the
+    // pre-execution changes (index 0) and after each transaction (index `i + 1`).
+    wrapped.apply_pre_execution_changes()?;
+    if bal_hash.is_some() {
+        wrapped.evm_mut().db_mut().bump_bal_index();
+    }
+    for tx in block.transactions_recovered() {
+        wrapped.execute_transaction(tx)?;
+        if bal_hash.is_some() {
+            wrapped.evm_mut().db_mut().bump_bal_index();
+        }
+    }
+    let result = wrapped.apply_post_execution_changes()?;
+
+    if let Some(expected) = bal_hash &&
+        let Some(bal) = db.bal_state.bal_builder.clone()
+    {
+        let bal = bal.into_alloy_bal();
+        let computed = alloy_eip7928::compute_block_access_list_hash(&bal);
+        // A mismatch means the rebuilt list is wrong, not the block: fail rather than emit an
+        // RLP that does not match the header.
+        if computed != expected {
+            return Err(BlockExecutionError::msg(format!(
+                "reconstructed block access list hash mismatch for block {}: expected {expected}, computed {computed}",
+                block.header().number(),
+            )));
+        }
+        if let Some(header) = tracer_guard.tracer_mut().block_mut().and_then(|b| b.header.as_mut())
+        {
+            header.block_access_list_rlp = Some(alloy_rlp::encode(&bal));
+        }
+    }
+
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
