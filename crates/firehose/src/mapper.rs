@@ -83,10 +83,11 @@ where
         parent_beacon_root: header.parent_beacon_block_root(),
         requests_hash: header.requests_hash(),
         tx_dependency: None,
-        // EIP-7843: Amsterdam slot number — not yet exposed by reth Header trait
-        slot_number: None,
-        // EIP-7928: the hash the header commits to. The full list is known only after
-        // execution, but the block starts before it, so the RLP is not emitted.
+        // EIP-7843: Amsterdam slot number, straight from the header.
+        slot_number: header.slot_number(),
+        // EIP-7928: the hash the header commits to. The RLP-encoded list is only known after
+        // this node has executed the block; it is patched in post-execution via
+        // `Tracer::block_mut` (live engine path: `payload_validator.rs`).
         block_access_list_hash: header.block_access_list_hash(),
         block_access_list_rlp: None,
     }
@@ -424,6 +425,7 @@ mod tests {
             blob_gas_used: Some(0),
             excess_blob_gas: Some(0),
             parent_beacon_block_root: Some(B256::repeat_byte(0x33)),
+            slot_number: Some(7),
             ..Default::default()
         };
         let body = BlockBody {
@@ -451,7 +453,7 @@ mod tests {
         assert!(data.uncles.is_empty());
         assert!(data.withdrawals.is_empty());
         assert!(data.size > 0, "RLP size of a sealed block must be non-zero");
-        assert_eq!(data.slot_number, None);
+        assert_eq!(data.slot_number, Some(7));
         assert_eq!(data.tx_dependency, None);
     }
 
