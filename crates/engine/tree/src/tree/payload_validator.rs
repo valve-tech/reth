@@ -886,15 +886,14 @@ where
                 .ok()
         };
 
-        // Firehose live path: the EIP-7928 block access list RLP for the emitted header. The
-        // payload sidecar gives the exact bytes the header hash commits to. A downloaded block
-        // without a sidecar falls back to the list this execution built, which
-        // `validate_post_execution` below checks against the header hash before the flush.
+        // Firehose live path: the EIP-7928 block access list RLP for the emitted header. See
+        // `firehose_bal_rlp`.
         let fh_bal_rlp = fh_tracer.is_some().then(|| {
-            decoded_bal
-                .as_ref()
-                .map(|bal| bal.as_raw_bal().as_raw().to_vec())
-                .or_else(|| built_bal.as_ref().map(alloy_rlp::encode))
+            firehose_bal_rlp(
+                block.header().block_access_list_hash(),
+                decoded_bal.as_ref().map(|bal| bal.as_raw_bal().as_raw().as_ref()),
+                built_bal.as_ref(),
+            )
         });
 
         ensure_ok_post_block!(
@@ -2428,4 +2427,60 @@ struct ExecutedBal {
     alloy: BlockAccessList,
     /// Revm form, shared with the executed block so consumers can reuse it.
     revm: Arc<RevmBal>,
+}
+
+/// Picks the EIP-7928 block access list RLP for the Firehose header. A sidecar is used only when it
+/// hashes to the header's `block_access_list_hash`: a payload's header hash is derived from its
+/// sidecar, but a downloaded block carries its sidecar separately. Otherwise the list this
+/// execution built is used, which `validate_post_execution` checks against the header hash before
+/// the Firehose flush.
+fn firehose_bal_rlp(
+    header_hash: Option<B256>,
+    sidecar: Option<&[u8]>,
+    built: Option<&BlockAccessList>,
+) -> Option<Vec<u8>> {
+    sidecar
+        .filter(|sidecar| header_hash == Some(alloy_primitives::keccak256(sidecar)))
+        .map(<[u8]>::to_vec)
+        .or_else(|| built.map(alloy_rlp::encode))
+}
+
+#[cfg(test)]
+mod firehose_bal_rlp_tests {
+    use super::*;
+    use alloy_primitives::keccak256;
+
+    fn built() -> BlockAccessList {
+        vec![alloy_eip7928::AccountChanges::new(Address::repeat_byte(1))]
+    }
+
+    #[test]
+    fn sidecar_that_hashes_to_the_header_is_emitted() {
+        let sidecar = alloy_rlp::encode(built());
+        let hash = keccak256(&sidecar);
+        assert_eq!(firehose_bal_rlp(Some(hash), Some(&sidecar), None), Some(sidecar));
+    }
+
+    #[test]
+    fn sidecar_that_does_not_hash_to_the_header_falls_back_to_the_built_list() {
+        let built = built();
+        let expected = alloy_rlp::encode(&built);
+        let hash = keccak256(&expected);
+        let wrong_sidecar = alloy_rlp::encode(Vec::<alloy_eip7928::AccountChanges>::new());
+        assert_eq!(
+            firehose_bal_rlp(Some(hash), Some(&wrong_sidecar), Some(&built)),
+            Some(expected)
+        );
+        assert_eq!(firehose_bal_rlp(Some(hash), Some(&wrong_sidecar), None), None);
+    }
+
+    #[test]
+    fn block_without_sidecar_uses_the_built_list() {
+        let built = built();
+        let expected = alloy_rlp::encode(&built);
+        assert_eq!(
+            firehose_bal_rlp(Some(keccak256(&expected)), None, Some(&built)),
+            Some(expected)
+        );
+    }
 }
