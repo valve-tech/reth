@@ -1,6 +1,6 @@
 # reth db scan-empty-hashed-accounts
 
-Finds all-zero `HashedAccounts` rows that EIP-161 deleted from `PlainAccountState` (read-only, safe on a running node)
+Finds all-zero `HashedAccounts` rows that EIP-161 deleted from `PlainAccountState` (read-only, safe on a running node; v1 checks PlainAccountState, v2 the AccountsTrie)
 
 ```bash
 $ reth db scan-empty-hashed-accounts --help
@@ -10,14 +10,14 @@ Usage: reth db scan-empty-hashed-accounts [OPTIONS]
 
 Options:
       --max-rows-per-sec <MAX_ROWS_PER_SEC>
-          Maximum number of rows to read per second, over both passes. 0 disables the throttle
+          Maximum number of rows to read per second, over all passes. 0 disables the throttle
 
           [default: 200000]
 
       --max-plain-empty <MAX_PLAIN_EMPTY>
-          Abort if `PlainAccountState` holds more all-zero accounts than this. Bounds memory use (about 64 bytes per entry)
+          Abort if the set of all-zero accounts held in memory grows above this. v1 holds the all-zero `PlainAccountState` accounts, v2 the all-zero `HashedAccounts` rows. About 32 to 64 bytes per entry; the default of 20M costs up to about 1.3 GB (640 MB in v2)
 
-          [default: 5000000]
+          [default: 20000000]
 
       --renew-every-rows <RENEW_EVERY_ROWS>
           Renew the read transaction after this many rows. Short transactions stop a live node's database from growing while the scan runs
