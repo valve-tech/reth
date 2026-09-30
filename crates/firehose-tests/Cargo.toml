@@ -42,6 +42,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 [dev-dependencies]
+alloy-eip7928.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace = true
 reth-e2e-test-utils.workspace = true
@@ -55,3 +58,7 @@ path = "tests/prestate.rs"
 [[test]]
 name = "batch_executor"
 path = "tests/batch_executor.rs"
+
+[[test]]
+name = "bal_pipeline"
+path = "tests/bal_pipeline.rs"
