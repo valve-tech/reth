@@ -99,12 +99,13 @@ The "severe" 256 GiB → 16 MiB GrowthStep change ends the wasteful chunked file
 
 ### 4.2 `--msgboard.gossip-disable` flag — ✅ FIXED
 
-Wired as `--msgboard.gossip-disable` (bool). When set:
-- The bulk-announce on peer connect is skipped
-- The per-message broadcast forward to peers is skipped
-- The board still **receives** announcements and full messages, and still serves `GetBoardMessages` requests
+Wired as `--msgboard.gossip-disable` (bool), read from `MsgboardConfig::gossip_disabled`. When set (verified against the code 2026-10-01):
+- The node sends no announcements: no bulk announce on connect, and no per-message forward (`protocol.rs`, the `gossip_disabled` checks in the connection loop).
+- The node requests nothing. It ignores `BoardMessageIDs` and the pending retry queue.
+- The node drops every delivered body without a peer penalty (`board.rs`, `add_remote` returns `(0, 0)`), as erigon's `AddRemoteMsgs` returns `nil` on `cfg.NoGossip`.
+- The node still **serves** `GetBoardMessages` requests from its own board, when the board is ready.
 
-`MsgboardProtocolHandler::new_gossip_disabled(board)` is the constructor used when the flag is set; `MsgboardProtocolHandler::new(board)` is used otherwise.
+The last point diverges. Erigon with `NoGossip` never calls `ConnectSentries` (`msgboard/board.go:166`), so it serves nothing. Reth keeps the subprotocol up and answers requests, which costs an operator nothing and helps peers. A `MsgboardProtocolHandler::new_gossip_disabled` constructor no longer exists.
 
 `--msgboard.external` is **N/A** to reth: no gRPC sentry separation exists, and the reth deployment does not need it.
 
@@ -246,7 +247,7 @@ Ten new gaps surfaced — all closed in this round:
 
 **Wire / verification (minor):**
 - **N5** ✅ `filter_wanted` now drops announcements whose `MsgID.version() != VERSION_V1` before issuing a `GetBoardMessages` request, mirroring erigon `FilterMessageIDs`. Saves one RTT.
-- **N6** ✅ `PoWMsg::difficulty` switched from `saturating_mul`/`saturating_div` to `wrapping_mul`/`wrapping_div`, mirroring erigon's plain `uint64` arithmetic. Eliminates a wire divergence where reth would reject a message with absurd-multiplier overflow that erigon would (after wrap) silently accept. Honest inputs are unaffected.
+- **N6** ✅ *Superseded (2026-10-01).* This item once switched `PoWMsg::difficulty` to wrapping `u64` arithmetic, "mirroring erigon". Neither half is true today. Reth computes `D` exactly in `U256` (`msgboard-types/src/pow.rs`, `difficulty`), so it never wraps or saturates. Erigon computes the product exactly in 192 bits and saturates the quotient at `MaxUint64` (`msgboard/pow_message.go`, `difficulty`). The two agree for every `D` that fits in `u64`, which covers every honest message. See §14.1 for why wrapping was dropped and §29.2 for the remaining difference.
 - **N9** ✅ `BROADCAST_CAPACITY` raised from 64 to 1024 (mirrors erigon's gRPC subscriber buffer). Removes the failure mode where a brief peer-task slowdown triggered a full-board re-announce storm under sustained ingest.
 - **N10** ✅ `BlockFilter::set_head` floors `lower` at `1`, mirroring erigon `calcLower`. Block 0 never sits inside the live window once the chain has advanced past genesis.
 
@@ -1586,7 +1587,7 @@ does not meet:
 |---|---|---|
 | inbound packet ≤ 100 KiB | **no inbound check at all**; the real cap is `MAX_PAYLOAD_SIZE` = 16 MiB, 160× the spec | `eth-wire/src/p2pstream.rs:34`, `:501-506` |
 | oversized packet → disconnect | nothing between 100 KiB and 16 MiB | as above |
-| duplicate IDs in `GET_BOARD_MESSAGES` → kick | dedupes and truncates, no penalty (§14.3) | `msgboard/src/protocol.rs:553-587` |
+| duplicate IDs in `GET_BOARD_MESSAGES` → kick | ✅ *Now met (verified 2026-10-01).* A request that names a hash twice gets `report_bad_protocol` and no reply, as erigon's `CheckUniqueHashes` (`msgboard/fetch.go:251-253`). It is no longer deduped. | `protocol.rs`, `a_hash_request_naming_the_same_hash_twice_is_kicked` |
 | duplicate IDs in `BOARD_MESSAGE_IDS` → kick | **no duplicate check exists** | `protocol.rs:498` |
 | `--msgboard.enabled`, off by default | no such flag; msgboard is registered unconditionally | `msgboard/src/args.rs:18-19` |
 
@@ -2597,7 +2598,6 @@ The difference is disk-only. The wire carries `PoWMsg` and the claimed hash
 reth node and an erigon node never exchange this record. The one consequence:
 a reth msgboard database cannot be copied into an erigon node, or the other
 way round.
-
 ## 28. Block window divergences recorded 2026-10-01
 
 ### 28.1 Reth registers every committed block, not only the last one
@@ -2614,3 +2614,76 @@ Erigon also ignores `ChangeBlock` until the board is ready (`board.go:218`).
 Reth applies every block from startup. This is harmless: before ready, reth
 does not gossip and refuses local messages, and its window is only more
 current when ready comes.
+
+## 29. RPC parity, review round 2 (2026-10-01)
+
+The erigon references are to `~/go/src/gitlab.com/pulsechaincom/erigon-pulse`,
+files `rpc/jsonrpc/msgboard_api.go`, `rpc/types.go` and `msgboard/`.
+
+### 29.1 Fixed
+
+- **Subscription name.** Erigon registers its subscription as the Go method
+  `Messages`, and `formatName` (`rpc/service.go:288`) lower-cases the first
+  letter, so the wire kind is `"messages"`. Reth accepted only `"newMessages"`,
+  so an erigon client could not subscribe. Reth now accepts both.
+- **Block bounds.** Erigon's `fromBlock` and `toBlock` are `*rpc.BlockNumber`.
+  Reth took only a JSON number, so the hex strings most clients send got
+  `-32602`. Reth now takes a number, a decimal string, a `0x` string, or a tag,
+  with erigon's meaning: `toProto` casts the value to `uint64`, and the board
+  reads 0 as no bound. So 0 and `earliest` give no bound. Every other tag is a
+  negative `int64`, near 2^64 after the cast: as `toBlock` it admits every
+  block, as `fromBlock` none. A value above `int64` max is `-32602`, as in
+  erigon. Reth does not read a tag as the head, because erigon does not.
+  A side effect: `toBlock: 0` used to return only block 0 and now returns all.
+  The parser accepts a small superset of erigon's: leading zeros in hex
+  (`"0x014"`) and a leading `+` (`"+20"`). Both read as the same number, so no
+  erigon-valid input changes meaning; this is kept rather than tightened.
+- **`msgboard_contentPage` permits.** The method shared the two
+  `msgboard_content` permits, so callers that loop full-board builds starved
+  pagers. It now has four of its own (`CONTENT_PAGE_CONCURRENT_BUILDS`).
+- **Permit lifetime.** A content permit used to drop when the build ended,
+  while the 167 MB response stayed alive until jsonrpsee wrote it. The permit
+  now lives until jsonrpsee reports the response processed
+  (`ResponsePayload::notify_on_completion`). The bound this gives: at most two
+  full-board responses are in the build-to-handoff phase at once. On WebSocket
+  and IPC, handoff is entry into the connection's send queue. On HTTP, it is
+  the handoff to the HTTP layer. After handoff, the transport owns the bytes,
+  and only the connection limits bound them. jsonrpsee has no hook for "written
+  to the socket", so a tighter bound needs a transport change. In a JSON-RPC
+  batch, the permit comes back when the batch builder copies the response into
+  the batch buffer. So a batch of three content calls cannot deadlock on two
+  permits. The bound covers single calls, not the batch buffer, which
+  `--rpc.max-response-size` still caps.
+- **`msgboard_addMessage` off the worker.** Decode, `PoW` verification (a
+  secp256k1 scalar multiplication) and the board insert now run on the blocking pool, at most eight at once (`ADD_MESSAGE_CONCURRENT_VERIFIES`).
+
+### 29.2 Kept on purpose
+
+Each item below is a known difference. Clients can depend on reth's behaviour,
+so reth keeps it.
+
+- **`msgboard_getMessage` on a miss returns `null`.** Erigon returns the error
+  `msgboard: message not found` (`ErrMsgNotFound`, `msgboard/board.go:55`).
+  Clients may already test for `null`.
+- **`msgboard_addMessage` error codes.** Erigon's gRPC `AddMessage` returns a
+  decode or `Validate` failure as a transport error, so its JSON-RPC layer
+  gives `-32000` with a gRPC-wrapped message. Only failures reported in the
+  result, such as `powmsg: invalid work`, get `-32602`. Reth gives `-32602`
+  for every decode and validation failure. See `msgboard_error_to_rpc`.
+- **Default minimum difficulty.** Reth's defaults are `workMultiplier` 10,000
+  and `workDivisor` 1,000,000. Erigon's are 1 and 100
+  (`msgboard/msgboardcfg/config.go`). The ratio is the same, 0.01, and the
+  integer `D` is the same, so acceptance does not change. `msgboard_status`
+  reports different numbers.
+- **Subscription filter `{}`.** Erigon's `NewMessagesFilter.Category` is a
+  plain hash, so `{}` filters on the zero category and delivers almost nothing.
+  Reth reads `{}` as "every category", the same as no filter.
+- **`D == 0` is rejected at decode.** See §27.1.
+- **Unknown-block bodies do not penalise the peer.** Erigon's
+  `AddRemoteWireMsgs` penalises on `ErrMsgTooOld`, and an unknown block hash
+  gives that error. Reth counts `BlockTooOld` as circumstantial and does not
+  penalise (`board.rs`, `add_remote_msgs`). A peer one block ahead of us is not
+  misbehaving.
+- **Difficulty overflow.** Reth computes `D` exactly in `U256`. Erigon
+  saturates at `MaxUint64`. Only a message whose `D` exceeds `u64::MAX` can
+  differ, and no honest client builds one. §N6 in §10 is corrected to match.
