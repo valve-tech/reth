@@ -9435,6 +9435,7 @@ dependencies = [
  "metrics-util",
  "parking_lot",
  "reth-chain-state",
+ "reth-chainspec",
  "reth-eth-wire",
  "reth-execution-types",
  "reth-fs-util",
