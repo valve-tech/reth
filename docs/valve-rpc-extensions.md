@@ -65,3 +65,30 @@ curl -s http://localhost:8545 -H 'content-type: application/json' \
        "params":[{"limit":500,"after":"0x3f1c…"}]}' \
   | jq '.result.next'   # pass back unchanged as `after`; stop on null
 ```
+
+## Metrics
+
+### `reth_rpc_eth_send_raw_rejected_total`
+
+This counter counts the transactions that RPC clients submit and the node rejects. It has one label, `reason`. Upstream reth counts most pool rejections in `reth_transaction_pool_invalid_transactions`, which also counts p2p gossip and does not say why. This counter covers only RPC submissions: `eth_sendRawTransaction`, `eth_sendRawTransactionSync` and `eth_sendTransaction`. A transaction that the node forwards with `--rpc.forwarder` does not count.
+
+| `reason` | The node rejects the transaction because |
+| --- | --- |
+| `decode` | the bytes do not decode, or the signer does not recover |
+| `already_known` | the pool already has it |
+| `replacement_underpriced` | it replaces a pooled transaction but does not raise the fee enough |
+| `underpriced` | its fee is below the pool or protocol minimum |
+| `pool_full` | the pool has no space for it, or for more transactions from its sender |
+| `conflicting_type` | the sender has a pooled transaction of the other kind (blob or non-blob) |
+| `nonce_too_low` | its nonce is below the sender's state nonce |
+| `insufficient_funds` | the sender cannot pay for it |
+| `fee_cap` | its maximum fee is above `--rpc.txfeecap` |
+| `intrinsic_gas` | its gas limit is below the intrinsic gas |
+| `gas_limit` | its gas limit is above the block gas limit or the per-transaction maximum |
+| `other` | any other reason |
+
+The set is fixed. A new pool error does not compile until somebody gives it a reason.
+
+```promql
+sum by (reason) (rate(reth_rpc_eth_send_raw_rejected_total[5m]))
+```
