@@ -18,6 +18,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use alloy_primitives::B256;
 use reth_chain_state::{CanonStateNotifications, CanonStateSubscriptions};
 use reth_msgboard_types::MsgboardConfig;
 use reth_network::protocol::{IntoRlpxSubProtocol, RlpxSubProtocol};
@@ -175,12 +176,12 @@ impl MsgboardLauncher {
 
     /// Spawn post-launch tasks bound to the running node:
     ///
-    /// 1. seed `headBlock` immediately from `chain_info()` so RPC reads the real head from the
-    ///    first call instead of waiting for the next canonical commit (tens of seconds on a quiet
-    ///    chain);
+    /// 1. seed the block window from the provider (see `seed_head_window`), so RPC reads the real
+    ///    head from the first call and the board accepts messages anchored anywhere in the window
+    ///    without waiting for the next canonical commit;
     /// 2. spawn a sync watcher that flips the board's ready flag once the network finishes syncing
     ///    and has at least one peer;
-    /// 3. spawn a canonical-state subscriber that pushes each new tip into [`MsgBoard::set_head`]
+    /// 3. spawn a canonical-state subscriber that pushes each new block into [`MsgBoard::set_head`]
     ///    so the block-window prune-and-expiry pipeline advances with the chain.
     ///
     /// No-op if [`Self::init_board`] has not run.
@@ -205,13 +206,15 @@ impl MsgboardLauncher {
             return;
         };
 
-        match provider.chain_info() {
-            Ok(info) => board.set_head(info.best_number, info.best_hash),
-            Err(err) => tracing::warn!(
+        // Subscribe before the seed. A block committed between the two then
+        // waits in the stream; the driver skips it if the seed already has it.
+        let rx = provider.subscribe_to_canonical_state();
+        if let Err(err) = seed_head_window(&board, &provider, self.config.block_range) {
+            tracing::warn!(
                 target: "msgboard",
                 %err,
                 "could not seed msgboard head at startup; will pick up on first canonical commit",
-            ),
+            );
         }
 
         let board_for_watcher = Arc::clone(&board);
@@ -228,7 +231,9 @@ impl MsgboardLauncher {
 
         tokio::spawn(drive_canonical_head(
             Arc::clone(&board),
-            provider.subscribe_to_canonical_state(),
+            rx,
+            provider,
+            self.config.block_range,
         ));
     }
 
@@ -287,7 +292,7 @@ impl Drop for FinalFlushGuard {
     }
 }
 
-/// Push each canonical tip into [`MsgBoard::set_head`].
+/// Push each canonical block into [`MsgBoard::set_head`].
 ///
 /// The block-window prune-and-expiry pipeline advances only from here. If this
 /// loop stops, the board keeps serving messages anchored to a chain it no
@@ -297,16 +302,39 @@ impl Drop for FinalFlushGuard {
 /// Split out of [`MsgboardLauncher::install_post_launch_tasks`] so a test can
 /// drive it with a real notification stream. Inside the `spawn` closure it was
 /// reachable only from a running node.
-async fn drive_canonical_head<N>(board: Arc<MsgBoard>, mut rx: CanonStateNotifications<N>)
-where
+async fn drive_canonical_head<N, P>(
+    board: Arc<MsgBoard>,
+    mut rx: CanonStateNotifications<N>,
+    provider: P,
+    block_range: u64,
+) where
     N: NodePrimitives,
+    P: BlockNumReader,
     N::BlockHeader: AlloyBlockHeader,
 {
     loop {
         match rx.recv().await {
             Ok(notification) => {
-                let tip = notification.tip();
-                board.set_head(tip.number(), tip.hash());
+                // Deliberate divergence from erigon, which passes only the
+                // last block of each batch to `ChangeBlock` (`fetch.go:403-407`).
+                // Register every committed block in the window, oldest first,
+                // so a catch-up or a multi-block reorg leaves no hash in the
+                // window unknown. See docs/msgboard-parity-gaps.md §28.1.
+                // Reverted blocks need no extra step: a lower `set_head` drops
+                // everything above it.
+                let committed = notification.committed();
+                // A plain commit at or below the head is old news: the stream
+                // keeps it after a lag, or the startup seed already read it.
+                // Applying it would lower the head and drop the hashes above.
+                // A reorg can lower the head on purpose, so it always applies.
+                if notification.reverted().is_none() && committed.tip().number() <= board.status().1
+                {
+                    continue;
+                }
+                let lower = window_lower(committed.tip().number(), block_range);
+                for block in committed.blocks_iter().filter(|b| b.number() >= lower) {
+                    board.set_head(block.number(), block.hash());
+                }
             }
             Err(RecvError::Lagged(n)) => {
                 tracing::warn!(
@@ -314,10 +342,74 @@ where
                     lagged = n,
                     "canonical-state stream lagged; head update may have skipped blocks",
                 );
+                // The skipped blocks are gone from the stream, so read the
+                // window back from the provider.
+                if let Err(err) = seed_head_window(&board, &provider, block_range) {
+                    tracing::warn!(
+                        target: "msgboard",
+                        %err,
+                        "could not re-seed msgboard window after lag",
+                    );
+                }
             }
             Err(RecvError::Closed) => break,
         }
     }
+}
+
+/// Load the canonical hashes of the live block window into the board.
+///
+/// Mirrors erigon-pulse `BlockFilter.Initialize` (`block_filter.go:37-58`):
+/// every canonical hash in `[lower, head]` goes in, oldest first, so the board
+/// accepts messages anchored anywhere in the window. Peers send their full
+/// board only on connect, so a board that knew only the head would reject the
+/// older messages and never get them again.
+///
+/// The read is bounded by `block_range`, which [`BlockFilter`] caps at
+/// [`MAX_BLOCK_RANGE`].
+///
+/// [`BlockFilter`]: crate::block_filter::BlockFilter
+/// [`MAX_BLOCK_RANGE`]: crate::block_filter::MAX_BLOCK_RANGE
+fn seed_head_window<P: BlockNumReader>(
+    board: &MsgBoard,
+    provider: &P,
+    block_range: u64,
+) -> reth_storage_api::errors::ProviderResult<()> {
+    let info = provider.chain_info()?;
+    let head = info.best_number;
+    let lower = window_lower(head, block_range);
+    // `canonical_hashes_range` gives hashes without numbers. Only a full
+    // answer can be numbered from `lower`; anything else falls back to the
+    // head alone, as the seed did before it read the window.
+    let mut blocks: Vec<(u64, B256)> = match provider.canonical_hashes_range(lower, head + 1) {
+        Ok(hashes) if hashes.len() as u64 == head + 1 - lower => (lower..).zip(hashes).collect(),
+        Ok(hashes) => {
+            tracing::warn!(
+                target: "msgboard",
+                got = hashes.len(),
+                want = head + 1 - lower,
+                "short canonical hash read; seeding msgboard head only",
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "msgboard",
+                %err,
+                "canonical hash read failed; seeding msgboard head only",
+            );
+            Vec::new()
+        }
+    };
+    blocks.push((head, info.best_hash));
+    board.seed_window(head, blocks);
+    Ok(())
+}
+
+/// The lowest block of a `block_range` window that ends at `head`.
+fn window_lower(head: u64, block_range: u64) -> u64 {
+    let range = block_range.clamp(1, crate::block_filter::MAX_BLOCK_RANGE);
+    head.saturating_sub(range - 1).max(1)
 }
 
 /// The namespace an operator names in `--http.api`, `--ws.api` or `--ipc.api`
@@ -356,6 +448,7 @@ mod tests {
     use reth_execution_types::Chain;
     use reth_msgboard_types::{MsgboardConfig, PoWMsg, VERSION_V1};
     use reth_rpc_builder::{RpcModuleSelection, TransportRpcModuleConfig};
+    use reth_storage_api::errors::ProviderResult;
 
     use super::*;
 
@@ -374,7 +467,7 @@ mod tests {
         assert_eq!(board.status().1, 0, "a fresh board has no head");
 
         let (tx, rx) = tokio::sync::broadcast::channel::<CanonStateNotification>(4);
-        tokio::spawn(drive_canonical_head(Arc::clone(&board), rx));
+        tokio::spawn(drive_canonical_head(Arc::clone(&board), rx, FakeChain::new(0), 120));
 
         let mut builder = TestBlockBuilder::eth();
         let executed = builder.get_executed_block_with_number(HEIGHT, B256::ZERO);
@@ -395,6 +488,256 @@ mod tests {
 
         let (_, head, ..) = board.status();
         assert_eq!(head, HEIGHT, "the commit must advance the board head");
+    }
+
+    /// A canonical chain whose block `n` has hash `chain_hash(n)`.
+    #[derive(Debug, Clone)]
+    struct FakeChain {
+        head: u64,
+        range: RangeMode,
+    }
+
+    /// How [`FakeChain::canonical_hashes_range`] answers.
+    #[derive(Debug, Clone, Copy)]
+    enum RangeMode {
+        /// Every hash in the range.
+        Full,
+        /// An error.
+        Fail,
+        /// The range without its first hash.
+        DropFirst,
+    }
+
+    impl FakeChain {
+        const fn new(head: u64) -> Self {
+            Self { head, range: RangeMode::Full }
+        }
+
+        const fn with_range(head: u64, range: RangeMode) -> Self {
+            Self { head, range }
+        }
+    }
+
+    fn chain_hash(n: u64) -> B256 {
+        B256::left_padding_from(&(n + 1).to_be_bytes())
+    }
+
+    impl reth_storage_api::BlockHashReader for FakeChain {
+        fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
+            Ok((number <= self.head).then(|| chain_hash(number)))
+        }
+
+        fn canonical_hashes_range(&self, start: u64, end: u64) -> ProviderResult<Vec<B256>> {
+            let all = (start..end.min(self.head + 1)).map(chain_hash);
+            match self.range {
+                RangeMode::Full => Ok(all.collect()),
+                RangeMode::Fail => {
+                    Err(reth_storage_api::errors::ProviderError::BlockHashNotFound(B256::ZERO))
+                }
+                RangeMode::DropFirst => Ok(all.skip(1).collect()),
+            }
+        }
+    }
+
+    impl BlockNumReader for FakeChain {
+        fn chain_info(&self) -> ProviderResult<reth_chainspec::ChainInfo> {
+            Ok(reth_chainspec::ChainInfo {
+                best_hash: chain_hash(self.head),
+                best_number: self.head,
+            })
+        }
+
+        fn best_block_number(&self) -> ProviderResult<u64> {
+            Ok(self.head)
+        }
+
+        fn last_block_number(&self) -> ProviderResult<u64> {
+            Ok(self.head)
+        }
+
+        fn block_number(&self, hash: B256) -> ProviderResult<Option<u64>> {
+            Ok((0..=self.head).find(|n| chain_hash(*n) == hash))
+        }
+    }
+
+    /// A ready board with cheap work limits and the default block window.
+    fn window_board() -> Arc<MsgBoard> {
+        let board = Arc::new(MsgBoard::new(cheap_launcher().config));
+        board.set_ready();
+        board
+    }
+
+    fn accepts(board: &MsgBoard, anchor: B256, tag: u8) -> bool {
+        board.add_local_msg(mine(anchor, &[tag])).is_ok()
+    }
+
+    /// Erigon's `BlockFilter.Initialize` loads every canonical hash in
+    /// `[lower, head]` at startup (`block_filter.go:37-58`). Peers send their
+    /// full board only on connect. A node that knows only the head after a
+    /// restart rejects every message anchored to an older block in the window,
+    /// and it never gets that message again.
+    #[tokio::test]
+    async fn startup_seeds_every_hash_in_the_window() {
+        const HEAD: u64 = 1_000;
+        let board = window_board();
+        let range = cheap_launcher().config.block_range;
+        seed_head_window(&board, &FakeChain::new(HEAD), range).expect("seed");
+
+        assert!(accepts(&board, chain_hash(HEAD - 50), 1), "H-50 is inside the window");
+        assert!(accepts(&board, chain_hash(HEAD - range + 1), 2), "the lower bound is inside");
+        assert!(!accepts(&board, chain_hash(HEAD - range), 3), "H-range is outside");
+        assert!(!accepts(&board, chain_hash(HEAD - (range + 1)), 4), "H-(range+1) is outside");
+    }
+
+    /// Wait until the driver task makes `cond` true, or give up.
+    async fn settle(cond: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A commit of several blocks (catch-up, multi-block reorg) must register
+    /// every block, not only the tip. Erigon registers only the last block of a
+    /// batch; reth registers all of them on purpose (parity gaps §28.1).
+    #[tokio::test]
+    async fn a_multi_block_commit_registers_every_block() {
+        let board = window_board();
+        let (tx, rx) = tokio::sync::broadcast::channel::<CanonStateNotification>(4);
+        tokio::spawn(drive_canonical_head(Arc::clone(&board), rx, FakeChain::new(0), 120));
+
+        let mut builder = TestBlockBuilder::eth();
+        let blocks: Vec<_> =
+            builder.get_executed_blocks(10..15).map(|b| b.recovered_block().clone()).collect();
+        let hashes: Vec<_> = blocks.iter().map(|b| b.hash()).collect();
+        let chain = Arc::new(Chain::new(blocks, Default::default(), BTreeMap::new()));
+        tx.send(CanonStateNotification::Commit { new: chain }).expect("receiver is live");
+        settle(|| board.status().1 == 14).await;
+
+        for (i, hash) in hashes.into_iter().enumerate() {
+            assert!(accepts(&board, hash, i as u8), "block {} must be known", 10 + i);
+        }
+    }
+
+    fn commit_at(builder: &mut TestBlockBuilder, n: u64) -> CanonStateNotification {
+        let block = builder.get_executed_block_with_number(n, B256::ZERO);
+        let chain = Arc::new(Chain::new(
+            [block.recovered_block().clone()],
+            Default::default(),
+            BTreeMap::new(),
+        ));
+        CanonStateNotification::Commit { new: chain }
+    }
+
+    /// After `Lagged` the driver has missed blocks that the stream cannot give
+    /// back, so it re-reads the window from the provider. The stream then still
+    /// yields the older notifications it kept. Those must not move the head
+    /// back: a lower `set_head` drops every hash above it.
+    #[tokio::test]
+    async fn a_lagged_stream_reseeds_and_keeps_the_head() {
+        const HEAD: u64 = 500;
+        let board = window_board();
+        let (tx, rx) = tokio::sync::broadcast::channel::<CanonStateNotification>(1);
+
+        // Overflow the channel before the driver runs, so its first recv lags
+        // and the next recv yields the stale `HEAD - 1` commit.
+        let mut builder = TestBlockBuilder::eth();
+        for n in [HEAD - 2, HEAD - 1] {
+            tx.send(commit_at(&mut builder, n)).expect("receiver is live");
+        }
+        tokio::spawn(drive_canonical_head(Arc::clone(&board), rx, FakeChain::new(HEAD), 120));
+        settle(|| false).await;
+
+        assert_eq!(board.status().1, HEAD, "the stale commit must not lower the head");
+        assert!(accepts(&board, chain_hash(HEAD), 1), "the head hash stays known");
+        assert!(accepts(&board, chain_hash(HEAD - 60), 2), "the lag re-seed loads the window");
+    }
+
+    /// A plain commit at or below the head, sent after the re-seed, is old
+    /// news and must be skipped too.
+    #[tokio::test]
+    async fn an_old_commit_after_a_lag_is_skipped() {
+        const HEAD: u64 = 500;
+        let board = window_board();
+        let (tx, rx) = tokio::sync::broadcast::channel::<CanonStateNotification>(1);
+        let mut builder = TestBlockBuilder::eth();
+        for n in [HEAD - 3, HEAD - 2] {
+            tx.send(commit_at(&mut builder, n)).expect("receiver is live");
+        }
+        tokio::spawn(drive_canonical_head(Arc::clone(&board), rx, FakeChain::new(HEAD), 120));
+        settle(|| false).await;
+
+        tx.send(commit_at(&mut builder, HEAD - 1)).expect("receiver is live");
+        settle(|| false).await;
+
+        assert_eq!(board.status().1, HEAD);
+        assert!(accepts(&board, chain_hash(HEAD), 1), "the head hash stays known");
+    }
+
+    /// A reorg can lower the head, so the skip rule must not apply to it.
+    #[tokio::test]
+    async fn a_reorg_to_a_lower_tip_still_moves_the_head() {
+        let board = window_board();
+        let (tx, rx) = tokio::sync::broadcast::channel::<CanonStateNotification>(4);
+        tokio::spawn(drive_canonical_head(Arc::clone(&board), rx, FakeChain::new(0), 120));
+
+        let mut builder = TestBlockBuilder::eth();
+        let old: Vec<_> =
+            builder.get_executed_blocks(10..15).map(|b| b.recovered_block().clone()).collect();
+        let old_tip = old.last().expect("five blocks").hash();
+        let new_block = builder.get_executed_block_with_number(12, old[1].hash());
+        let new_hash = new_block.recovered_block().hash();
+        let old_part = Arc::new(Chain::new(old[2..].to_vec(), Default::default(), BTreeMap::new()));
+        let old_all = Arc::new(Chain::new(old, Default::default(), BTreeMap::new()));
+        tx.send(CanonStateNotification::Commit { new: old_all }).expect("receiver is live");
+        settle(|| board.status().1 == 14).await;
+
+        let new = Arc::new(Chain::new(
+            [new_block.recovered_block().clone()],
+            Default::default(),
+            BTreeMap::new(),
+        ));
+        tx.send(CanonStateNotification::Reorg { old: old_part, new }).expect("receiver is live");
+        settle(|| board.status().1 == 12).await;
+
+        assert_eq!(board.status().1, 12, "the reorg lowers the head");
+        assert!(accepts(&board, new_hash, 1), "the new tip is known");
+        assert!(!accepts(&board, old_tip, 2), "the orphaned tip is forgotten");
+    }
+
+    /// If the provider cannot give the window, the seed still loads the head,
+    /// as the startup code did before it loaded the window.
+    #[tokio::test]
+    async fn a_failed_range_read_still_seeds_the_head() {
+        const HEAD: u64 = 1_000;
+        let board = window_board();
+        let range = cheap_launcher().config.block_range;
+        let chain = FakeChain::with_range(HEAD, RangeMode::Fail);
+        seed_head_window(&board, &chain, range).expect("the head alone is enough");
+
+        assert_eq!(board.status().1, HEAD);
+        assert!(accepts(&board, chain_hash(HEAD), 1), "the head hash is known");
+    }
+
+    /// `canonical_hashes_range` gives no block numbers. If it returns fewer
+    /// hashes than asked for, the seed must not pair a hash with the wrong
+    /// number.
+    #[tokio::test]
+    async fn a_short_range_read_never_misnumbers_a_hash() {
+        const HEAD: u64 = 1_000;
+        let board = window_board();
+        let range = cheap_launcher().config.block_range;
+        let chain = FakeChain::with_range(HEAD, RangeMode::DropFirst);
+        seed_head_window(&board, &chain, range).expect("seed");
+
+        for (tag, n) in (HEAD - range + 1..=HEAD).enumerate() {
+            if let Ok(msg) = board.add_local_msg(mine(chain_hash(n), &[tag as u8, 0xEE])) {
+                assert_eq!(msg.block_number, n, "hash of block {n} got the wrong number");
+            }
+        }
+        assert!(accepts(&board, chain_hash(HEAD), 1), "the head hash is known");
     }
 
     /// A transport whose allowlist does not name msgboard must not carry it.
