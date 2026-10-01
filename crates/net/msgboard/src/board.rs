@@ -26,7 +26,10 @@ use reth_msgboard_types::{
 };
 
 use crate::{
-    block_filter::BlockFilter, db, index::MsgIndex, metrics::MsgboardMetrics,
+    block_filter::BlockFilter,
+    db,
+    index::{IndexPage, MsgIndex},
+    metrics::MsgboardMetrics,
     pending::PendingRequests,
 };
 
@@ -866,6 +869,19 @@ impl MsgBoard {
     ) -> Vec<Arc<CheckedPoWMsg>> {
         let state = self.state.lock();
         state.index.all_msgs_filtered(from_block, to_block)
+    }
+
+    /// One `msgboard_contentPage` page. See [`MsgIndex::content_page`].
+    pub fn content_page(
+        &self,
+        category: Option<&B256>,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+        after: Option<B256>,
+        limit: usize,
+    ) -> IndexPage {
+        let state = self.state.lock();
+        state.index.content_page(category, from_block, to_block, after, limit)
     }
 
     /// All known category hashes, sorted ascending (for `msgboard_categories` RPC).
@@ -2265,5 +2281,52 @@ mod tests {
             Arc::ptr_eq(&batch.current[0], &inserted),
             "the flush must borrow the board's messages, not copy them",
         );
+    }
+
+    /// Every board path that changes the index leaves its hash-ordered maps
+    /// in step with the ordered vec: load, insert, count-limit eviction,
+    /// `set_head` expiry and `seed_window` expiry.
+    #[test]
+    fn index_stays_consistent_through_every_board_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MsgboardConfig { work_divisor: CHEAP_WORK_DIVISOR, ..easy_cfg() };
+        let block = |i: u64| B256::repeat_byte(i as u8);
+        let check = |board: &MsgBoard| board.state.lock().index.assert_consistent();
+        {
+            let env = crate::db::open_msgboard_db(dir.path()).expect("open db");
+            let board = MsgBoard::with_db(cfg.clone(), env);
+            board.set_ready();
+            for i in 1..=6u64 {
+                board.set_head(i, block(i));
+                board
+                    .add_local_msg(mine_for_block(block(i), CHEAP_WORK_DIVISOR, &[i as u8]))
+                    .expect("valid");
+                check(&board);
+            }
+        }
+
+        let env = crate::db::open_msgboard_db(dir.path()).expect("reopen");
+        let board = MsgBoard::with_db(MsgboardConfig { count_limit: 4, ..cfg }, env);
+        board.load_from_db().expect("load");
+        check(&board);
+        assert_eq!(board.all_messages().len(), 4);
+
+        board.set_ready();
+        board.set_head(7, block(7));
+        board.add_local_msg(mine_for_block(block(7), CHEAP_WORK_DIVISOR, &[7])).expect("valid");
+        check(&board);
+        assert_eq!(board.all_messages().len(), 4, "the insert evicted one");
+
+        // The window covers `block_range` blocks below the head, so a far
+        // head expires everything below it.
+        let range = board.config().block_range;
+        board.set_head(5 + range, block(9));
+        check(&board);
+        let left = board.all_messages().len();
+        assert!(left < 4, "set_head expired something, {left} left");
+
+        board.seed_window(200 + range, [(200 + range, block(10))]);
+        check(&board);
+        assert!(board.all_messages().is_empty(), "seed_window expired the rest");
     }
 }
