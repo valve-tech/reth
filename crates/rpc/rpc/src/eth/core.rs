@@ -520,6 +520,21 @@ where
         origin: reth_transaction_pool::TransactionOrigin,
         transaction: <N::Pool as TransactionPool>::Transaction,
     ) -> Result<AddedTransactionOutcome, EthApiError> {
+        Ok(self.submit_pool_transaction(origin, transaction).await??)
+    }
+
+    /// Adds an _unvalidated_ transaction into the pool via the transaction batch sender.
+    ///
+    /// Unlike [`Self::add_pool_transaction`], this keeps the pool's rejection as a
+    /// [`PoolError`](reth_transaction_pool::error::PoolError) in the inner result, so the caller
+    /// can tell why the pool rejected the transaction. The outer error means that the batch task
+    /// did not answer.
+    pub async fn submit_pool_transaction(
+        &self,
+        origin: reth_transaction_pool::TransactionOrigin,
+        transaction: <N::Pool as TransactionPool>::Transaction,
+    ) -> Result<Result<AddedTransactionOutcome, reth_transaction_pool::error::PoolError>, EthApiError>
+    {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let request = reth_transaction_pool::BatchTxRequest::new(origin, transaction, response_tx);
 
@@ -527,7 +542,7 @@ where
             .send(request)
             .map_err(|_| reth_rpc_eth_types::EthApiError::BatchTxSendError)?;
 
-        Ok(response_rx.await??)
+        Ok(response_rx.await?)
     }
 
     /// Returns the pending block kind
