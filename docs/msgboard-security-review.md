@@ -43,6 +43,28 @@ Severity is after verification. Finding 1 was reported as high; the reviewer ass
 | 18 | Info | Reth rejects a whole frame for a message with D = 0; erigon rejects only that message. Stricter, cannot split honest nodes. | `pow.rs:155`, `wire.rs:74` | `msgboard/rpc-cli-docs` | accepted and documented in `docs/msgboard-parity-gaps.md` §27.1 |
 | 19 | Info | `CheckedPoWMsg` DB encoding has a timestamp field erigon lacks. Disk only. | `pow.rs:121-131` | `msgboard/rpc-cli-docs` | accepted and documented in `docs/msgboard-parity-gaps.md` §27.2 |
 
+## Round 2 findings (2026-10-01)
+
+Round 2 reviewed `main` at `0b46d7d398` with four read-only reviewers: the changes since round 1, a section-by-section walk of the specs against the erigon-pulse Go code, an attempt to break each round-1 fix, and a fresh denial-of-service and test-quality pass. It found one bypass of a round-1 fix (finding 2), two client-visible RPC differences from erigon, and several lower issues. Round-1 findings 1 and 3 to 19 hold.
+
+| # | Severity | Finding | Where | Branch | Status |
+|---|---|---|---|---|---|
+| 20 | High | Withholding fix bypass: a sybil evicted from a claim's alternate list can announce the same ID again and re-enter. About 17 looping sybils flush every honest announcer and then withhold through retries at no reputation cost. R1 is understated. | `pending.rs:182-198`, `board.rs:436` | `fix/msgboard-r2-p2p` | in progress |
+| 21 | High (client) | `msgboard_subscribe` accepts only `"newMessages"`; erigon's name on the wire is `"messages"`. | `rpc.rs:33,213` | `fix/msgboard-r2-rpc` | in progress |
+| 22 | High (client) | `fromBlock`/`toBlock` accept only JSON numbers; erigon accepts hex and decimal strings. | `rpc_api.rs:101-105` | `fix/msgboard-r2-rpc` | in progress |
+| 23 | Medium | Honest reth peers can strike each other: a responder serves only the budget-sized part of a request, and the requester counts a later frame's request as unanswered. | `protocol.rs` serve and request paths | `fix/msgboard-r2-p2p` | in progress |
+| 24 | Medium | A stalled reader gets reply encoding for free: the lookup and encode run, the send fails, and the budget is refunded, so the rate cap never applies. | `protocol.rs:591-606,1184-1240,1384-1413` | `fix/msgboard-r2-p2p` | in progress |
+| 25 | Medium | After a restart the block window holds only the head hash; erigon seeds every canonical hash in the window. Messages anchored before the restart are rejected and never fetched again. | `launch.rs:209` | `fix/msgboard-r2-block-window` | in progress |
+| 26 | Medium | Full-board memory is not bounded by the build limit: each finished reply (about 167 MB) stays alive until the client has read it. R5 and R6 are understated. | `rpc.rs:98-106` | `fix/msgboard-r2-rpc` | in progress |
+| 27 | Low-Med | Only the tip of each canonical update enters the block window, so messages anchored on intermediate blocks of a multi-block commit are refused. | `launch.rs:305-309` | `fix/msgboard-r2-block-window` | in progress |
+| 28 | Low-Med | Orphan block hashes survive a reorg that lowers the head; reth then accepts messages erigon rejects. | `block_filter.rs:49` | `fix/msgboard-r2-block-window` | in progress |
+| 29 | Low | `msgboard_contentPage` shares the two build slots with full-board `msgboard_content`, so looping full builds starve pagers. | `rpc.rs:66-115` | `fix/msgboard-r2-rpc` | in progress |
+| 30 | Low | `msgboard_addMessage` verifies PoW on the RPC async worker. | `rpc.rs:105-112` | `fix/msgboard-r2-rpc` | in progress |
+| 31 | Low | Withhold strikes live per connection, so a reconnect before the third strike resets escalation. | `protocol.rs:804` | `fix/msgboard-r2-p2p` | in progress |
+| 32 | Low | A page call copies the whole board under the board mutex before it applies the cursor; a txpool page copies the whole pool. | `board.rs:766-773`, `txpool_page.rs:184` | none | open (accepted for now; see R8) |
+| 33 | Info | Further erigon differences to document as intentional: `getMessage` miss returns `null` (erigon errors), `addMessage` decode errors return -32602 (erigon -32000), status difficulty shown as 10000/1000000 (erigon 1/100, same ratio), subscription filter `{}` means all categories, lenient penalty for unknown-block bodies. Two parity-gaps entries are stale. | `docs/msgboard-parity-gaps.md` | `fix/msgboard-r2-rpc` | in progress |
+| 34 | Info | Test quality: six tests would still pass if the behaviour they test broke (claim release on a dropped send, the session gauge in the connection loop, subscription gauge decrement, two sleep-based tests, an eviction test with no upper bound); ten important behaviours have no test. | test modules | `fix/msgboard-r2-p2p` | in progress |
+
 ## Residual risks
 
 These risks stay after the fixes. We accept them on purpose, and the auditor should see them stated.
@@ -57,6 +79,8 @@ These risks stay after the fixes. We accept them on purpose, and the auditor sho
 | R4 | On SIGTERM, a message accepted between the final flush and the stop of the network is lost. | The window is milliseconds. The fix stops intake before the final flush where that is safe. | 4 |
 | R5 | A full default board is about 167 MB of JSON, which is close to reth's default `--rpc.max-response-size` of 160 MiB. A stock reth node cannot send a nearly full board. | Our build raises the default to 200 MiB (see R6). Stock reth and erigon nodes must set `--rpc.max-response-size 200`; the RPC doc says so. | 14 |
 | R6 | Our build raises the default `--rpc.max-response-size` from 160 MiB to 200 MiB so a full board fits. The limit applies to every RPC method, so `debug_trace*`, `eth_getLogs` and others can build up to 25% larger replies before they fail. | Needed for erigon parity on `msgboard_content`. Full-board builds are limited to two at a time. Operators can set the flag lower on nodes that do not serve msgboard. | 14 |
+| R7 | Anyone willing to pay the PoW can flush every honest message off the board: eviction removes the oldest block first, then the lowest work, and the cheapest message needs about 168k hashes. | This matches erigon. The PoW cost is the only price. | 20 |
+| R8 | A `msgboard_contentPage` call costs O(board) under the board mutex, and a txpool page call costs O(pool), whatever the page size. | Bounded by the build slots; a hash-ordered index or a pool range iterator would remove it later. | 32 |
 
 ## Checked and found correct
 
@@ -78,3 +102,4 @@ The reviewers verified these. The auditor can use this list to see what we cover
 | 2026-09-28 | Branches reviewed. Recorded residual risks R1-R5. Finding 14: decided to serve the whole board. Finding 1: limits set at 256 frames and 16 MiB per peer. |
 | 2026-09-28 | All four branches approved and merged into `msgboard/security-review`. Local CI: 672 + 7 tests pass. |
 | 2026-09-28 | MR !3 merged to GitLab `main` as 9423eb56b3. Pipeline 2835 passed. Findings 1-12 and 14-17 fixed; 13, 18 and 19 accepted and documented. |
+| 2026-10-01 | Round 2 review: findings 20-34 recorded, R7 and R8 added. R1, R1b, R5 and R6 are understated until findings 20, 23 and 26 are fixed. |
