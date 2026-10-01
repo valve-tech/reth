@@ -11,7 +11,8 @@ use alloy_primitives::{Bytes, B256};
 use async_trait::async_trait;
 use futures::{future::ready, StreamExt};
 use jsonrpsee::{
-    core::RpcResult, types::ErrorObjectOwned, PendingSubscriptionSink, SubscriptionMessage,
+    core::RpcResult, types::ErrorObjectOwned, PendingSubscriptionSink, ResponsePayload,
+    SubscriptionMessage,
 };
 use reth_msgboard_types::{decode_validated_pow_msg, CheckedPoWMsg, MsgboardError};
 use serde::Serialize;
@@ -28,9 +29,14 @@ use crate::{
     },
 };
 
-/// Subscription kind discriminator. Matches erigon-pulse's
-/// `msgboard_subscribe(["newMessages", filter?])` shape.
-const SUBSCRIPTION_KIND_NEW_MESSAGES: &str = "newMessages";
+/// Subscription kinds that `msgboard_subscribe` accepts.
+///
+/// Erigon-pulse registers the subscription as its Go method `Messages`, and
+/// `formatName` in its `rpc` package lower-cases the first letter, so
+/// erigon's wire name is `"messages"`. `"newMessages"` is the name in
+/// erigon's doc comment and reth's older name; reth keeps it for clients
+/// written against it.
+const SUBSCRIPTION_KINDS: [&str; 2] = ["messages", "newMessages"];
 
 /// Holds the live-subscription gauge up for as long as a subscription runs.
 ///
@@ -63,9 +69,15 @@ impl Drop for SubscriptionGuard {
 #[derive(Debug, Clone)]
 pub struct MsgboardApi {
     board: Arc<MsgBoard>,
-    /// Bounds concurrent `msgboard_content` builds; see
+    /// Bounds concurrent `msgboard_content` responses; see
     /// [`CONTENT_CONCURRENT_BUILDS`].
     content_permits: Arc<Semaphore>,
+    /// Bounds concurrent `msgboard_contentPage` responses; see
+    /// [`CONTENT_PAGE_CONCURRENT_BUILDS`].
+    page_permits: Arc<Semaphore>,
+    /// Bounds concurrent `msgboard_addMessage` verifications; see
+    /// [`ADD_MESSAGE_CONCURRENT_VERIFIES`].
+    add_permits: Arc<Semaphore>,
     #[cfg(test)]
     probe: Arc<tests::BuildProbe>,
 }
@@ -76,103 +88,179 @@ impl MsgboardApi {
         Self {
             board,
             content_permits: Arc::new(Semaphore::new(CONTENT_CONCURRENT_BUILDS)),
+            page_permits: Arc::new(Semaphore::new(CONTENT_PAGE_CONCURRENT_BUILDS)),
+            add_permits: Arc::new(Semaphore::new(ADD_MESSAGE_CONCURRENT_VERIFIES)),
             #[cfg(test)]
             probe: Default::default(),
         }
     }
 
-    /// Waits for a content permit, then runs `f` on the blocking pool and
-    /// serialises its result there. `msgboard_content` and
-    /// `msgboard_contentPage` share the permits.
+    /// Waits for one of `permits`, then runs `f` on the blocking pool and
+    /// serialises its result there.
     ///
     /// A full default board is about 80 MB of `data` and 167 MB of JSON, and
     /// building it takes seconds. The blocking pool does the snapshot, the
     /// deep copy and the hex serialisation: the handler returns
     /// pre-serialised JSON, so jsonrpsee has nothing left to serialise on the
     /// runtime worker.
+    ///
+    /// The permit lives until jsonrpsee reports the response processed, not
+    /// only until the build ends. jsonrpsee copies the JSON into its own
+    /// response buffer, and that copy lives until the transport takes it. On
+    /// `WebSocket` and IPC, the report comes when the response enters the
+    /// connection's send queue. On HTTP, it comes when jsonrpsee hands the
+    /// response to the HTTP layer. After that point the transport owns the
+    /// bytes, and the permit does not cover them.
     async fn build<T: Serialize>(
         &self,
+        permits: &Arc<Semaphore>,
         method: &'static str,
         f: impl FnOnce(&MsgBoard) -> T + Send + 'static,
-    ) -> RpcResult<Box<RawValue>> {
-        let permit = Arc::clone(&self.content_permits)
-            .acquire_owned()
-            .await
-            .map_err(|err| internal_error(format!("{method} permit: {err}")))?;
+    ) -> ResponsePayload<'static, Box<RawValue>> {
+        let permit = match Arc::clone(permits).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                return ResponsePayload::error(internal_error(format!("{method} permit: {err}")))
+            }
+        };
         #[cfg(test)]
         let probe = Arc::clone(&self.probe);
         let board = Arc::clone(&self.board);
 
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+        // The permit moves into the blocking task and comes back with the
+        // result, so a build that outlives a disconnected caller still holds
+        // it until the build ends.
+        let built = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             let _guard = probe.enter();
-            serde_json::value::to_raw_value(&f(&board))
+            (permit, serde_json::value::to_raw_value(&f(&board)))
         })
-        .await
-        .map_err(|err| internal_error(format!("{method} task failed: {err}")))?
-        .map_err(|err| internal_error(format!("{method} serialisation failed: {err}")))
+        .await;
+        let (permit, json) = match built {
+            Ok(built) => built,
+            Err(err) => {
+                return ResponsePayload::error(internal_error(format!(
+                    "{method} task failed: {err}"
+                )))
+            }
+        };
+        let json = match json {
+            Ok(json) => json,
+            Err(err) => {
+                return ResponsePayload::error(internal_error(format!(
+                    "{method} serialisation failed: {err}"
+                )))
+            }
+        };
+
+        let (payload, processed) = ResponsePayload::success(json).notify_on_completion();
+        // `processed` also resolves, with an error, when jsonrpsee drops the
+        // response unsent, so the permit always comes back.
+        tokio::spawn(async move {
+            let _ = processed.await;
+            drop(permit);
+        });
+        payload
     }
 }
 
-/// Most `msgboard_content` responses the node builds at once.
+/// Most `msgboard_content` responses the node holds at once.
 ///
 /// One full default board holds about 80 MB of copied `data` and 167 MB of
 /// JSON while it is built, so unbounded callers could hold gigabytes. A call
 /// past this bound waits for a permit. A caller that disconnects while it
 /// waits drops the handler future, and with it the wait, so nothing is built.
-/// The permit moves into the blocking task, so a build that outlives its
-/// caller still holds its permit until it ends.
+/// A permit covers the build and jsonrpsee's copy of the response until the
+/// transport takes it; see [`MsgboardApi::build`].
 pub const CONTENT_CONCURRENT_BUILDS: usize = 2;
+
+/// Most `msgboard_contentPage` responses the node holds at once.
+///
+/// A page holds at most [`MSGBOARD_CONTENT_PAGE_MAX_LIMIT`] messages, about
+/// 17 MB of JSON at the default 8 KiB size limit. These permits are separate
+/// from [`CONTENT_CONCURRENT_BUILDS`], so callers that loop full-board builds
+/// cannot starve a pager.
+pub const CONTENT_PAGE_CONCURRENT_BUILDS: usize = 4;
+
+/// Most `msgboard_addMessage` verifications the node runs at once.
+///
+/// Each call takes a thread from tokio's shared blocking pool (512 threads by
+/// default) and then the board mutex. Without a cap, a flood of calls could
+/// fill that pool with threads that wait on one lock, and starve every other
+/// blocking task in the node. Eight is about one per core on the fleet's
+/// boxes. A call past the cap waits for a permit before it takes a thread, so
+/// a caller that disconnects while it waits costs nothing.
+pub const ADD_MESSAGE_CONCURRENT_VERIFIES: usize = 8;
 
 #[async_trait]
 impl MsgboardApiServer for MsgboardApi {
     async fn msgboard_add_message(&self, input: Bytes) -> RpcResult<B256> {
         // Mirror erigon-pulse `PoWMsgFromRLP`: decode + validate at the RPC
         // boundary so the board's hot path can trust its inputs and the
-        // validation error code is identical to erigon's.
-        let msg = decode_validated_pow_msg(input.as_ref()).map_err(msgboard_error_to_rpc)?;
-
-        match self.board.add_local_msg(msg) {
-            Ok(checked) => Ok(checked.hash),
-            Err(err) => Err(msgboard_error_to_rpc(err)),
-        }
+        // validation error code is identical to erigon's. The `PoW` check is
+        // a secp256k1 scalar multiplication, so it runs on the blocking pool,
+        // not on the runtime worker, under `add_permits`.
+        let permit = Arc::clone(&self.add_permits)
+            .acquire_owned()
+            .await
+            .map_err(|err| internal_error(format!("msgboard_addMessage permit: {err}")))?;
+        #[cfg(test)]
+        let probe = Arc::clone(&self.probe);
+        let board = Arc::clone(&self.board);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            let _guard = probe.enter_verify();
+            let msg = decode_validated_pow_msg(input.as_ref())?;
+            board.add_local_msg(msg).map(|checked| checked.hash)
+        })
+        .await
+        .map_err(|err| internal_error(format!("msgboard_addMessage task failed: {err}")))?
+        .map_err(msgboard_error_to_rpc)
     }
 
     async fn msgboard_categories(&self) -> RpcResult<Vec<B256>> {
         Ok(self.board.categories())
     }
 
-    async fn msgboard_content(&self, filter: Option<ContentFilter>) -> RpcResult<Box<RawValue>> {
+    async fn msgboard_content(
+        &self,
+        filter: Option<ContentFilter>,
+    ) -> ResponsePayload<'static, Box<RawValue>> {
         let filter = filter.unwrap_or_default();
         if filter.after.is_some() {
-            return Err(invalid_params(
+            return ResponsePayload::error(invalid_params(
                 "msgboard_content has no `after` cursor; page with msgboard_contentPage",
             ));
         }
         if filter.limit == Some(0) {
-            return Err(invalid_params("msgboard_content: `limit` must be at least 1"));
+            return ResponsePayload::error(invalid_params(
+                "msgboard_content: `limit` must be at least 1",
+            ));
         }
         let offset = filter.offset.unwrap_or(0);
         let limit = filter.limit.unwrap_or(usize::MAX);
         let ContentFilter { category, from_block, to_block, .. } = filter;
-        self.build("msgboard_content", move |board| {
+        self.build(&self.content_permits, "msgboard_content", move |board| {
             let msgs = matching(board, category, from_block, to_block);
             group_by_category(msgs.iter().skip(offset).take(limit))
         })
         .await
     }
 
-    async fn msgboard_content_page(&self, request: ContentPageRequest) -> RpcResult<Box<RawValue>> {
+    async fn msgboard_content_page(
+        &self,
+        request: ContentPageRequest,
+    ) -> ResponsePayload<'static, Box<RawValue>> {
         let ContentPageRequest { limit, after, category, from_block, to_block } = request;
         if limit == 0 || limit > MSGBOARD_CONTENT_PAGE_MAX_LIMIT {
-            return Err(invalid_params(format!(
+            return ResponsePayload::error(invalid_params(format!(
                 "msgboard_contentPage: `limit` must be from 1 to \
                  {MSGBOARD_CONTENT_PAGE_MAX_LIMIT}, got {limit}"
             )));
         }
 
-        self.build("msgboard_contentPage", move |board| {
+        self.build(&self.page_permits, "msgboard_contentPage", move |board| {
             let mut msgs = matching(board, category, from_block, to_block);
             // A hash never changes and every replica computes the same one,
             // so inserts and evictions cannot shift a message across the
@@ -210,7 +298,7 @@ impl MsgboardApiServer for MsgboardApi {
         kind: String,
         filter: Option<NewMessagesFilter>,
     ) -> jsonrpsee::core::SubscriptionResult {
-        if kind != SUBSCRIPTION_KIND_NEW_MESSAGES {
+        if !SUBSCRIPTION_KINDS.contains(&kind.as_str()) {
             let err = ErrorObjectOwned::owned(
                 -32602,
                 format!("unsupported subscription kind: {kind:?}"),
@@ -373,7 +461,11 @@ mod tests {
     use std::collections::HashSet;
 
     use alloy_primitives::Bytes;
-    use jsonrpsee::{core::server::MethodsError, RpcModule};
+    use jsonrpsee::{
+        core::server::{ConnectionId, Extensions, MethodCallback, MethodsError},
+        types::{Id, Params},
+        RpcModule,
+    };
     use reth_msgboard_types::{MsgboardConfig, PoWMsg, VERSION_V1};
     use serde_json::{json, Value};
 
@@ -385,9 +477,18 @@ mod tests {
     pub(super) struct BuildProbe {
         in_flight: std::sync::atomic::AtomicUsize,
         peak: std::sync::atomic::AtomicUsize,
+        /// Thread that ran the last `msgboard_addMessage` `PoW` verification.
+        pub(super) verify_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
     }
 
     impl BuildProbe {
+        /// Records the verifying thread, then counts the verification like a
+        /// build.
+        pub(super) fn enter_verify(self: &Arc<Self>) -> BuildGuard {
+            *self.verify_thread.lock().unwrap() = Some(std::thread::current().id());
+            self.enter()
+        }
+
         pub(super) fn enter(self: &Arc<Self>) -> BuildGuard {
             use std::sync::atomic::Ordering::SeqCst;
             let now = self.in_flight.fetch_add(1, SeqCst) + 1;
@@ -414,16 +515,9 @@ mod tests {
         let probe = Arc::clone(&api.probe);
         let m = api.into_rpc();
 
-        // `msgboard_contentPage` shares the same permits.
         let m = &m;
-        let calls = (0..12).map(|i| async move {
-            if i % 2 == 0 {
-                m.call::<_, Value>("msgboard_content", rpc_params_none()).await.unwrap()
-            } else {
-                let page: Value =
-                    m.call("msgboard_contentPage", vec![json!({"limit": 10})]).await.unwrap();
-                page["content"].clone()
-            }
+        let calls = (0..12).map(|_| async move {
+            m.call::<_, Value>("msgboard_content", rpc_params_none()).await.unwrap()
         });
         for v in futures::future::join_all(calls).await {
             assert_eq!(total_msgs(&v), 4);
@@ -1215,8 +1309,7 @@ mod tests {
         for request in [json!({}), json!({"limit": 0}), json!({"limit": 1_001})] {
             assert_eq!(call_err_code(&m, "msgboard_contentPage", vec![request]).await, -32602);
         }
-        let v: Value =
-            m.call("msgboard_contentPage", vec![json!({"limit": 1_000})]).await.unwrap();
+        let v: Value = m.call("msgboard_contentPage", vec![json!({"limit": 1_000})]).await.unwrap();
         assert_eq!(total_msgs(&v["content"]), 3);
     }
 
@@ -1240,10 +1333,7 @@ mod tests {
     #[tokio::test]
     async fn content_rejects_a_zero_limit() {
         let m = module(filled_board(3, 8));
-        assert_eq!(
-            call_err_code(&m, "msgboard_content", vec![json!({"limit": 0})]).await,
-            -32602
-        );
+        assert_eq!(call_err_code(&m, "msgboard_content", vec![json!({"limit": 0})]).await, -32602);
     }
 
     // ── subscribe: the server's own cap ──────────────────────────────────────
@@ -1437,5 +1527,190 @@ mod tests {
     /// serializes an empty positional list, which is what a client sends.
     fn rpc_params_none() -> Vec<Value> {
         Vec::new()
+    }
+
+    // ── review round 2 ───────────────────────────────────────────────────────
+
+    /// Erigon names the subscription after its Go method `Messages`, and
+    /// `formatName` lower-cases the first letter, so its wire name is
+    /// `"messages"`. Reth also keeps its older `"newMessages"`.
+    #[tokio::test]
+    async fn subscribe_accepts_the_erigon_and_the_legacy_kind_names() {
+        for kind in ["messages", "newMessages"] {
+            let board = ready_board(10);
+            let m = module(Arc::clone(&board));
+            let mut sub = m
+                .subscribe_unbounded("msgboard_subscribe", vec![kind])
+                .await
+                .unwrap_or_else(|e| panic!("kind {kind:?} must subscribe: {e:?}"));
+            let msg = mined(&[9], category(0xAB), 10);
+            let hash = board.add_local_msg(msg).unwrap().hash;
+            let (got, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), sub.next::<MsgboardMsg>())
+                    .await
+                    .expect("notification in time")
+                    .expect("stream open")
+                    .expect("decodes");
+            assert_eq!(got.hash, hash, "kind {kind:?}");
+        }
+    }
+
+    /// Ready board at head 30 with one message at each of blocks 10, 20 and 30.
+    fn three_block_board() -> Arc<MsgBoard> {
+        let board = ready_board(30);
+        for h in [10u64, 20, 30] {
+            board.set_head(h, B256::repeat_byte(h as u8));
+        }
+        board.set_head(30, B256::repeat_byte(30));
+        for h in [10u64, 20, 30] {
+            let msg = (1u64..=1_000_000)
+                .find_map(|n| {
+                    let mut c = pow_msg(n, &[h as u8], category(0xAA));
+                    c.block_hash = B256::repeat_byte(h as u8);
+                    c.clone().to_checked(h, 0).is_ok().then_some(c)
+                })
+                .expect("nonce");
+            board.add_local_msg(msg).unwrap();
+        }
+        board
+    }
+
+    /// `fromBlock` and `toBlock` take every form erigon's `rpc.BlockNumber`
+    /// takes, with erigon's meaning, on both content methods.
+    #[tokio::test]
+    async fn content_block_bounds_accept_erigon_block_number_forms() {
+        let m = module(three_block_board());
+        // (filter, messages expected)
+        let cases = [
+            (json!({"fromBlock": 20, "toBlock": 20}), 1),
+            (json!({"fromBlock": "0x14", "toBlock": "0x14"}), 1),
+            (json!({"fromBlock": "20", "toBlock": "20"}), 1),
+            (json!({"fromBlock": "0x14"}), 2),
+            (json!({"fromBlock": null, "toBlock": null}), 3),
+            // Erigon reads 0 as "no bound", and "earliest" is 0.
+            (json!({"toBlock": 0}), 3),
+            (json!({"toBlock": "earliest"}), 3),
+            (json!({"fromBlock": "earliest", "toBlock": "0x14"}), 2),
+            // A tag is a negative int64 in erigon, cast to uint64: as an upper
+            // bound it admits every block, as a lower bound none.
+            (json!({"toBlock": "latest"}), 3),
+            (json!({"toBlock": "pending"}), 3),
+            (json!({"toBlock": "safe"}), 3),
+            (json!({"toBlock": "finalized"}), 3),
+            (json!({"fromBlock": "latest"}), 0),
+        ];
+        for (filter, want) in cases {
+            let v: Value = m
+                .call("msgboard_content", vec![filter.clone()])
+                .await
+                .unwrap_or_else(|e| panic!("content {filter}: {e:?}"));
+            assert_eq!(total_msgs(&v), want, "content {filter}");
+
+            let mut request = filter.clone();
+            request["limit"] = json!(10);
+            let v: Value = m
+                .call("msgboard_contentPage", vec![request])
+                .await
+                .unwrap_or_else(|e| panic!("contentPage {filter}: {e:?}"));
+            assert_eq!(total_msgs(&v["content"]), want, "contentPage {filter}");
+        }
+
+        for bad in [json!("foo"), json!("0x8000000000000000"), json!(-1), json!(1.5)] {
+            let code = call_err_code(&m, "msgboard_content", vec![json!({"toBlock": bad})]).await;
+            assert_eq!(code, -32602, "toBlock {bad}");
+        }
+    }
+
+    /// Full-board builds that hold every content permit must not stall a
+    /// page call: `msgboard_contentPage` has permits of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn content_page_is_not_starved_by_full_board_builds() {
+        let api = MsgboardApi::new(filled_board(4, 8));
+        let held = Arc::clone(&api.content_permits)
+            .acquire_many_owned(CONTENT_CONCURRENT_BUILDS as u32)
+            .await
+            .unwrap();
+        let m = api.into_rpc();
+
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            m.call::<_, Value>("msgboard_contentPage", vec![json!({"limit": 10})]),
+        )
+        .await
+        .expect("a page call must not wait for full-board builds")
+        .unwrap();
+        assert_eq!(total_msgs(&page["content"]), 4);
+        drop(held);
+    }
+
+    /// The content permit must cover the serialised response until the
+    /// transport takes it, not only the build: otherwise N slow clients each
+    /// hold a full-board response with no permit.
+    #[tokio::test]
+    async fn content_permit_is_held_until_the_response_is_handed_off() {
+        let api = MsgboardApi::new(filled_board(4, 8));
+        let permits = Arc::clone(&api.content_permits);
+        let m = api.into_rpc();
+        let Some(MethodCallback::Async(cb)) = m.method("msgboard_content") else {
+            panic!("msgboard_content must be an async method");
+        };
+
+        let response =
+            cb(Id::Number(1), Params::new(None), ConnectionId(0), usize::MAX, Extensions::new())
+                .await;
+        assert!(response.is_success());
+        assert_eq!(
+            permits.available_permits(),
+            CONTENT_CONCURRENT_BUILDS - 1,
+            "the response exists but the transport has not taken it: the permit must be held",
+        );
+
+        let (_json, notify, _) = response.into_parts();
+        notify.expect("the response must ask to be told when it is sent").notify(true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while permits.available_permits() != CONTENT_CONCURRENT_BUILDS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the permit must come back once the transport has the response");
+    }
+
+    /// A flood of `msgboard_addMessage` calls must not fill the shared
+    /// blocking pool: at most [`ADD_MESSAGE_CONCURRENT_VERIFIES`] run at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn add_message_verifies_are_bounded_by_the_permit_count() {
+        let api = MsgboardApi::new(ready_board(10));
+        let probe = Arc::clone(&api.probe);
+        let m = api.into_rpc();
+        let n = 3 * ADD_MESSAGE_CONCURRENT_VERIFIES;
+        let msgs: Vec<_> =
+            (0..n).map(|i| mined(&(i as u32).to_be_bytes(), category(0xCA), 10)).collect();
+
+        let m = &m;
+        let calls = msgs.iter().map(|msg| async move {
+            m.call::<_, B256>("msgboard_addMessage", vec![rlp_hex(msg)]).await.unwrap()
+        });
+        futures::future::join_all(calls).await;
+
+        let peak = probe.peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=ADD_MESSAGE_CONCURRENT_VERIFIES).contains(&peak),
+            "{peak} verifies ran at once; the bound is {ADD_MESSAGE_CONCURRENT_VERIFIES}",
+        );
+    }
+
+    /// `PoW` verification is a secp256k1 scalar multiplication; it must run on the
+    /// blocking pool, not on the runtime worker that serves the call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_message_verifies_off_the_runtime_worker() {
+        let api = MsgboardApi::new(ready_board(10));
+        let probe = Arc::clone(&api.probe);
+        let m = api.into_rpc();
+        let msg = mined(&[5, 5], category(0xCA), 10);
+
+        let _: B256 = m.call("msgboard_addMessage", vec![rlp_hex(&msg)]).await.unwrap();
+        let verified_on = probe.verify_thread.lock().unwrap().expect("verify ran");
+        assert_ne!(verified_on, std::thread::current().id(), "verify ran on the runtime worker");
     }
 }
