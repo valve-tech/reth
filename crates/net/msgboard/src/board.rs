@@ -136,12 +136,27 @@ pub struct MsgBoard {
     /// Prometheus metrics. Cloned out of the struct via `metrics()` for
     /// outside-the-lock observation (e.g. by the protocol handler).
     metrics: MsgboardMetrics,
+    /// Hashes looked up to serve `GetBoardMessages`, so tests can prove a
+    /// reply did no work.
+    #[cfg(test)]
+    wire_lookups: AtomicU64,
 }
 
 impl MsgBoard {
     /// Create a new board with the given configuration (in-memory only).
     pub fn new(cfg: MsgboardConfig) -> Self {
         Self::build(cfg, None)
+    }
+
+    /// Create an in-memory board that records into `metrics`.
+    ///
+    /// `MsgboardMetrics::default()` caches one instance per process, so a test
+    /// that needs handles bound to its own recorder builds them itself.
+    #[cfg(test)]
+    pub(crate) fn with_metrics(cfg: MsgboardConfig, metrics: MsgboardMetrics) -> Self {
+        let mut board = Self::build(cfg, None);
+        board.metrics = metrics;
+        board
     }
 
     /// Create a board backed by an MDBX database for persistence.
@@ -169,6 +184,8 @@ impl MsgBoard {
             ready: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             metrics: MsgboardMetrics::default(),
+            #[cfg(test)]
+            wire_lookups: AtomicU64::new(0),
         }
     }
 
@@ -413,6 +430,18 @@ impl MsgBoard {
     /// The name still mirrors erigon's `FilterMessageIDs`, which does the same
     /// filtering minus the in-flight check.
     pub fn filter_wanted(&self, peer: PeerId, ids: &[MsgID]) -> Vec<MsgID> {
+        self.filter_wanted_from(peer, None, ids)
+    }
+
+    /// [`filter_wanted`](Self::filter_wanted) for an announcer whose remote
+    /// address is in `subnet`, from `pending::subnet_of`. The subnet caps how
+    /// many announcers from one address range count for a claim's alternates.
+    pub fn filter_wanted_from(
+        &self,
+        peer: PeerId,
+        subnet: Option<u64>,
+        ids: &[MsgID],
+    ) -> Vec<MsgID> {
         let now = tokio::time::Instant::now();
         let mut state = self.state.lock();
         let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
@@ -426,33 +455,11 @@ impl MsgBoard {
         let wanted: Vec<MsgID> = ids
             .iter()
             .filter(|id| {
-                // Mirrors erigon's `FilterMessageIDs`: drop announcements with a
-                // version we don't speak before requesting the body, instead of
-                // wasting an RTT and rejecting at decode time.
-                //
-                if id.version() != VERSION_V1 {
-                    return false;
-                }
-                if index.has(&id.message_hash()) {
-                    return false;
-                }
-                if !self.cfg.is_size_acceptable(id.size() as usize) {
-                    return false;
-                }
-                if !self.cfg.is_work_acceptable(id.work_multiplier(), id.work_divisor()) {
-                    return false;
-                }
-                // Skip messages anchored to blocks about to expire.
-                if let Some(block_num) = block_filter.block_number(&id.block_hash()) {
-                    if block_num < stale_lower {
-                        return false;
-                    }
-                } else {
-                    // Block hash not in our window — skip.
+                if !self.is_fetchable(index, block_filter, stale_lower, id) {
                     return false;
                 }
                 // Claimed last, so an ID rejected above never occupies a slot.
-                if pending.claim(**id, peer, now) {
+                if pending.claim_from(**id, peer, subnet, now) {
                     true
                 } else {
                     suppressed += 1;
@@ -468,6 +475,49 @@ impl MsgBoard {
         self.metrics.requests_suppressed.increment(suppressed);
         self.metrics.pending_requests.set(live_claims as f64);
         wanted
+    }
+
+    /// The subset of `ids` that [`filter_wanted`](Self::filter_wanted) could
+    /// return, without claiming anything.
+    ///
+    /// Used to queue announced IDs that a peer cannot serve yet without
+    /// holding claims for them. The caller passes them through
+    /// `filter_wanted` once it can request them.
+    pub fn fetchable(&self, ids: &[MsgID]) -> Vec<MsgID> {
+        let state = self.state.lock();
+        let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
+        ids.iter()
+            .filter(|id| self.is_fetchable(&state.index, &state.block_filter, stale_lower, id))
+            .copied()
+            .collect()
+    }
+
+    /// Whether an announced ID is worth requesting, before the in-flight check.
+    fn is_fetchable(
+        &self,
+        index: &MsgIndex,
+        block_filter: &BlockFilter,
+        stale_lower: u64,
+        id: &MsgID,
+    ) -> bool {
+        // Mirrors erigon's `FilterMessageIDs`: drop announcements with a
+        // version we don't speak before requesting the body, instead of
+        // wasting an RTT and rejecting at decode time.
+        if id.version() != VERSION_V1 {
+            return false;
+        }
+        if index.has(&id.message_hash()) {
+            return false;
+        }
+        if !self.cfg.is_size_acceptable(id.size() as usize) {
+            return false;
+        }
+        if !self.cfg.is_work_acceptable(id.work_multiplier(), id.work_divisor()) {
+            return false;
+        }
+        // Skip messages anchored to blocks about to expire, and blocks not in
+        // our window at all.
+        block_filter.block_number(&id.block_hash()).is_some_and(|n| n >= stale_lower)
     }
 
     /// Hand back claims taken by [`filter_wanted`](Self::filter_wanted) for a
@@ -494,6 +544,14 @@ impl MsgBoard {
     /// Claims then ask `peer` last among their alternates.
     pub fn note_withheld(&self, peer: PeerId) {
         self.state.lock().pending.note_withheld(peer, tokio::time::Instant::now());
+    }
+
+    /// Record one withholding event by `peer`. Returns `true` when it is the
+    /// third inside a minute and earns the larger penalty.
+    ///
+    /// Kept on the board by peer ID, so a reconnect does not reset the count.
+    pub fn record_withhold_strike(&self, peer: PeerId) -> bool {
+        self.state.lock().pending.record_strike(peer, tokio::time::Instant::now())
     }
 
     /// IDs whose request to another peer went unanswered, which `peer` also
@@ -527,21 +585,41 @@ impl MsgBoard {
     }
 
     /// Fetch the messages named by these work hashes, each paired with the hash
-    /// it is held under.
+    /// it is held under, while `afford` accepts each one's encoded length.
     ///
     /// Used to respond to a `GetBoardMessages` packet under the
     /// `pulse-v3.4.4` behaviour set, where the request names 32-byte hashes and
     /// the reply carries the hash alongside each body. Mirrors erigon's
     /// `GetMessage(ctx, h)` loop (`msgboard/fetch.go:256-266`): a hash we do
     /// not hold is skipped, not reported.
-    pub fn get_wire_messages_for_hashes(&self, hashes: &[B256]) -> Vec<WirePoWMsg> {
+    ///
+    /// The lookup stops at the first message `afford` refuses, so a request
+    /// past the peer's reply budget costs no further lookups under the board
+    /// mutex.
+    pub fn get_wire_messages_for_hashes(
+        &self,
+        hashes: &[B256],
+        mut afford: impl FnMut(u64) -> bool,
+    ) -> Vec<WirePoWMsg> {
         let state = self.state.lock();
-        hashes
-            .iter()
-            .filter_map(|hash| {
-                state.index.get(hash).map(|m| WirePoWMsg::new(m.msg.clone(), m.hash))
-            })
-            .collect()
+        let mut out = Vec::new();
+        for hash in hashes {
+            #[cfg(test)]
+            self.wire_lookups.fetch_add(1, Ordering::Relaxed);
+            let Some(m) = state.index.get(hash) else { continue };
+            let wire = WirePoWMsg::new(m.msg.clone(), m.hash);
+            if !afford(alloy_rlp::Encodable::length(&wire) as u64) {
+                break;
+            }
+            out.push(wire);
+        }
+        out
+    }
+
+    /// Hashes looked up to serve `GetBoardMessages` so far.
+    #[cfg(test)]
+    pub(crate) fn wire_lookups(&self) -> u64 {
+        self.wire_lookups.load(Ordering::Relaxed)
     }
 
     /// Add `PoWMsg`s received from a remote peer.
