@@ -375,6 +375,24 @@ impl MsgBoard {
         self.metrics.change_block_duration_seconds.record(start.elapsed().as_secs_f64());
     }
 
+    /// Replace the block window under one lock, then expire messages below it.
+    ///
+    /// See [`BlockFilter::seed`]. A reader never sees a partly loaded window,
+    /// so an announcement anchored in the window is never wrongly rejected
+    /// while the window loads.
+    pub fn seed_window(&self, head: u64, blocks: impl IntoIterator<Item = (u64, B256)>) {
+        let mut state = self.state.lock();
+        state.block_filter.seed(head, blocks);
+        let lower = state.block_filter.lower();
+        let stale = state.index.remove_below_block(lower);
+        self.metrics.expired.increment(stale.len() as u64);
+        for evicted in stale {
+            state.discard(evicted);
+        }
+        self.metrics.msg_count.set(state.index.len() as f64);
+        self.metrics.msg_size.set(state.index.total_size() as f64);
+    }
+
     /// Filter a slice of peer-announced [`MsgID`]s, returning the subset we want to fetch.
     ///
     /// An ID is wanted if we don't already have it, no request for it is
