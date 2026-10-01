@@ -22,6 +22,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
     board::MsgBoard,
+    index::IndexPage,
     metrics::MsgboardMetrics,
     rpc_api::{
         ContentFilter, ContentPage, ContentPageRequest, MsgboardApiServer, MsgboardMsg,
@@ -261,23 +262,11 @@ impl MsgboardApiServer for MsgboardApi {
         }
 
         self.build(&self.page_permits, "msgboard_contentPage", move |board| {
-            let mut msgs = matching(board, category, from_block, to_block);
             // A hash never changes and every replica computes the same one,
             // so inserts and evictions cannot shift a message across the
             // cursor.
-            if let Some(after) = after {
-                msgs.retain(|m| m.hash > after);
-            }
-            // More than `limit` left means a message remains after the page,
-            // so `next` must not be null.
-            let more = msgs.len() > limit;
-            if more {
-                // Select the `limit` lowest hashes in O(N), then sort only those.
-                msgs.select_nth_unstable_by_key(limit, |m| m.hash);
-                msgs.truncate(limit);
-            }
-            msgs.sort_unstable_by_key(|m| m.hash);
-            let next = if more { msgs.last().map(|m| m.hash) } else { None };
+            let IndexPage { msgs, next, .. } =
+                board.content_page(category.as_ref(), from_block, to_block, after, limit);
             ContentPage { content: group_by_category(msgs.iter()), next }
         })
         .await
