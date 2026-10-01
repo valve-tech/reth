@@ -30,7 +30,7 @@ use crate::{
     db,
     index::{IndexPage, MsgIndex},
     metrics::MsgboardMetrics,
-    pending::PendingRequests,
+    pending::{ExhaustedClaim, PendingRequests},
 };
 
 /// Capacity of the broadcast channel for new-message notifications.
@@ -449,11 +449,11 @@ impl MsgBoard {
         let mut state = self.state.lock();
         let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
 
-        let BoardState { index, block_filter, pending, .. } = &mut *state;
         // The map can only grow on this path, so it is trimmed here without a
         // background task. The sweep is rate-limited, so a flood of
         // announcements does not scan the whole map each time.
-        pending.maybe_sweep(now, |id| index.has(&id.message_hash()));
+        let exhausted = self.sweep_pending(&mut state, now);
+        let BoardState { index, block_filter, pending, .. } = &mut *state;
         let mut suppressed = 0u64;
         let wanted: Vec<MsgID> = ids
             .iter()
@@ -475,6 +475,7 @@ impl MsgBoard {
         let live_claims = pending.len();
         drop(state);
 
+        self.report_exhausted(exhausted);
         self.metrics.requests_suppressed.increment(suppressed);
         self.metrics.pending_requests.set(live_claims as f64);
         wanted
@@ -566,9 +567,82 @@ impl MsgBoard {
     pub fn take_retries(&self, peer: PeerId) -> Vec<MsgID> {
         let now = tokio::time::Instant::now();
         let mut state = self.state.lock();
+        let exhausted = self.sweep_pending(&mut state, now);
+        let retries = state.pending.take_retries(peer, now);
+        drop(state);
+        self.report_exhausted(exhausted);
+        retries
+    }
+
+    /// IDs that every announcer withheld, to request from `peer`, which never
+    /// announced them.
+    ///
+    /// No claim backs these. The caller requests them so that an empty
+    /// answer costs `peer` nothing.
+    pub fn take_speculative(&self, peer: PeerId) -> Vec<MsgID> {
+        let mut state = self.state.lock();
         let BoardState { index, pending, .. } = &mut *state;
+        let mut ids = pending.take_speculative(peer);
+        ids.retain(|id| !index.has(&id.message_hash()));
+        ids
+    }
+
+    /// Record a new `msg/1` session with `peer`, whose address is in `subnet`.
+    ///
+    /// The returned id tells this session from the peer's earlier ones. A
+    /// claim remembers an announcer per session, so a peer that reconnects
+    /// and announces again can be asked again. Pass the id to
+    /// [`close_peer_session`](Self::close_peer_session) when the session ends.
+    pub fn open_peer_session(&self, peer: PeerId, subnet: Option<u64>) -> u64 {
+        self.state.lock().pending.open_session(peer, subnet)
+    }
+
+    /// Forget a session opened with [`open_peer_session`](Self::open_peer_session).
+    pub fn close_peer_session(&self, peer: PeerId, session: u64) {
+        self.state.lock().pending.close_session(peer, session);
+    }
+
+    /// Mark a session as one with a peer that reth trusts. Claims ask trusted
+    /// announcers first after the first owner.
+    pub fn mark_peer_trusted(&self, peer: PeerId, session: u64) {
+        self.state.lock().pending.set_trusted(peer, session);
+    }
+
+    /// Whether the board holds the message with this work hash.
+    pub fn holds(&self, hash: &B256) -> bool {
+        self.state.lock().index.has(hash)
+    }
+
+    /// Run the claim sweep if it is due, and settle the claims it exhausted.
+    /// Returns what [`report_exhausted`](Self::report_exhausted) records once
+    /// the lock is released.
+    fn sweep_pending(
+        &self,
+        state: &mut BoardState,
+        now: tokio::time::Instant,
+    ) -> (u64, Vec<ExhaustedClaim>) {
+        let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
+        let BoardState { index, block_filter, pending, .. } = state;
         pending.maybe_sweep(now, |id| index.has(&id.message_hash()));
-        pending.take_retries(peer, now)
+        pending.settle_exhausted(now, |id| self.is_fetchable(index, block_filter, stale_lower, id))
+    }
+
+    /// Count and log the claims that ran out of announcers.
+    fn report_exhausted(&self, (count, claims): (u64, Vec<ExhaustedClaim>)) {
+        if count == 0 {
+            return;
+        }
+        self.metrics.claims_exhausted.increment(count);
+        for claim in claims {
+            let hash = claim.id.message_hash();
+            tracing::debug!(
+                target: "msgboard",
+                msg = %alloy_primitives::hex::encode(&hash[..8]),
+                tried = claim.tried,
+                asked_others = claim.asked,
+                "no announcer delivered an announced message",
+            );
+        }
     }
 
     /// All current message IDs (for announcing to a newly connected peer).

@@ -167,6 +167,8 @@ fn every_metric_is_instantiated_and_moves() {
             "msgboard.bodies_received",
             "msgboard.bodies_served",
             "msgboard.change_block_duration_seconds",
+            "msgboard.claims_exhausted",
+            "msgboard.claims_rescued",
             "msgboard.evicted",
             "msgboard.expired",
             "msgboard.flush_failures",
