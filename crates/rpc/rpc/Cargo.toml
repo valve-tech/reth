@@ -101,6 +101,7 @@ reth-db-common.workspace = true
 reth-storage-overlay.workspace = true
 
 rand.workspace = true
+metrics-util = { workspace = true, features = ["debugging"] }
 
 jsonrpsee = { workspace = true, features = ["client"] }
 

@@ -25,6 +25,7 @@ use reth_primitives_traits::{
 use reth_rpc_convert::{transaction::RpcConvert, RpcTxReq, TransactionConversionError};
 use reth_rpc_eth_types::{
     block::convert_transaction_receipt,
+    send_raw_rejected::SendRawRejectReason,
     utils::{binary_search, decode_raw_transaction},
     EthApiError::{self, TransactionConfirmationTimeout},
     EthResult, FillTransaction, SignError, TransactionSource,
@@ -86,7 +87,9 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         tx: Bytes,
     ) -> impl Future<Output = Result<B256, Self::Error>> + Send {
         async move {
-            let pool_transaction = self.recover_raw_pool_transaction(&tx)?;
+            let pool_transaction = self
+                .recover_raw_pool_transaction(&tx)
+                .inspect_err(|_| SendRawRejectReason::Decode.record())?;
             self.send_pool_transaction(
                 TransactionOrigin::Local,
                 WithEncoded::new(tx, pool_transaction),
