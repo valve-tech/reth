@@ -107,8 +107,10 @@ impl<R: Receipt> ReceiptRootTaskHandle<R> {
             }
         }
 
+        // Execution stops early when a payload has an invalid transaction. The validator
+        // already reports that payload as invalid, so this is expected and not an error.
         if receipts_len.is_some_and(|len| len != next) {
-            tracing::error!(
+            tracing::debug!(
                 target: "engine::tree::payload_processor",
                 expected = receipts_len,
                 received = next,
