@@ -2597,3 +2597,20 @@ The difference is disk-only. The wire carries `PoWMsg` and the claimed hash
 reth node and an erigon node never exchange this record. The one consequence:
 a reth msgboard database cannot be copied into an erigon node, or the other
 way round.
+
+## 28. Block window divergences recorded 2026-10-01
+
+### 28.1 Reth registers every committed block, not only the last one
+
+Erigon passes only the last block of each state-change batch to `ChangeBlock`
+(`fetch.go:403-407`). A batch of several blocks (catch-up or multi-block reorg)
+leaves the earlier hashes unknown, so erigon rejects messages anchored to them
+until a restart runs `Initialize` again. Reth registers every committed block
+in the window, oldest first (`launch.rs`, `drive_canonical_head`). Reth accepts
+a superset of what erigon accepts, and both still reject anything outside
+`[lower, head]`.
+
+Erigon also ignores `ChangeBlock` until the board is ready (`board.go:218`).
+Reth applies every block from startup. This is harmless: before ready, reth
+does not gossip and refuses local messages, and its window is only more
+current when ready comes.

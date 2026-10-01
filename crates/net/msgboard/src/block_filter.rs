@@ -46,7 +46,26 @@ impl BlockFilter {
         // inside the live window once the chain has advanced past genesis.
         self.lower = height.saturating_sub(self.limit.saturating_sub(1)).max(1);
         self.hash_to_num.insert(hash, height);
-        self.hash_to_num.retain(|_, &mut num| num >= self.lower);
+        // Erigon drops every hash outside `[lower, head]`, so a reorg to a lower
+        // head also forgets the orphans above it (`block_filter.go:89-93`).
+        let (lower, head) = (self.lower, self.head);
+        self.hash_to_num.retain(|_, &mut num| lower <= num && num <= head);
+    }
+
+    /// Replace the whole window in one step: set the head to `head` and keep
+    /// only the `(number, hash)` pairs of `blocks` inside the new window.
+    ///
+    /// This is erigon's `Initialize` without the intermediate states: a reader
+    /// never sees a window that holds only part of the hashes.
+    pub fn seed(&mut self, head: u64, blocks: impl IntoIterator<Item = (u64, B256)>) {
+        self.head = head;
+        self.lower = head.saturating_sub(self.limit.saturating_sub(1)).max(1);
+        let (lower, head) = (self.lower, self.head);
+        self.hash_to_num = blocks
+            .into_iter()
+            .filter(|&(num, _)| lower <= num && num <= head)
+            .map(|(n, h)| (h, n))
+            .collect();
     }
 
     /// Look up the block number for a given block hash, if it is within the live window.
@@ -181,5 +200,51 @@ mod tests {
         assert_eq!(f.lower(), 1);
         assert!(!f.within_bounds(0));
         assert!(f.within_bounds(50));
+    }
+
+    /// A reorg that lowers the head must drop the hashes above the new head.
+    /// Erigon prunes everything outside `[lower, head]` (`block_filter.go:89-93`).
+    /// If the orphan survives, it is accepted again once the new chain grows
+    /// back past its height.
+    #[test]
+    fn a_reorg_to_a_lower_head_forgets_the_orphans() {
+        let mut f = BlockFilter::new(10);
+        for n in 95..=100 {
+            f.set_head(n, hash(n as u8));
+        }
+        // Reorg back to 98 on a new branch, then regrow past 100.
+        f.set_head(98, hash(0xB8));
+        assert_eq!(f.block_number(&hash(100)), None, "orphan above the new head is gone");
+        for n in 99..=102 {
+            f.set_head(n, hash(0xA0 + (n - 99) as u8));
+        }
+        assert_eq!(f.block_number(&hash(99)), None, "orphan at 99 stays unknown");
+        assert_eq!(f.block_number(&hash(100)), None, "orphan at 100 stays unknown");
+        assert_eq!(f.block_number(&hash(97)), Some(97), "common ancestor stays known");
+    }
+
+    /// A seed replaces the old window and drops pairs outside the new one.
+    #[test]
+    fn seed_replaces_the_window_in_one_step() {
+        let mut f = BlockFilter::new(3);
+        f.set_head(50, hash(50));
+        f.seed(10, [(7, hash(7)), (8, hash(8)), (9, hash(9)), (10, hash(10)), (11, hash(11))]);
+        assert_eq!((f.head(), f.lower()), (10, 8));
+        assert_eq!(f.block_number(&hash(50)), None, "the old window is gone");
+        assert_eq!(f.block_number(&hash(7)), None, "below lower");
+        assert_eq!(f.block_number(&hash(11)), None, "above head");
+        assert_eq!(f.block_number(&hash(8)), Some(8));
+        assert_eq!(f.block_number(&hash(10)), Some(10));
+    }
+
+    /// A same-height replacement keeps both hashes, as erigon does: `SetHead`
+    /// only prunes by height, and the orphan sits at the head height.
+    #[test]
+    fn a_same_height_reorg_keeps_both_hashes_like_erigon() {
+        let mut f = BlockFilter::new(10);
+        f.set_head(100, hash(1));
+        f.set_head(100, hash(2));
+        assert_eq!(f.block_number(&hash(1)), Some(100));
+        assert_eq!(f.block_number(&hash(2)), Some(100));
     }
 }
