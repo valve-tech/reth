@@ -31,20 +31,29 @@
 //! message already sorts at or after the tail. [`erigon_insert_pos`] ports
 //! that, so no binary search may be substituted for it.
 
-use std::{cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
+    ops::Bound,
+    sync::Arc,
+};
 
 use alloy_primitives::B256;
 use reth_msgboard_types::CheckedPoWMsg;
 
-/// In-memory index of live messages with O(1) hash lookups and ordered eviction.
+/// In-memory index of live messages with hash-ordered lookups and ordered eviction.
 #[derive(Debug, Default)]
 pub struct MsgIndex {
     /// Sorted `(block_number ASC, difficulty_ratio ASC)`. Eviction removes `msgs[0]`.
     msgs: Vec<Arc<CheckedPoWMsg>>,
-    /// Fast lookup by `PoW` hash.
-    by_hash: HashMap<B256, Arc<CheckedPoWMsg>>,
-    /// Category hash → { message hash → message }.
-    categories: HashMap<B256, HashMap<B256, Arc<CheckedPoWMsg>>>,
+    /// Lookup by `PoW` hash. A `BTreeMap`, not a `HashMap`, so that
+    /// [`content_page`](Self::content_page) can range-scan it in hash order.
+    /// Every mutation already updates this map, so the hash order cannot
+    /// drift from `msgs`.
+    by_hash: BTreeMap<B256, Arc<CheckedPoWMsg>>,
+    /// Category hash → { message hash → message }, hash-ordered for the same
+    /// reason as `by_hash`.
+    categories: HashMap<B256, BTreeMap<B256, Arc<CheckedPoWMsg>>>,
     /// Sum of all message `data` field lengths in bytes.
     total_size: u64,
 }
@@ -241,6 +250,77 @@ impl MsgIndex {
     pub const fn total_size(&self) -> u64 {
         self.total_size
     }
+
+    /// One `msgboard_contentPage` page: up to `limit` matching messages with a
+    /// hash strictly above `after`, in ascending hash order.
+    ///
+    /// `next` is the last hash of the page when a matching message remains
+    /// after it, and `None` otherwise.
+    ///
+    /// The call range-scans the hash-ordered map from `after` and stops at
+    /// the `limit + 1`-th match, so an unfiltered page costs `O(limit)` under
+    /// the board mutex, not `O(board)`. A `category` scans that category's
+    /// map only. The block range is checked per message during the scan.
+    /// Hash order says nothing about blocks, so a range that matches few
+    /// messages can still scan the whole board (or category) to fill a page.
+    /// That is no worse than the full copy this replaces, and `count_limit`
+    /// caps the board.
+    pub fn content_page(
+        &self,
+        category: Option<&B256>,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+        after: Option<B256>,
+        limit: usize,
+    ) -> IndexPage {
+        let range = (after.map_or(Bound::Unbounded, Bound::Excluded), Bound::Unbounded);
+        let in_blocks = |m: &CheckedPoWMsg| {
+            from_block.is_none_or(|f| m.block_number >= f) &&
+                to_block.is_none_or(|t| m.block_number <= t)
+        };
+        match category {
+            None => page_from(self.by_hash.range(range).map(|(_, m)| m), in_blocks, limit),
+            Some(cat) => match self.categories.get(cat) {
+                Some(map) => page_from(map.range(range).map(|(_, m)| m), in_blocks, limit),
+                None => IndexPage { msgs: Vec::new(), next: None, scanned: 0 },
+            },
+        }
+    }
+
+    /// Panics unless the ordered vec, the hash map, the category maps and
+    /// `total_size` all describe the same set of messages.
+    #[cfg(test)]
+    pub(crate) fn assert_consistent(&self) {
+        use std::collections::BTreeSet;
+        let in_vec: BTreeSet<B256> = self.msgs.iter().map(|m| m.hash).collect();
+        assert_eq!(in_vec.len(), self.msgs.len(), "duplicate hash in the ordered vec");
+        let in_map: BTreeSet<B256> = self.by_hash.keys().copied().collect();
+        assert_eq!(in_map, in_vec, "hash map differs from the ordered vec");
+        let mut in_cats = BTreeSet::new();
+        for (cat, map) in &self.categories {
+            assert!(!map.is_empty(), "empty category {cat} kept");
+            for (hash, m) in map {
+                assert_eq!(&m.msg.category, cat, "message filed under the wrong category");
+                assert_eq!(hash, &m.hash, "category key differs from the message hash");
+                assert!(in_cats.insert(*hash), "message in two categories");
+            }
+        }
+        assert_eq!(in_cats, in_vec, "category maps differ from the ordered vec");
+        let size: u64 = self.msgs.iter().map(|m| m.msg.data.len() as u64).sum();
+        assert_eq!(size, self.total_size, "total_size drifted");
+    }
+}
+
+/// One page of [`MsgIndex::content_page`].
+#[derive(Debug)]
+pub struct IndexPage {
+    /// The page's messages, in ascending hash order.
+    pub msgs: Vec<Arc<CheckedPoWMsg>>,
+    /// The cursor for the next page, or `None` at the end.
+    pub next: Option<B256>,
+    /// How many indexed messages the call examined. Tests use it to show
+    /// that a page's cost follows `limit`, not the board size.
+    pub scanned: usize,
 }
 
 /// Insert position for a message, matching erigon-pulse's `MsgIndex.Insert`
@@ -310,6 +390,29 @@ const fn cmp_ratio(a: u64, b: u64, c: u64, d: u64) -> Ordering {
     } else {
         Ordering::Equal
     }
+}
+
+/// Collects up to `limit` messages that pass `keep` from a hash-ordered
+/// iterator, plus one lookahead match to decide `next`.
+fn page_from<'a>(
+    msgs: impl Iterator<Item = &'a Arc<CheckedPoWMsg>>,
+    keep: impl Fn(&CheckedPoWMsg) -> bool,
+    limit: usize,
+) -> IndexPage {
+    let mut page = Vec::<Arc<CheckedPoWMsg>>::new();
+    let mut scanned = 0;
+    for m in msgs {
+        scanned += 1;
+        if keep(m) {
+            if page.len() == limit {
+                // A match remains after the page, so `next` is not null.
+                let next = page.last().map(|m| m.hash);
+                return IndexPage { msgs: page, next, scanned };
+            }
+            page.push(Arc::clone(m));
+        }
+    }
+    IndexPage { msgs: page, next: None, scanned }
 }
 
 #[cfg(test)]
@@ -988,6 +1091,164 @@ mod tests {
             for h in &old_removed {
                 assert!(!new.has(h) && new.get(h).is_none(), "round {round}: hash lookup");
             }
+        }
+    }
+
+    /// The `msgboard_contentPage` algorithm before the hash-ordered maps: copy
+    /// every match, drop those at or below the cursor, select the `limit`
+    /// lowest hashes. [`MsgIndex::content_page`] must agree with it on every
+    /// input.
+    fn reference_page(
+        idx: &MsgIndex,
+        category: Option<&B256>,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+        after: Option<B256>,
+        limit: usize,
+    ) -> (Vec<B256>, Option<B256>) {
+        let mut msgs = match category {
+            Some(cat) => idx.category_msgs_filtered(cat, from_block, to_block),
+            None => idx.all_msgs_filtered(from_block, to_block),
+        };
+        if let Some(after) = after {
+            msgs.retain(|m| m.hash > after);
+        }
+        let more = msgs.len() > limit;
+        if more {
+            msgs.select_nth_unstable_by_key(limit, |m| m.hash);
+            msgs.truncate(limit);
+        }
+        msgs.sort_unstable_by_key(|m| m.hash);
+        let next = if more { msgs.last().map(|m| m.hash) } else { None };
+        (msgs.iter().map(|m| m.hash).collect(), next)
+    }
+
+    /// A message with a pseudo-random hash, so hash order is unrelated to
+    /// board order. Nothing here reads the `PoW`.
+    fn random_msg(next: &mut impl FnMut() -> u64) -> Arc<CheckedPoWMsg> {
+        let mut hash = [0u8; 32];
+        for chunk in hash.chunks_mut(8) {
+            chunk.copy_from_slice(&next().to_be_bytes());
+        }
+        Arc::new(CheckedPoWMsg {
+            msg: PoWMsg {
+                version: VERSION_V1,
+                block_hash: block_hash_one(),
+                nonce: 1,
+                work_multiplier: 1 + next() % 5,
+                work_divisor: 1_000_000,
+                category: category((next() % 4) as u8),
+                data: alloy_primitives::Bytes::from(vec![0u8; (next() % 9) as usize]),
+            },
+            block_number: next() % 30,
+            timestamp: 0,
+            hash: B256::from(hash),
+        })
+    }
+
+    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    /// Random boards under every mutation path, random filters, cursors and
+    /// limits: `content_page` returns what the old algorithm returns, and the
+    /// index stays consistent after every mutation.
+    #[test]
+    fn content_page_matches_the_reference_on_random_boards() {
+        let mut next = xorshift(0x9E37_79B9_7F4A_7C15);
+        for round in 0..300u64 {
+            let mut idx = MsgIndex::default();
+            let mut live: Vec<B256> = Vec::new();
+            for step in 0..60u64 {
+                match next() % 10 {
+                    0..=5 => {
+                        let m = random_msg(&mut next);
+                        live.push(m.hash);
+                        idx.insert(m);
+                    }
+                    6 => {
+                        idx.evict_oldest();
+                    }
+                    7 => {
+                        idx.remove_below_block(next() % 12);
+                    }
+                    8 if !live.is_empty() => {
+                        let h = live[(next() % live.len() as u64) as usize];
+                        idx.remove(&h);
+                    }
+                    _ => {
+                        // A duplicate insert must change nothing.
+                        if let Some(h) = live.last() &&
+                            let Some(m) = idx.get(h)
+                        {
+                            assert!(!idx.insert(m));
+                        }
+                    }
+                }
+                idx.assert_consistent();
+
+                for _ in 0..4 {
+                    let cat = next().is_multiple_of(3).then(|| category((next() % 5) as u8));
+                    let from = next().is_multiple_of(3).then(|| next() % 30);
+                    let to = next().is_multiple_of(3).then(|| next() % 30);
+                    let after = match next() % 4 {
+                        0 => None,
+                        1 if !live.is_empty() => Some(live[(next() % live.len() as u64) as usize]),
+                        _ => Some(random_msg(&mut next).hash),
+                    };
+                    let limit = 1 + (next() % 12) as usize;
+                    let page = idx.content_page(cat.as_ref(), from, to, after, limit);
+                    let got = (page.msgs.iter().map(|m| m.hash).collect::<Vec<_>>(), page.next);
+                    assert_eq!(
+                        got,
+                        reference_page(&idx, cat.as_ref(), from, to, after, limit),
+                        "round {round} step {step}: cat={cat:?} from={from:?} to={to:?} \
+                         after={after:?} limit={limit}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// An unfiltered page examines at most `limit + 1` messages, whatever the
+    /// board size, and a full walk examines each message about once.
+    #[test]
+    fn content_page_scan_follows_limit_not_board_size() {
+        let mut next = xorshift(0xDEAD_BEEF_CAFE_F00D);
+        for n in [1_000usize, 10_000] {
+            let mut idx = MsgIndex::default();
+            while idx.len() < n {
+                idx.insert(random_msg(&mut next));
+            }
+            let limit = 10;
+            let page = idx.content_page(None, None, None, None, limit);
+            assert!(page.scanned <= limit + 1, "n={n}: first page scanned {}", page.scanned);
+
+            let mut after = None;
+            let (mut pages, mut scanned, mut seen) = (0usize, 0usize, 0usize);
+            loop {
+                let page = idx.content_page(None, None, None, after, 100);
+                pages += 1;
+                scanned += page.scanned;
+                seen += page.msgs.len();
+                let Some(cursor) = page.next else { break };
+                after = Some(cursor);
+            }
+            assert_eq!(seen, n);
+            assert!(scanned <= n + pages, "n={n}: walk scanned {scanned} over {pages} pages");
+
+            // A category page scans that category only.
+            let cat = category(1);
+            let in_cat = idx.category_msgs(&cat).count();
+            let page = idx.content_page(Some(&cat), None, None, None, limit);
+            assert!(page.scanned <= limit + 1, "n={n}: category page scanned {}", page.scanned);
+            assert!(in_cat > limit, "the category must be larger than one page");
         }
     }
 }
