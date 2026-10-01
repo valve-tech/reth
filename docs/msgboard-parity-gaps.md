@@ -2687,3 +2687,34 @@ so reth keeps it.
 - **Difficulty overflow.** Reth computes `D` exactly in `U256`. Erigon
   saturates at `MaxUint64`. Only a message whose `D` exceeds `u64::MAX` can
   differ, and no honest client builds one. §N6 in §10 is corrected to match.
+
+## 30. Claim recovery divergences recorded 2026-10-01
+
+These behaviours are reth-only and change only whom reth asks for a message.
+They add no message type and no field, so they are wire-compatible with erigon.
+The erigon references are to `~/go/src/gitlab.com/pulsechaincom/erigon-pulse`,
+package `msgboard/`.
+
+### 30.1 Trusted peers are asked first, and peers that did not announce are asked last
+
+Erigon asks the first announcer of a message and nobody else. It has no
+alternates and no notion of a trusted peer in `msgboard/`.
+
+Reth keeps alternates for each claim (see `PendingRequests` in
+`crates/net/msgboard/src/pending.rs`). Two orderings are reth-only:
+
+- A peer that reth marks as `PeerKind::Trusted` is asked first after the first
+  owner. The random draw that keeps the alternate list bounded never evicts it.
+  Without trusted peers the order and the draw are unchanged.
+- When every announcer was asked and none delivered, reth sends
+  `GetBoardMessages` for that hash to up to three connected peers that did not
+  announce it, trusted peers first and then one per subnet. At most 16 such
+  requests go out per second across all claims, and these peers are never
+  penalised for an empty answer.
+
+The second one depends on erigon's `GET_BOARD_MESSAGES` arm
+(`fetch.go:242-266`), which looks up every requested hash with
+`board.GetMessage` and serves whatever it holds, whether or not it announced
+it. A hash it lacks is skipped, and an empty reply sends nothing. Reth's own
+arm behaves the same. A peer of either client therefore answers a speculative
+request correctly, and an empty answer costs it nothing.
