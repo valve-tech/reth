@@ -11,7 +11,9 @@ use reth_rpc_eth_api::{
     helpers::{spec::SignersForRpc, EthTransactions, LoadTransaction},
     FromEvmError, RpcNodeCore,
 };
-use reth_rpc_eth_types::{error::RpcPoolError, EthApiError};
+use reth_rpc_eth_types::{
+    error::RpcPoolError, send_raw_rejected::SendRawRejectReason, EthApiError,
+};
 use reth_storage_api::BlockReaderIdExt;
 use reth_transaction_pool::{
     error::Eip4844PoolTransactionError, AddedTransactionOutcome, EthBlobTransactionSidecar,
@@ -107,8 +109,11 @@ where
         // broadcast raw transaction to subscribers if there is any.
         self.broadcast_raw_transaction(tx);
 
-        let AddedTransactionOutcome { hash, .. } =
-            self.inner.add_pool_transaction(origin, pool_transaction).await?;
+        let AddedTransactionOutcome { hash, .. } = self
+            .inner
+            .submit_pool_transaction(origin, pool_transaction)
+            .await?
+            .inspect_err(|err| SendRawRejectReason::from_pool_error(err).record())?;
 
         Ok(hash)
     }
@@ -134,6 +139,7 @@ mod tests {
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{map::AddressMap, Address, Bytes, Signature, U256};
     use alloy_rpc_types_eth::request::TransactionRequest;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
     use reth_chainspec::{ChainSpec, ChainSpecBuilder};
     use reth_ethereum_primitives::TransactionSigned;
     use reth_evm::SenderRecoveryCache;
@@ -146,9 +152,13 @@ mod tests {
     };
     use reth_rpc_eth_api::node::RpcNodeCoreAdapter;
     use reth_transaction_pool::{
-        test_utils::{testing_pool, TestPool, TransactionGenerator},
-        EthPooledTransaction, PoolPooledTx, TransactionOrigin, TransactionPool,
+        blobstore::InMemoryBlobStore,
+        test_utils::{testing_pool, TestPool, TransactionBuilder, TransactionGenerator},
+        validate::EthTransactionValidatorBuilder,
+        CoinbaseTipOrdering, EthPooledTransaction, EthTransactionValidator, Pool, PoolPooledTx,
+        TransactionOrigin, TransactionPool,
     };
+    use std::collections::BTreeMap;
 
     fn mock_eth_api(
         accounts: AddressMap<ExtendedAccount>,
@@ -755,5 +765,139 @@ mod tests {
             filled.tx.max_fee_per_blob_gas().is_none(),
             "max_fee_per_blob_gas should not be set for non-blob tx"
         );
+    }
+
+    /// Name of the per-reason counter for rejected RPC transaction submissions, before the
+    /// `reth_` prefix that the node's Prometheus recorder adds.
+    const SEND_RAW_REJECTED: &str = "rpc.eth.send_raw_rejected_total";
+
+    type ValidatingPool = Pool<
+        EthTransactionValidator<MockEthProvider, EthPooledTransaction, EthEvmConfig>,
+        CoinbaseTipOrdering<EthPooledTransaction>,
+        InMemoryBlobStore,
+    >;
+
+    /// Builds an [`EthApi`] whose pool runs the real Ethereum validator over `provider`, so that
+    /// stateful checks (nonce, balance, fee cap) reject transactions as they do on a node.
+    fn eth_api_with_validating_pool(
+        provider: MockEthProvider,
+    ) -> EthApi<
+        RpcNodeCoreAdapter<MockEthProvider, ValidatingPool, NoopNetwork, EthEvmConfig>,
+        EthRpcConverter<ChainSpec>,
+    > {
+        let evm_config = EthEvmConfig::new(provider.chain_spec());
+        let blob_store = InMemoryBlobStore::default();
+        let validator = EthTransactionValidatorBuilder::new(provider.clone(), evm_config.clone())
+            .build(blob_store.clone());
+        let pool =
+            Pool::new(validator, CoinbaseTipOrdering::default(), blob_store, Default::default());
+        EthApi::builder(provider, pool, NoopNetwork::default(), evm_config).build()
+    }
+
+    /// Returns the increments of each `reason` series of [`SEND_RAW_REJECTED`] since the last
+    /// call. A debugging-recorder snapshot resets the counters it reads, and this drops the
+    /// series that did not change.
+    fn rejected_by_reason(snapshotter: &Snapshotter) -> BTreeMap<String, u64> {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| key.key().name() == SEND_RAW_REJECTED)
+            .map(|(key, _, _, value)| {
+                let reason = key
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "reason")
+                    .expect("every series has a reason label")
+                    .value()
+                    .to_owned();
+                let DebugValue::Counter(count) = value else {
+                    panic!("{SEND_RAW_REJECTED} must be a counter")
+                };
+                (reason, count)
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
+
+    /// Each rejected `eth_sendRawTransaction` increments the counter for its reason by exactly
+    /// one, and an accepted transaction increments nothing.
+    #[test]
+    fn send_raw_transaction_rejections_count_by_reason() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        // The recorder is local to this thread, so tests that run in parallel cannot add to
+        // these counts. A current-thread runtime keeps the RPC handler on this thread.
+        reth_metrics::metrics::with_local_recorder(&recorder, || {
+            let runtime =
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let funded_key = B256::repeat_byte(0x11);
+                let tx = |nonce: u64| {
+                    TransactionBuilder::default()
+                        .signer(funded_key)
+                        .nonce(nonce)
+                        .gas_limit(21_000)
+                        .max_fee_per_gas(2_000_000_000)
+                        .max_priority_fee_per_gas(1_000_000_000)
+                        .to(Address::repeat_byte(0x22))
+                };
+                let raw = |signed: TransactionSigned| Bytes::from(signed.encoded_2718());
+
+                let accepted = tx(1).into_eip1559();
+                let funded = accepted.try_recover().unwrap();
+
+                let provider = MockEthProvider::default()
+                    .with_chain_spec(ChainSpecBuilder::mainnet().cancun_activated().build());
+                provider.add_block(
+                    B256::ZERO,
+                    Block::new(
+                        Header {
+                            gas_limit: 30_000_000,
+                            timestamp: 1,
+                            excess_blob_gas: Some(0),
+                            base_fee_per_gas: Some(1_000_000_000),
+                            blob_gas_used: Some(0),
+                            ..Default::default()
+                        },
+                        Default::default(),
+                    ),
+                );
+                // State nonce 1, so a nonce-0 transaction is stale.
+                provider.add_account(funded, ExtendedAccount::new(1, U256::from(10u128.pow(20))));
+                let eth_api = eth_api_with_validating_pool(provider);
+
+                eth_api.send_raw_transaction(raw(accepted.clone())).await.unwrap();
+                assert!(
+                    rejected_by_reason(&snapshotter).is_empty(),
+                    "an accepted transaction must not count as rejected"
+                );
+
+                let rejected = [
+                    ("already_known", raw(accepted)),
+                    ("replacement_underpriced", raw(tx(1).value(1).into_eip1559())),
+                    ("nonce_too_low", raw(tx(0).into_eip1559())),
+                    // 1e14 wei max fee * 21_000 gas = 2.1 ETH, above the 1 ETH default cap.
+                    ("fee_cap", raw(tx(2).max_fee_per_gas(100_000_000_000_000).into_eip1559())),
+                    // This signer has no account, so its balance is zero.
+                    (
+                        "insufficient_funds",
+                        raw(tx(0).signer(B256::repeat_byte(0x33)).into_eip1559()),
+                    ),
+                    // An EIP-1559 type byte followed by an empty list.
+                    ("decode", Bytes::from_static(&[0x02, 0xc0])),
+                ];
+
+                for (reason, raw) in rejected {
+                    let err = eth_api.send_raw_transaction(raw).await.unwrap_err();
+                    assert_eq!(
+                        rejected_by_reason(&snapshotter),
+                        BTreeMap::from([(reason.to_owned(), 1)]),
+                        "after the {reason} submission (error: {err})"
+                    );
+                }
+            })
+        });
     }
 }
