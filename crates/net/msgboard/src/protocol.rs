@@ -58,7 +58,7 @@ use alloy_primitives::{bytes::BytesMut, B256};
 use crate::{
     board::MsgBoard,
     metrics::MsgboardMetrics,
-    pending::{WantList, WithholdStrikes, MAX_WANT_PER_PEER},
+    pending::{subnet_of, WantList, MAX_WANT_PER_PEER},
 };
 
 /// Per-packet size limit for chunked P2P responses. Erigon's `MaxMessageSize`
@@ -397,7 +397,7 @@ pub trait PeerReporter: std::fmt::Debug + Send + Sync {
 ///
 /// The burst in force is [`serve_burst_bytes`], which is never less than one
 /// full reply at the configured `size_limit`.
-const SERVE_MIN_BURST_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const SERVE_MIN_BURST_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Rate at which a peer's reply budget refills.
 ///
@@ -405,7 +405,7 @@ const SERVE_MIN_BURST_BYTES: u64 = 4 * 1024 * 1024;
 /// peer still drains a full default board of maximum-size messages (~87 MB)
 /// from us in under two minutes, and one looping peer can make us upload at
 /// most 1 MiB/s.
-const SERVE_REFILL_BYTES_PER_SEC: u64 = 1024 * 1024;
+pub(crate) const SERVE_REFILL_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 /// How long a served message stays "recent" for the peer it went to.
 ///
@@ -474,21 +474,23 @@ impl MsgboardProtocolHandler {
 impl ProtocolHandler for MsgboardProtocolHandler {
     type ConnectionHandler = MsgboardConnectionHandler;
 
-    fn on_incoming(&self, _socket_addr: SocketAddr) -> Option<Self::ConnectionHandler> {
+    fn on_incoming(&self, socket_addr: SocketAddr) -> Option<Self::ConnectionHandler> {
         Some(MsgboardConnectionHandler {
             board: Arc::clone(&self.board),
             reporter: self.reporter.clone(),
+            remote: socket_addr,
         })
     }
 
     fn on_outgoing(
         &self,
-        _socket_addr: SocketAddr,
+        socket_addr: SocketAddr,
         _peer_id: PeerId,
     ) -> Option<Self::ConnectionHandler> {
         Some(MsgboardConnectionHandler {
             board: Arc::clone(&self.board),
             reporter: self.reporter.clone(),
+            remote: socket_addr,
         })
     }
 }
@@ -498,6 +500,8 @@ impl ProtocolHandler for MsgboardProtocolHandler {
 pub struct MsgboardConnectionHandler {
     board: Arc<MsgBoard>,
     reporter: Option<Arc<dyn PeerReporter>>,
+    /// The peer's address, so its announcements count in its subnet.
+    remote: SocketAddr,
 }
 
 impl ConnectionHandler for MsgboardConnectionHandler {
@@ -540,10 +544,11 @@ impl ConnectionHandler for MsgboardConnectionHandler {
     ) -> Self::Connection {
         let board = self.board;
         let reporter = self.reporter;
+        let subnet = subnet_of(self.remote.ip());
         let (tx, rx) = outbound_channel();
 
         tokio::spawn(async move {
-            run_connection(board, reporter, peer_id, conn, tx).await;
+            run_connection_from(board, reporter, peer_id, Some(subnet), conn, tx).await;
         });
 
         ReceiverStream::new(rx)
@@ -671,6 +676,12 @@ impl OutboundQueue {
         }
     }
 
+    /// Whether the peer has stopped reading and its queue has no free slot.
+    /// Anything sent now is dropped, so a reply is not worth building.
+    fn is_stalled_and_full(&self) -> bool {
+        self.stalled.load(Ordering::Relaxed) && self.tx.capacity() == 0
+    }
+
     /// Queue depth the multiplexer has yet to take, for tests.
     #[cfg(test)]
     fn max_capacity(&self) -> usize {
@@ -783,10 +794,25 @@ enum Sent {
 ///
 /// Generic over the frame stream so tests can drive the loop. Production passes
 /// [`ProtocolConnection`], which cannot be built outside `reth-eth-wire`.
+#[cfg(test)]
 async fn run_connection<S>(
     board: Arc<MsgBoard>,
     reporter: Option<Arc<dyn PeerReporter>>,
     peer_id: PeerId,
+    conn: S,
+    tx: OutboundQueue,
+) where
+    S: futures::Stream<Item = BytesMut> + Unpin,
+{
+    run_connection_from(board, reporter, peer_id, None, conn, tx).await
+}
+
+/// [`run_connection`] for a peer whose remote address is in `subnet`.
+async fn run_connection_from<S>(
+    board: Arc<MsgBoard>,
+    reporter: Option<Arc<dyn PeerReporter>>,
+    peer_id: PeerId,
+    subnet: Option<u64>,
     mut conn: S,
     tx: OutboundQueue,
 ) where
@@ -801,7 +827,7 @@ async fn run_connection<S>(
     // What this peer is allowed to deliver. Per connection, so erigon's
     // `(peer, hash)` key is the instance plus the hash — see [`WantList`].
     let mut wants = WantList::default();
-    let mut strikes = WithholdStrikes::default();
+    wants.subnet = subnet;
     // Finds reservations this peer left unspent and requests what other peers
     // withheld from us. See [`service_pending`].
     let mut pending_timer = tokio::time::interval(PENDING_SERVICE_INTERVAL);
@@ -900,8 +926,7 @@ async fn run_connection<S>(
 
             _ = pending_timer.tick() => {
                 let sent = service_pending(
-                    &board, reporter_as_deref(reporter.as_ref()), &tx, &mut wants, &mut strikes,
-                    peer_id,
+                    &board, reporter_as_deref(reporter.as_ref()), &tx, &mut wants, peer_id,
                 ).await;
                 if sent == Sent::Closed {
                     break;
@@ -939,6 +964,11 @@ async fn request_wanted(
     // suppressed for the full claim TTL and nobody fetches it.
     let now = tokio::time::Instant::now();
     wants.prune(now);
+    if retry {
+        // Retries are not queued behind the pacer, but they draw on the same
+        // reply budget at the responder.
+        wants.pacer.charge(request_cost_of(wanted), now);
+    }
     wants.start_request();
     let mut reserved = Vec::with_capacity(wanted.len());
     let mut refused = Vec::new();
@@ -955,6 +985,7 @@ async fn request_wanted(
     if !refused.is_empty() {
         metrics.wants_refused.increment(refused.len() as u64);
         board.release_pending(peer_id, &refused);
+        wants.pacer.refund(request_cost_of(&refused));
     }
     if reserved.is_empty() {
         return Sent::Ok;
@@ -1008,6 +1039,7 @@ async fn request_wanted(
             Sent::Dropped => {
                 board.release_pending(peer_id, chunk);
                 wants.release(chunk.iter().map(MsgID::message_hash));
+                wants.pacer.refund(request_cost_of(chunk));
             }
             Sent::Closed => {
                 let unsent = &reserved[i * MAX_GET_BOARD_MESSAGES..];
@@ -1034,7 +1066,6 @@ async fn service_pending(
     reporter: Option<&dyn PeerReporter>,
     tx: &OutboundQueue,
     wants: &mut WantList,
-    strikes: &mut WithholdStrikes,
     peer_id: PeerId,
 ) -> Sent {
     let now = tokio::time::Instant::now();
@@ -1052,7 +1083,7 @@ async fn service_pending(
         // one event each, so a single lost frame cannot ban an honest peer.
         // Only a request answered with nothing counts toward escalation; a
         // partial answer earns the small penalty and never the larger one.
-        let repeatedly = expired.silent && strikes.record(now);
+        let repeatedly = expired.silent && board.record_withhold_strike(peer_id);
         tracing::debug!(
             target: "msgboard",
             ?peer_id,
@@ -1069,13 +1100,72 @@ async fn service_pending(
     if !board.is_ready() || board.config().gossip_disabled {
         return Sent::Ok;
     }
+    let deadline = frame_deadline();
     let retries = board.take_retries(peer_id);
-    if retries.is_empty() {
+    if !retries.is_empty() {
+        tracing::debug!(target: "msgboard", ?peer_id, count = retries.len(), "requesting messages another peer withheld");
+        if request_wanted(board, tx, wants, &retries, peer_id, deadline, true).await == Sent::Closed
+        {
+            return Sent::Closed;
+        }
+    }
+    request_deferred(board, tx, wants, peer_id, deadline).await
+}
+
+/// Request as many queued announced IDs as this peer's reply budget allows.
+///
+/// Each ID is claimed only now, through `filter_wanted`. An ID another peer
+/// claimed meanwhile makes this peer an alternate, and its budget goes back.
+async fn request_deferred(
+    board: &Arc<MsgBoard>,
+    tx: &OutboundQueue,
+    wants: &mut WantList,
+    peer_id: PeerId,
+    deadline: tokio::time::Instant,
+) -> Sent {
+    let now = tokio::time::Instant::now();
+    wants.prune(now);
+    let room = wants.room();
+    let batch = wants.pacer.take_affordable(now, room, request_cost);
+    if batch.is_empty() {
         return Sent::Ok;
     }
-    tracing::debug!(target: "msgboard", ?peer_id, count = retries.len(), "requesting messages another peer withheld");
-    request_wanted(board, tx, wants, &retries, peer_id, frame_deadline(), true).await
+    let wanted = board.filter_wanted_from(peer_id, wants.subnet, &batch);
+    if wanted.len() < batch.len() {
+        let kept: HashSet<B256> = wanted.iter().map(MsgID::message_hash).collect();
+        let unused: Vec<MsgID> =
+            batch.into_iter().filter(|id| !kept.contains(&id.message_hash())).collect();
+        wants.pacer.refund(request_cost_of(&unused));
+    }
+    if wanted.is_empty() {
+        return Sent::Ok;
+    }
+    request_wanted(board, tx, wants, &wanted, peer_id, deadline, false).await
 }
+
+/// An upper bound of the bytes a reth responder charges to serve `id`.
+fn request_cost(id: &MsgID) -> u64 {
+    max_wire_body_len(id.size() as usize) as u64
+}
+
+fn request_cost_of(ids: &[MsgID]) -> u64 {
+    ids.iter().map(request_cost).sum()
+}
+
+/// Most announced IDs one connection queues for later requests.
+///
+/// Bounded in bytes, because any peer can fill its queue with IDs that pass
+/// `fetchable` and back no real message. Each queued ID is held twice, in the
+/// queue and in its dedup set, so 256 KiB is about 1,080 IDs: more than one
+/// full announcement frame, and about 33 MiB across 130 peers at most. A
+/// board announced past that is dropped from this peer's queue and fetched
+/// from other announcers, or from this one when it announces the IDs again.
+const fn max_deferred() -> usize {
+    MAX_DEFERRED_BYTES / (2 * MSG_ID_SIZE)
+}
+
+/// Bytes of IDs one connection's request queue may hold.
+const MAX_DEFERRED_BYTES: usize = 256 * 1024;
 
 /// Borrow the trait object out of an `Option<Arc<dyn PeerReporter>>` without
 /// cloning the `Arc`. The standard library doesn't ship an `as_deref` for
@@ -1173,13 +1263,22 @@ async fn handle_incoming(
             if !ready || gossip_disabled {
                 return Sent::Ok;
             }
-            let wanted = board.filter_wanted(peer_id, &ids);
-            if wanted.is_empty() {
+            // Queued first and requested as the peer's reply budget allows;
+            // see [`RequestPacer`](crate::pending::RequestPacer).
+            let fetchable = board.fetchable(&ids);
+            if fetchable.is_empty() {
                 return Sent::Ok;
             }
-            if request_wanted(board, tx, wants, &wanted, peer_id, deadline, false).await ==
-                Sent::Closed
-            {
+            let dropped = wants.pacer.defer(fetchable, max_deferred());
+            if dropped > 0 {
+                tracing::debug!(
+                    target: "msgboard",
+                    ?peer_id,
+                    dropped,
+                    "request queue full; dropping announced ids",
+                );
+            }
+            if request_deferred(board, tx, wants, peer_id, deadline).await == Sent::Closed {
                 return Sent::Closed;
             }
         }
@@ -1202,32 +1301,43 @@ async fn handle_incoming(
             if !ready {
                 return Sent::Ok;
             }
+            // A peer that has stopped reading and whose queue is still full
+            // would only get frames we drop. Return before the lookup, so its
+            // requests cost no board lock, no encoding, and no budget.
+            if tx.is_stalled_and_full() {
+                metrics.outbound_dropped.increment(1);
+                return Sent::Ok;
+            }
+            // Refunds go only to a peer that was reading when the reply began.
+            let stalled_at_start = tx.stalled.load(Ordering::Relaxed);
             // Neither a repeat nor a short budget costs the peer reputation:
             // an honest peer meets both, and the budget alone bounds the cost.
+            let burst = serve_burst_bytes(board.config().size_limit);
             let msgs = {
                 let now = tokio::time::Instant::now();
-                let burst = serve_burst_bytes(board.config().size_limit);
                 let mut serve = tx.serve.lock();
                 let fresh: Vec<B256> =
                     hashes.iter().copied().filter(|h| !serve.is_recent(h, now)).collect();
                 if fresh.len() < hashes.len() {
                     metrics.requests_repeated.increment(1);
                 }
-                let mut msgs = board.get_wire_messages_for_hashes(&fresh);
-                let fits = msgs
-                    .iter()
-                    .take_while(|m| serve.try_spend(m.length() as u64, burst, now))
-                    .count();
-                if fits < msgs.len() {
+                // Spent per message during the lookup, so the lookup stops at
+                // the budget instead of fetching all 256 bodies first.
+                let mut cut = false;
+                let msgs = board.get_wire_messages_for_hashes(&fresh, |len| {
+                    let fits = serve.try_spend(len, burst, now);
+                    cut |= !fits;
+                    fits
+                });
+                if cut {
                     tracing::debug!(
                         target: "msgboard",
                         ?peer_id,
-                        served = fits,
-                        requested = msgs.len(),
+                        served = msgs.len(),
+                        requested = fresh.len(),
                         "GetBoardMessages reply cut at the peer's budget",
                     );
                     metrics.requests_over_budget.increment(1);
-                    msgs.truncate(fits);
                 }
                 msgs
             };
@@ -1236,9 +1346,11 @@ async fn handle_incoming(
             }
             metrics.bodies_served.increment(msgs.len() as u64);
             // Recorded only once queued, so a peer that asks again for a reply
-            // we dropped is served rather than skipped. A dropped frame is our
-            // stall, not the peer's cost, so its bytes go back to the budget.
-            let burst = serve_burst_bytes(board.config().size_limit);
+            // we dropped is served rather than skipped. A frame dropped while
+            // the peer was reading is our stall, so its bytes go back to the
+            // budget. A frame dropped for a peer that had already stopped
+            // reading is the peer's cost, and so is the rest of the reply,
+            // which is never sent.
             let mut record = |chunk: &[reth_msgboard_types::WirePoWMsg], queued: bool| {
                 let mut serve = tx.serve.lock();
                 if queued {
@@ -1246,7 +1358,7 @@ async fn handle_incoming(
                     for msg in chunk {
                         serve.record(msg.hash, now);
                     }
-                } else {
+                } else if !stalled_at_start {
                     let bytes: usize = chunk.iter().map(Encodable::length).sum();
                     serve.refund(bytes as u64, burst);
                 }
@@ -1414,6 +1526,10 @@ fn decode_hash_request(payload: &[u8]) -> Result<Vec<B256>, MsgboardError> {
 /// [`WirePoWMsg`](reth_msgboard_types::WirePoWMsg) after. The packing rule is
 /// the same either way, and one copy of it is what keeps the two paths from
 /// drifting.
+///
+/// Stops at the first frame the queue drops. Every later frame of the reply
+/// would be dropped as well, so it is not encoded, and `on_outcome` hears
+/// only about the frames that were attempted.
 async fn send_packed_bodies<T: Encodable + Clone>(
     metrics: &MsgboardMetrics,
     tx: &OutboundQueue,
@@ -1431,7 +1547,10 @@ async fn send_packed_bodies<T: Encodable + Clone>(
             match send_bodies_frame(metrics, tx, peer_id, deadline, &chunk, encode).await {
                 Sent::Closed => return Sent::Closed,
                 Sent::Ok => on_outcome(&chunk, true),
-                Sent::Dropped => on_outcome(&chunk, false),
+                Sent::Dropped => {
+                    on_outcome(&chunk, false);
+                    return Sent::Ok;
+                }
             }
             chunk.clear();
             chunk_size = 0;
@@ -1565,6 +1684,7 @@ mod tests {
 
     use alloy_primitives::{Bytes, B256};
     use futures::poll;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use reth_msgboard_types::{
         decode_msg_hash_list, decode_wire_pow_msg_list, encode_msg_hash_list, encode_pow_msg_list,
         encode_wire_pow_msg_list, CheckedPoWMsg, MsgboardConfig, PoWMsg, WirePoWMsg,
@@ -3793,6 +3913,7 @@ mod tests {
         // One outbound slot and nothing draining it, so the task parks inside
         // its first send and cannot run ahead of this test.
         let (out_tx, mut out_rx) = mpsc::channel::<BytesMut>(1);
+        let probe = out_tx.clone();
         let task = tokio::spawn(run_connection(
             Arc::clone(&board),
             None,
@@ -3800,7 +3921,10 @@ mod tests {
             ReceiverStream::new(conn_rx),
             OutboundQueue::new(out_tx),
         ));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait until the task has filled the slot, not for a guessed time.
+        while probe.capacity() > 0 {
+            tokio::task::yield_now().await;
+        }
 
         // A message reaches the board while the peer is flooding.
         board.add_local_msg(mined(&[0xAA], 10)).expect("accepted");
@@ -4648,39 +4772,48 @@ mod tests {
         let ids = seed_multi_frame_response(&board);
         let hashes: Vec<B256> = ids.iter().map(MsgID::message_hash).collect();
         let rep = RecordingReporter::default();
-        // A full one-frame queue on a peer already marked as not reading: the
-        // whole reply is dropped at once, with no wait to age the repeat window.
+        // One slot that is not drained while the reply goes out: the first
+        // frame queues, the second waits out the deadline and is dropped.
         let (raw_tx, mut rx) = mpsc::channel::<BytesMut>(1);
-        raw_tx.try_send(BytesMut::from(&[BOARD_MESSAGES, 0xc0][..])).unwrap();
         let tx = OutboundQueue::new(raw_tx);
-        tx.stalled.store(true, Ordering::Relaxed);
 
         let (first, _) = request_hashes(&board, &rep, &tx, &mut rx, &hashes).await;
-        assert!(first.is_empty(), "the harness must drop the whole first reply");
+        assert!(!first.is_empty() && first.len() < hashes.len(), "the harness must drop a frame");
 
-        let (second, _) = request_hashes(&board, &rep, &tx, &mut rx, &hashes).await;
+        // Only the rest: the deadline wait aged the first frame out of the
+        // repeat window, so asking for everything would serve it again.
+        let rest: Vec<B256> = hashes.iter().copied().filter(|h| !first.contains(h)).collect();
+        let (second, _) = request_hashes(&board, &rep, &tx, &mut rx, &rest).await;
         assert!(!second.is_empty(), "what we dropped must be served when asked again");
         assert_eq!(rep.penalties(), 0, "the peer is not charged for our drop");
     }
 
-    /// A frame our queue dropped costs the peer no budget.
+    /// A frame our queue dropped while the peer was reading costs the peer no
+    /// budget.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_reply_is_refunded_to_the_budget() {
         let board = board_at(10);
         let ids = seed_multi_frame_response(&board);
         let rep = RecordingReporter::default();
         let (raw_tx, mut rx) = mpsc::channel::<BytesMut>(1);
-        raw_tx.try_send(BytesMut::from(&[BOARD_MESSAGES, 0xc0][..])).unwrap();
         let tx = OutboundQueue::new(raw_tx);
-        tx.stalled.store(true, Ordering::Relaxed);
 
         let hashes: Vec<B256> = ids.iter().map(MsgID::message_hash).collect();
-        let (served, _) = request_hashes(&board, &rep, &tx, &mut rx, &hashes).await;
-        assert!(served.is_empty(), "the harness must drop the whole reply");
+        let (served, served_bytes) = request_hashes(&board, &rep, &tx, &mut rx, &hashes).await;
+        assert!(served.len() < hashes.len(), "the harness must drop a frame");
 
+        // Spent: the queued frame and the never-sent remainder. Refunded: the
+        // dropped frame. So more than the queued frame alone is left out of
+        // the burst, and more than the whole reply is left in it.
+        let all: u64 = board
+            .get_wire_messages_for_hashes(&hashes, |_| true)
+            .iter()
+            .map(|m| m.length() as u64)
+            .sum();
         let burst = serve_burst_bytes(board.config().size_limit);
-        let now = tokio::time::Instant::now();
-        assert!(tx.serve.lock().try_spend(burst, burst, now), "the full burst must remain");
+        let tokens = tx.serve.lock().tokens.expect("the budget was used");
+        assert!(tokens > burst - all, "the dropped frame was not refunded");
+        assert!(tokens < burst - served_bytes as u64 + 1024);
     }
 
     /// Many distinct requests draw on one bucket: bytes served stop at the
@@ -4801,6 +4934,323 @@ mod tests {
 
         assert!(drain(&mut rx).is_empty(), "nothing is served over budget");
         assert_eq!(rep.penalties(), 0);
+    }
+
+    // ── review round 2 ───────────────────────────────────────────────────────
+
+    /// An honest reth responder serves the prefix of a reply that fits its
+    /// reply budget and drops the rest. A requester that asks for more than
+    /// that budget at once reads the dropped remainder as withholding, so two
+    /// honest reth nodes strike each other on a bulk sync.
+    ///
+    /// 600 bodies of 8 KiB are about 5 MB, past the 4 MiB burst.
+    #[tokio::test(start_paused = true)]
+    async fn a_bulk_sync_past_the_reply_budget_costs_an_honest_responder_nothing() {
+        let responder = board_at(10);
+        let hashes = seed_distinct(&responder, 600, 8 * 1024);
+        let (resp_tx, mut resp_rx) = channel();
+        let mut resp_wants = WantList::default();
+
+        let requester = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (in_tx, conn_rx) = mpsc::channel::<BytesMut>(4096);
+        let (out_tx, mut out_rx) = mpsc::channel::<BytesMut>(4096);
+        let responder_id = PeerId::repeat_byte(0x5E);
+        let task = tokio::spawn(run_connection(
+            Arc::clone(&requester),
+            Some(Arc::clone(&rep) as Arc<dyn PeerReporter>),
+            responder_id,
+            ReceiverStream::new(conn_rx),
+            OutboundQueue::new(out_tx),
+        ));
+
+        send_board_message_ids(&responder, &resp_tx, peer()).await;
+        // Two simulated minutes, relayed in 100 ms steps.
+        for _ in 0..1200 {
+            for f in drain(&mut resp_rx) {
+                in_tx.send(f).await.unwrap();
+            }
+            while let Ok(f) = out_rx.try_recv() {
+                handle_incoming(&responder, None, &resp_tx, &mut resp_wants, f, peer()).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        task.abort();
+
+        assert_eq!(rep.penalties(), 0, "an honest responder was penalised for its reply budget");
+        let held: HashSet<B256> = requester.all_messages().iter().map(|m| m.hash).collect();
+        let missing = hashes.iter().filter(|h| !held.contains(*h)).count();
+        assert_eq!(missing, 0, "{missing} of {} messages never arrived", hashes.len());
+    }
+
+    /// The requester's copy of the reply budget must leave a margin. A request
+    /// that waited in transit longer than the next one leaves the responder
+    /// less refill time between them than the requester counted, so an exact
+    /// copy over-asks and the responder cuts the reply.
+    ///
+    /// Every other request frame is held 200 ms longer than the one after
+    /// it, in order, as TCP keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn request_pacing_survives_arrival_jitter() {
+        let responder = board_at(10);
+        let hashes = seed_distinct(&responder, 900, 8 * 1024);
+        let (resp_tx, mut resp_rx) = channel();
+        let mut resp_wants = WantList::default();
+
+        let requester = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let (in_tx, conn_rx) = mpsc::channel::<BytesMut>(4096);
+        let (out_tx, mut out_rx) = mpsc::channel::<BytesMut>(4096);
+        let task = tokio::spawn(run_connection(
+            Arc::clone(&requester),
+            Some(Arc::clone(&rep) as Arc<dyn PeerReporter>),
+            PeerId::repeat_byte(0x5E),
+            ReceiverStream::new(conn_rx),
+            OutboundQueue::new(out_tx),
+        ));
+
+        send_board_message_ids(&responder, &resp_tx, peer()).await;
+        let mut in_transit: VecDeque<(tokio::time::Instant, BytesMut)> = VecDeque::new();
+        let mut sent = 0u64;
+        for _ in 0..1800 {
+            for f in drain(&mut resp_rx) {
+                in_tx.send(f).await.unwrap();
+            }
+            let now = tokio::time::Instant::now();
+            while let Ok(f) = out_rx.try_recv() {
+                let delay = if sent.is_multiple_of(2) {
+                    Duration::from_millis(200)
+                } else {
+                    Duration::ZERO
+                };
+                sent += 1;
+                let due = in_transit.back().map_or(now + delay, |(d, _)| (*d).max(now + delay));
+                in_transit.push_back((due, f));
+            }
+            while in_transit.front().is_some_and(|(due, _)| *due <= now) {
+                let (_, f) = in_transit.pop_front().unwrap();
+                handle_incoming(&responder, None, &resp_tx, &mut resp_wants, f, peer()).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        task.abort();
+
+        assert_eq!(rep.penalties(), 0, "an honest responder was penalised under jitter");
+        let held: HashSet<B256> = requester.all_messages().iter().map(|m| m.hash).collect();
+        let missing = hashes.iter().filter(|h| !held.contains(*h)).count();
+        assert_eq!(missing, 0, "{missing} of {} messages never arrived", hashes.len());
+    }
+
+    /// The per-connection request queue is bounded in bytes, not by the
+    /// board's message count: each connection can fill it with junk IDs.
+    #[test]
+    fn the_request_queue_holds_at_most_256_kib_of_ids() {
+        // A MsgID is 121 bytes, and each queued ID is held twice.
+        assert_eq!(MSG_ID_SIZE, 121);
+        let bytes = max_deferred() * 2 * MSG_ID_SIZE;
+        assert!(bytes <= 256 * 1024, "{bytes} bytes of IDs");
+        assert!(max_deferred() >= MAX_IDS_PER_FRAME, "one full announcement must fit");
+    }
+
+    /// A peer whose queue is full and that has stopped reading gets no reply
+    /// work: no lookup under the board mutex, no encoding, and no change to
+    /// its budget. Otherwise every request pays for the lookup and the
+    /// encoding, the frames are dropped, the bytes are refunded, and the reply
+    /// budget never applies.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_peer_with_a_full_queue_gets_no_reply_work() {
+        let board = board_at(10);
+        let ids = seed_multi_frame_response(&board);
+        let hashes: Vec<B256> = ids.iter().map(MsgID::message_hash).collect();
+        let rep = RecordingReporter::default();
+        let (raw_tx, rx) = mpsc::channel::<BytesMut>(1);
+        raw_tx.try_send(BytesMut::from(&[BOARD_MESSAGES, 0xc0][..])).unwrap();
+        let tx = OutboundQueue::new(raw_tx);
+        tx.stalled.store(true, Ordering::Relaxed);
+
+        let before = board.wire_lookups();
+        for _ in 0..10 {
+            let raw = frame(GET_BOARD_MESSAGES, &encode_msg_hash_list(&hashes));
+            handle_incoming(&board, Some(&rep), &tx, &mut WantList::default(), raw, peer()).await;
+        }
+        assert_eq!(rx.len(), 1, "nothing may be queued past the full slot");
+        assert_eq!(board.wire_lookups(), before, "a stalled peer made us look up its request");
+        assert!(tx.serve.lock().tokens.is_none(), "a stalled peer's budget was touched");
+        assert_eq!(rep.penalties(), 0);
+    }
+
+    /// Once one frame of a reply is dropped, the rest of the reply is not
+    /// encoded, and the bytes spent on it are not refunded. A reply cut short
+    /// by the peer's own stall is the peer's cost.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_stops_at_its_first_dropped_frame() {
+        let board = board_at(10);
+        let ids = seed_multi_frame_response(&board);
+        let hashes: Vec<B256> = ids.iter().map(MsgID::message_hash).collect();
+        // One slot that nobody drains: the first frame queues, the second
+        // waits out the deadline and is dropped.
+        let (raw_tx, mut rx) = mpsc::channel::<BytesMut>(1);
+        let tx = OutboundQueue::new(raw_tx);
+
+        let raw = frame(GET_BOARD_MESSAGES, &encode_msg_hash_list(&hashes));
+        handle_incoming(&board, None, &tx, &mut WantList::default(), raw, peer()).await;
+
+        let queued = drain(&mut rx);
+        assert_eq!(queued.len(), 1);
+        let served = decode_wire_pow_msg_list(&queued[0][1..]).unwrap();
+        let served_bytes: u64 = served.iter().map(|m| m.length() as u64).sum();
+        let burst = serve_burst_bytes(board.config().size_limit);
+        let tokens = tx.serve.lock().tokens.expect("the budget was used");
+        assert!(
+            tokens < burst - served_bytes,
+            "the unsent remainder of the reply was refunded: {tokens} of {burst} left after \
+             queueing {served_bytes}",
+        );
+    }
+
+    /// Escalation follows the peer, not the connection. A peer that withholds
+    /// twice, reconnects, and withholds again has three strikes in a minute.
+    #[tokio::test(start_paused = true)]
+    async fn reconnecting_does_not_reset_withholding_escalation() {
+        let board = board_at(10);
+        let rep = Arc::new(RecordingReporter::default());
+        let fakes = wantable_ids(3);
+        let id = PeerId::repeat_byte(0x9B);
+
+        for round in 0..3 {
+            let mut silent = SilentPeer::spawn(&board, &rep, 0x9B);
+            silent.announce(&fakes[round..=round]).await;
+            assert!(silent.asked_within(Duration::from_secs(2)).await);
+            tokio::time::sleep(WANT_TIMEOUT + Duration::from_secs(2)).await;
+            if round < 2 {
+                assert!(!rep.escalated(id), "escalated before the third strike");
+            }
+            // The peer disconnects and comes back.
+            drop(silent);
+        }
+        assert!(rep.escalated(id), "a reconnect reset the peer's strikes");
+    }
+
+    /// A request chunk the queue drops gives back its claims and reservations
+    /// at once, and so does every later chunk. Another announcer gets the
+    /// released IDs at once, not after the claim TTL.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_request_chunks_release_their_claims() {
+        let board = board_at(10);
+        let ids = wantable_ids(3 * MAX_GET_BOARD_MESSAGES);
+        assert_eq!(board.filter_wanted(peer(), &ids).len(), ids.len());
+
+        // One slot that nobody drains, and a deadline already past: the first
+        // chunk queues and the other two are dropped.
+        let (raw_tx, _rx) = mpsc::channel::<BytesMut>(1);
+        let tx = OutboundQueue::new(raw_tx);
+        let mut wants = WantList::default();
+        let now = tokio::time::Instant::now();
+        let sent = request_wanted(&board, &tx, &mut wants, &ids, peer(), now, false).await;
+
+        assert_eq!(sent, Sent::Ok);
+        assert_eq!(wants.len(), MAX_GET_BOARD_MESSAGES, "only the queued chunk stays reserved");
+        let other = PeerId::repeat_byte(0x0E);
+        assert_eq!(
+            board.filter_wanted(other, &ids),
+            ids[MAX_GET_BOARD_MESSAGES..].to_vec(),
+            "the dropped chunks must be requestable from another peer at once",
+        );
+    }
+
+    /// The same for a queue that closes mid-request: the chunks never sent
+    /// are released.
+    #[tokio::test]
+    async fn a_queue_closed_mid_request_releases_the_unsent_chunks() {
+        let board = board_at(10);
+        let ids = wantable_ids(3 * MAX_GET_BOARD_MESSAGES);
+        assert_eq!(board.filter_wanted(peer(), &ids).len(), ids.len());
+
+        let (raw_tx, rx) = mpsc::channel::<BytesMut>(1);
+        let tx = OutboundQueue::new(raw_tx);
+        let mut wants = WantList::default();
+        let deadline = frame_deadline();
+        let mut request =
+            Box::pin(request_wanted(&board, &tx, &mut wants, &ids, peer(), deadline, false));
+        // The first chunk fills the slot; the second waits for room.
+        assert!(poll!(&mut request).is_pending());
+        drop(rx);
+        assert_eq!(request.await, Sent::Closed);
+
+        assert_eq!(wants.len(), MAX_GET_BOARD_MESSAGES, "only the queued chunk stays reserved");
+        let other = PeerId::repeat_byte(0x0E);
+        assert_eq!(
+            board.filter_wanted(other, &ids),
+            ids[MAX_GET_BOARD_MESSAGES..].to_vec(),
+            "the unsent chunks must be requestable from another peer at once",
+        );
+    }
+
+    /// The live-session gauge returns to zero however `run_connection` ends:
+    /// the peer's stream ends, the outbound queue closes, or the network drops
+    /// the task (a kick).
+    #[tokio::test(start_paused = true)]
+    async fn the_session_gauge_returns_to_zero_when_a_connection_ends() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Metric handles bind to the recorder that is live when they are
+        // built, and `MsgboardMetrics::default()` is cached per process, so
+        // the handles are built here against this test's recorder.
+        let metrics = metrics::with_local_recorder(&recorder, || {
+            MsgboardMetrics::new_with_labels(Vec::<metrics::Label>::new())
+        });
+        let board = Arc::new(MsgBoard::with_metrics(easy_cfg(), metrics));
+        board.set_ready();
+        board.set_head(10, block_hash_one());
+        let spawn = |conn_rx, out_tx| {
+            tokio::spawn(run_connection(
+                Arc::clone(&board),
+                None,
+                peer(),
+                ReceiverStream::new(conn_rx),
+                OutboundQueue::new(out_tx),
+            ))
+        };
+
+        // The stream ends.
+        let (in_tx, conn_rx) = mpsc::channel::<BytesMut>(1);
+        let (out_tx, _out_rx) = mpsc::channel::<BytesMut>(8);
+        let task = spawn(conn_rx, out_tx);
+        tokio::task::yield_now().await;
+        drop(in_tx);
+        task.await.unwrap();
+
+        // The outbound queue closes. A message to announce makes the task
+        // find out.
+        let (_in_tx, conn_rx) = mpsc::channel::<BytesMut>(1);
+        let (out_tx, out_rx) = mpsc::channel::<BytesMut>(8);
+        let task = spawn(conn_rx, out_tx);
+        tokio::task::yield_now().await;
+        drop(out_rx);
+        board.add_local_msg(mined(&[0xC1], 10)).expect("accepted");
+        task.await.unwrap();
+
+        // The network drops the connection task.
+        let (_in_tx, conn_rx) = mpsc::channel::<BytesMut>(1);
+        let (out_tx, _out_rx) = mpsc::channel::<BytesMut>(8);
+        let task = spawn(conn_rx, out_tx);
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let snap = snapshotter.snapshot().into_vec();
+        let read = |name: &str| {
+            snap.iter().find_map(|(key, _, _, value)| {
+                (key.key().name() == name).then(|| match value {
+                    DebugValue::Gauge(g) => g.into_inner(),
+                    DebugValue::Counter(c) => *c as f64,
+                    other => panic!("{name} is {other:?}"),
+                })
+            })
+        };
+        assert_eq!(read("msgboard.peer_sessions_opened"), Some(3.0));
+        assert_eq!(read("msgboard.peer_sessions_closed"), Some(3.0), "a session did not close");
+        assert_eq!(read("msgboard.peer_sessions"), Some(0.0), "the gauge did not return to zero");
     }
 
     // ── inbound queue bound ──────────────────────────────────────────────────
