@@ -2,7 +2,7 @@
 
 A practical guide to talking to a reth node's `msgboard_*` namespace. For protocol/wire-level details (P2P codes, RLP layouts, gRPC), see [`specs/02-msgboard.md`](../specs/02-msgboard.md). This document is the reference for **client-side request/response** shapes — the surface that users and AIs need to construct valid calls and parse replies.
 
-> **Implementation note:** This describes the **reth** msgboard implementation on the `extension-model` branch. Method signatures match the `erigon-pulse` JSON-RPC surface, so existing erigon-pulse RPC clients work unchanged. `msgboard_addMessage` takes the same hex-encoded RLP `PoWMsg` that erigon-pulse takes. `msgboard_content` returns the whole board in the same grouped-by-category map, and `msgboard_subscribe` takes the same `["newMessages", filter?]` shape. Reth adds `msgboard_contentPage` for clients that want pages (see [`msgboard_contentPage`](#msgboard_contentpage-reth-extension)), and optional `limit` and deprecated `offset` fields on `msgboard_content`.
+> **Implementation note:** This describes the **reth** msgboard implementation on the `extension-model` branch. Method signatures match the `erigon-pulse` JSON-RPC surface, so existing erigon-pulse RPC clients work unchanged. `msgboard_addMessage` takes the same hex-encoded RLP `PoWMsg` that erigon-pulse takes. `msgboard_content` returns the whole board in the same grouped-by-category map, and `msgboard_subscribe` takes erigon-pulse's `["messages", filter?]` shape (reth also accepts its older kind name `"newMessages"`). Reth adds `msgboard_contentPage` for clients that want pages (see [`msgboard_contentPage`](#msgboard_contentpage-reth-extension)), and optional `limit` and deprecated `offset` fields on `msgboard_content`.
 
 ---
 
@@ -106,8 +106,8 @@ Optional filter. Returns matching live messages **grouped by category**.
 | Field | Type | Optional | Meaning |
 |---|---|---|---|
 | `category` | B256 hex | yes | Restrict to one category |
-| `fromBlock` | uint64 | yes | Inclusive lower bound on `blockNumber` |
-| `toBlock` | uint64 | yes | Inclusive upper bound on `blockNumber` |
+| `fromBlock` | block number | yes | Inclusive lower bound on `blockNumber`. See [Block bounds](#block-bounds). |
+| `toBlock` | block number | yes | Inclusive upper bound on `blockNumber`. See [Block bounds](#block-bounds). |
 | `limit` | number | yes | **Reth extension.** Maximum messages in the response, counted across all categories. Omitted: no limit. `0` gives `-32602`. |
 | `offset` | number | yes | **Reth extension. Deprecated:** use [`msgboard_contentPage`](#msgboard_contentpage-reth-extension). Messages to skip before the response starts. Default `0`. Unstable: see [Paging](#paging-reth-extension). |
 
@@ -115,13 +115,26 @@ Optional filter. Returns matching live messages **grouped by category**.
 
 Omitting the filter (or any field) means "no constraint." Pass `null` or `[]` for no filter. **With no `limit`, the response holds every matching message, the same as erigon-pulse.**
 
+#### Block bounds
+
+`fromBlock` and `toBlock` take the same forms as erigon-pulse's `rpc.BlockNumber`, with erigon's meaning, on `msgboard_content` and `msgboard_contentPage`:
+
+| Value | Meaning |
+|---|---|
+| `20`, `"20"`, `"0x14"` | Block 20. JSON number, decimal string or `0x` hex string. Reth also accepts leading zeros in hex and a leading `+`, which erigon rejects. |
+| `0`, `"earliest"`, `null`, missing | No bound. Erigon reads 0 as "not set", and `earliest` is 0. |
+| `"latest"`, `"pending"`, `"safe"`, `"finalized"`, `"latestExecuted"`, `"null"` | Erigon stores a tag as a negative `int64` and casts it to `uint64`, so the bound is near 2^64. As `toBlock` it admits every block. As `fromBlock` it admits none. |
+| above `2^63 − 1`, negative, fractional, any other string | `-32602`. |
+
+A tag does **not** mean the current head. Erigon's category path gives the same result for a tag `fromBlock`. Its all-categories path fails open on a `fromBlock` past the head and returns everything; reth returns nothing ([parity gaps §13.4](./msgboard-parity-gaps.md)).
+
 #### Response size and `--rpc.max-response-size`
 
 A full default board (10,000 messages of 8 KiB) makes a response of about 167.3 MB, and at most 168,600,045 bytes. Stock reth's default `--rpc.max-response-size` is 160 MiB (167,772,160 bytes), which is less. On a nearly full board, a no-limit call then fails with a response-too-large error. It never returns part of the board.
 
 This build of reth sets the `--rpc.max-response-size` default to 200 MiB, so a full default board fits and you need no flag. The default applies to every RPC method, not only `msgboard_*`: any response up to 200 MiB now goes out where stock reth refuses it above 160 MiB. An explicit `--rpc.max-response-size` still overrides it; do not set it below 200 on a node that serves `msgboard_content`. A stock reth, or any node on the 160 MiB default, needs `--rpc.max-response-size 200` (the value is in MiB). If you raise `--msgboard.count-limit` or `--msgboard.size-limit`, scale this up too: the response is about 2 × `count-limit` × `size-limit` bytes, plus up to about 500 bytes per message.
 
-The node builds the response on a blocking thread, not on the async runtime. Building a full board takes seconds. The node builds at most two `msgboard_content` responses at once; a further call waits its turn, and a caller that disconnects while it waits costs nothing.
+The node builds the response on a blocking thread, not on the async runtime. Building a full board takes seconds. The node holds at most two `msgboard_content` responses at once. A slot stays taken until jsonrpsee hands the response to the transport: on WebSocket and IPC, until the response enters the connection's send queue; on HTTP, until jsonrpsee gives the response to the HTTP layer. In a JSON-RPC batch, the slot comes back when jsonrpsee copies the response into the batch, so a batch of several content calls cannot deadlock; `--rpc.max-response-size` caps the batch. A further call waits its turn, and a caller that disconnects while it waits costs nothing.
 
 #### Paging (reth extension)
 
@@ -164,8 +177,8 @@ Returns one page of live messages in ascending `hash` order, with a cursor for t
 | `limit` | number | no | Most messages in the page, from `1` to `1000`. Missing, `0` or above `1000` gives `-32602`. |
 | `after` | B256 hex | yes | The page holds the matching messages whose `hash` is above `after`. Omitted: the page starts at the lowest hash. |
 | `category` | B256 hex | yes | Restrict to one category |
-| `fromBlock` | uint64 | yes | Inclusive lower bound on `blockNumber` |
-| `toBlock` | uint64 | yes | Inclusive upper bound on `blockNumber` |
+| `fromBlock` | block number | yes | Inclusive lower bound on `blockNumber`. See [Block bounds](#block-bounds). |
+| `toBlock` | block number | yes | Inclusive upper bound on `blockNumber`. See [Block bounds](#block-bounds). |
 
 **Response:** `{ "content": {…}, "next": B256 | null }`.
 
@@ -176,7 +189,7 @@ Returns one page of live messages in ascending `hash` order, with a cursor for t
 
 A message that stays on the board for the whole walk comes back exactly once. This holds when messages arrive or leave between pages, and when the calls go to different replicas behind a load balancer, because a message hash never changes and every node computes the same one. A message that arrives during the walk comes back only if its hash is above the cursor at that time.
 
-The node builds each page on a blocking thread. `msgboard_content` and `msgboard_contentPage` share the same two build slots. The node installs this method on every transport that names the `msgboard` namespace.
+The node builds each page on a blocking thread. `msgboard_contentPage` has four build slots of its own, separate from the two of `msgboard_content`, so full-board calls cannot starve a pager. The node installs this method on every transport that names the `msgboard` namespace.
 
 ```bash
 # First page.
@@ -276,23 +289,23 @@ await fetch(rpcUrl, {
 
 Streams newly accepted messages to the subscriber. Available on the **WebSocket transport only** (jsonrpsee binds subscriptions to WS, not HTTP) — start the node with `--ws --ws.port 8546 --ws.api msgboard,...`.
 
-**Subscribe:** method `msgboard_subscribe`, params `["newMessages", filter?]`:
+**Subscribe:** method `msgboard_subscribe`, params `["messages", filter?]`:
 
-- First param: literal string `"newMessages"` — the subscription kind (only one is currently supported; matches erigon-pulse's discriminator).
+- First param: the subscription kind, `"messages"` (erigon-pulse's wire name, from its Go method `Messages`) or `"newMessages"` (reth's older name). Both open the same subscription.
 - Second param (optional): a `NewMessagesFilter` object:
 
   | Field | Type | Optional | Meaning |
   |---|---|---|---|
   | `category` | B256 hex | yes | Only emit messages whose `category` matches |
 
-If you omit the filter (`["newMessages"]`) the server pushes every accepted message; with a filter, the server discards non-matching messages before sending.
+If you omit the filter (`["messages"]`) the server pushes every accepted message; with a filter, the server discards non-matching messages before sending.
 
 **Unsubscribe:** method `msgboard_unsubscribe`, params `[subscription_id]`.
 
 **Each notification** is a [`MsgboardMsg`](#message-shape).
 
 **Errors:**
-- `-32602 unsupported subscription kind: "<kind>"` — first param was anything other than `"newMessages"`.
+- `-32602 unsupported subscription kind: "<kind>"` — first param was neither `"messages"` nor `"newMessages"`.
 
 #### Wire example (`websocat`)
 
@@ -301,10 +314,10 @@ If you omit the filter (`["newMessages"]`) the server pushes every accepted mess
 websocat ws://localhost:8546
 
 # Send (one line) — subscribe to ALL new messages:
-{"jsonrpc":"2.0","id":1,"method":"msgboard_subscribe","params":["newMessages"]}
+{"jsonrpc":"2.0","id":1,"method":"msgboard_subscribe","params":["messages"]}
 
 # Or subscribe with a category filter:
-{"jsonrpc":"2.0","id":1,"method":"msgboard_subscribe","params":["newMessages",{"category":"0x67b9…"}]}
+{"jsonrpc":"2.0","id":1,"method":"msgboard_subscribe","params":["messages",{"category":"0x67b9…"}]}
 
 # Receive (subscription id):
 {"jsonrpc":"2.0","id":1,"result":"0x9f3a4b…"}
@@ -338,8 +351,8 @@ ws.onopen = () => {
   ws.send(JSON.stringify({
     jsonrpc: '2.0', id: 1,
     method: 'msgboard_subscribe',
-    // Either ['newMessages'] or ['newMessages', { category: '0x…' }]
-    params: ['newMessages']
+    // Either ['messages'] or ['messages', { category: '0x…' }]
+    params: ['messages']
   }));
 };
 
@@ -463,7 +476,7 @@ Reference implementation: `crates/net/msgboard-types/src/pow.rs` — `PoWMsg::ca
 - **`blockHash` must be recent.** If your `blockHash` is older than `head − block-range + stale-block-buffer` blocks, the node will reject with `block too old`. Fetch the head via `eth_blockNumber` / `eth_getBlockByNumber("latest", false)` immediately before starting your PoW search.
 - **Messages expire.** A successfully accepted message disappears from the board once its `blockNumber < head − block-range`. Subscribers see no "delete" event — clients should treat absence-on-`getMessage` as deletion.
 - **Categories are opaque 32-byte values.** The protocol does not interpret or hash them — see [Categories](#categories). Clients sharing a category must agree on its exact byte representation; if you use `keccak256(text)`, the two ends must agree on the exact UTF-8 (no trim, no case fold) to land in the same bucket.
-- **The subscription requires the kind discriminator.** `msgboard_subscribe`'s first param must be the literal string `"newMessages"` — sending an empty `params: []` returns a parse error. WebSocket transport must be enabled (`--ws --ws.api msgboard,...`); HTTP can't carry subscriptions.
+- **The subscription requires the kind discriminator.** `msgboard_subscribe`'s first param must be the kind, `"messages"` or `"newMessages"` — sending an empty `params: []` returns a parse error. WebSocket transport must be enabled (`--ws --ws.api msgboard,...`); HTTP can't carry subscriptions.
 - **The subscription drops on lag.** A slow consumer misses notifications silently (broadcast channel overflow). For complete history, periodically reconcile via `msgboard_content` and de-dupe by `hash`.
 - **Sync gate.** Until initial sync completes, `addMessage` returns `not synced`. Use `msgboard_status` (`headBlock`) and `eth_syncing` together to decide when to start submitting.
 - **The board does not mine.** The node only validates; PoW must be done client-side.
