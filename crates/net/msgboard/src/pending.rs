@@ -24,7 +24,7 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use reth_msgboard_types::MsgID;
+use reth_msgboard_types::{MsgID, MAX_GET_BOARD_MESSAGES};
 use reth_network_api::PeerId;
 // The tokio clock, so tests can pause and advance time through these TTLs.
 use tokio::time::Instant;
@@ -99,8 +99,9 @@ const SEEN_FILTER_BITS: usize = 4096;
 /// one address range. Counting at most two announcers per IPv4 /24 or IPv6
 /// /56 makes each draw ticket cost a real network prefix: to cut an honest
 /// announcer's odds to 16/k, an attacker needs about k/2 distinct prefixes.
-/// Further announcers from a full subnet are remembered, so they cannot
-/// re-enter, but are never candidates.
+/// Further announcers from a full subnet are never candidates. A peer already
+/// counted in the subnet re-enters from a new session without a new slot.
+/// Trusted peers are never capped.
 const MAX_CANDIDATES_PER_SUBNET: u8 = 2;
 
 /// Candidates after which a claim's reservoir is frozen.
@@ -150,6 +151,36 @@ pub(crate) const WANT_TIMEOUT: Duration = Duration::from_secs(15);
 /// figure times the msgboard peer count — 32 KiB of hashes per peer.
 pub(crate) const MAX_WANT_PER_PEER: usize = 1024;
 
+/// Peers that did not announce an exhausted claim's ID and are asked for it.
+///
+/// A claim is exhausted when every announcer it remembered was asked and none
+/// delivered. Three extra requests reach an honest holder when most peers are
+/// honest, and they cost each peer asked one lookup of a hash.
+pub(crate) const SPECULATIVE_PEERS_PER_CLAIM: usize = 3;
+
+/// Requests to non-announcers allowed per second, across all claims.
+///
+/// An attacker exhausts a claim cheaply: it announces an ID that backs no
+/// message and withholds it. Without a global bound, each such ID would make
+/// us ask [`SPECULATIVE_PEERS_PER_CLAIM`] honest peers for nothing. At 16 per
+/// second the worst case is 16 hash lookups per second spread over our peers.
+pub(crate) const MAX_SPECULATIVE_FETCHES_PER_SEC: u32 = 16;
+
+/// Exhausted claims that wait for [`PendingRequests::settle_exhausted`].
+///
+/// The queue holds one claim per first-owner subnet, so 64 subnets must
+/// exhaust claims at once to fill it. Past it a claim is still counted but
+/// gets no speculative fetch, unless it has priority and replaces the oldest
+/// claim without priority.
+const MAX_QUEUED_EXHAUSTED: usize = 64;
+
+/// How long an exhausted claim may wait for speculative budget.
+///
+/// A message lives about 20 minutes (`block_range` = 120 blocks). A claim the
+/// budget has not served within a minute is dropped, so a long flood cannot
+/// keep stale entries in the queue.
+const MAX_EXHAUSTED_AGE: Duration = Duration::from_secs(60);
+
 /// Tracks message IDs that have been requested but not yet received.
 ///
 /// Each claim records the peer that was asked (the owner) and up to
@@ -165,15 +196,22 @@ pub(crate) const MAX_WANT_PER_PEER: usize = 1024;
 ///
 /// Residual risk: an attacker that controls most of our msgboard peers can
 /// still delay delivery, one TTL per withholding peer asked, or cause its loss
-/// for this node if every alternate withholds. Honest peers announce once, so
-/// an exhausted claim is not re-claimed until a new peer announces the ID.
-/// Each distinct announcer counts once per claim, so an attacker lowers an
+/// for this node if every alternate withholds and no peer it asks without an
+/// announcement holds the message. Each distinct announcer counts once per
+/// claim and session, so an attacker lowers an
 /// honest announcer's odds of staying in the list only by adding connections:
 /// with `k` distinct announcers the odds are 16/k. Hand-offs go through the
-/// alternates, and each peer enters them at most once per claim, so every
-/// hand-off, and every TTL of delay, costs the attacker one more connection
-/// that announced the ID. Erigon has no alternates, so it loses the message to
-/// the first withholding peer.
+/// alternates, and each peer enters them at most once per claim and session,
+/// so every hand-off, and every TTL of delay, costs the attacker one more
+/// connection that announced the ID.
+///
+/// Three things narrow that risk. A peer re-enters a claim from a new session,
+/// so an honest peer that reconnects and re-announces is asked again. Trusted
+/// peers (reth `PeerKind::Trusted`) are asked first after the owner and never
+/// leave the alternates by the draw. A claim that runs out of announcers asks
+/// up to [`SPECULATIVE_PEERS_PER_CLAIM`] peers that never announced the ID; see
+/// [`settle_exhausted`](Self::settle_exhausted). Erigon has no alternates, so it loses the message
+/// to the first withholding peer.
 ///
 /// Not thread-safe on its own — [`MsgBoard`](crate::MsgBoard) keeps it inside
 /// the state mutex that `filter_wanted` already holds.
@@ -200,6 +238,28 @@ pub(crate) struct PendingRequests {
     /// Process-random key for [`SeenFilter`], so a remote peer cannot pick
     /// peer IDs that collide with an honest one.
     seen_key: std::collections::hash_map::RandomState,
+    /// Live `msg/1` sessions. One entry per connected peer, so the map is
+    /// bounded by the peer count.
+    sessions: HashMap<PeerId, PeerSession>,
+    /// The id the next session gets. Starts at 1: 0 means "no session known".
+    next_session: u64,
+    /// Claims the sweep found exhausted, for
+    /// [`settle_exhausted`](Self::settle_exhausted).
+    exhausted: Vec<Exhausted>,
+    /// Claims exhausted since the last
+    /// [`settle_exhausted`](Self::settle_exhausted), including ones past
+    /// [`MAX_QUEUED_EXHAUSTED`].
+    exhausted_count: u64,
+    /// Message IDs to request from peers that never announced them. See
+    /// [`take_speculative`](Self::take_speculative).
+    speculative: HashMap<PeerId, Vec<MsgID>>,
+    /// Start of the current one-second window for
+    /// [`MAX_SPECULATIVE_FETCHES_PER_SEC`].
+    speculative_window: Option<Instant>,
+    /// Speculative requests queued in the current window.
+    speculative_used: u32,
+    /// First-owner subnets served in the current window.
+    speculative_groups: Vec<Option<u64>>,
 }
 
 impl PendingRequests {
@@ -221,6 +281,14 @@ impl PendingRequests {
                 std::collections::hash_map::RandomState::new().build_hasher().finish() | 1
             },
             seen_key: std::collections::hash_map::RandomState::new(),
+            sessions: HashMap::new(),
+            next_session: 1,
+            exhausted: Vec::new(),
+            exhausted_count: 0,
+            speculative: HashMap::new(),
+            speculative_window: None,
+            speculative_used: 0,
+            speculative_groups: Vec::new(),
         }
     }
 
@@ -252,8 +320,9 @@ impl PendingRequests {
         subnet: Option<u64>,
         now: Instant,
     ) -> bool {
-        let Self { claims, owned, retries, struck, rng, ttl, capacity, seen_key, .. } = self;
-        let peer_hash = std::hash::BuildHasher::hash_one(&*seen_key, peer);
+        let Self { claims, owned, retries, struck, rng, ttl, capacity, seen_key, sessions, .. } =
+            self;
+        let keys = AnnouncerKeys::of(seen_key, sessions, peer);
         let Some(claim) = claims.get_mut(&id) else {
             let held = owned.get(&peer).copied().unwrap_or_default();
             if claims.len() < *capacity && held < MAX_CLAIMS_PER_PEER {
@@ -263,10 +332,15 @@ impl PendingRequests {
                         claimed_at: now,
                         owner: peer,
                         alternates: Vec::new(),
-                        seen: SeenFilter::with(peer_hash),
+                        seen: SeenFilter::with(keys.session),
+                        announcers: SeenFilter::with(keys.peer),
+                        group: subnet,
+                        trusted_announcer: is_trusted(sessions, &peer),
                         candidates: 0,
                         subnets: Vec::new(),
                         retry: false,
+                        tried: 1,
+                        tried_subnets: subnet.into_iter().collect(),
                     },
                 );
                 *owned.entry(peer).or_default() += 1;
@@ -282,8 +356,10 @@ impl PendingRequests {
                 claim.claimed_at = now;
                 claim.retry = false;
                 if claim.candidates < MAX_DRAW_CANDIDATES {
-                    claim.seen.insert(peer_hash);
+                    claim.seen.insert(keys.session);
+                    claim.announcers.insert(keys.peer);
                 }
+                claim.note_tried(subnet);
                 decrement(owned, previous);
                 *owned.entry(peer).or_default() += 1;
                 return true;
@@ -291,9 +367,9 @@ impl PendingRequests {
             // Peers are waiting. Do what the sweep would do, so an announcer
             // that arrives just after expiry cannot jump the queue.
             decrement(owned, claim.owner);
-            claim.hand_to_next_alternate(now, struck, owned, retries, id);
+            claim.hand_to_next_alternate(now, struck, sessions, owned, retries, id);
         }
-        claim.admit(peer, peer_hash, subnet, rng);
+        claim.admit(peer, keys, subnet, sessions, rng);
         false
     }
 
@@ -319,6 +395,7 @@ impl PendingRequests {
             claim.hand_to_next_alternate(
                 now,
                 &self.struck,
+                &self.sessions,
                 &mut self.owned,
                 &mut self.retries,
                 *id,
@@ -348,21 +425,39 @@ impl PendingRequests {
     /// and queues a retry for that peer.
     ///
     /// Dropping an exhausted claim re-arms its ID: the next peer to announce it
-    /// claims it at once and is asked.
+    /// claims it at once and is asked. A claim dropped with no alternate left
+    /// and its message missing is kept for
+    /// [`settle_exhausted`](Self::settle_exhausted), which the caller runs next.
     pub(crate) fn sweep(&mut self, now: Instant, is_held: impl Fn(&MsgID) -> bool) {
         let ttl = self.ttl;
         self.struck.retain(|_, at| now.duration_since(*at) < WITHHOLD_WINDOW);
         self.strikes.prune(now);
-        let Self { claims, owned, retries, struck, .. } = self;
+        let Self { claims, owned, retries, struck, sessions, exhausted, exhausted_count, .. } =
+            self;
         claims.retain(|id, claim| {
             if now.duration_since(claim.claimed_at) < ttl {
                 return true;
             }
             decrement(owned, claim.owner);
-            if claim.alternates.is_empty() || is_held(id) {
+            if is_held(id) {
                 return false;
             }
-            claim.hand_to_next_alternate(now, struck, owned, retries, *id);
+            if claim.alternates.is_empty() {
+                // Every announcer the claim kept was asked, and none delivered.
+                *exhausted_count += 1;
+                let entry = Exhausted {
+                    id: *id,
+                    tried: claim.tried,
+                    announcers: std::mem::replace(&mut claim.announcers, SeenFilter::empty()),
+                    priority: claim.trusted_announcer || claim.tried_subnets.len() >= 2,
+                    tried_subnets: std::mem::take(&mut claim.tried_subnets),
+                    group: claim.group,
+                    at: now,
+                };
+                queue_exhausted(exhausted, entry);
+                return false;
+            }
+            claim.hand_to_next_alternate(now, struck, sessions, owned, retries, *id);
             true
         });
         // A retry goes stale when its claim moves on, for example to a later
@@ -407,6 +502,152 @@ impl PendingRequests {
     pub(crate) fn len(&self) -> usize {
         self.claims.len()
     }
+
+    /// Record a new `msg/1` session with `peer`, whose address is in `subnet`.
+    /// Returns the session's id, for [`close_session`](Self::close_session).
+    pub(crate) fn open_session(&mut self, peer: PeerId, subnet: Option<u64>) -> u64 {
+        let id = self.next_session;
+        self.next_session += 1;
+        self.sessions.insert(peer, PeerSession { id, subnet, trusted: false });
+        id
+    }
+
+    /// Forget session `session` of `peer`. Does nothing when a newer session
+    /// of the same peer replaced it.
+    pub(crate) fn close_session(&mut self, peer: PeerId, session: u64) {
+        if self.sessions.get(&peer).is_some_and(|s| s.id == session) {
+            self.sessions.remove(&peer);
+            self.speculative.remove(&peer);
+        }
+    }
+
+    /// Mark session `session` of `peer` as one with a peer that reth trusts.
+    pub(crate) fn set_trusted(&mut self, peer: PeerId, session: u64) {
+        if let Some(s) = self.sessions.get_mut(&peer) &&
+            s.id == session
+        {
+            s.trusted = true;
+        }
+    }
+
+    /// Handle the claims the sweep found exhausted.
+    ///
+    /// Each one whose message `is_wanted` still is gets up to
+    /// [`SPECULATIVE_PEERS_PER_CLAIM`] requests to connected peers that did
+    /// not announce it, inside [`MAX_SPECULATIVE_FETCHES_PER_SEC`].
+    ///
+    /// The budget is shared fairly. Claims with a trusted announcer, or whose
+    /// owners came from two or more subnets, go first, then the oldest. Each
+    /// window serves at most one claim per first-owner subnet, and the queue
+    /// keeps at most one claim per first-owner subnet (see
+    /// [`queue_exhausted`]). A claim the budget cannot serve stays queued for
+    /// a later window, for at most [`MAX_EXHAUSTED_AGE`].
+    ///
+    /// Returns how many claims were exhausted since the last call, and what
+    /// happened to each claim this call finished with.
+    pub(crate) fn settle_exhausted(
+        &mut self,
+        now: Instant,
+        is_wanted: impl Fn(&MsgID) -> bool,
+    ) -> (u64, Vec<ExhaustedClaim>) {
+        if self
+            .speculative_window
+            .is_none_or(|start| now.duration_since(start) >= Duration::from_secs(1))
+        {
+            self.speculative_window = Some(now);
+            self.speculative_used = 0;
+            self.speculative_groups.clear();
+        }
+        let count = std::mem::take(&mut self.exhausted_count);
+        let mut queue = std::mem::take(&mut self.exhausted);
+        queue.sort_by_key(|claim| (!claim.priority, claim.at));
+        let mut settled = Vec::new();
+        for claim in queue {
+            let done = |asked| ExhaustedClaim { id: claim.id, tried: claim.tried, asked };
+            if !is_wanted(&claim.id) || now.duration_since(claim.at) >= MAX_EXHAUSTED_AGE {
+                settled.push(done(0));
+            } else if self.speculative_used >= MAX_SPECULATIVE_FETCHES_PER_SEC ||
+                self.speculative_groups.contains(&claim.group)
+            {
+                self.exhausted.push(claim);
+            } else {
+                self.speculative_groups.push(claim.group);
+                let asked = self.ask_non_announcers(&claim);
+                settled.push(done(asked));
+            }
+        }
+        (count, settled)
+    }
+
+    /// Queue `claim`'s ID for up to [`SPECULATIVE_PEERS_PER_CLAIM`] connected
+    /// peers that did not announce it, inside the global rate. Returns how
+    /// many were queued.
+    ///
+    /// Trusted peers come first. Then peers outside the subnets already
+    /// asked, one per subnet, in random order, so the attacker that withheld
+    /// cannot predict or crowd out who is asked. A peer that announced in any
+    /// session is never asked.
+    fn ask_non_announcers(&mut self, claim: &Exhausted) -> usize {
+        let room = MAX_SPECULATIVE_FETCHES_PER_SEC.saturating_sub(self.speculative_used) as usize;
+        let want = SPECULATIVE_PEERS_PER_CLAIM.min(room);
+        let Self { sessions, seen_key, rng, speculative, .. } = self;
+        let mut candidates: Vec<_> = sessions
+            .iter()
+            .filter(|(peer, _)| {
+                !claim.announcers.contains(std::hash::BuildHasher::hash_one(&*seen_key, **peer)) &&
+                    speculative.get(*peer).is_none_or(|q| q.len() < MAX_GET_BOARD_MESSAGES)
+            })
+            .map(|(peer, session)| {
+                let tried = session.subnet.is_some_and(|s| claim.tried_subnets.contains(&s));
+                (!session.trusted, tried, next_random(rng), *peer, session.subnet)
+            })
+            .collect();
+        candidates.sort_unstable();
+        // One peer per subnet first; trusted peers are never held back.
+        let mut picked = Vec::with_capacity(want);
+        let mut subnets = Vec::with_capacity(want);
+        for (untrusted, _, _, peer, subnet) in &candidates {
+            if picked.len() == want {
+                break;
+            }
+            if !untrusted || subnet.is_none_or(|s| !subnets.contains(&s)) {
+                picked.push(*peer);
+                subnets.extend(*subnet);
+            }
+        }
+        for (_, _, _, peer, _) in &candidates {
+            if picked.len() == want {
+                break;
+            }
+            if !picked.contains(peer) {
+                picked.push(*peer);
+            }
+        }
+        for peer in &picked {
+            speculative.entry(*peer).or_default().push(claim.id);
+        }
+        self.speculative_used += picked.len() as u32;
+        picked.len()
+    }
+
+    /// Take the IDs queued for `peer` by
+    /// [`settle_exhausted`](Self::settle_exhausted). `peer` never announced
+    /// them, so the caller must request them in a way that never penalises
+    /// `peer` for an empty answer.
+    pub(crate) fn take_speculative(&mut self, peer: PeerId) -> Vec<MsgID> {
+        self.speculative.remove(&peer).unwrap_or_default()
+    }
+}
+
+/// What [`PendingRequests::settle_exhausted`] did with one exhausted claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExhaustedClaim {
+    /// The claimed ID.
+    pub(crate) id: MsgID,
+    /// Announcers the claim asked before it ran out.
+    pub(crate) tried: u32,
+    /// Non-announcers queued to be asked for it.
+    pub(crate) asked: usize,
 }
 
 impl Default for PendingRequests {
@@ -431,7 +672,7 @@ impl Default for PendingRequests {
 /// instance lives in each connection task, so the peer half of erigon's key is
 /// the instance itself and only the hash is stored.
 ///
-/// [`take`](Self::take) spends the reservation for a named hash, mirroring
+/// [`take_kind`](Self::take_kind) spends the reservation for a named hash, mirroring
 /// erigon's `Take(peer, hash, now)`. It relies on the claimed hash that
 /// `WirePoWMsg` carries: without one, nothing identifies a delivery before
 /// verification, because the index key is the sha256 of the compressed `PoW`
@@ -517,12 +758,15 @@ impl WantList {
             let expired = self.queue.pop_front().expect("front exists");
             if self.live.get(&expired.hash).is_some_and(|l| l.expires_at == expired.expires_at) {
                 let live = self.live.remove(&expired.hash).expect("checked above");
-                if live.first_hand {
-                    self.expired.first_hand += 1;
-                    let answered = self.requests.get(&live.request).is_some_and(|r| r.answered);
-                    self.expired.silent |= !answered;
-                } else {
-                    self.expired.retries += 1;
+                match live.kind {
+                    RequestKind::FirstHand => {
+                        self.expired.first_hand += 1;
+                        let answered = self.requests.get(&live.request).is_some_and(|r| r.answered);
+                        self.expired.silent |= !answered;
+                    }
+                    RequestKind::Retry => self.expired.retries += 1,
+                    // The peer never said it held the message.
+                    RequestKind::Speculative => {}
                 }
                 self.settle(live.request, false);
             }
@@ -534,7 +778,14 @@ impl WantList {
         std::mem::take(&mut self.expired)
     }
 
-    /// Reserve `hash`, authorising this peer to deliver one message.
+    /// Reserve `hash` for a first-hand request. Test use only.
+    #[cfg(test)]
+    pub(crate) fn reserve(&mut self, hash: B256, now: Instant) -> bool {
+        self.reserve_kind(hash, now, RequestKind::FirstHand)
+    }
+
+    /// Reserve `hash`, authorising this peer to deliver one message, for a
+    /// request of this `kind`.
     ///
     /// Returns `false` when the peer already owes us that hash or the list is
     /// full. Only unspent reservations count toward the cap, as in erigon
@@ -543,23 +794,15 @@ impl WantList {
     /// is a message we would refuse to verify on arrival, so requesting it
     /// would waste the round trip. The caller must hand a refused ID back to
     /// [`PendingRequests`] rather than request it.
-    pub(crate) fn reserve(&mut self, hash: B256, now: Instant) -> bool {
-        self.reserve_inner(hash, now, true)
-    }
-
-    /// Reserve `hash` for a retry: a request made because another peer
-    /// withheld the message.
     ///
-    /// Behaves like [`reserve`](Self::reserve), but the reservation does not
-    /// count toward [`take_expired`](Self::take_expired). The
-    /// retry reaches this peer a TTL or more after it announced, when it may
-    /// have evicted or pruned the message, and a responder sends nothing for a
-    /// hash it lacks. That is not withholding.
-    pub(crate) fn reserve_retry(&mut self, hash: B256, now: Instant) -> bool {
-        self.reserve_inner(hash, now, false)
-    }
-
-    fn reserve_inner(&mut self, hash: B256, now: Instant, first_hand: bool) -> bool {
+    /// Only a [`RequestKind::FirstHand`] reservation counts as withholding
+    /// when it expires. A [`RequestKind::Retry`] reaches this peer a TTL or
+    /// more after it announced, when it may have evicted or pruned the
+    /// message, and a responder sends nothing for a hash it lacks. Its expiry
+    /// counts only toward [`take_expired`](Self::take_expired)'s `retries`. A
+    /// [`RequestKind::Speculative`] reservation goes to a peer that never
+    /// announced the message, so its expiry counts for nothing at all.
+    pub(crate) fn reserve_kind(&mut self, hash: B256, now: Instant, kind: RequestKind) -> bool {
         if self.live.contains_key(&hash) || self.live.len() >= self.capacity {
             return false;
         }
@@ -573,7 +816,7 @@ impl WantList {
         }
         let expires_at = now + self.ttl;
         self.queue.push_back(Want { hash, expires_at });
-        self.live.insert(hash, Live { expires_at, first_hand, request: self.request });
+        self.live.insert(hash, Live { expires_at, kind, request: self.request });
         self.requests.entry(self.request).or_default().outstanding += 1;
         true
     }
@@ -603,11 +846,20 @@ impl WantList {
     /// spent reservation is not restored if the message then fails validation,
     /// matching erigon: the peer is penalised, and another peer may already
     /// hold its own reservation for the same message.
-    pub(crate) fn take(&mut self, hash: B256, now: Instant) -> bool {
+    ///
+    /// Returns why the reservation was made, or `None` when there was none.
+    pub(crate) fn take_kind(&mut self, hash: B256, now: Instant) -> Option<RequestKind> {
         self.prune(now);
-        let Some(live) = self.live.remove(&hash) else { return false };
+        let live = self.live.remove(&hash)?;
         self.settle(live.request, true);
-        true
+        Some(live.kind)
+    }
+
+    /// Whether [`take_kind`](Self::take_kind) found a reservation. Test use
+    /// only.
+    #[cfg(test)]
+    pub(crate) fn take(&mut self, hash: B256, now: Instant) -> bool {
+        self.take_kind(hash, now).is_some()
     }
 
     /// Number of live reservations, for tests.
@@ -807,77 +1059,154 @@ struct Claim {
     owner: PeerId,
     /// Later announcers, in announcement order.
     alternates: Vec<PeerId>,
-    /// Every peer that announced this ID, the first owner included.
+    /// Every announcer of this ID, the first owner included, keyed per
+    /// session (see [`AnnouncerKeys`]).
     seen: Box<SeenFilter>,
     /// Distinct announcers after the first owner: the reservoir count.
     candidates: u64,
     /// Candidates counted per subnet, for [`MAX_CANDIDATES_PER_SUBNET`]. At
     /// most [`MAX_DRAW_CANDIDATES`] entries.
-    subnets: Vec<(u64, u8)>,
+    subnets: Vec<SubnetCount>,
     /// The claim moved to `owner`, which has not been asked yet.
     retry: bool,
+    /// Owners asked so far, the first one included.
+    tried: u32,
+    /// Subnets of the owners asked so far, without repeats. At most
+    /// `2 * MAX_ALTERNATES` entries.
+    tried_subnets: Vec<u64>,
+    /// Every announcer by peer ID alone, in any session. Only the
+    /// speculative fetch reads it, so that an announcer is never asked as a
+    /// non-announcer. Filled like `seen`, so its false-positive rate matches.
+    announcers: Box<SeenFilter>,
+    /// The first owner's subnet; see [`Exhausted::group`].
+    group: Option<u64>,
+    /// A trusted peer announced this ID.
+    trusted_announcer: bool,
 }
 
 impl Claim {
     /// Consider `peer`, which announced this claimed ID, as an alternate.
     ///
-    /// A peer is considered once per claim. While the list has room, every
-    /// newcomer joins. Once it is full, the `k`-th distinct candidate replaces
-    /// a random entry with odds `MAX_ALTERNATES / k` and is dropped otherwise
-    /// (reservoir sampling). Every candidate then holds a slot with the same
-    /// odds, whatever the order of announcements. A fixed choice, such as the
-    /// oldest or a struck peer, lets an attacker push out a chosen honest
-    /// peer: it controls the announcement order, and it can steer a soft
-    /// strike onto an honest peer. Strikes only order who is asked.
-    fn admit(&mut self, peer: PeerId, peer_hash: u64, subnet: Option<u64>, rng: &mut u64) {
-        if self.owner == peer || self.candidates >= MAX_DRAW_CANDIDATES {
+    /// A peer is considered once per claim and session. While the list has
+    /// room, every newcomer joins. Once it is full, the `k`-th distinct
+    /// candidate replaces a random entry with odds `MAX_ALTERNATES / k` and is
+    /// dropped otherwise (reservoir sampling). Every candidate then holds a
+    /// slot with the same odds, whatever the order of announcements. A fixed
+    /// choice, such as the oldest or a struck peer, lets an attacker push out
+    /// a chosen honest peer: it controls the announcement order, and it can
+    /// steer a soft strike onto an honest peer. Strikes only order who is
+    /// asked.
+    ///
+    /// A peer that announced in an earlier session re-enters as a new
+    /// candidate. Honest peers re-announce their whole board on every new
+    /// session, and without this a peer whose session ended before its turn
+    /// could never be asked again. A looping peer must reconnect for each new
+    /// ticket, and reth throttles inbound connections from one IP for 30 s
+    /// (`INBOUND_IP_THROTTLE_DURATION`). A peer counted in its subnet before
+    /// does not need a new subnet slot to re-enter.
+    ///
+    /// Trusted peers skip the subnet cap. A trusted newcomer to a full list
+    /// replaces a random untrusted entry, and the draw never evicts a trusted
+    /// entry. Without trusted peers the draw is unchanged.
+    fn admit(
+        &mut self,
+        peer: PeerId,
+        keys: AnnouncerKeys,
+        subnet: Option<u64>,
+        sessions: &HashMap<PeerId, PeerSession>,
+        rng: &mut u64,
+    ) {
+        if self.owner == peer ||
+            self.candidates >= MAX_DRAW_CANDIDATES ||
+            self.alternates.contains(&peer)
+        {
             return;
         }
+        let trusted = is_trusted(sessions, &peer);
         // A full subnet is checked before the filter, so its extra announcers
         // neither enter the draw nor fill the filter. They cannot re-enter
         // later either: the subnet stays full for the life of the claim.
         let slot =
-            subnet.map(|subnet| self.subnets.iter().position(|(s, _)| *s == subnet).ok_or(subnet));
-        if let Some(Ok(i)) = slot &&
-            self.subnets[i].1 >= MAX_CANDIDATES_PER_SUBNET
+            subnet.map(|subnet| self.subnets.iter().position(|c| c.subnet == subnet).ok_or(subnet));
+        // A member gets one rejoin per claim, so it holds at most two draw
+        // tickets however often it reconnects.
+        let rejoin = match slot {
+            Some(Ok(i)) => self.subnets[i].member(keys.peer).map(|m| (i, m)),
+            _ => None,
+        };
+        if let Some((i, m)) = rejoin &&
+            self.subnets[i].rejoined[m]
         {
             return;
         }
-        if !self.seen.insert(peer_hash) {
+        if !trusted &&
+            rejoin.is_none() &&
+            let Some(Ok(i)) = slot &&
+            self.subnets[i].count >= MAX_CANDIDATES_PER_SUBNET
+        {
             return;
         }
-        match slot {
-            Some(Ok(i)) => self.subnets[i].1 += 1,
-            Some(Err(subnet)) => self.subnets.push((subnet, 1)),
-            None => {}
+        if !self.seen.insert(keys.session) {
+            return;
+        }
+        self.announcers.insert(keys.peer);
+        self.trusted_announcer |= trusted;
+        if let Some((i, m)) = rejoin {
+            // A rejoin in the member's first session is a repeat, which the
+            // filter refused above, so this is a new session.
+            self.subnets[i].rejoined[m] = true;
+        } else {
+            match slot {
+                Some(Ok(i)) => self.subnets[i].add(keys.peer),
+                Some(Err(subnet)) => self.subnets.push(SubnetCount::new(subnet, keys.peer)),
+                None => {}
+            }
         }
         self.candidates += 1;
         if self.alternates.len() < MAX_ALTERNATES {
             self.alternates.push(peer);
             return;
         }
-        *rng ^= *rng << 13;
-        *rng ^= *rng >> 7;
-        *rng ^= *rng << 17;
-        let slot = (*rng % self.candidates) as usize;
-        if slot < MAX_ALTERNATES {
+        if trusted {
+            let untrusted: Vec<usize> = (0..self.alternates.len())
+                .filter(|i| !is_trusted(sessions, &self.alternates[*i]))
+                .collect();
+            if !untrusted.is_empty() {
+                let i = untrusted[(next_random(rng) % untrusted.len() as u64) as usize];
+                self.alternates[i] = peer;
+            }
+            return;
+        }
+        let slot = (next_random(rng) % self.candidates) as usize;
+        if slot < MAX_ALTERNATES && !is_trusted(sessions, &self.alternates[slot]) {
             self.alternates[slot] = peer;
         }
     }
 
-    /// Make the first alternate without a live strike the owner (or the first
-    /// alternate, if all have one) and queue a retry for it. A retry still
-    /// queued for the previous owner is withdrawn. The caller accounts for the
-    /// previous owner's claim count.
+    /// Make the next alternate the owner and queue a retry for it. Trusted
+    /// alternates go first, then alternates without a live strike, each in
+    /// announcement order. A retry still queued for the previous owner is
+    /// withdrawn. The caller accounts for the previous owner's claim count.
+    ///
+    /// Trust outranks a strike on purpose. A compromised trusted peer that
+    /// withholds is asked first on every claim it announces, so it costs one
+    /// TTL of delay per such claim. That is accepted: the operator chose to
+    /// trust it, and the other alternates are still asked after it.
     fn hand_to_next_alternate(
         &mut self,
         now: Instant,
         struck: &HashMap<PeerId, Instant>,
+        sessions: &HashMap<PeerId, PeerSession>,
         owned: &mut HashMap<PeerId, usize>,
         retries: &mut HashMap<PeerId, Vec<MsgID>>,
         id: MsgID,
     ) {
-        let pick = self.alternates.iter().position(|p| !is_struck(struck, p, now)).unwrap_or(0);
+        let pick = self
+            .alternates
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, p)| (!is_trusted(sessions, p), is_struck(struck, p, now), *i))
+            .map_or(0, |(i, _)| i);
         let next = self.alternates.remove(pick);
         if self.retry &&
             let std::collections::hash_map::Entry::Occupied(mut e) = retries.entry(self.owner)
@@ -890,16 +1219,107 @@ impl Claim {
         self.owner = next;
         self.claimed_at = now;
         self.retry = true;
+        self.note_tried(sessions.get(&next).and_then(|s| s.subnet));
         *owned.entry(next).or_default() += 1;
         retries.entry(next).or_default().push(id);
+    }
+
+    /// Count one more owner asked, from `subnet`.
+    fn note_tried(&mut self, subnet: Option<u64>) {
+        self.tried += 1;
+        if let Some(subnet) = subnet &&
+            self.tried_subnets.len() < 2 * MAX_ALTERNATES &&
+            !self.tried_subnets.contains(&subnet)
+        {
+            self.tried_subnets.push(subnet);
+        }
+    }
+}
+
+/// The candidates one subnet has put into a claim's draw.
+#[derive(Debug)]
+struct SubnetCount {
+    subnet: u64,
+    count: u8,
+    /// The first [`MAX_CANDIDATES_PER_SUBNET`] candidates, as truncated
+    /// [`AnnouncerKeys::peer`] hashes, so they can rejoin from a new session.
+    /// A collision only lets one more peer in, so 32 bits is enough.
+    members: [u32; MAX_CANDIDATES_PER_SUBNET as usize],
+    /// Which members have used their one rejoin in this claim.
+    rejoined: [bool; MAX_CANDIDATES_PER_SUBNET as usize],
+}
+
+impl SubnetCount {
+    fn new(subnet: u64, peer: u64) -> Self {
+        let mut count = Self {
+            subnet,
+            count: 0,
+            members: [0; MAX_CANDIDATES_PER_SUBNET as usize],
+            rejoined: [false; MAX_CANDIDATES_PER_SUBNET as usize],
+        };
+        count.add(peer);
+        count
+    }
+
+    fn add(&mut self, peer: u64) {
+        if let Some(slot) = self.members.get_mut(self.count as usize) {
+            *slot = peer as u32;
+        }
+        self.count = self.count.saturating_add(1);
+    }
+
+    /// The member slot of `peer`, if it is a member.
+    fn member(&self, peer: u64) -> Option<usize> {
+        self.members[..(self.count as usize).min(self.members.len())]
+            .iter()
+            .position(|m| *m == peer as u32)
+    }
+}
+
+/// The filter keys of one announcer.
+#[derive(Debug, Clone, Copy)]
+struct AnnouncerKeys {
+    /// Keyed hash of the peer ID alone.
+    peer: u64,
+    /// Keyed hash of the peer ID and its session, so a new session reads as a
+    /// new announcer. Equal to `peer` when no session is known.
+    session: u64,
+}
+
+impl AnnouncerKeys {
+    fn of(
+        key: &std::collections::hash_map::RandomState,
+        sessions: &HashMap<PeerId, PeerSession>,
+        peer: PeerId,
+    ) -> Self {
+        match sessions.get(&peer) {
+            Some(session) => Self::for_session(key, peer, session.id),
+            None => {
+                let peer = std::hash::BuildHasher::hash_one(key, peer);
+                Self { peer, session: peer }
+            }
+        }
+    }
+
+    fn for_session(
+        key: &std::collections::hash_map::RandomState,
+        peer: PeerId,
+        session: u64,
+    ) -> Self {
+        Self {
+            peer: std::hash::BuildHasher::hash_one(key, peer),
+            session: std::hash::BuildHasher::hash_one(key, (peer, session)),
+        }
     }
 }
 
 /// The peers that announced one claimed ID: a Bloom filter with three probes,
 /// keyed per process.
 ///
-/// It must remember every announcer: a forgotten peer could announce again,
-/// re-enter the reservoir draw, and buy itself unlimited tickets. A filter
+/// It must remember every announcer of the current session: a forgotten peer
+/// could announce again, re-enter the reservoir draw, and buy itself unlimited
+/// tickets. Keys include the session (see [`AnnouncerKeys`]), so a new session
+/// reads as a new announcer, at the cost of one reconnect. A filter
 /// remembers all of them in fixed memory. Its only error is a false positive,
 /// which refuses an honest newcomer as if it had announced already. With 4096
 /// bits and three probes the rate is (1 - e^(-3n/4096))^3 for n entries:
@@ -911,13 +1331,17 @@ struct SeenFilter([u64; SEEN_FILTER_BITS / 64]);
 impl SeenFilter {
     /// A filter holding one peer.
     fn with(peer_hash: u64) -> Box<Self> {
-        let mut filter = Box::new(Self([0; SEEN_FILTER_BITS / 64]));
+        let mut filter = Self::empty();
         filter.insert(peer_hash);
         filter
     }
 
+    /// An empty filter.
+    fn empty() -> Box<Self> {
+        Box::new(Self([0; SEEN_FILTER_BITS / 64]))
+    }
+
     /// Whether a peer is (probably) present.
-    #[cfg(test)]
     fn contains(&self, peer_hash: u64) -> bool {
         (0..3).all(|probe| {
             let bit = (peer_hash >> (probe * 16)) as usize % SEEN_FILTER_BITS;
@@ -938,6 +1362,73 @@ impl SeenFilter {
     }
 }
 
+/// Why a peer was asked for a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestKind {
+    /// The peer announced the message and was asked first-hand.
+    FirstHand,
+    /// The peer announced the message and was asked because another
+    /// announcer withheld it.
+    Retry,
+    /// The peer never announced the message. It was asked because every
+    /// announcer withheld it.
+    Speculative,
+}
+
+/// One live `msg/1` session, as the claims see it.
+#[derive(Debug, Clone, Copy)]
+struct PeerSession {
+    /// Unique per session for the life of the process.
+    id: u64,
+    subnet: Option<u64>,
+    /// Reth marks the peer as trusted.
+    trusted: bool,
+}
+
+/// A claim the sweep dropped with its message still missing.
+#[derive(Debug)]
+struct Exhausted {
+    id: MsgID,
+    tried: u32,
+    /// Every announcer of the claim, by peer ID in any session, so none is
+    /// asked speculatively.
+    announcers: Box<SeenFilter>,
+    /// Subnets of the announcers that were asked.
+    tried_subnets: Vec<u64>,
+    /// The first owner's subnet. The queue and each window hold one claim
+    /// per group, so one subnet cannot take the whole budget.
+    group: Option<u64>,
+    /// A trusted peer announced the claim, or owners from two or more
+    /// subnets withheld it. Served first.
+    priority: bool,
+    /// When the sweep found it exhausted.
+    at: Instant,
+}
+
+/// Add `entry` to the exhausted queue, keeping one claim per group and at
+/// most [`MAX_QUEUED_EXHAUSTED`] claims.
+///
+/// A newer claim replaces its group's queued one, unless only the older one
+/// has priority. When the queue is full, a priority claim replaces the oldest
+/// claim without priority; any other claim is dropped. It is still counted.
+fn queue_exhausted(queue: &mut Vec<Exhausted>, entry: Exhausted) {
+    if let Some(old) = queue.iter_mut().find(|e| e.group == entry.group) {
+        if entry.priority || !old.priority {
+            *old = entry;
+        }
+        return;
+    }
+    if queue.len() < MAX_QUEUED_EXHAUSTED {
+        queue.push(entry);
+        return;
+    }
+    if entry.priority &&
+        let Some(oldest) = queue.iter_mut().filter(|e| !e.priority).min_by_key(|e| e.at)
+    {
+        *oldest = entry;
+    }
+}
+
 /// The subnet an address counts in for [`Claim::admit`]: its IPv4 /24, or its
 /// IPv6 /56. An IPv4-mapped IPv6 address counts as IPv4.
 pub(crate) fn subnet_of(ip: std::net::IpAddr) -> u64 {
@@ -945,6 +1436,19 @@ pub(crate) fn subnet_of(ip: std::net::IpAddr) -> u64 {
         std::net::IpAddr::V4(v4) => u64::from(u32::from(v4) >> 8),
         std::net::IpAddr::V6(v6) => (1 << 63) | (u128::from(v6) >> 72) as u64,
     }
+}
+
+/// Whether reth marks the session of `peer` as trusted.
+fn is_trusted(sessions: &HashMap<PeerId, PeerSession>, peer: &PeerId) -> bool {
+    sessions.get(peer).is_some_and(|s| s.trusted)
+}
+
+/// Step the xorshift state and return it.
+const fn next_random(rng: &mut u64) -> u64 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    *rng
 }
 
 /// Whether `peer` withheld first-hand inside [`WITHHOLD_WINDOW`] before `now`.
@@ -967,8 +1471,8 @@ fn decrement(owned: &mut HashMap<PeerId, usize>, peer: PeerId) {
 #[derive(Debug)]
 struct Live {
     expires_at: Instant,
-    /// Made for an announcement this peer sent, not for a retry.
-    first_hand: bool,
+    /// Why this peer was asked.
+    kind: RequestKind,
     /// The request this reservation belongs to.
     request: u64,
 }
@@ -1236,6 +1740,401 @@ mod tests {
             })
             .count();
         assert!(survived >= 170, "the honest peer survived {survived} of 200 runs; expected ~188");
+    }
+
+    /// An honest announcer whose session ended before its turn re-enters the
+    /// claim when it reconnects and announces again, and is asked. Honest
+    /// peers re-announce their whole board on every new session, so this is
+    /// how they recover.
+    #[test]
+    fn a_reconnected_announcer_re_enters_the_claim() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let honest = p(0x77);
+        for n in 0..=2 {
+            pending.open_session(p(n), None);
+        }
+        let first = pending.open_session(honest, None);
+
+        pending.claim(id(1), p(0), t0);
+        pending.claim(id(1), honest, t0);
+        pending.claim(id(1), p(1), t0);
+        pending.claim(id(1), p(2), t0);
+        // The hand-off reaches the honest peer after its session ended.
+        pending.close_session(honest, first);
+        pending.sweep(t0 + ttl, |_| false);
+        pending.sweep(t0 + 2 * ttl, |_| false);
+
+        pending.open_session(honest, None);
+        pending.claim(id(1), honest, t0 + 2 * ttl);
+        pending.sweep(t0 + 3 * ttl, |_| false);
+        assert_eq!(pending.take_retries(p(2), t0 + 3 * ttl), vec![id(1)]);
+        pending.sweep(t0 + 4 * ttl, |_| false);
+        assert_eq!(
+            pending.take_retries(honest, t0 + 4 * ttl),
+            vec![id(1)],
+            "the reconnected honest peer was never asked again",
+        );
+    }
+
+    /// Inside one session a repeat announcement never re-enters a claim, so a
+    /// peer cannot loop its announcements to buy draw tickets.
+    #[test]
+    fn a_repeat_announcement_in_one_session_does_not_re_enter() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let looping = p(0x66);
+        for n in 0..=1 {
+            pending.open_session(p(n), None);
+        }
+        pending.open_session(looping, None);
+
+        pending.claim(id(1), p(0), t0);
+        pending.claim(id(1), looping, t0);
+        pending.claim(id(1), p(1), t0);
+        pending.sweep(t0 + ttl, |_| false);
+        assert_eq!(pending.take_retries(looping, t0 + ttl), vec![id(1)]);
+        pending.sweep(t0 + 2 * ttl, |_| false);
+        pending.claim(id(1), looping, t0 + 2 * ttl);
+        pending.claim(id(1), looping, t0 + 2 * ttl);
+        assert!(pending.claims[&id(1)].alternates.is_empty(), "the looping peer re-entered");
+    }
+
+    /// A rejoin from a subnet whose cap is full still re-enters: the peer was
+    /// counted in that subnet already.
+    #[test]
+    fn a_reconnected_announcer_re_enters_through_a_full_subnet() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let net = Some(subnet_of("198.51.100.7".parse().unwrap()));
+        let honest = p(0x77);
+        pending.open_session(p(0), None);
+        pending.open_session(p(1), net);
+        let first = pending.open_session(honest, net);
+
+        pending.claim_from(id(1), p(0), None, t0);
+        pending.claim_from(id(1), honest, net, t0);
+        pending.claim_from(id(1), p(1), net, t0);
+        pending.close_session(honest, first);
+        pending.sweep(t0 + ttl, |_| false);
+        pending.sweep(t0 + 2 * ttl, |_| false);
+
+        pending.open_session(honest, net);
+        pending.claim_from(id(1), honest, net, t0 + 2 * ttl);
+        assert!(pending.claims[&id(1)].alternates.contains(&honest), "the subnet cap kept it out");
+    }
+
+    /// After the first owner fails, a trusted announcer is asked before
+    /// untrusted ones that announced earlier.
+    #[test]
+    fn a_trusted_alternate_is_asked_first() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let trusted = p(0x7E);
+        for n in 0..=3 {
+            pending.open_session(p(n), None);
+        }
+        let session = pending.open_session(trusted, None);
+        pending.set_trusted(trusted, session);
+
+        pending.claim(id(1), p(0), t0);
+        for n in 1..=3 {
+            pending.claim(id(1), p(n), t0);
+        }
+        pending.claim(id(1), trusted, t0);
+        pending.sweep(t0 + ttl, |_| false);
+        assert_eq!(pending.take_retries(trusted, t0 + ttl), vec![id(1)], "trusted is not first");
+    }
+
+    /// The random draw never evicts a trusted alternate.
+    #[test]
+    fn a_trusted_alternate_is_never_evicted() {
+        let now = Instant::now();
+        let trusted = p(0x7E);
+        for _ in 0..100 {
+            let mut pending = PendingRequests::default();
+            for n in 0..=100 {
+                pending.open_session(p(n), None);
+            }
+            let session = pending.open_session(trusted, None);
+            pending.set_trusted(trusted, session);
+            pending.claim(id(1), p(0), now);
+            pending.claim(id(1), trusted, now);
+            for n in 1..=100 {
+                pending.claim(id(1), p(n), now);
+            }
+            assert!(pending.claims[&id(1)].alternates.contains(&trusted), "trusted was evicted");
+        }
+    }
+
+    /// A trusted announcer that arrives when the list is full of untrusted
+    /// ones always takes a slot.
+    #[test]
+    fn a_late_trusted_announcer_always_finds_a_slot() {
+        let now = Instant::now();
+        let trusted = p(0x7E);
+        for _ in 0..100 {
+            let mut pending = PendingRequests::default();
+            for n in 0..=100 {
+                pending.open_session(p(n), None);
+            }
+            let session = pending.open_session(trusted, None);
+            pending.set_trusted(trusted, session);
+            for n in 0..=100 {
+                pending.claim(id(1), p(n), now);
+            }
+            pending.claim(id(1), trusted, now);
+            assert!(pending.claims[&id(1)].alternates.contains(&trusted), "trusted found no slot");
+        }
+    }
+
+    /// A claim whose announcers all withhold is counted, and up to three
+    /// connected peers that did not announce it are queued to be asked, a
+    /// trusted one first. No announcer is asked speculatively.
+    #[test]
+    fn an_exhausted_claim_asks_peers_that_did_not_announce_it() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let trusted = p(0x7E);
+        let others: Vec<PeerId> = (0x10..0x16).map(p).collect();
+        pending.open_session(p(1), None);
+        pending.open_session(p(2), None);
+        for (n, peer) in others.iter().enumerate() {
+            let ip = format!("198.51.{n}.7").parse().unwrap();
+            pending.open_session(*peer, Some(subnet_of(ip)));
+        }
+        let session = pending.open_session(trusted, None);
+        pending.set_trusted(trusted, session);
+
+        pending.claim(id(1), p(1), t0);
+        pending.claim(id(1), p(2), t0);
+        pending.sweep(t0 + ttl, |_| false);
+        assert_eq!(pending.take_retries(p(2), t0 + ttl), vec![id(1)]);
+        pending.sweep(t0 + 2 * ttl, |_| false);
+
+        let (count, claims) = pending.settle_exhausted(t0 + 2 * ttl, |_| true);
+        assert_eq!(count, 1);
+        assert_eq!(claims, vec![ExhaustedClaim { id: id(1), tried: 2, asked: 3 }]);
+        assert!(pending.take_speculative(p(1)).is_empty(), "an announcer was asked again");
+        assert!(pending.take_speculative(p(2)).is_empty(), "an announcer was asked again");
+        assert_eq!(pending.take_speculative(trusted), vec![id(1)], "trusted was not picked");
+        let asked = others.iter().filter(|o| !pending.take_speculative(**o).is_empty()).count();
+        assert_eq!(asked, 2);
+    }
+
+    /// An exhausted claim whose message is no longer wanted is counted but
+    /// asks nobody.
+    #[test]
+    fn an_exhausted_claim_no_longer_wanted_asks_nobody() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        pending.open_session(p(1), None);
+        pending.open_session(p(9), None);
+
+        pending.claim(id(1), p(1), t0);
+        pending.sweep(t0 + ttl, |_| false);
+        let (count, claims) = pending.settle_exhausted(t0 + ttl, |_| false);
+        assert_eq!(count, 1);
+        assert_eq!(claims, vec![ExhaustedClaim { id: id(1), tried: 1, asked: 0 }]);
+        assert!(pending.take_speculative(p(9)).is_empty());
+    }
+
+    /// Speculative requests stay inside the global rate however many claims
+    /// run out at once.
+    #[test]
+    fn speculative_fetches_are_rate_limited() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        for n in 0x10..0x20 {
+            pending.open_session(p(n), None);
+        }
+        let speculative = |pending: &mut PendingRequests| {
+            std::mem::take(&mut pending.speculative).values().map(Vec::len).sum::<usize>()
+        };
+
+        // Each claim's owner is on its own subnet, so fairness between
+        // subnets does not limit this test.
+        for n in 0..40u8 {
+            pending.open_session(owner(n), Some(u64::from(n)));
+        }
+        for n in 0..20 {
+            pending.claim_from(id(n), owner(n), Some(u64::from(n)), t0);
+        }
+        pending.sweep(t0 + ttl, |_| false);
+        let (count, _) = pending.settle_exhausted(t0 + ttl, |_| true);
+        assert_eq!(count, 20);
+        assert_eq!(speculative(&mut pending), MAX_SPECULATIVE_FETCHES_PER_SEC as usize);
+
+        for n in 20..40 {
+            pending.claim_from(id(n), owner(n), Some(u64::from(n)), t0 + ttl);
+        }
+        pending.sweep(t0 + 2 * ttl, |_| false);
+        pending.settle_exhausted(t0 + 2 * ttl, |_| true);
+        assert_eq!(
+            speculative(&mut pending),
+            MAX_SPECULATIVE_FETCHES_PER_SEC as usize,
+            "the next window allows a fresh budget, and no more",
+        );
+    }
+
+    /// A distinct peer, by number, for tests that need more than 255 peers.
+    fn owner(n: u8) -> PeerId {
+        PeerId::left_padding_from(&[0xEE, n])
+    }
+
+    /// A peer for tests that need many distinct peers.
+    fn many(n: u64) -> PeerId {
+        PeerId::left_padding_from(&(n + 1_000_000).to_be_bytes())
+    }
+
+    /// A counted member that reconnects many times holds at most two draw
+    /// tickets in one claim: its first and one rejoin.
+    #[test]
+    fn reconnecting_does_not_multiply_draw_tickets() {
+        let now = Instant::now();
+        let net = Some(subnet_of("198.51.100.7".parse().unwrap()));
+        let member = p(0x77);
+        for _ in 0..20 {
+            let mut pending = PendingRequests::default();
+            pending.open_session(p(0), None);
+            pending.claim(id(1), p(0), now);
+            for n in 0..100u64 {
+                let peer = many(n);
+                pending.open_session(peer, Some(n << 8));
+                pending.claim_from(id(1), peer, Some(n << 8), now);
+            }
+            let before = pending.claims[&id(1)].candidates;
+            for _ in 0..10 {
+                pending.open_session(member, net);
+                pending.claim_from(id(1), member, net, now);
+            }
+            let tickets = pending.claims[&id(1)].candidates - before;
+            assert!(tickets <= 2, "one member bought {tickets} tickets by reconnecting");
+        }
+    }
+
+    /// The subnet bypass is for members only. While a member rejoins a full
+    /// subnet, a new peer from that subnet is still refused.
+    #[test]
+    fn only_members_bypass_a_full_subnet() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let net = Some(subnet_of("198.51.100.7".parse().unwrap()));
+        pending.open_session(p(0), None);
+        pending.open_session(p(1), net);
+        let first = pending.open_session(p(2), net);
+        pending.claim_from(id(1), p(0), None, t0);
+        pending.claim_from(id(1), p(2), net, t0);
+        pending.claim_from(id(1), p(1), net, t0);
+        pending.close_session(p(2), first);
+        pending.sweep(t0 + ttl, |_| false);
+        pending.sweep(t0 + 2 * ttl, |_| false);
+
+        pending.open_session(p(2), net);
+        pending.open_session(p(3), net);
+        pending.claim_from(id(1), p(2), net, t0 + 2 * ttl);
+        pending.claim_from(id(1), p(3), net, t0 + 2 * ttl);
+        let alternates = &pending.claims[&id(1)].alternates;
+        assert!(alternates.contains(&p(2)), "the member did not rejoin");
+        assert!(!alternates.contains(&p(3)), "a new peer passed the full subnet");
+    }
+
+    /// Closing or trusting a stale session leaves the newer one alone.
+    #[test]
+    fn a_stale_session_id_changes_nothing() {
+        let mut pending = PendingRequests::default();
+        let old = pending.open_session(p(1), None);
+        let new = pending.open_session(p(1), None);
+        pending.set_trusted(p(1), old);
+        assert!(!is_trusted(&pending.sessions, &p(1)), "a stale id set trust");
+        pending.close_session(p(1), old);
+        assert_eq!(pending.sessions.get(&p(1)).map(|s| s.id), Some(new), "a stale id closed it");
+        pending.close_session(p(1), new);
+        assert!(!pending.sessions.contains_key(&p(1)));
+    }
+
+    /// An announcer that reconnected without announcing again is still an
+    /// announcer, and is not asked speculatively.
+    #[test]
+    fn a_reconnected_announcer_is_not_asked_speculatively() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let first = pending.open_session(p(1), None);
+        pending.claim(id(1), p(1), t0);
+        pending.close_session(p(1), first);
+        pending.open_session(p(1), None);
+        pending.open_session(p(9), None);
+        pending.sweep(t0 + ttl, |_| false);
+        pending.settle_exhausted(t0 + ttl, |_| true);
+        assert!(pending.take_speculative(p(1)).is_empty(), "the announcer was asked");
+        assert_eq!(pending.take_speculative(p(9)), vec![id(1)]);
+    }
+
+    /// One subnet's flood of exhausted claims does not keep another subnet's
+    /// exhausted claim from being asked for.
+    #[test]
+    fn one_subnets_exhausted_claims_do_not_starve_another() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let flood = Some(1);
+        let honest = Some(2);
+        pending.open_session(p(1), flood);
+        pending.open_session(p(2), honest);
+        for n in 0x10..0x14 {
+            pending.open_session(p(n), Some(u64::from(n)));
+        }
+        for n in 0..1000u64 {
+            let mut raw = [0u8; reth_msgboard_types::MSG_ID_SIZE];
+            raw[..8].copy_from_slice(&(n + 1).to_be_bytes());
+            raw[8] = 0xF0;
+            let fake = MsgID::decode_list(&raw).expect("one id-sized record")[0];
+            pending.claim_from(fake, p(1), flood, t0);
+        }
+        pending.claim_from(id(1), p(2), honest, t0);
+        pending.sweep(t0 + ttl, |_| false);
+        let (_, settled) = pending.settle_exhausted(t0 + ttl, |_| true);
+        let real = settled.iter().find(|c| c.id == id(1));
+        assert!(real.is_some_and(|c| c.asked > 0), "the honest claim was starved: {real:?}");
+    }
+
+    /// Claims past the rate are kept for a later window, and the queue stays
+    /// bounded.
+    #[test]
+    fn exhausted_claims_past_the_rate_wait_for_the_next_window() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        for n in 0x10..0x20 {
+            pending.open_session(p(n), None);
+        }
+        for n in 0..100u8 {
+            pending.open_session(owner(n), Some(u64::from(n)));
+            pending.claim_from(id(n), owner(n), Some(u64::from(n)), t0);
+        }
+        pending.sweep(t0 + ttl, |_| false);
+        assert!(pending.exhausted.len() <= MAX_QUEUED_EXHAUSTED);
+        let asked = |pending: &mut PendingRequests| {
+            std::mem::take(&mut pending.speculative).values().map(Vec::len).sum::<usize>()
+        };
+        pending.settle_exhausted(t0 + ttl, |_| true);
+        assert_eq!(asked(&mut pending), MAX_SPECULATIVE_FETCHES_PER_SEC as usize);
+        assert!(pending.exhausted.len() <= MAX_QUEUED_EXHAUSTED);
+        pending.settle_exhausted(t0 + ttl + Duration::from_secs(1), |_| true);
+        assert_eq!(
+            asked(&mut pending),
+            MAX_SPECULATIVE_FETCHES_PER_SEC as usize,
+            "claims past the rate were dropped instead of kept",
+        );
     }
 
     /// An announcer that arrives after the claim expires, before the sweep
