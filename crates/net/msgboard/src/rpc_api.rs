@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use alloy_primitives::{Bytes, B256};
-use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use jsonrpsee::{core::RpcResult, proc_macros::rpc, ResponsePayload};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -97,11 +97,15 @@ pub struct ContentFilter {
     /// Category to filter by. If `None`, returns all categories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<B256>,
-    /// Minimum block number (inclusive).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Minimum block number (inclusive). Takes the forms of erigon's
+    /// `rpc.BlockNumber`: a number, a decimal or `0x` string, or a tag. 0 and
+    /// `earliest` mean no bound.
+    #[serde(default, with = "block_number", skip_serializing_if = "Option::is_none")]
     pub from_block: Option<u64>,
-    /// Maximum block number (inclusive).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Maximum block number (inclusive). Takes the forms of erigon's
+    /// `rpc.BlockNumber`: a number, a decimal or `0x` string, or a tag. 0 and
+    /// `earliest` mean no bound.
+    #[serde(default, with = "block_number", skip_serializing_if = "Option::is_none")]
     pub to_block: Option<u64>,
     /// Maximum number of messages in the response, counted across every
     /// category it holds. **Reth extension.** Omitted, the response holds
@@ -135,11 +139,11 @@ pub struct ContentPageRequest {
     /// Category to filter by. If `None`, pages all categories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<B256>,
-    /// Minimum block number (inclusive).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Minimum block number (inclusive), as in [`ContentFilter::from_block`].
+    #[serde(default, with = "block_number", skip_serializing_if = "Option::is_none")]
     pub from_block: Option<u64>,
-    /// Maximum block number (inclusive).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Maximum block number (inclusive), as in [`ContentFilter::to_block`].
+    #[serde(default, with = "block_number", skip_serializing_if = "Option::is_none")]
     pub to_block: Option<u64>,
 }
 
@@ -222,7 +226,10 @@ pub trait MsgboardApi {
     /// between pages shifts that list, so an offset walk can repeat or skip
     /// messages, and two replicas can order the list differently.
     #[method(name = "content")]
-    async fn msgboard_content(&self, filter: Option<ContentFilter>) -> RpcResult<Box<RawValue>>;
+    async fn msgboard_content(
+        &self,
+        filter: Option<ContentFilter>,
+    ) -> ResponsePayload<'static, Box<RawValue>>;
 
     /// Return one page of live messages, in ascending hash order. **Reth
     /// extension.**
@@ -239,7 +246,10 @@ pub trait MsgboardApi {
     /// whatever the board does between pages and whichever replica serves
     /// each call.
     #[method(name = "contentPage")]
-    async fn msgboard_content_page(&self, request: ContentPageRequest) -> RpcResult<Box<RawValue>>;
+    async fn msgboard_content_page(
+        &self,
+        request: ContentPageRequest,
+    ) -> ResponsePayload<'static, Box<RawValue>>;
 
     /// Look up a single message by its SHA-256 `PoW` hash.
     #[method(name = "getMessage")]
@@ -252,9 +262,9 @@ pub trait MsgboardApi {
     /// Subscribe to new messages. Emits a [`MsgboardMsg`] for each new
     /// message accepted into the board.
     ///
-    /// The first parameter must be the literal string `"newMessages"` (the
-    /// only subscription kind currently supported), matching erigon-pulse's
-    /// JSON-RPC shape `["newMessages", filter?]`. Pass an optional
+    /// The first parameter is the subscription kind: `"messages"`, erigon-pulse's
+    /// wire name (from its Go method `Messages`), or `"newMessages"`, reth's
+    /// older name. Both open the same subscription. Pass an optional
     /// [`NewMessagesFilter`] as the second parameter to restrict notifications
     /// to a single category.
     /// The notification method is `msgboard_subscription`, **not**
@@ -273,6 +283,80 @@ pub trait MsgboardApi {
         kind: String,
         filter: Option<NewMessagesFilter>,
     ) -> jsonrpsee::core::SubscriptionResult;
+}
+
+/// Deserialises a `fromBlock` / `toBlock` bound the way erigon-pulse's
+/// `rpc.BlockNumber` does, with erigon's meaning for `msgboard_content`.
+///
+/// Erigon accepts a JSON number, a decimal string, a `0x` hex string, or a
+/// tag. A tag is a negative `int64` (`latest` -1, `pending` -2, `safe` -3,
+/// `finalized` -4, `latestExecuted` -5; the string `"null"` is `latest`) and
+/// `earliest` is 0. `ContentFilter.toProto` casts the value to `uint64`, and
+/// the board reads 0 as "no bound". So:
+///
+/// - 0 and `earliest` give no bound (`None`).
+/// - Any other tag gives a bound near `u64::MAX`: as `toBlock` it admits every block, as
+///   `fromBlock` it admits none. Erigon's category path does the same; its all-categories path
+///   fails open on a `fromBlock` past the head and returns everything (parity-gaps §13.4).
+/// - A number above `i64::MAX` is an error, as in erigon.
+///
+/// JSON `null` or a missing field is `None`. Errors become `-32602`.
+mod block_number {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(u64),
+        Text(String),
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        let n = match Option::<Raw>::deserialize(d)? {
+            None => return Ok(None),
+            Some(Raw::Number(n)) => checked(n).map_err(D::Error::custom)?,
+            Some(Raw::Text(s)) => parse(&s).map_err(D::Error::custom)?,
+        };
+        Ok((n != 0).then_some(n))
+    }
+
+    pub(super) fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => s.serialize_u64(*n),
+            None => s.serialize_none(),
+        }
+    }
+
+    /// Erigon's tag values, as `toProto` casts them to `uint64`.
+    const fn tag(n: i64) -> u64 {
+        n as u64
+    }
+
+    const fn checked(n: u64) -> Result<u64, &'static str> {
+        if n > i64::MAX as u64 {
+            return Err("block number larger than int64");
+        }
+        Ok(n)
+    }
+
+    fn parse(s: &str) -> Result<u64, String> {
+        Ok(match s {
+            "earliest" => 0,
+            "latest" | "null" => tag(-1),
+            "pending" => tag(-2),
+            "safe" => tag(-3),
+            "finalized" => tag(-4),
+            "latestExecuted" => tag(-5),
+            _ => {
+                let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                    Some(hex) => u64::from_str_radix(hex, 16),
+                    None => s.parse::<u64>(),
+                };
+                let n = parsed.map_err(|err| format!("invalid block number {s:?}: {err}"))?;
+                checked(n)?
+            }
+        })
+    }
 }
 
 #[cfg(test)]
