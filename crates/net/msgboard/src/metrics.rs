@@ -190,4 +190,17 @@ pub struct MsgboardMetrics {
     /// peer inside `REPEAT_REQUEST_WINDOW`. Those messages are skipped, with
     /// no penalty.
     pub requests_repeated: Counter,
+    /// Claims that ran out of announcers to ask before the message arrived.
+    ///
+    /// Each one is a message some peer announced and no announcer delivered.
+    /// A steady rise names withholding announcers, or an announced ID that
+    /// backs no real message. The node then asks a few peers that did not
+    /// announce it; see [`claims_rescued`](Self::claims_rescued).
+    pub claims_exhausted: Counter,
+    /// Messages of exhausted claims that a peer which never announced them
+    /// delivered.
+    ///
+    /// Read against [`claims_exhausted`](Self::claims_exhausted). A rescue
+    /// means every announcer withheld a message that other peers held.
+    pub claims_rescued: Counter,
 }
