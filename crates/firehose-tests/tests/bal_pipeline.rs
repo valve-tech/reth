@@ -18,7 +18,7 @@ use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, TransactionSigned};
 use reth_evm::execute::{BasicBlockExecutor, Executor};
 use reth_evm_ethereum::EthEvmConfig;
-use reth_firehose::{run_wrapped_block, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust};
+use reth_firehose::{run_wrapped_block, take_traced_block_access_list, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust};
 use reth_firehose_tests::prestate::{parse_fire_block_for, seed_cache_db, Prestate};
 use reth_primitives_traits::{Block as _, RecoveredBlock};
 use reth_revm::State;
@@ -112,6 +112,10 @@ fn pipeline_rebuilds_bal_of_a_block_with_transactions() {
         NoPreTxAdjust,
         NoPostTxExtras,
     )
+    .and_then(|result| {
+        take_traced_block_access_list(&mut db, &block, &mut guard)?;
+        Ok(result)
+    })
     .expect("the rebuilt BAL must match upstream's hash");
     guard.mark_verified();
 
