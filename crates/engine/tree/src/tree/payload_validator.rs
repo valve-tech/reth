@@ -616,7 +616,17 @@ where
         // Get an iterator over the transactions in the payload
         let txs = self.tx_iterator_for(&input)?;
 
-        let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
+        // Firehose: read once, so the execution mode set up here and the execution path chosen
+        // below cannot disagree.
+        let firehose_tracing = reth_firehose::is_tracer_initialized();
+
+        // The traced path executes transactions one after another, so it never takes the parallel
+        // BAL path. The flag also selects how the payload processor streams transactions: in BAL
+        // mode it sends them in completion order, not block order. A sequential executor that
+        // reads that stream runs a sender's later nonce first and rejects a valid block ("nonce
+        // too high"), as on Sepolia block 11856337 at the Amsterdam fork.
+        let parallel_bal_execution = !firehose_tracing &&
+            ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
 
         // Prepare the state-root job before execution so it can provide streaming hooks.
         let mut state_root_job =
@@ -760,7 +770,7 @@ where
         // `streamingfast/release/reth-1.x:crates/engine/tree/src/tree/payload_validator.rs:
         // 476-510`.
         let (mut fh_tracer, input): (Option<reth_firehose::FirehoseBlockTracer>, _) =
-            if reth_firehose::is_tracer_initialized() {
+            if firehose_tracing {
                 // Converting to a block drops the access list, so carry it across: execution
                 // still needs it for BAL prewarming and validation.
                 let raw_bal = match &input {
