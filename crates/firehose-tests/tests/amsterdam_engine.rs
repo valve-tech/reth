@@ -100,6 +100,15 @@ async fn traced_engine_path_accepts_amsterdam_blocks() -> eyre::Result<()> {
     let tx = chain.tx(TxKind::Create, U256::from(7), hex!("6000ff").into(), 1);
     chain.block("create and selfdestruct", vec![tx], Vec::new()).await?;
 
+    // Many transactions from one sender. At 30 or more transactions the engine converts them on
+    // rayon, and on the parallel BAL path it sends them in completion order. The traced path
+    // executes them one after another, so it must get them in block order, or a later nonce
+    // runs first and the block fails with "nonce too high". Seen on Sepolia block 11856337.
+    let txs = (0..64)
+        .map(|_| chain.tx(TxKind::Call(Address::with_last_byte(1)), U256::from(1), Bytes::new(), 1))
+        .collect();
+    chain.block("one sender, many transactions", txs, Vec::new()).await?;
+
     Ok(())
 }
 
