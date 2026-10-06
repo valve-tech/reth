@@ -27,7 +27,7 @@ use reth_chain_state::{CanonStateNotification, CanonStateSubscriptions};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks};
 use reth_node_api::{
     AddOnsContext, BlockTy, EngineApiValidator, EngineTypes, FullNodeComponents, FullNodeTypes,
-    NodeAddOns, NodeTypes, PayloadTypes, PayloadValidator, PrimitivesTy, TreeConfig,
+    NodeAddOns, NodeTypes, PayloadTypes, PayloadValidator, PrimitivesTy, TreeConfig, TxTy,
 };
 use reth_node_core::{
     cli::config::RethTransactionPoolConfig,
@@ -1522,10 +1522,7 @@ where
             <Node::Types as NodeTypes>::Payload,
             Block = BlockTy<Node::Types>,
         > + Clone,
-    // Bug 6 fix (2026-05-22): propagated for the firehose live-path. `SignedTx` on Ethereum
-    // and PulseChain primitives satisfies this via blanket impls in `reth_firehose::mapper`.
-    <<Node::Types as reth_node_api::NodeTypes>::Primitives as reth_node_api::NodePrimitives>::SignedTx:
-        reth_firehose::mapper::SignatureFields,
+    TxTy<Node::Types>: reth_firehose::mapper::SignatureFields,
     Node::Evm: reth_firehose::FirehoseLiveHooks,
 {
     type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;

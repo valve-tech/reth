@@ -208,9 +208,7 @@ fn run_ethereum_node() -> eyre::Result<()> {
                 info!(target: "reth::cli", "Launching Ethereum node (firehose-instrumented)");
                 warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
 
-                reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer_config(
-                    firehose_output,
-                )));
+                reth_firehose::init_tracer(firehose_tracer_config(firehose_output));
 
                 let launcher_for_rpc = launcher.clone();
                 let handle = builder
@@ -228,6 +226,9 @@ fn run_ethereum_node() -> eyre::Result<()> {
                         install_txpool_page_rpc(ctx.modules, pool, converter)?;
                         Ok(())
                     })
+                    // Emit FIRE INIT and the genesis block before the consensus engine
+                    // exists, so no block is traced first. The ExEx only publishes health.
+                    .on_component_initialized(|node| reth_firehose::init_blockchain(&node.provider))
                     .install_exex("firehose", |ctx| async move {
                         Ok(async move { reth_firehose::run_exex(ctx).await })
                     })
@@ -309,9 +310,7 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                 info!(target: "reth::cli", "Launching PulseChain node (firehose-instrumented)");
                 warn_if_jit_requested_with_firehose(builder.config().jit.enabled);
 
-                reth_firehose::init_tracer(firehose_tracer::Tracer::new(firehose_tracer_config(
-                    firehose_output,
-                )));
+                reth_firehose::init_tracer(firehose_tracer_config(firehose_output));
 
                 let handle = builder
                     .with_types::<PulsechainNode>()
@@ -332,6 +331,9 @@ fn run_pulsechain_node() -> eyre::Result<()> {
 
                         Ok(())
                     })
+                    // Emit FIRE INIT and the genesis block before the consensus engine
+                    // exists, so no block is traced first. The ExEx only publishes health.
+                    .on_component_initialized(|node| reth_firehose::init_blockchain(&node.provider))
                     .install_exex("firehose", |ctx| async move {
                         Ok(async move { reth_firehose::run_exex(ctx).await })
                     })

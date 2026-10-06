@@ -199,7 +199,36 @@ pub(super) fn drive_txs(
                 None,
             );
 
+            evm.inspector.start_transaction();
             let result = evm.inspect_tx_commit(tx).expect("transaction executes");
+
+            // Mirrors the production executor: a transaction revm included without opening its
+            // root frame gets that root traced before the post-tx accounting.
+            if !evm.inspector.root_frame_entered() {
+                let kind = to.map_or(TxKind::Create, TxKind::Call);
+                let value = U256::from(value);
+                let root_gas_limit = FramelessTx::root_gas_limit(
+                    &evm.ctx.cfg,
+                    kind,
+                    SENDER,
+                    value,
+                    input,
+                    gas_limit,
+                    0,
+                    0,
+                    0,
+                );
+                let frameless = FramelessTx {
+                    kind,
+                    value,
+                    input: input.clone(),
+                    nonce: tx_index as u64,
+                    root_gas_limit,
+                };
+                // Gas is free here (`gas_price: 0`), so the gas buy costs nothing.
+                evm.inspector
+                    .trace_frameless_root_call(SENDER, U256::ZERO, frameless, |_| U256::ZERO);
+            }
 
             let gas_used = result.tx_gas_used();
             let committed_log_count = result.logs().len() as u32;

@@ -5,14 +5,14 @@ use firehose_tracer::{
 };
 use reth_revm::revm::{
     context::JournalEntry,
-    context_interface::{ContextTr, JournalTr},
+    context_interface::{cfg::gas_params::Eip2780TxInfo, Cfg, ContextTr, JournalTr},
     inspector::{Inspector, JournalExt},
     interpreter::{
         interpreter::EthInterpreter,
         interpreter_types::{Jumps, LoopControl},
         CallInputs, CallOutcome, CreateInputs, CreateOutcome, Gas, Interpreter,
     },
-    primitives::KECCAK_EMPTY,
+    primitives::{TxKind, KECCAK_EMPTY},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -75,6 +75,53 @@ impl PostTxGasAccounting {
     /// Accounting for a transaction that moves no native balance for gas.
     pub const fn none() -> Self {
         Self { refund_gas_price: 0, reward_gas_price: 0, extra_reward: U256::ZERO }
+    }
+}
+
+/// The transaction fields [`FirehoseInspector::trace_frameless_root_call`] needs to trace the
+/// root call revm never opened.
+#[derive(Debug, Clone)]
+pub struct FramelessTx {
+    /// Whether the transaction is a call (and to whom) or a contract creation.
+    pub kind: TxKind,
+    /// Value the transaction would have transferred.
+    pub value: U256,
+    /// Calldata, or the init code of a creation.
+    pub input: Bytes,
+    /// Nonce the transaction was sent with.
+    pub nonce: u64,
+    /// Regular gas the root frame would have been handed, see [`Self::root_gas_limit`].
+    pub root_gas_limit: u64,
+}
+
+impl FramelessTx {
+    /// Regular gas the root frame of a transaction is handed: what is left of `gas_limit` once
+    /// the intrinsic cost is paid, as revm's `Handler::tx_gas` computes it (the part above
+    /// `tx_gas_limit_cap` goes to the EIP-8037 state gas reservoir instead).
+    #[allow(clippy::too_many_arguments)]
+    pub fn root_gas_limit(
+        cfg: &impl Cfg,
+        kind: TxKind,
+        caller: Address,
+        value: U256,
+        input: &[u8],
+        gas_limit: u64,
+        access_list_accounts: u64,
+        access_list_storages: u64,
+        authorization_count: u64,
+    ) -> u64 {
+        let eip2780 = cfg
+            .is_amsterdam_eip2780_enabled()
+            .then(|| Eip2780TxInfo { value, is_self_transfer: kind.to() == Some(&caller) });
+        let initial = cfg.gas_params().initial_tx_gas(
+            input,
+            kind.is_create(),
+            access_list_accounts,
+            access_list_storages,
+            authorization_count,
+            eip2780,
+        );
+        initial.initial_gas_and_reservoir(gas_limit, cfg.tx_gas_limit_cap()).0
     }
 }
 
@@ -173,6 +220,13 @@ pub struct FirehoseInspector<'a> {
     // SSTORE opcode in step_end, or by the precompile gather in call_end). Prevents the
     // call_end precompile-storage gather from re-emitting opcode SSTOREs.
     storage_processed_up_to: usize,
+
+    /// Whether the current transaction opened its root frame. Cleared by
+    /// [`Self::start_transaction`], set by the depth-0 frame hook and consumed by
+    /// [`Self::trace_frameless_root_call`], which traces the root call itself when revm included
+    /// the transaction without ever opening one. Cleared at transaction start rather than trusted
+    /// from the previous one because system calls open depth-0 frames too.
+    root_frame_entered: bool,
 }
 
 impl<'a> Debug for FirehoseInspector<'a> {
@@ -214,6 +268,7 @@ impl<'a> FirehoseInspector<'a> {
             log_block_index: 0,
             trx_logs_count: 0,
             storage_processed_up_to: 0,
+            root_frame_entered: false,
         }
     }
 
@@ -646,6 +701,7 @@ impl<'a> FirehoseInspector<'a> {
         }
 
         self.journal_processed_up_to = context.journal().journal().len();
+        self.root_frame_entered = true;
 
         // Clear the previous tx's journal snapshot at the start of this tx. It is re-seeded
         // at this tx's root call/create exit (see `call_end` / `create_end`) and read by
@@ -1323,6 +1379,96 @@ impl<'a> FirehoseInspector<'a> {
         self.trx_logs_count = 0;
     }
 
+    /// Traces the root call of a transaction revm included without ever opening a frame, and
+    /// returns whether it did. A no-op for a transaction whose root frame ran.
+    ///
+    /// Under Amsterdam, EIP-2780 moves the state-dependent charges (EIP-8037 state gas for a
+    /// created or newly funded account, the cold load of a delegation target) to a runtime phase
+    /// that runs after the intrinsic check but before the first frame. When that phase runs out
+    /// of gas, revm skips execution and includes the transaction as an out-of-gas halt: the gas
+    /// buy stands, a creation still bumps the sender's nonce, and no inspector hook fires. Left
+    /// alone, the tracer would see a transaction with no call, which it treats as a bad block:
+    /// it drops the receipt and leaves the status unknown.
+    ///
+    /// The root call is traced the way the frame would have ended had it been entered with
+    /// `tx.root_gas_limit` and run out of gas at once, like a creation sent with exactly its
+    /// intrinsic gas: the gas buy and the nonce bump, then a failed call that consumed all of its
+    /// gas. The live sender balance after the gas buy is recorded so the gas refund that
+    /// [`Self::process_post_tx_gas_accounting`] emits next starts from it.
+    ///
+    /// Must be called after the transaction executed and before
+    /// [`Self::process_post_tx_gas_accounting`]. Callers check [`Self::root_frame_entered`]
+    /// first so they only build `tx` for the rare transaction that needs it. `gas_buy_cost` is what
+    /// the sender was charged upfront, blob fee included; `get_pre_tx_balance` reads the
+    /// sender's balance before it.
+    pub fn trace_frameless_root_call<F>(
+        &mut self,
+        sender: Address,
+        gas_buy_cost: U256,
+        tx: FramelessTx,
+        mut get_pre_tx_balance: F,
+    ) -> bool
+    where
+        F: FnMut(Address) -> U256,
+    {
+        if std::mem::take(&mut self.root_frame_entered) {
+            return false;
+        }
+
+        // Nothing ran, so nothing the post-tx accounting reads from a root exit exists.
+        self.tx_journal_snapshot.clear();
+
+        let pre_tx_balance = get_pre_tx_balance(sender);
+        let post_gas_buy_balance = pre_tx_balance.saturating_sub(gas_buy_cost);
+        self.tx_post_pre_exec_sender_balance = Some(post_gas_buy_balance);
+        let reason = self
+            .root_balance_reason_override
+            .take()
+            .unwrap_or(pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy);
+        self.tracer.on_balance_change(sender, pre_tx_balance, post_gas_buy_balance, reason);
+        self.tracer.on_nonce_change(sender, tx.nonce, tx.nonce + 1);
+
+        let (call_type, target) = match tx.kind {
+            TxKind::Create => (Opcode::Create as u8, sender.create(tx.nonce)),
+            TxKind::Call(to) => (Opcode::Call as u8, to),
+        };
+        self.tracer.on_call_enter(
+            0,
+            call_type,
+            sender,
+            target,
+            &tx.input,
+            tx.root_gas_limit,
+            tx.value,
+        );
+
+        let err = Self::failure_reason(
+            reth_revm::revm::interpreter::InstructionResult::OutOfGas,
+            tx.kind.is_create(),
+        );
+        self.tracer.on_call_exit(
+            0,
+            &[],
+            tx.root_gas_limit,
+            Some(&err as &dyn std::error::Error),
+            true,
+        );
+
+        true
+    }
+
+    /// Resets the per-transaction state that must not carry over from whatever ran before in the
+    /// block, a system call included. Call right before a transaction executes.
+    pub const fn start_transaction(&mut self) {
+        self.root_frame_entered = false;
+    }
+
+    /// Whether the current transaction opened its root frame, see
+    /// [`Self::trace_frameless_root_call`].
+    pub const fn root_frame_entered(&self) -> bool {
+        self.root_frame_entered
+    }
+
     /// Map EVM call scheme to Firehose call type opcode
     fn map_call_type_opcode(scheme: &reth_revm::revm::interpreter::CallScheme) -> u8 {
         use reth_revm::revm::interpreter::CallScheme;
@@ -1624,15 +1770,21 @@ where
 
         self.enter_frame_pre_hook(context, inputs.caller);
 
-        self.tracer.on_call_enter(
-            depth,
-            call_type,
-            from,
-            to,
-            inputs.input.bytes(context).as_ref(),
-            inputs.gas_limit,
-            inputs.value.get(),
-        );
+        // `as_bytes` reads an internal call's input from the shared memory buffer without copying
+        // it, since the tracer copies only the part it records. It borrows `context` until the
+        // end of this block.
+        {
+            let input = inputs.input.as_bytes(context);
+            self.tracer.on_call_enter(
+                depth,
+                call_type,
+                from,
+                to,
+                &input,
+                inputs.gas_limit,
+                inputs.value.get(),
+            );
+        }
 
         // EIP-7702: override address_delegates_to using the live EVM state.
         // on_call_enter uses the pre-block state reader which misses delegations committed
@@ -1977,6 +2129,21 @@ pub trait FirehoseInspectorApi {
         get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
     );
 
+    /// See [`FirehoseInspector::start_transaction`].
+    fn start_transaction(&mut self);
+
+    /// See [`FirehoseInspector::root_frame_entered`].
+    fn root_frame_entered(&self) -> bool;
+
+    /// Type-erased version of [`FirehoseInspector::trace_frameless_root_call`].
+    fn trace_frameless_root_call_erased(
+        &mut self,
+        sender: Address,
+        gas_buy_cost: U256,
+        tx: FramelessTx,
+        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
+    ) -> bool;
+
     /// Type-erased version of [`FirehoseInspector::post_tx_balance`].
     ///
     /// Chain-specific [`PostTxExtras`](crate::PostTxExtras) impls call this to obtain the
@@ -2044,6 +2211,24 @@ impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
             committed_log_count,
             get_pre_tx_balance,
         );
+    }
+
+    fn start_transaction(&mut self) {
+        Self::start_transaction(self);
+    }
+
+    fn root_frame_entered(&self) -> bool {
+        Self::root_frame_entered(self)
+    }
+
+    fn trace_frameless_root_call_erased(
+        &mut self,
+        sender: Address,
+        gas_buy_cost: U256,
+        tx: FramelessTx,
+        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
+    ) -> bool {
+        self.trace_frameless_root_call(sender, gas_buy_cost, tx, get_pre_tx_balance)
     }
 
     fn post_tx_balance_erased(

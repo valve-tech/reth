@@ -7,7 +7,6 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_forks::EthereumHardforks;
 use reth_evm::execute::BlockExecutor;
 use reth_exex::{ExExContext, ExExEvent};
-use reth_primitives_traits::SealedBlock;
 use reth_provider::{
     BlockIdReader, BlockNumReader, BlockReader, EvmStateProviderBox, StateProviderFactory,
 };
@@ -35,7 +34,9 @@ where
 
     tracer.on_block_start(firehose_tracer::types::BlockEvent {
         block: mapper::to_block_data(block.sealed_block()),
-        finalized: mapper::to_finalized_ref(ctx.provider().finalized_block_num_hash()),
+        finalized: mapper::finalized_ref_from_num_hash(
+            ctx.provider().finalized_block_num_hash().ok().flatten(),
+        ),
         flash_block: None,
     });
 
@@ -172,41 +173,9 @@ where
     let datadir = ctx.config.datadir().data_dir().to_path_buf();
     let mut health = crate::health::HealthPublisher::start(&datadir, chain_id, replica)?;
 
-    crate::tracer().on_blockchain_init(
-        "reth",
-        env!("CARGO_PKG_VERSION"),
-        firehose_tracer::config::ChainConfig::new(chain_id),
-    );
-
-    let head = ctx
-        .provider()
-        .last_block_number()
-        .wrap_err("failed to read last_block_number — provider not initialized?")?;
-    if head == 0 {
-        let genesis_block = ctx
-            .provider()
-            .block_by_number(0)
-            .wrap_err("failed to read genesis block from provider")?
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "reth has no block 0 in DB at run_exex start — chain spec init didn't run?"
-                )
-            })?;
-        let genesis = SealedBlock::seal_slow(genesis_block);
-        info!(
-            number = 0,
-            hash = %genesis.hash(),
-            "Emitting FIRE BLOCK 0 with chain-spec genesis allocations (fresh chain detected)"
-        );
-        crate::tracer().on_genesis_block(
-            firehose_tracer::types::BlockEvent {
-                block: mapper::to_block_data(&genesis),
-                finalized: None,
-                flash_block: None,
-            },
-            mapper::to_genesis_alloc(ctx.config.chain.genesis()),
-        );
-    }
+    // `init_blockchain` (from the node builder's `on_component_initialized` hook) emits
+    // FIRE INIT and the genesis block before the consensus engine starts. This ExEx only
+    // publishes the thatis health.json heartbeat.
 
     while let Some(notification) = ctx.notifications.next().await {
         let notification = notification?;

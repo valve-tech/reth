@@ -15,7 +15,7 @@ use firehose_tracer::types::{
     AccessTuple, BlockData, GenesisAlloc, SetCodeAuthorization, TxEvent, UncleData, WithdrawalData,
 };
 use reth_primitives_traits::{Block as BlockTrait, BlockBody};
-use reth_provider::{AccountReader, ProviderResult};
+use reth_provider::AccountReader;
 
 pub(crate) fn to_genesis_alloc(genesis: &Genesis) -> GenesisAlloc {
     genesis
@@ -84,11 +84,10 @@ where
         requests_hash: header.requests_hash(),
         tx_dependency: None,
         slot_number: header.slot_number(),
-        // EIP-7928: the hash the header commits to. The full list is known only after
-        // execution, so the RLP is patched into the buffered block later through
-        // `Tracer::block_mut`: from the payload sidecar on the live engine path
-        // (`payload_validator.rs`), and from re-execution in `run_wrapped_block`.
         block_access_list_hash: header.block_access_list_hash(),
+        // Only known after this node has executed the block; patched in post-execution via
+        // `Tracer::block_mut` (see `payload_validator.rs` for the live path, `executor.rs`'s
+        // `run_wrapped_block` for pipeline/backfill).
         block_access_list_rlp: None,
     }
 }
@@ -125,10 +124,15 @@ where
         .collect()
 }
 
-pub(crate) fn to_finalized_ref(
-    block_ref: ProviderResult<Option<alloy_eips::BlockNumHash>>,
+/// Builds a Firehose [`FinalizedBlockRef`](firehose_tracer::types::FinalizedBlockRef) from the
+/// finalized block's number/hash, if known.
+///
+/// Callers on the live engine path read this from the in-memory canonical state (updated by
+/// forkchoiceUpdated); a `None` num_hash means no finalized head is known yet.
+pub fn finalized_ref_from_num_hash(
+    num_hash: Option<alloy_eips::BlockNumHash>,
 ) -> Option<firehose_tracer::types::FinalizedBlockRef> {
-    block_ref.ok().flatten().map(|num_hash| firehose_tracer::types::FinalizedBlockRef {
+    num_hash.map(|num_hash| firehose_tracer::types::FinalizedBlockRef {
         number: num_hash.number,
         hash: Some(num_hash.hash),
     })
@@ -646,14 +650,14 @@ mod tests {
     }
 
     #[test]
-    fn to_finalized_ref_maps_ok_some_and_none() {
+    fn finalized_ref_from_num_hash_maps_some_and_none() {
         let hash = B256::repeat_byte(0x55);
-        let ok_some = Ok(Some(alloy_eips::BlockNumHash { number: 99, hash }));
-        let mapped = to_finalized_ref(ok_some).expect("Some");
+        let some = Some(alloy_eips::BlockNumHash { number: 99, hash });
+        let mapped = finalized_ref_from_num_hash(some).expect("Some");
         assert_eq!(mapped.number, 99);
         assert_eq!(mapped.hash, Some(hash));
 
-        assert!(to_finalized_ref(Ok(None)).is_none());
+        assert!(finalized_ref_from_num_hash(None).is_none());
     }
 
     #[test]

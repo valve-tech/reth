@@ -27,8 +27,9 @@ use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, TransactionSigne
 use reth_evm::execute::Executor as _;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_firehose::{
-    init_tracer, is_tracer_initialized, run_wrapped_block, take_traced_block_access_list,
-    FirehoseBlockExecutor, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust,
+    init_tracer_with_buffer, is_tracer_initialized, run_wrapped_block,
+    take_traced_block_access_list, FirehoseBlockExecutor, FirehoseBlockTracer, NoPostTxExtras,
+    NoPreTxAdjust,
 };
 use reth_primitives_traits::{Block as _, RecoveredBlock};
 use reth_revm::State;
@@ -107,35 +108,6 @@ pub struct LoadedPrestate {
     pub db: CacheDB<EmptyDB>,
 }
 
-/// Loads `case_folder`'s `prestate.json` into the block it describes and a state database seeded
-/// with its genesis allocation.
-pub fn load_prestate(case_folder: &Path) -> eyre::Result<LoadedPrestate> {
-    let prestate_path = case_folder.join("prestate.json");
-    let prestate: Prestate = serde_json::from_slice(&std::fs::read(&prestate_path)?)
-        .with_context(|| format!("reading prestate.json at {}", prestate_path.display()))?;
-
-    let chain_spec = Arc::new(ChainSpec::from(prestate.genesis.clone()));
-    let parent_hash = chain_spec.genesis_hash();
-
-    let tx_bytes = decode_hex(&prestate.input).context("decoding prestate.input hex")?;
-    let signed_tx = TransactionSigned::network_decode(&mut tx_bytes.as_slice())
-        .context("RLP-decoding prestate.input as a signed transaction")?;
-
-    let transactions = vec![signed_tx];
-    let header = build_header(&prestate.context, parent_hash, &transactions);
-    let block = Block {
-        header,
-        body: BlockBody { transactions, ommers: vec![], withdrawals: Some(Withdrawals::default()) },
-    };
-    let recovered: RecoveredBlock<Block> =
-        block.try_into_recovered().map_err(|_| eyre::eyre!("recovering tx senders"))?;
-
-    let mut db = CacheDB::new(EmptyDB::default());
-    seed_cache_db(&mut db, &prestate.genesis)?;
-
-    Ok(LoadedPrestate { prestate, chain_spec, block: recovered, db })
-}
-
 /// Run the prestate-driven Firehose harness against `case_folder` and return the captured Block.
 ///
 /// `case_folder` must contain `prestate.json` (Geth-style genesis + block context + RLP-encoded
@@ -206,6 +178,39 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
     Ok(RunOutcome { block, raw })
 }
 
+/// Loads `case_folder`'s `prestate.json` into the block it describes and a state database seeded
+/// with its genesis allocation.
+pub fn load_prestate(case_folder: &Path) -> eyre::Result<LoadedPrestate> {
+    let prestate_path = case_folder.join("prestate.json");
+    let prestate: Prestate = serde_json::from_slice(&std::fs::read(&prestate_path)?)
+        .with_context(|| format!("reading prestate.json at {}", prestate_path.display()))?;
+
+    let chain_spec = Arc::new(ChainSpec::from(prestate.genesis.clone()));
+    let parent_hash = chain_spec.genesis_hash();
+
+    let tx_bytes = decode_hex(&prestate.input).context("decoding prestate.input hex")?;
+    let signed_tx = TransactionSigned::network_decode(&mut tx_bytes.as_slice())
+        .context("RLP-decoding prestate.input as a signed transaction")?;
+
+    let transactions = vec![signed_tx];
+    let header = build_header(&prestate.context, parent_hash, &transactions);
+
+    // Match Geth's `extblock` RLP shape on Shanghai+ chains: 4-element list
+    // [header, txs, uncles, withdrawals] where the withdrawals slot is always present (empty
+    // list when the block has no withdrawals). Reth's encoder elides the slot entirely when
+    // `withdrawals: None`, producing a 3-element list and a 1-byte-shorter `block.size`.
+    let block = Block {
+        header,
+        body: BlockBody { transactions, ommers: vec![], withdrawals: Some(Withdrawals::default()) },
+    };
+    let recovered: RecoveredBlock<Block> =
+        block.try_into_recovered().map_err(|_| eyre::eyre!("recovering tx senders"))?;
+
+    let mut db = CacheDB::new(EmptyDB::default());
+    seed_cache_db(&mut db, &prestate.genesis)?;
+    Ok(LoadedPrestate { prestate, chain_spec, block: recovered, db })
+}
+
 /// Like [`run_prestate`], but drives the block through the pipeline
 /// [`FirehoseBlockExecutor`] (`Executor::execute_and_trace_one`) using the **process-wide**
 /// tracer, exactly as staged sync does — instead of `run_wrapped_block` with a local tracer.
@@ -219,8 +224,9 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
 ///
 /// # Panics / once-per-process
 ///
-/// Initializes the global tracer via [`init_tracer`], which may only be called once per process.
-/// Call this from a dedicated integration-test file (its own test binary) with a single test.
+/// Initializes the global tracer via [`init_tracer_with_buffer`], which may only be called once per
+/// process. Call this from a dedicated integration-test file (its own test binary) with a single
+/// test.
 pub fn run_prestate_via_block_executor(case_folder: &Path) -> eyre::Result<RunOutcome> {
     assert!(
         !is_tracer_initialized(),
@@ -257,19 +263,13 @@ pub fn run_prestate_via_block_executor(case_folder: &Path) -> eyre::Result<RunOu
 
     // Initialize the PROCESS-WIDE tracer (vs. the local tracer used by `run_prestate`). The
     // `FirehoseBlockExecutor` resolves it via `is_tracer_initialized()` / the global handle.
-    let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
-        firehose_tracer::config::Config::default(),
-        firehose_tracer::config::ChainConfig {
-            chain_id: prestate.genesis.config.chain_id,
-            shanghai_time: prestate.genesis.config.shanghai_time,
-            cancun_time: prestate.genesis.config.cancun_time,
-            prague_time: prestate.genesis.config.prague_time,
-            verkle_time: None,
-        },
-        "reth-firehose-tests",
-        env!("CARGO_PKG_VERSION"),
+    let config = &prestate.genesis.config;
+    let buffer = init_tracer_with_buffer(
+        config.chain_id,
+        config.shanghai_time,
+        config.cancun_time,
+        config.prague_time,
     );
-    init_tracer(tracer);
 
     let mut executor = FirehoseBlockExecutor::new(evm_config, state);
     executor
