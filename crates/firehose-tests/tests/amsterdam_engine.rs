@@ -24,7 +24,7 @@ use reth_e2e_test_utils::{
     eth_payload_attributes, test_chain_spec, transaction::TransactionTestContext, wallet::Wallet,
     E2ETestSetupExt, NodeHelperType,
 };
-use reth_firehose::init_tracer;
+use reth_firehose::init_tracer_with_buffer;
 use reth_node_ethereum::EthereumNode;
 
 /// Recipient of the withdrawal block's withdrawals.
@@ -32,20 +32,7 @@ const WITHDRAWAL_RECIPIENT: Address = address!("0x000000000000000000000000000000
 
 #[tokio::test(flavor = "multi_thread")]
 async fn traced_engine_path_accepts_amsterdam_blocks() -> eyre::Result<()> {
-    let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
-        firehose_tracer::config::Config::default(),
-        // firehose-tracer 5.4.4's ChainConfig has no Amsterdam field; these are all it takes.
-        firehose_tracer::config::ChainConfig {
-            chain_id: 1,
-            shanghai_time: Some(0),
-            cancun_time: Some(0),
-            prague_time: Some(0),
-            verkle_time: None,
-        },
-        "reth-firehose-tests",
-        env!("CARGO_PKG_VERSION"),
-    );
-    init_tracer(tracer);
+    let buffer = init_tracer_with_buffer(1, Some(0), Some(0), Some(0));
 
     // The builder's next payload takes its withdrawals from here.
     let withdrawals = Arc::new(Mutex::new(Vec::<Withdrawal>::new()));

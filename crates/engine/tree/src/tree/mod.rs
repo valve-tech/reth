@@ -1852,7 +1852,19 @@ where
         };
 
         // backfill height is the block number that the backfill finished at
-        let Some(backfill_height) = backfill_height else { return Ok(()) };
+        let Some(backfill_height) = backfill_height else {
+            // Backfill made no progress (no P2P peers or no blocks to download).  This is the
+            // normal situation for OP Stack nodes that receive all blocks exclusively via the
+            // engine API and never via P2P.  The blocks that arrived as engine_newPayload during
+            // the backfill window are sitting in the block buffer.  Try to connect them to the
+            // current canonical head now so they are executed and Firehose-traced.  This is safe
+            // for non-OP-Stack chains too: any buffered blocks whose parent state is available
+            // will be connected; those without parent state are re-buffered, unchanged.
+            let current_head = self.state.tree_state.current_canonical_head;
+            debug!(target: "engine::tree", ?current_head, "backfill made no progress, trying to connect buffered blocks");
+            self.try_connect_buffered_blocks(current_head)?;
+            return Ok(());
+        };
 
         // state house keeping after backfill sync
         // remove all executed blocks below the backfill height

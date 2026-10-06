@@ -14,25 +14,13 @@ use reth_chainspec::{ChainSpecBuilder, MAINNET};
 use reth_ethereum_primitives::{Block, BlockBody};
 use reth_evm::execute::Executor;
 use reth_evm_ethereum::EthEvmConfig;
-use reth_firehose::{init_tracer, FirehoseBlockExecutor};
+use reth_firehose::FirehoseBlockExecutor;
 use reth_primitives_traits::RecoveredBlock;
 use revm::database::EmptyDB;
 
 #[test]
 fn only_execute_and_trace_one_emits_the_block() {
-    let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
-        firehose_tracer::config::Config::default(),
-        firehose_tracer::config::ChainConfig {
-            chain_id: MAINNET.chain.id(),
-            shanghai_time: None,
-            cancun_time: None,
-            prague_time: None,
-            verkle_time: None,
-        },
-        "reth-firehose-tests",
-        env!("CARGO_PKG_VERSION"),
-    );
-    init_tracer(tracer);
+    let buffer = reth_firehose::init_tracer_with_buffer(MAINNET.chain.id(), None, None, None);
 
     let evm_config =
         EthEvmConfig::new(Arc::new(ChainSpecBuilder::mainnet().paris_activated().build()));

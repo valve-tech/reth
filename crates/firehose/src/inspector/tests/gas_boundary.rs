@@ -136,6 +136,58 @@ fn create_at_intrinsic_gas_floor_gets_a_zero_gas_frame() {
     assert_eq!(root.gas_consumed, 0, "the constructor never ran an opcode");
 }
 
+/// Amsterdam charges the account-creation state gas of a creation transaction (EIP-2780,
+/// EIP-8037) after the intrinsic phase but before the root `CREATE` frame exists. When that
+/// charge runs out of gas, revm includes the transaction as an out-of-gas halt without ever
+/// opening a frame, so no inspector call hook fires. The trace must still carry a failed root
+/// `CREATE`, its receipt and the sender's nonce bump — a transaction with no call at all is
+/// what the tracer treats as a bad block, dropping the receipt and leaving the status unknown.
+///
+/// Battlefield `contract_fail_code_copy` hits this with a 99309 gas deployment.
+#[test]
+fn amsterdam_create_starved_of_creation_state_gas_keeps_a_failed_root_call() {
+    // PUSH1 0, PUSH1 0, RETURN: a constructor that would deploy empty code if it ever ran.
+    let initcode = [0x60, 0x00, 0x60, 0x00, 0xf3];
+    // Above Amsterdam's intrinsic cost for this init code, far below the creation state gas.
+    const GAS_LIMIT: u64 = 30_000;
+
+    let accounts = [(SENDER, balance_account(u64::MAX))];
+    let tx = DriveTx::create(initcode.to_vec()).with_gas(GAS_LIMIT);
+    let block = drive_txs(SpecId::AMSTERDAM, &accounts, &[tx]);
+
+    let trx = block.transaction_traces.first().expect("the transaction is included");
+    assert_eq!(trx.gas_used, GAS_LIMIT, "an out-of-gas halt charges the whole gas limit");
+    assert_eq!(
+        trx.status,
+        pb::sf::ethereum::r#type::v2::TransactionTraceStatus::Failed as i32,
+        "the creation never happened"
+    );
+    let receipt = trx.receipt.as_ref().expect("the receipt is kept");
+    assert_eq!(receipt.cumulative_gas_used, GAS_LIMIT);
+
+    let root = trx.calls.first().expect("a root call");
+    assert_eq!(
+        root.call_type,
+        pb::sf::ethereum::r#type::v2::CallType::Create as i32,
+        "root call is the CREATE"
+    );
+    assert_eq!(root.caller, SENDER.to_vec());
+    assert_eq!(root.address, SENDER.create(0).to_vec(), "address the creation targeted");
+    assert!(root.status_failed);
+    assert!(
+        root.failure_reason.contains("out of gas"),
+        "expected an out-of-gas failure, got {:?}",
+        root.failure_reason
+    );
+    assert!(!root.executed_code, "the constructor never ran");
+    assert_eq!(root.gas_consumed, root.gas_limit, "the frame burns all the gas it was handed");
+    assert!(root.code_changes.is_empty(), "nothing is deployed");
+
+    let nonces: Vec<_> =
+        root.nonce_changes.iter().map(|n| (n.address.clone(), n.old_value, n.new_value)).collect();
+    assert_eq!(nonces, vec![(SENDER.to_vec(), 0, 1)], "a creation's nonce bump survives the halt");
+}
+
 /// Hoodi block 3171397: value sent straight to a precompile that is then starved of gas.
 /// The frame fails, revm rolls the transfer back, and geth still reports the debit and the
 /// credit — so must we. Unlike the hook-level test in [`super::precompile`], this runs a real

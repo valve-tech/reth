@@ -13,7 +13,7 @@ use alloy_consensus::BlockHeader;
 use alloy_primitives::keccak256;
 use reth_evm::execute::Executor;
 use reth_evm_ethereum::EthEvmConfig;
-use reth_firehose::{init_tracer, FirehoseBlockExecutor};
+use reth_firehose::FirehoseBlockExecutor;
 use reth_firehose_tests::{load_prestate, parse_fire_block_for, LoadedPrestate};
 
 #[test]
@@ -35,20 +35,13 @@ fn staged_sync_rebuilds_the_block_access_list() {
     let bal = executor.take_bal().expect("execute_one rebuilds the block access list");
     assert_eq!(keccak256(alloy_rlp::encode(&bal)), expected_hash);
 
-    let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
-        firehose_tracer::config::Config::default(),
-        firehose_tracer::config::ChainConfig {
-            chain_id: prestate.genesis.config.chain_id,
-            shanghai_time: prestate.genesis.config.shanghai_time,
-            cancun_time: prestate.genesis.config.cancun_time,
-            prague_time: prestate.genesis.config.prague_time,
-            verkle_time: None,
-        },
-        "reth-firehose-tests",
-        env!("CARGO_PKG_VERSION"),
+    let config = &prestate.genesis.config;
+    let buffer = reth_firehose::init_tracer_with_buffer(
+        config.chain_id,
+        config.shanghai_time,
+        config.cancun_time,
+        config.prague_time,
     );
-    init_tracer(tracer);
-
     let mut executor = FirehoseBlockExecutor::new(evm_config, db);
     executor.execute_and_trace_one(&block).expect("execute_and_trace_one succeeds");
     let bal = executor.take_bal().expect("execute_and_trace_one rebuilds the block access list");
