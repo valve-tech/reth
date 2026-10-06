@@ -27,8 +27,8 @@ use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, TransactionSigne
 use reth_evm::execute::Executor as _;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_firehose::{
-    init_tracer, is_tracer_initialized, run_wrapped_block, FirehoseBlockExecutor,
-    FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust,
+    init_tracer, is_tracer_initialized, run_wrapped_block, take_traced_block_access_list,
+    FirehoseBlockExecutor, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust,
 };
 use reth_primitives_traits::{Block as _, RecoveredBlock};
 use reth_revm::State;
@@ -94,13 +94,22 @@ pub struct TraceContext {
     pub block_access_list_hash: Option<B256>,
 }
 
-/// Run the prestate-driven Firehose harness against `case_folder` and return the captured Block.
-///
-/// `case_folder` must contain `prestate.json` (Geth-style genesis + block context + RLP-encoded
-/// signed transaction). The captured `Block` is the protobuf parsed from the single
-/// `FIRE BLOCK` line emitted for the executed block; assert against a `.binpb` golden via
-/// [`assert_block_equals_golden`].
-pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
+/// A test case's `prestate.json`, turned into what executing its block needs.
+#[derive(Debug)]
+pub struct LoadedPrestate {
+    /// The parsed fixture.
+    pub prestate: Prestate,
+    /// Chain spec built from the fixture's genesis.
+    pub chain_spec: Arc<ChainSpec>,
+    /// The block to execute, carrying the fixture's single transaction.
+    pub block: RecoveredBlock<Block>,
+    /// State database seeded with the genesis allocation.
+    pub db: CacheDB<EmptyDB>,
+}
+
+/// Loads `case_folder`'s `prestate.json` into the block it describes and a state database seeded
+/// with its genesis allocation.
+pub fn load_prestate(case_folder: &Path) -> eyre::Result<LoadedPrestate> {
     let prestate_path = case_folder.join("prestate.json");
     let prestate: Prestate = serde_json::from_slice(&std::fs::read(&prestate_path)?)
         .with_context(|| format!("reading prestate.json at {}", prestate_path.display()))?;
@@ -114,11 +123,6 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
 
     let transactions = vec![signed_tx];
     let header = build_header(&prestate.context, parent_hash, &transactions);
-
-    // Match Geth's `extblock` RLP shape on Shanghai+ chains: 4-element list
-    // [header, txs, uncles, withdrawals] where the withdrawals slot is always present (empty
-    // list when the block has no withdrawals). Reth's encoder elides the slot entirely when
-    // `withdrawals: None`, producing a 3-element list and a 1-byte-shorter `block.size`.
     let block = Block {
         header,
         body: BlockBody { transactions, ommers: vec![], withdrawals: Some(Withdrawals::default()) },
@@ -128,6 +132,18 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
 
     let mut db = CacheDB::new(EmptyDB::default());
     seed_cache_db(&mut db, &prestate.genesis)?;
+
+    Ok(LoadedPrestate { prestate, chain_spec, block: recovered, db })
+}
+
+/// Run the prestate-driven Firehose harness against `case_folder` and return the captured Block.
+///
+/// `case_folder` must contain `prestate.json` (Geth-style genesis + block context + RLP-encoded
+/// signed transaction). The captured `Block` is the protobuf parsed from the single
+/// `FIRE BLOCK` line emitted for the executed block; assert against a `.binpb` golden via
+/// [`assert_block_equals_golden`].
+pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
+    let LoadedPrestate { prestate, chain_spec, block: recovered, db } = load_prestate(case_folder)?;
     let mut state = State::builder().with_database(db).with_bundle_update().build();
 
     let evm_config = EthEvmConfig::new(chain_spec.clone());
@@ -168,7 +184,11 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
         &mut block_tracer,
         NoPreTxAdjust,
         NoPostTxExtras,
-    );
+    )
+    .and_then(|result| {
+        take_traced_block_access_list(&mut state, &recovered, &mut block_tracer)?;
+        Ok(result)
+    });
 
     match exec_result {
         Ok(_) => block_tracer.mark_verified(),

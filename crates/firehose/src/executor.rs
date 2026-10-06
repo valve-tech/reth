@@ -57,7 +57,8 @@ use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredB
 use reth_provider::EvmStateProviderBox;
 use reth_revm::{
     database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
-    revm::context::Block as RevmBlock, Database as _, State,
+    revm::{context::Block as RevmBlock, state::bal::Bal},
+    Database as _, State,
 };
 
 /// Chain-specific hook that emits additional post-tx balance changes after the generic
@@ -656,6 +657,9 @@ pub struct FirehoseBlockExecutor<F, DB, H = NoChainHooks> {
     pending_tracer: Option<FirehoseBlockTracer>,
     /// Chain-specific per-block wrapping strategy.
     hooks: H,
+    /// Block access list rebuilt by the most recent `execute_and_trace_one`, handed out by
+    /// `take_bal` for post-execution validation.
+    built_bal: Option<BlockAccessList>,
 }
 
 impl Debug for FirehoseBlockExecutor<(), ()> {
@@ -675,7 +679,7 @@ impl<F, DB: reth_evm::Database, H> FirehoseBlockExecutor<F, DB, H> {
     /// Creates a new `FirehoseBlockExecutor` with a caller-supplied [`ChainHooks`].
     pub fn new_with_chain_hooks(strategy_factory: F, db: DB, hooks: H) -> Self {
         let db = State::builder().with_database(db).with_bundle_update().build();
-        Self { strategy_factory, db, pending_tracer: None, hooks }
+        Self { strategy_factory, db, pending_tracer: None, hooks, built_bal: None }
     }
 }
 
@@ -699,11 +703,30 @@ where
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
-        let result = self
+        self.built_bal = None;
+        let mut executor = self
             .strategy_factory
             .executor_for_block(&mut self.db, block)
-            .map_err(BlockExecutionError::other)?
-            .execute_block(block.transactions_recovered())?;
+            .map_err(BlockExecutionError::other)?;
+
+        // Same EIP-7928 index tracking as `BasicBlockExecutor::execute_one`: index 0 is
+        // pre-execution, each transaction gets its own index, the last one is post-execution.
+        let has_bal = block.header().block_access_list_hash().is_some();
+        executor.evm_mut().db_mut().bal_state.bal_builder = has_bal.then(Bal::new);
+
+        executor.apply_pre_execution_changes()?;
+        if has_bal {
+            executor.evm_mut().db_mut().bump_bal_index();
+        }
+
+        for tx in block.transactions_recovered() {
+            executor.execute_transaction(tx)?;
+            if has_bal {
+                executor.evm_mut().db_mut().bump_bal_index();
+            }
+        }
+
+        let result = executor.apply_post_execution_changes()?;
         self.db.merge_transitions(BundleRetention::Reverts);
         Ok(result)
     }
@@ -737,8 +760,14 @@ where
         let mut tracer =
             FirehoseBlockTracer::start::<F::Primitives>(block.sealed_block(), finalized);
 
-        let block_result =
-            self.hooks.execute_one_traced(&self.strategy_factory, &mut self.db, block, &mut tracer);
+        self.built_bal = None;
+        let block_result = self
+            .hooks
+            .execute_one_traced(&self.strategy_factory, &mut self.db, block, &mut tracer)
+            .and_then(|result| {
+                self.built_bal = take_traced_block_access_list(&mut self.db, block, &mut tracer)?;
+                Ok(result)
+            });
 
         match block_result {
             Ok(result) => {
@@ -790,7 +819,7 @@ where
     }
 
     fn take_bal(&mut self) -> Option<BlockAccessList> {
-        self.db.take_built_alloy_bal()
+        self.built_bal.take().or_else(|| self.db.take_built_alloy_bal())
     }
 }
 
@@ -810,6 +839,9 @@ where
 /// Does **not** emit `on_block_start` / `on_block_end` — those are owned by the
 /// [`FirehoseBlockTracer`] lifecycle (see [`FirehoseBlockTracer::start`] and
 /// [`FirehoseBlockTracer::mark_verified`]).
+///
+/// When the header declares a block access list, the one rebuilt by this execution is left in
+/// `db`; collect it with [`take_traced_block_access_list`].
 pub fn run_wrapped_block<F, DB, Extras, Adjust, G>(
     evm_config: &F,
     db: &mut State<DB>,
@@ -849,9 +881,9 @@ where
 
     // EIP-7928: this path (pipeline/backfill) has no payload sidecar to read the block access
     // list from, so it rebuilds the list during execution, as `BasicBlockExecutor::execute_one`
-    // does. The built list stays in `db` so `Executor::take_bal` still hands it to the stage.
-    let bal_hash = block.header().block_access_list_hash();
-    db.bal_state.bal_builder = bal_hash.map(|_| reth_revm::revm::state::bal::Bal::new());
+    // does. The rebuilt list is left in `db`; collect it with [`take_traced_block_access_list`].
+    let has_bal = block.header().block_access_list_hash().is_some();
+    db.bal_state.bal_builder = has_bal.then(Bal::new);
 
     let inspector = tracer_guard.inspector();
     let evm = evm_config.evm_with_env_and_inspector(&mut *db, evm_env, inspector);
@@ -874,37 +906,49 @@ where
     // The steps of `BlockExecutor::execute_block`, with the BAL index advanced after the
     // pre-execution changes (index 0) and after each transaction (index `i + 1`).
     wrapped.apply_pre_execution_changes()?;
-    if bal_hash.is_some() {
+    if has_bal {
         wrapped.evm_mut().db_mut().bump_bal_index();
     }
     for tx in block.transactions_recovered() {
         wrapped.execute_transaction(tx)?;
-        if bal_hash.is_some() {
+        if has_bal {
             wrapped.evm_mut().db_mut().bump_bal_index();
         }
     }
-    let result = wrapped.apply_post_execution_changes()?;
+    wrapped.apply_post_execution_changes()
+}
 
-    if let Some(expected) = bal_hash &&
-        let Some(bal) = db.bal_state.bal_builder.clone()
-    {
-        let bal = bal.into_alloy_bal();
-        let computed = alloy_eip7928::compute_block_access_list_hash(&bal);
-        // A mismatch means the rebuilt list is wrong, not the block: fail rather than emit an
-        // RLP that does not match the header.
-        if computed != expected {
-            return Err(BlockExecutionError::msg(format!(
-                "reconstructed block access list hash mismatch for block {}: expected {expected}, computed {computed}",
-                block.header().number(),
-            )));
-        }
-        if let Some(header) = tracer_guard.tracer_mut().block_mut().and_then(|b| b.header.as_mut())
-        {
-            header.block_access_list_rlp = Some(alloy_rlp::encode(&bal));
-        }
+/// Takes the block access list [`run_wrapped_block`] rebuilt for `block` out of `db`, checks it
+/// against the header's `block_access_list_hash` and records its RLP on the traced block.
+///
+/// Returns `None` when the header declares no block access list.
+pub fn take_traced_block_access_list<B, DB, G>(
+    db: &mut State<DB>,
+    block: &RecoveredBlock<B>,
+    tracer_guard: &mut FirehoseBlockTracer<G>,
+) -> Result<Option<BlockAccessList>, BlockExecutionError>
+where
+    B: BlockTrait,
+    DB: reth_evm::Database,
+    G: std::ops::DerefMut<Target = firehose_tracer::Tracer>,
+{
+    let Some(expected_hash) = block.header().block_access_list_hash() else { return Ok(None) };
+    let Some(bal) = db.take_built_alloy_bal() else { return Ok(None) };
+
+    let computed_hash = alloy_eip7928::compute_block_access_list_hash(&bal);
+    // A mismatch means the rebuilt list is wrong, not the block: fail rather than emit an
+    // RLP that does not match the header.
+    if computed_hash != expected_hash {
+        return Err(BlockExecutionError::msg(format!(
+            "reconstructed block access list hash mismatch for block {}: expected {expected_hash}, computed {computed_hash}",
+            block.header().number(),
+        )));
+    }
+    if let Some(header) = tracer_guard.tracer_mut().block_mut().and_then(|b| b.header.as_mut()) {
+        header.block_access_list_rlp = Some(alloy_rlp::encode(&bal));
     }
 
-    Ok(result)
+    Ok(Some(bal))
 }
 
 // ---------------------------------------------------------------------------

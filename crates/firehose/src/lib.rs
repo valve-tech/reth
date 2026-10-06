@@ -45,9 +45,9 @@ pub mod health;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
-    reject_jit_capable_inner, run_wrapped_block, ChainHooks, FirehoseBlockExecutor,
-    FirehoseEvmConfig, FirehoseLiveHooks, FirehoseWrappedExecutor, LiveTracedEvm, NoChainHooks,
-    NoPostTxExtras, NoPreTxAdjust, PostTxExtras, PreTxAdjust,
+    reject_jit_capable_inner, run_wrapped_block, take_traced_block_access_list, ChainHooks,
+    FirehoseBlockExecutor, FirehoseEvmConfig, FirehoseLiveHooks, FirehoseWrappedExecutor,
+    LiveTracedEvm, NoChainHooks, NoPostTxExtras, NoPreTxAdjust, PostTxExtras, PreTxAdjust,
 };
 pub use inspector::PostTxGasAccounting;
 pub use runner::run_exex;
