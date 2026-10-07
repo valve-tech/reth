@@ -1,6 +1,7 @@
 use crate::stages::MERKLE_STAGE_DEFAULT_INCREMENTAL_THRESHOLD;
 use alloy_consensus::BlockHeader;
 use alloy_eip7928::bal::Bal;
+use alloy_eips::NumHash;
 use alloy_primitives::BlockNumber;
 use num_traits::Zero;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
@@ -13,9 +14,9 @@ use reth_exex::{ExExManagerHandle, ExExNotification, ExExNotificationSource};
 use reth_primitives_traits::{format_gas_throughput, BlockBody, NodePrimitives};
 use reth_provider::{
     providers::{StaticFileProvider, StaticFileWriter},
-    BlockHashReader, BlockReader, DBProvider, EitherWriter, ExecutionOutcome,
+    BalStoreHandle, BlockHashReader, BlockReader, DBProvider, EitherWriter, ExecutionOutcome,
     HashedPostStateProvider, HeaderProvider, LatestStateProviderRef, OriginalValuesKnown,
-    ProviderError, StateProvider, StateWriteConfig, StateWriter, StaticFileProviderFactory,
+    ProviderError, RawBal, StateProvider, StateWriteConfig, StateWriter, StaticFileProviderFactory,
     StatsReader, StoragePath, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
@@ -97,6 +98,11 @@ where
     exex_manager_handle: ExExManagerHandle<E::Primitives>,
     /// Executor metrics.
     metrics: ExecutorMetrics,
+    /// Store for the block access lists that this stage rebuilds and validates.
+    ///
+    /// Without it, a block that staged sync executes has no stored BAL, and
+    /// `engine_getPayloadBodies*V2` answers `blockAccessList: null` for it.
+    bal_store: Option<BalStoreHandle>,
 }
 
 impl<E> ExecutionStage<E>
@@ -120,7 +126,14 @@ where
             post_unwind_commit_input: None,
             exex_manager_handle,
             metrics: ExecutorMetrics::default(),
+            bal_store: None,
         }
+    }
+
+    /// Stores each validated block access list that this stage rebuilds in `bal_store`.
+    pub fn with_bal_store(mut self, bal_store: BalStoreHandle) -> Self {
+        self.bal_store = Some(bal_store);
+        self
     }
 
     /// Create an execution stage with the provided executor.
@@ -337,6 +350,8 @@ where
         let mut results = Vec::new();
         // Reused across blocks for BAL hash encoding.
         let mut bal_buf = Vec::new();
+        // Validated BALs, stored once the range is executed.
+        let mut built_bals = Vec::new();
         for block_number in start_block..=max_block {
             // Fetch the block
             let fetch_block_start = Instant::now();
@@ -382,6 +397,12 @@ where
                     error: BlockErrorKind::Validation(err),
                 })
             }
+            // The consensus check above bound this BAL to the header, so it is safe to serve.
+            if self.bal_store.is_some() &&
+                let Some(bal) = built_bal
+            {
+                built_bals.push((block.num_hash(), RawBal::new(alloy_rlp::encode(&bal).into())));
+            }
             results.push(result);
 
             execution_duration += execute_start.elapsed();
@@ -419,6 +440,12 @@ where
             ) {
                 break
             }
+        }
+
+        if let Some(bal_store) = &self.bal_store &&
+            !built_bals.is_empty()
+        {
+            store_built_bals(bal_store, built_bals);
         }
 
         // prepare execution output for writing
@@ -773,6 +800,25 @@ where
     debug!(target: "sync::stages::execution", ?range, ?duration, "Finished calculating gas used from headers");
 
     Ok(gas_total)
+}
+
+/// Writes BALs that staged sync rebuilt and validated to the BAL store.
+///
+/// The engine stores a BAL only when a payload carries one. Without this, staged sync leaves
+/// every block it executes without one, and `engine_getPayloadBodies*V2` returns
+/// `blockAccessList: null` for them. A failure here is logged and does not fail the stage, the
+/// same as the engine's own BAL store writes.
+fn store_built_bals(bal_store: &BalStoreHandle, built_bals: Vec<(NumHash, RawBal)>) {
+    let blocks: Vec<NumHash> = built_bals.iter().map(|(block, _)| *block).collect();
+    if let Err(err) = bal_store.insert_many(built_bals).and_then(|()| bal_store.flush(&blocks)) {
+        warn!(
+            target: "sync::stages::execution",
+            first = ?blocks.first(),
+            last = ?blocks.last(),
+            %err,
+            "Failed to store block access lists built by staged sync"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -109,7 +109,7 @@ use crate::tree::{
 };
 use alloy_consensus::transaction::{Either, TxHashRef};
 use alloy_eip7928::{
-    bal::{Bal, DecodedBal},
+    bal::{Bal, DecodedBal, RawBal},
     BlockAccessList,
 };
 use alloy_eips::{eip1898::BlockWithParent, eip4895::Withdrawal, NumHash};
@@ -880,6 +880,9 @@ where
             )
         });
 
+        // Without a sidecar, the built list is the only source of the BAL that the store serves.
+        let built_bal_for_store = if decoded_bal.is_none() { built_bal.clone() } else { None };
+
         ensure_ok_post_block!(
             self.validate_post_execution(
                 &block,
@@ -1017,11 +1020,16 @@ where
 
         // The payload's raw bytes are already bound to this header: payload-to-block conversion
         // and downloaded-sidecar verification both check their hash against it, so pairing them
-        // with the BAL this execution produced is sound. The zip leaves the BAL unset for a
-        // downloaded block that carried only a BAL hash and no sidecar.
-        let bal = revm_bal.zip(decoded_bal).map(|(revm_bal, decoded_bal)| {
-            Arc::new(DecodedRevmBal::with_raw_bal(revm_bal, decoded_bal.as_raw_bal().clone()))
-        });
+        // with the BAL this execution produced is sound. A downloaded block that carried only a
+        // BAL hash and no sidecar gets the RLP of the list this execution built, which
+        // `validate_post_execution` checked against the header. See `raw_bal_to_store`.
+        let raw_bal = raw_bal_to_store(
+            decoded_bal.as_deref().map(DecodedBal::as_raw_bal),
+            built_bal_for_store.as_ref(),
+        );
+        let bal = revm_bal
+            .zip(raw_bal)
+            .map(|(revm_bal, raw_bal)| Arc::new(DecodedRevmBal::with_raw_bal(revm_bal, raw_bal)));
         let executed_block = self
             .spawn_deferred_trie_task(Arc::new(block), output, hashed_state, trie_output)
             .with_bal(bal);
@@ -2433,6 +2441,46 @@ fn firehose_bal_rlp(
         .filter(|sidecar| header_hash == Some(alloy_primitives::keccak256(sidecar)))
         .map(<[u8]>::to_vec)
         .or_else(|| built.map(alloy_rlp::encode))
+}
+
+/// Picks the raw block access list that the BAL store keeps for a validated block.
+///
+/// The sidecar wins when there is one. A block without a sidecar, such as one the engine downloaded
+/// from a peer, falls back to the list this execution built. Without that fallback the store has
+/// no entry for the block, and `engine_getPayloadBodies*V2` returns `blockAccessList: null`.
+/// `built` must already be validated against the header's `block_access_list_hash`.
+fn raw_bal_to_store(sidecar: Option<&RawBal>, built: Option<&BlockAccessList>) -> Option<RawBal> {
+    sidecar.cloned().or_else(|| {
+        built.map(|bal| RawBal::from(alloy_primitives::Bytes::from(alloy_rlp::encode(bal))))
+    })
+}
+
+#[cfg(test)]
+mod raw_bal_to_store_tests {
+    use super::*;
+
+    fn built() -> BlockAccessList {
+        vec![alloy_eip7928::AccountChanges::new(Address::repeat_byte(1))]
+    }
+
+    #[test]
+    fn sidecar_is_stored_as_received() {
+        // The empty-list RLP: different bytes from the built list, so the sidecar must win.
+        let sidecar = RawBal::from(alloy_primitives::Bytes::from_static(&[0xc0]));
+        assert_eq!(raw_bal_to_store(Some(&sidecar), Some(&built())), Some(sidecar));
+    }
+
+    #[test]
+    fn block_without_sidecar_stores_the_built_list() {
+        let built = built();
+        let stored = raw_bal_to_store(None, Some(&built)).expect("the built list is stored");
+        assert_eq!(stored.as_raw().as_ref(), alloy_rlp::encode(&built).as_slice());
+    }
+
+    #[test]
+    fn nothing_to_store_without_a_list() {
+        assert_eq!(raw_bal_to_store(None, None), None);
+    }
 }
 
 #[cfg(test)]
