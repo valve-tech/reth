@@ -3529,3 +3529,34 @@ async fn test_fcu_back_to_reorged_out_head_with_pending_disk_reorg() {
 async fn test_fcu_back_to_reorged_out_head_above_shorter_branch_with_pending_disk_reorg() {
     assert_fcu_back_to_reorged_out_head_with_pending_disk_reorg(1).await;
 }
+
+/// Tests that a backfill run with no progress, on the Ethereum engine kind that PulseChain runs,
+/// leaves a buffered block whose parent is unknown in the buffer and returns without error.
+///
+/// The harness EVM is a no-op, so this test cannot cover a buffered child that gets executed.
+#[test]
+fn test_backfill_no_progress_keeps_unconnected_buffered_blocks() {
+    reth_tracing::init_test_tracing();
+
+    let chain_spec = MAINNET.clone();
+    let mut test_harness = TestHarness::new(chain_spec);
+    assert_eq!(test_harness.tree.engine_kind, EngineApiKind::Ethereum);
+
+    let blocks: Vec<_> = test_harness.block_builder.get_executed_blocks(0..2).collect();
+    let head = blocks[1].recovered_block().clone();
+    test_harness = test_harness.with_blocks(blocks);
+    test_harness.tree.state.tree_state.set_canonical_head(head.num_hash());
+
+    // Buffer the grandchild of the head only, so its parent is unknown to the tree and buffer.
+    let orphan = test_harness.block_builder.create_fork(&head, 2)[1].clone();
+    test_harness.tree.state.buffer.insert_block(orphan.clone_sealed_block().into());
+
+    test_harness
+        .tree
+        .on_backfill_sync_finished(ControlFlow::NoProgress { block_number: None })
+        .unwrap();
+
+    assert!(test_harness.tree.state.buffer.block(&orphan.hash()).is_some());
+    assert_eq!(test_harness.tree.state.tree_state.current_canonical_head, head.num_hash());
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+}

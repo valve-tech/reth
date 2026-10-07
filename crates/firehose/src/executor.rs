@@ -35,7 +35,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::{
     block_tracer::FirehoseBlockTracer,
-    inspector::{FirehoseInspector, FirehoseInspectorApi, PostTxGasAccounting},
+    inspector::{FirehoseInspector, FirehoseInspectorApi, FramelessTx, PostTxGasAccounting},
     mapper,
     mapper::SignatureFields,
 };
@@ -46,7 +46,7 @@ use alloy_evm::{
     block::{BlockExecutor, CommitChanges, ExecutableTx, GasOutput},
     RecoveredTx,
 };
-use alloy_primitives::{Address, Log, Sealable, U256};
+use alloy_primitives::{Address, Bytes, Log, Sealable, TxKind, U256};
 use reth_evm::{
     execute::{BlockExecutionError, Executor},
     ConfigureEvm, Evm as _, EvmFor, JitBackend, OnStateHook,
@@ -56,8 +56,10 @@ use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, BlockTy, RecoveredBlock, TxTy};
 use reth_provider::EvmStateProviderBox;
 use reth_revm::{
-    database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
-    revm::context::Block as RevmBlock, Database as _, State,
+    database::StateProviderDatabase,
+    db::states::bundle_state::BundleRetention,
+    revm::{context::Block as RevmBlock, context_interface::Cfg, state::bal::Bal},
+    Database as _, State,
 };
 
 /// Chain-specific hook that emits additional post-tx balance changes after the generic
@@ -206,6 +208,14 @@ pub struct FirehoseWrappedExecutor<Inner, Extras = NoPostTxExtras, Adjust = NoPr
     log_index: u32,
     extras: Extras,
     adjust: Adjust,
+    /// Whether the underlying DB's `bal_builder` was armed by the caller (see
+    /// [`Self::with_bal_tracking`]). When set, the wrapper advances the DB's BAL index at each
+    /// phase boundary (pre-execution changes, each committed transaction) so a caller-initialized
+    /// `bal_builder` accumulates a correctly-indexed EIP-7928 block access list. The wrapper does
+    /// not itself arm `bal_builder` or extract the result — that needs a concrete `State<DB>`,
+    /// which this generically-bounded type does not have direct access to (see
+    /// `run_wrapped_block`).
+    has_bal: bool,
 }
 
 impl Debug for FirehoseWrappedExecutor<()> {
@@ -230,6 +240,7 @@ impl<Inner> FirehoseWrappedExecutor<Inner, NoPostTxExtras, NoPreTxAdjust> {
             log_index: 0,
             extras: NoPostTxExtras,
             adjust: NoPreTxAdjust,
+            has_bal: false,
         }
     }
 }
@@ -253,6 +264,7 @@ impl<Inner, Extras> FirehoseWrappedExecutor<Inner, Extras, NoPreTxAdjust> {
             log_index: 0,
             extras,
             adjust: NoPreTxAdjust,
+            has_bal: false,
         }
     }
 }
@@ -268,16 +280,88 @@ impl<Inner, Extras, Adjust> FirehoseWrappedExecutor<Inner, Extras, Adjust> {
         adjust: Adjust,
         extras: Extras,
     ) -> Self {
-        Self { inner, withdrawals, ommer_beneficiaries, log_index: 0, extras, adjust }
+        Self {
+            inner,
+            withdrawals,
+            ommer_beneficiaries,
+            log_index: 0,
+            extras,
+            adjust,
+            has_bal: false,
+        }
+    }
+
+    /// Arms EIP-7928 BAL-index tracking: the wrapper will advance the underlying DB's BAL index
+    /// (via [`alloy_evm::block::BalIndexedDatabase`]) after pre-execution changes and after each
+    /// committed transaction, matching the indexing scheme `BasicBlockExecutor::execute_one` uses.
+    ///
+    /// The caller remains responsible for arming `bal_state.bal_builder` on the concrete DB before
+    /// execution starts, and for extracting the built list via `State::take_built_alloy_bal`
+    /// afterwards — this type only sees `Inner::Evm::DB` through the generic `BalIndexedDatabase`
+    /// bound, not the concrete `State<DB>` those two operations need.
+    pub const fn with_bal_tracking(mut self, has_bal: bool) -> Self {
+        self.has_bal = has_bal;
+        self
     }
 }
 
-impl<Inner, Extras, Adjust> BlockExecutor for FirehoseWrappedExecutor<Inner, Extras, Adjust>
+// GUARD (not enforceable by the compiler — `alloy_evm::block::BlockExecutor`'s defaulted methods
+// are backward-compatible by construction, so Rust cannot flag "a new default was silently
+// inherited" the way it flags a missing *required* method): whenever `alloy-evm` is bumped, diff
+// its `BlockExecutor` trait (`crates/evm/src/block/mod.rs`) against this list of the methods it
+// currently defines a default body for, as of alloy-evm 0.37.0 (streamingfast/evm.git tag
+// v0.37.0-sf):
+//   execute_transaction, execute_transaction_with_index,
+//   execute_transaction_with_index_and_result_closure, execute_transaction_with_result_closure,
+//   execute_transaction_with_commit_condition, apply_post_execution_changes, execute_block.
+// Of these, `execute_transaction_with_commit_condition` is the sole point chain integrators
+// (e.g. an OP Stack producer wrapped as `Inner`) hook to change per-tx commit/decline behavior,
+// and the rest of the defaulted family (`execute_transaction`,
+// `execute_transaction_with_index[_and_result_closure]`, `execute_transaction_with_result_closure`)
+// all bottom out in it via the trait's own default bodies.
+// `apply_post_execution_changes` and `execute_block` are deliberately NOT forwarded to
+// `self.inner` — their defaults route back through
+// `Self::finish`/`Self::apply_pre_execution_changes`/ `Self::execute_transaction`, i.e. through
+// *our* overrides; forwarding them to `self.inner` instead would bypass this wrapper entirely.
+//
+// KNOWN GAP, deliberately not "fixed" by forwarding: below,
+// `execute_transaction_with_commit_condition` still manually composes
+// `execute_transaction_without_commit` + `commit_transaction` rather than calling `self.inner.
+// execute_transaction_with_commit_condition` directly. A prior attempt at full delegation was
+// reverted because it is not achievable without breaking tracing correctness — see the long comment
+// inside the method body for why (it is a proven, not theoretical, regression: caught by `crates/
+// firehose-tests`' golden files, every `RewardTransactionFee.old_value` came out wrong). Practical
+// effect: if a wrapped `Inner` overrides `execute_transaction_with_commit_condition` (e.g. OP Stack
+// refund-policy snapshot/restore around a *declined* candidate — CommitChanges::No), that override
+// does not run through this wrapper. This does not affect canonical/traced block execution, which
+// always commits (`CommitChanges::Yes`) via the `execute_transaction`/`execute_block` convenience
+// path; it only matters for callers that invoke `execute_transaction_with_commit_condition`
+// directly with a real decline condition (e.g. speculative/candidate execution during block
+// building). Closing this gap properly requires changing alloy-evm's
+// `execute_transaction_with_commit_condition` closure signature (in the streamingfast/evm.git fork)
+// to also hand the closure `&mut Self::Evm`, so wrapper accounting can run from inside it without
+// violating Rust's aliasing rules. That is a public-trait change affecting every `BlockExecutor`
+// implementor and is out of scope here — flag it to whoever owns the OP Stack
+// producer/candidate-execution path if the decline branch is reachable with Firehose tracing
+// enabled.
+//
+// If a future alloy-evm version adds a new defaulted method to `BlockExecutor`, or changes what an
+// existing default composes, re-run this triage: does the new/changed default matter for a wrapped
+// `Inner` that might override it, and if so, is it safely forwardable (does it need EVM/inspector
+// access from inside a closure `self.inner` already holds — if so, expect the same wall).
+impl<'bal, Inner, Extras, Adjust, BalDB> BlockExecutor
+    for FirehoseWrappedExecutor<Inner, Extras, Adjust>
 where
-    Inner: BlockExecutor,
+    Inner: BlockExecutor<Evm: reth_evm::Evm<DB = &'bal mut State<BalDB>>>,
     Inner::Transaction: Transaction + TxHashRef + SignatureFields,
     <Inner::Evm as reth_evm::Evm>::Inspector: FirehoseInspectorApi,
-    <Inner::Evm as reth_evm::Evm>::DB: reth_revm::Database,
+    <Inner::Evm as reth_evm::Evm>::Spec: Into<reth_revm::revm::primitives::hardfork::SpecId>,
+    // Every real caller (`run_wrapped_block`, the live engine path) instantiates `Inner` with an
+    // EVM borrowing a `reth_revm::State<DB>`, never an owned or otherwise-shaped `Database`. That
+    // concrete shape is pinned down here (rather than bounding on the generic `Database` trait, as
+    // before) so `bump_bal_index`/`bal_state` — inherent on `State<DB>`, with no blanket
+    // `&mut State<DB>` trait impl available — resolve via ordinary auto-deref.
+    BalDB: reth_revm::Database + 'bal,
     Inner::Receipt: TxReceipt<Log = Log>,
     Extras: PostTxExtras<Inner::Evm>,
     Adjust: PreTxAdjust<Inner::Evm>,
@@ -291,6 +375,11 @@ where
         self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_start();
         let res = self.inner.apply_pre_execution_changes();
         self.inner.evm_mut().inspector_mut().tracer_mut().on_system_call_end();
+        if res.is_ok() && self.has_bal {
+            // BAL index 0 is reserved for pre-transaction changes; advance to 1 so transaction 0
+            // (about to run) is attributed to index 1, matching `BasicBlockExecutor::execute_one`.
+            self.inner.evm_mut().db_mut().bump_bal_index();
+        }
         res
     }
 
@@ -313,6 +402,7 @@ where
             gas_price_opt,
             gas_limit,
             blob_gas_used,
+            frameless_parts,
             mut tx_event,
         ) = {
             let inner_tx: &Inner::Transaction = recovered.tx();
@@ -327,6 +417,7 @@ where
                 // EIP-4844: total blob gas consumed by this tx (num_blobs × GAS_PER_BLOB); 0 for
                 // non-blob tx types. Geth populates `receipt.BlobGasUsed` from this value.
                 inner_tx.blob_gas_used().unwrap_or(0),
+                FramelessParts::of(inner_tx),
                 tx_event,
             )
         };
@@ -345,8 +436,31 @@ where
 
         self.inner.evm_mut().inspector_mut().tracer_mut().on_tx_start(tx_event, None);
 
-        // Split execute_transaction into without_commit + commit so post-tx balance accounting
-        // can run in between.
+        // NOTE on `execute_transaction_with_commit_condition`: alloy-evm's `BlockExecutor` gives
+        // it a default body composing `execute_transaction_without_commit` + `commit_transaction`,
+        // and chain integrators (e.g. an OP Stack producer) can override it — e.g. to snapshot and
+        // restore refund-policy state around a declined candidate. Delegating this whole method to
+        // `self.inner.execute_transaction_with_commit_condition` was tried here and reverted: the
+        // closure passed to it cannot re-borrow `self.inner` (already held by the outer call), so
+        // all EVM/inspector-dependent accounting below would have to move to *after* that call
+        // returns. `process_post_tx_balance_changes`'s `get_pre_tx_balance` fallback is the
+        // *primary* source of the coinbase `RewardTransactionFee` `old_value` (mainnet gas-refund
+        // and coinbase-tip crediting produce no `JournalEntry`), and it must read pre-commit DB
+        // state — reading it after `self.inner`'s delegated call returns means the DB already
+        // reflects this tx's own `commit_transaction`, which produced a demonstrably wrong
+        // `old_value` (verified against `crates/firehose-tests`' golden files: every
+        // `RewardTransactionFee` reported the post-reward balance as its own pre-reward baseline).
+        // `PostTxExtras::emit_post_tx_extras` (OP Stack fee-vault credits) has the identical
+        // requirement for chain-specific addresses this crate cannot enumerate, so pre-capturing a
+        // fixed address set does not generalize either. Splitting into
+        // `execute_transaction_without_commit` + `commit_transaction` remains the only safe option
+        // until alloy-evm's `execute_transaction_with_commit_condition` closure signature is
+        // changed (in the streamingfast/evm.git fork) to also hand the closure `&mut Self::Evm`.
+        // KNOWN GAP: because of this, an `Inner` override of
+        // `execute_transaction_with_commit_condition` does not run through this wrapper —
+        // see the GUARD comment above `impl BlockExecutor for FirehoseWrappedExecutor` for
+        // what that means in practice.
+        self.inner.evm_mut().inspector_mut().start_transaction();
         let result = self.inner.execute_transaction_without_commit((tx_env, recovered))?;
 
         let gas_used = result.result().result.tx_gas_used();
@@ -363,6 +477,19 @@ where
             self.inner.evm_mut(),
             PostTxGasAccounting::ethereum(effective_gas_price, base_fee),
         );
+
+        // An Amsterdam transaction whose EIP-2780 runtime gas phase ran out of gas is included
+        // without its root frame ever opening, see `trace_frameless_root_call`.
+        if !self.inner.evm().inspector().root_frame_entered() {
+            let tx = frameless_parts.into_tx(self.inner.evm().cfg_env(), sender, gas_limit);
+            let gas_buy_cost = U256::from(gas_limit) * U256::from(effective_gas_price) +
+                U256::from(blob_gas_used) * blob_gas_price.unwrap_or_default();
+            let (evm_db, inspector, _) = self.inner.evm_mut().components_mut();
+            let mut get_pre = |addr: Address| -> U256 {
+                evm_db.basic(addr).ok().flatten().map(|i| i.balance).unwrap_or(U256::ZERO)
+            };
+            inspector.trace_frameless_root_call_erased(sender, gas_buy_cost, tx, &mut get_pre);
+        }
 
         // Post-tx balance changes (gas refund to sender, fee reward to coinbase). The DB at
         // this point reflects state up to but not including this transaction's commit, so
@@ -396,6 +523,9 @@ where
         }
 
         let gas_output = self.inner.commit_transaction(result);
+        if self.has_bal {
+            self.inner.evm_mut().db_mut().bump_bal_index();
+        }
 
         let log_index_start = self.log_index;
         let receipt_data = {
@@ -656,6 +786,9 @@ pub struct FirehoseBlockExecutor<F, DB, H = NoChainHooks> {
     pending_tracer: Option<FirehoseBlockTracer>,
     /// Chain-specific per-block wrapping strategy.
     hooks: H,
+    /// Block access list rebuilt by the most recent `execute_and_trace_one`, handed out by
+    /// `take_bal` for post-execution validation.
+    built_bal: Option<BlockAccessList>,
 }
 
 impl Debug for FirehoseBlockExecutor<(), ()> {
@@ -675,7 +808,7 @@ impl<F, DB: reth_evm::Database, H> FirehoseBlockExecutor<F, DB, H> {
     /// Creates a new `FirehoseBlockExecutor` with a caller-supplied [`ChainHooks`].
     pub fn new_with_chain_hooks(strategy_factory: F, db: DB, hooks: H) -> Self {
         let db = State::builder().with_database(db).with_bundle_update().build();
-        Self { strategy_factory, db, pending_tracer: None, hooks }
+        Self { strategy_factory, db, pending_tracer: None, hooks, built_bal: None }
     }
 }
 
@@ -699,11 +832,30 @@ where
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
-        let result = self
+        self.built_bal = None;
+        let mut executor = self
             .strategy_factory
             .executor_for_block(&mut self.db, block)
-            .map_err(BlockExecutionError::other)?
-            .execute_block(block.transactions_recovered())?;
+            .map_err(BlockExecutionError::other)?;
+
+        // Same EIP-7928 index tracking as `BasicBlockExecutor::execute_one`: index 0 is
+        // pre-execution, each transaction gets its own index, the last one is post-execution.
+        let has_bal = block.header().block_access_list_hash().is_some();
+        executor.evm_mut().db_mut().bal_state.bal_builder = has_bal.then(Bal::new);
+
+        executor.apply_pre_execution_changes()?;
+        if has_bal {
+            executor.evm_mut().db_mut().bump_bal_index();
+        }
+
+        for tx in block.transactions_recovered() {
+            executor.execute_transaction(tx)?;
+            if has_bal {
+                executor.evm_mut().db_mut().bump_bal_index();
+            }
+        }
+
+        let result = executor.apply_post_execution_changes()?;
         self.db.merge_transitions(BundleRetention::Reverts);
         Ok(result)
     }
@@ -737,8 +889,14 @@ where
         let mut tracer =
             FirehoseBlockTracer::start::<F::Primitives>(block.sealed_block(), finalized);
 
-        let block_result =
-            self.hooks.execute_one_traced(&self.strategy_factory, &mut self.db, block, &mut tracer);
+        self.built_bal = None;
+        let block_result = self
+            .hooks
+            .execute_one_traced(&self.strategy_factory, &mut self.db, block, &mut tracer)
+            .and_then(|result| {
+                self.built_bal = take_traced_block_access_list(&mut self.db, block, &mut tracer)?;
+                Ok(result)
+            });
 
         match block_result {
             Ok(result) => {
@@ -761,14 +919,17 @@ where
     where
         S: OnStateHook + 'static,
     {
-        // v2.3.0 removed `with_state_hook`/`set_state_hook` from `BlockExecutor`; state hooks are
-        // now installed on the EVM's underlying `State` db. Mirror upstream `BasicBlockExecutor`:
-        // set the hook on the db, execute, then clear it before merging transitions.
         let mut executor = self
             .strategy_factory
             .executor_for_block(&mut self.db, block)
             .map_err(BlockExecutionError::other)?;
-        executor.evm_mut().db_mut().set_state_hook(Some(Box::new(state_hook)));
+        // State hooks moved from the executor to the revm State (alloy-evm #366). Mirror upstream
+        // `BasicBlockExecutor`: set the hook on the db, execute, then clear it before merging
+        // transitions, on the error path too.
+        executor
+            .evm_mut()
+            .db_mut()
+            .set_state_hook(Some(Box::new(state_hook) as Box<dyn OnStateHook + 'static>));
         let result = executor.execute_block(block.transactions_recovered());
         self.db.set_state_hook(None);
         self.db.merge_transitions(BundleRetention::Reverts);
@@ -790,7 +951,7 @@ where
     }
 
     fn take_bal(&mut self) -> Option<BlockAccessList> {
-        self.db.take_built_alloy_bal()
+        self.built_bal.take().or_else(|| self.db.take_built_alloy_bal())
     }
 }
 
@@ -810,6 +971,9 @@ where
 /// Does **not** emit `on_block_start` / `on_block_end` — those are owned by the
 /// [`FirehoseBlockTracer`] lifecycle (see [`FirehoseBlockTracer::start`] and
 /// [`FirehoseBlockTracer::mark_verified`]).
+///
+/// When the header declares a block access list, the one rebuilt by this execution is left in
+/// `db`; collect it with [`take_traced_block_access_list`].
 pub fn run_wrapped_block<F, DB, Extras, Adjust, G>(
     evm_config: &F,
     db: &mut State<DB>,
@@ -847,11 +1011,14 @@ where
     let exec_ctx =
         evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
 
-    // EIP-7928: this path (pipeline/backfill) has no payload sidecar to read the block access
-    // list from, so it rebuilds the list during execution, as `BasicBlockExecutor::execute_one`
-    // does. The built list stays in `db` so `Executor::take_bal` still hands it to the stage.
-    let bal_hash = block.header().block_access_list_hash();
-    db.bal_state.bal_builder = bal_hash.map(|_| reth_revm::revm::state::bal::Bal::new());
+    // EIP-7928: this path (pipeline/backfill replay) has no payload sidecar to source the block
+    // access list from, unlike the live engine path (see
+    // `crates/engine/tree/src/tree/payload_validator.rs`), so it's reconstructed from
+    // re-execution via revm's BAL-index tracking, the same mechanism
+    // `BasicBlockExecutor::execute_one` uses, whenever the header declares a hash.
+    let has_bal = block.header().block_access_list_hash().is_some();
+    db.bal_state.bal_builder = has_bal.then(Bal::new);
+    db.reset_bal_index();
 
     let inspector = tracer_guard.inspector();
     let evm = evm_config.evm_with_env_and_inspector(&mut *db, evm_env, inspector);
@@ -863,53 +1030,110 @@ where
         .ommers()
         .map(|o| o.iter().map(|h| h.beneficiary()).collect())
         .unwrap_or_default();
-    let mut wrapped = FirehoseWrappedExecutor::with_hooks(
+    let wrapped = FirehoseWrappedExecutor::with_hooks(
         inner,
         withdrawals,
         ommer_beneficiaries,
         adjust,
         extras,
-    );
+    )
+    .with_bal_tracking(has_bal);
 
-    // The steps of `BlockExecutor::execute_block`, with the BAL index advanced after the
-    // pre-execution changes (index 0) and after each transaction (index `i + 1`).
-    wrapped.apply_pre_execution_changes()?;
-    if bal_hash.is_some() {
-        wrapped.evm_mut().db_mut().bump_bal_index();
-    }
-    for tx in block.transactions_recovered() {
-        wrapped.execute_transaction(tx)?;
-        if bal_hash.is_some() {
-            wrapped.evm_mut().db_mut().bump_bal_index();
-        }
-    }
-    let result = wrapped.apply_post_execution_changes()?;
+    wrapped.execute_block(block.transactions_recovered())
+}
 
-    if let Some(expected) = bal_hash &&
-        let Some(bal) = db.bal_state.bal_builder.clone()
-    {
-        let bal = bal.into_alloy_bal();
-        let computed = alloy_eip7928::compute_block_access_list_hash(&bal);
-        // A mismatch means the rebuilt list is wrong, not the block: fail rather than emit an
-        // RLP that does not match the header.
-        if computed != expected {
-            return Err(BlockExecutionError::msg(format!(
-                "reconstructed block access list hash mismatch for block {}: expected {expected}, computed {computed}",
-                block.header().number(),
-            )));
-        }
-        if let Some(header) = tracer_guard.tracer_mut().block_mut().and_then(|b| b.header.as_mut())
-        {
-            header.block_access_list_rlp = Some(alloy_rlp::encode(&bal));
-        }
+/// Takes the block access list [`run_wrapped_block`] rebuilt for `block` out of `db`, checks it
+/// against the header's `block_access_list_hash` and records its RLP on the traced block.
+///
+/// Returns `None` when the header declares no block access list.
+pub fn take_traced_block_access_list<B, DB, G>(
+    db: &mut State<DB>,
+    block: &RecoveredBlock<B>,
+    tracer_guard: &mut FirehoseBlockTracer<G>,
+) -> Result<Option<BlockAccessList>, BlockExecutionError>
+where
+    B: BlockTrait,
+    DB: reth_evm::Database,
+    G: std::ops::DerefMut<Target = firehose_tracer::Tracer>,
+{
+    let Some(expected_hash) = block.header().block_access_list_hash() else { return Ok(None) };
+    let Some(bal) = db.take_built_alloy_bal() else { return Ok(None) };
+
+    let computed_hash = alloy_eip7928::compute_block_access_list_hash(bal.as_slice());
+    // Hard error rather than warn-and-continue: this is the first re-execution-based BAL
+    // reconstruction shipped, and a mismatch means the reconstruction is wrong somewhere, not
+    // that the block is invalid. Revisit once this has proven itself on testnets — the live
+    // path (payload-sourced, not reconstructed) is unaffected either way.
+    if computed_hash != expected_hash {
+        return Err(BlockExecutionError::msg(format!(
+            "reconstructed block access list hash mismatch for block {}: expected {expected_hash}, computed {computed_hash}",
+            block.header().number(),
+        )));
+    }
+    if let Some(header) = tracer_guard.tracer_mut().block_mut().and_then(|b| b.header.as_mut()) {
+        header.block_access_list_rlp = Some(alloy_rlp::encode(&bal));
     }
 
-    Ok(result)
+    Ok(Some(bal))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The fields of a transaction [`FramelessTx`] is built from, captured before the transaction is
+/// handed to the EVM, which takes it by value. Only turned into a [`FramelessTx`] for the rare
+/// transaction whose root frame never opened.
+struct FramelessParts {
+    kind: TxKind,
+    value: U256,
+    input: Bytes,
+    nonce: u64,
+    access_list_accounts: u64,
+    access_list_storages: u64,
+    authorization_count: u64,
+}
+
+impl FramelessParts {
+    fn of(tx: &impl Transaction) -> Self {
+        let (access_list_accounts, access_list_storages) =
+            tx.access_list().map_or((0, 0), |list| {
+                list.iter().fold((0, 0), |(accounts, storages), item| {
+                    (accounts + 1, storages + item.storage_keys.len() as u64)
+                })
+            });
+        Self {
+            kind: tx.kind(),
+            value: tx.value(),
+            input: tx.input().clone(),
+            nonce: tx.nonce(),
+            access_list_accounts,
+            access_list_storages,
+            authorization_count: tx.authorization_list().map_or(0, |list| list.len() as u64),
+        }
+    }
+
+    fn into_tx(self, cfg: &impl Cfg, sender: Address, gas_limit: u64) -> FramelessTx {
+        let root_gas_limit = FramelessTx::root_gas_limit(
+            cfg,
+            self.kind,
+            sender,
+            self.value,
+            &self.input,
+            gas_limit,
+            self.access_list_accounts,
+            self.access_list_storages,
+            self.authorization_count,
+        );
+        FramelessTx {
+            kind: self.kind,
+            value: self.value,
+            input: self.input,
+            nonce: self.nonce,
+            root_gas_limit,
+        }
+    }
+}
 
 /// Emits EIP-4895 withdrawal balance changes to the tracer after the post-execution system-call
 /// window has closed.

@@ -345,6 +345,20 @@ impl<N: NodePrimitives> TreeState<N> {
     pub const fn canonical_block_number(&self) -> BlockNumber {
         self.canonical_head().number
     }
+
+    /// Returns a reference to the [`OverlayManager`] that tracks flattened trie overlays
+    /// for all current in-memory blocks.
+    ///
+    /// **Added by StreamingFast for Firehose/op-reth.**
+    /// `OpFirehoseEngineValidator` (in `reth-optimism-firehose`) is an external re-implementation
+    /// of `BasicEngineValidator` that adds Firehose live-tracing hooks. Because it lives outside
+    /// this crate it cannot access `pub(crate)` fields directly. This accessor lets it call
+    /// `.with_state_trie_overlay_manager(state.tree_state().state_trie_overlays().clone())`
+    /// in its `overlay_builder_for_parent` helper — the exact same pattern `BasicEngineValidator`
+    /// uses internally — so there is no behavioral divergence between the two validators.
+    pub fn state_trie_overlays(&self) -> &OverlayManager<N> {
+        &self.overlay_manager
+    }
 }
 
 #[cfg(test)]
