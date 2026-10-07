@@ -612,10 +612,17 @@ where
         // Get an iterator over the transactions in the payload
         let txs = self.tx_iterator_for(&input)?;
 
-        // Firehose executes sequentially, and in BAL mode the payload processor streams
-        // transactions in conversion-completion order instead of block order.
-        let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref())) &&
-            !reth_firehose::is_tracer_initialized();
+        // Firehose: read once, so the execution mode set up here and the execution path chosen
+        // below cannot disagree.
+        let firehose_tracing = reth_firehose::is_tracer_initialized();
+
+        // The traced path executes transactions one after another, so it never takes the parallel
+        // BAL path. The flag also selects how the payload processor streams transactions: in BAL
+        // mode it sends them in completion order, not block order. A sequential executor that
+        // reads that stream runs a sender's later nonce first and rejects a valid block ("nonce
+        // too high"), as on Sepolia block 11856337 at the Amsterdam fork.
+        let parallel_bal_execution =
+            !firehose_tracing && ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
 
         // Prepare the state-root job before execution so it can provide streaming hooks.
         let mut state_root_job =
@@ -738,20 +745,19 @@ where
         //
         // When the converted block is not yet available (get() not ready or error), fall through
         // to the non-Firehose path.
-        let mut fh_tracer: Option<reth_firehose::FirehoseBlockTracer> =
-            if reth_firehose::is_tracer_initialized() {
-                // get() blocks until the background conversion/validation task completes and
-                // returns a reference to the Result<SealedBlock, _>.
-                match validated_block.get().as_ref() {
-                    Ok(sealed) => {
-                        let finalized = self.firehose_finalized_ref(sealed, &ctx);
-                        Some(reth_firehose::FirehoseBlockTracer::start::<N>(sealed, finalized))
-                    }
-                    Err(_) => None,
+        let mut fh_tracer: Option<reth_firehose::FirehoseBlockTracer> = if firehose_tracing {
+            // get() blocks until the background conversion/validation task completes and
+            // returns a reference to the Result<SealedBlock, _>.
+            match validated_block.get().as_ref() {
+                Ok(sealed) => {
+                    let finalized = self.firehose_finalized_ref(sealed, &ctx);
+                    Some(reth_firehose::FirehoseBlockTracer::start::<N>(sealed, finalized))
                 }
-            } else {
-                None
-            };
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
 
         // Execute the block and handle any execution errors.
         // The receipt root task is spawned before execution and receives receipts incrementally
