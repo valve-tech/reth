@@ -1,0 +1,98 @@
+# syntax=docker.io/docker/dockerfile:1.7-labs
+#
+# StreamingFast variant of reth's `Dockerfile`.
+#
+# Maintained by StreamingFast and intentionally kept separate from upstream's
+# `Dockerfile` so that upstream merges stay clean. It builds the
+# Firehose-instrumented `reth` binary (Firehose tracing is compiled into the
+# default `reth` binary in this fork) and installs it at a stable path
+# (`/usr/local/bin/reth`) that the `sf-release.yml` workflow can `docker cp` out
+# of the image to attach as a GitHub release asset.
+#
+# The final stage is based on the `firehose-ethereum` image, so the published
+# image bundles both the `fireeth` binary and `reth`. `fireeth` is the image
+# entrypoint and drives `reth` as its reader node. The bundled `fireeth` version
+# is selected by the `FIREHOSE_ETHEREUM` build arg (default `latest`).
+#
+# Keep this in sync with the upstream `Dockerfile` to avoid drift: when it
+# changes (base image, rust toolchain, build profile, build command), mirror the
+# relevant change here.
+
+# Bundled `fireeth` version = the `firehose-ethereum` runtime base image tag.
+# Declared before the first FROM so it is usable in the runtime stage's FROM.
+ARG FIREHOSE_ETHEREUM="latest"
+
+FROM lukemathwalker/cargo-chef:latest-rust-1.95-trixie AS chef
+WORKDIR /app
+
+LABEL org.opencontainers.image.source=https://github.com/streamingfast/reth
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
+# Install system dependencies. LLVM is required by `revmc-llvm` (via `llvm-sys`).
+COPY .github/scripts/install_llvm_ubuntu.sh /tmp/install_llvm.sh
+RUN /tmp/install_llvm.sh && rm /tmp/install_llvm.sh && \
+    apt-get install -y --no-install-recommends libclang-dev m4 pkg-config
+RUN cargo install cargo-auditable
+
+# Builds a cargo-chef plan
+FROM chef AS planner
+COPY --exclude=.git --exclude=dist . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+
+# Build profile: `maxperf` (full LTO) for release/tag builds, `release` for
+# faster branch/PR builds. Set by sf-release.yml.
+ARG BUILD_PROFILE=maxperf
+ENV BUILD_PROFILE=$BUILD_PROFILE
+
+# Extra Cargo flags
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS="$RUSTFLAGS"
+
+# Extra Cargo features
+ARG FEATURES=""
+ENV FEATURES=$FEATURES
+
+# Version of the release being built (e.g. the pushed tag). Stamped as an OCI
+# image label on the runtime stage below. `reth` derives its own `--version`
+# string from git metadata at compile time, so this is informational only.
+ARG VERSION="dev"
+
+# Builds dependencies
+RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path recipe.json
+
+# Build application
+# Platform-specific RUSTFLAGS: amd64 uses x86-64-v3 (Haswell+) with pclmulqdq for rocksdb.
+# TARGETPLATFORM is set by BuildKit: https://docs.docker.com/reference/dockerfile#automatic-platform-args-in-the-global-scope
+ARG TARGETPLATFORM
+COPY --exclude=dist . .
+RUN if [ -n "$RUSTFLAGS" ]; then \
+        export RUSTFLAGS="$RUSTFLAGS"; \
+    elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+        export RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"; \
+    fi && \
+    cargo auditable build --profile $BUILD_PROFILE --features "$FEATURES" --locked --bin reth
+
+# ARG is not resolved in COPY so we copy the binary to a fixed location.
+RUN cp /app/target/$BUILD_PROFILE/reth /app/reth-bin
+
+# Runtime image bundles the Firehose Ethereum stack (`fireeth`, at /app/fireeth)
+# plus the freshly built `reth`. The base is Ubuntu-based and already ships
+# ca-certificates / libstdc++ / openssl, so no extra packages are installed here.
+FROM ghcr.io/streamingfast/firehose-ethereum:${FIREHOSE_ETHEREUM}
+
+ARG VERSION="dev"
+LABEL org.opencontainers.image.version="${VERSION}"
+
+# Keep reth at the stable /usr/local/bin path that sf-release.yml `docker cp`s
+# out as a release asset, and symlink it into /app next to the bundled `fireeth`.
+COPY --from=builder /app/reth-bin /usr/local/bin/reth
+RUN chmod +x /usr/local/bin/reth && ln -sf /usr/local/bin/reth /app/reth
+COPY LICENSE-* /app/
+
+EXPOSE 30303 30303/udp 9001 8545 8546 8551
+
+# No ENTRYPOINT: inherit the firehose-ethereum image's entrypoint (`fireeth`),
+# which launches `reth` as its reader node.

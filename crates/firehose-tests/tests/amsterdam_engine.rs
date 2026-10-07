@@ -24,7 +24,7 @@ use reth_e2e_test_utils::{
     eth_payload_attributes, test_chain_spec, transaction::TransactionTestContext, wallet::Wallet,
     E2ETestSetupExt, NodeHelperType,
 };
-use reth_firehose::init_tracer;
+use reth_firehose::init_tracer_with_buffer;
 use reth_node_ethereum::EthereumNode;
 
 /// Recipient of the withdrawal block's withdrawals.
@@ -32,20 +32,7 @@ const WITHDRAWAL_RECIPIENT: Address = address!("0x000000000000000000000000000000
 
 #[tokio::test(flavor = "multi_thread")]
 async fn traced_engine_path_accepts_amsterdam_blocks() -> eyre::Result<()> {
-    let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
-        firehose_tracer::config::Config::default(),
-        // firehose-tracer 5.4.4's ChainConfig has no Amsterdam field; these are all it takes.
-        firehose_tracer::config::ChainConfig {
-            chain_id: 1,
-            shanghai_time: Some(0),
-            cancun_time: Some(0),
-            prague_time: Some(0),
-            verkle_time: None,
-        },
-        "reth-firehose-tests",
-        env!("CARGO_PKG_VERSION"),
-    );
-    init_tracer(tracer);
+    let buffer = init_tracer_with_buffer(1, Some(0), Some(0), Some(0));
 
     // The builder's next payload takes its withdrawals from here.
     let withdrawals = Arc::new(Mutex::new(Vec::<Withdrawal>::new()));
@@ -99,6 +86,15 @@ async fn traced_engine_path_accepts_amsterdam_blocks() -> eyre::Result<()> {
     // CREATE and SELFDESTRUCT in one transaction: the init code sends the endowment to 0x0.
     let tx = chain.tx(TxKind::Create, U256::from(7), hex!("6000ff").into(), 1);
     chain.block("create and selfdestruct", vec![tx], Vec::new()).await?;
+
+    // Many transactions from one sender. At 30 or more transactions the engine converts them on
+    // rayon, and on the parallel BAL path it sends them in completion order. The traced path
+    // executes them one after another, so it must get them in block order, or a later nonce
+    // runs first and the block fails with "nonce too high". Seen on Sepolia block 11856337.
+    let txs = (0..64)
+        .map(|_| chain.tx(TxKind::Call(Address::with_last_byte(1)), U256::from(1), Bytes::new(), 1))
+        .collect();
+    chain.block("one sender, many transactions", txs, Vec::new()).await?;
 
     Ok(())
 }

@@ -62,3 +62,8 @@ path = "tests/batch_executor.rs"
 [[test]]
 name = "bal_pipeline"
 path = "tests/bal_pipeline.rs"
+
+[[test]]
+name = "staged_sync_bal"
+path = "tests/staged_sync_bal.rs"
+
