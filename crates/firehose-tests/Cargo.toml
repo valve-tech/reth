@@ -47,8 +47,14 @@ alloy-signer.workspace = true
 alloy-signer-local.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace = true
+reth-consensus.workspace = true
+reth-db-common.workspace = true
 reth-e2e-test-utils.workspace = true
 reth-node-ethereum.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-stages.workspace = true
+reth-stages-api.workspace = true
+reth-static-file-types.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[test]]
@@ -67,3 +73,7 @@ path = "tests/bal_pipeline.rs"
 name = "staged_sync_bal"
 path = "tests/staged_sync_bal.rs"
 
+
+[[test]]
+name = "stage_bal_store"
+path = "tests/stage_bal_store.rs"
