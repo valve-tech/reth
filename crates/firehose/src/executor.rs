@@ -1081,17 +1081,6 @@ where
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Emits EIP-4895 withdrawal balance changes to the tracer after the post-execution system-call
-/// window has closed.
-///
-/// Validator withdrawals are applied via `db.increment_balances()` inside the executor's
-/// `finish()`, bypassing the EVM journal entirely — the [`crate::inspector::FirehoseInspector`]
-/// never sees them. This function bridges the gap by walking the withdrawal list in reverse
-/// from the known post-all-withdrawals DB balance, reconstructing per-step pre/post pairs (see
-/// [`withdrawal_balance_events`]) so each event gets a distinct monotonically increasing ordinal.
-///
-/// Must be called with `tracer.transaction == None` (i.e. outside any system-call window) so
-/// that `on_balance_change` routes the events to `block.balance_changes` directly.
 /// The fields of a transaction [`FramelessTx`] is built from, captured before the transaction is
 /// handed to the EVM, which takes it by value. Only turned into a [`FramelessTx`] for the rare
 /// transaction whose root frame never opened.
@@ -1146,6 +1135,17 @@ impl FramelessParts {
     }
 }
 
+/// Emits EIP-4895 withdrawal balance changes to the tracer after the post-execution system-call
+/// window has closed.
+///
+/// Validator withdrawals are applied via `db.increment_balances()` inside the executor's
+/// `finish()`, bypassing the EVM journal entirely — the [`crate::inspector::FirehoseInspector`]
+/// never sees them. This function bridges the gap by walking the withdrawal list in reverse
+/// from the known post-all-withdrawals DB balance, reconstructing per-step pre/post pairs (see
+/// [`withdrawal_balance_events`]) so each event gets a distinct monotonically increasing ordinal.
+///
+/// Must be called with `tracer.transaction == None` (i.e. outside any system-call window) so
+/// that `on_balance_change` routes the events to `block.balance_changes` directly.
 fn emit_withdrawal_balance_changes<E>(evm: &mut E, withdrawals: Option<&Withdrawals>)
 where
     E: reth_evm::Evm,

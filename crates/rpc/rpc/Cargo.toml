@@ -38,9 +38,6 @@ reth-rpc-server-types.workspace = true
 reth-network-types.workspace = true
 reth-consensus.workspace = true
 reth-consensus-common.workspace = true
-# Firehose addition: `reth_jit` RPC handler refuses to (re-)enable JIT while the Firehose tracer
-# is active — see crates/rpc/rpc/src/reth.rs.
-reth-firehose.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-node-api.workspace = true
 reth-payload-primitives.workspace = true
