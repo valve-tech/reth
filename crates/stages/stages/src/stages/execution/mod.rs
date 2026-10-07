@@ -19,6 +19,7 @@ use reth_provider::{
     ProviderError, RawBal, StateProvider, StateWriteConfig, StateWriter, StaticFileProviderFactory,
     StatsReader, StoragePath, StorageSettingsCache, TransactionVariant,
 };
+use reth_prune_types::PruneMode;
 use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::{
     BlockErrorKind, CheckpointBlockRange, EntitiesCheckpoint, ExecInput, ExecOutput,
@@ -398,7 +399,11 @@ where
                 })
             }
             // The consensus check above bound this BAL to the header, so it is safe to serve.
+            // A block already outside the retention window relative to the sync target is not
+            // stored: the store would only delete it again at the next prune, and a long
+            // historical sync would grow the store with old ranges until then.
             if self.bal_store.is_some() &&
+                within_bal_retention(block_number, max_block) &&
                 let Some(bal) = built_bal
             {
                 built_bals.push((block.num_hash(), RawBal::new(alloy_rlp::encode(&bal).into())));
@@ -802,6 +807,14 @@ where
     Ok(gas_total)
 }
 
+/// Whether `block` is inside the EIP-7928 retention window for a chain whose tip is `tip`.
+///
+/// This uses the same rule as `RocksDBBalStore::prune`, so staged sync never stores a BAL that the
+/// next prune would delete.
+fn within_bal_retention(block: BlockNumber, tip: BlockNumber) -> bool {
+    !PruneMode::Distance(alloy_eip7928::BAL_RETENTION_PERIOD_SLOTS).should_prune(block, tip)
+}
+
 /// Writes BALs that staged sync rebuilt and validated to the BAL store.
 ///
 /// The engine stores a BAL only when a payload carries one. Without this, staged sync leaves
@@ -824,6 +837,18 @@ fn store_built_bals(bal_store: &BalStoreHandle, built_bals: Vec<(NumHash, RawBal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bal_retention_matches_the_store_prune_rule() {
+        let window = alloy_eip7928::BAL_RETENTION_PERIOD_SLOTS;
+        let tip = 10 * window;
+        // The oldest block that the store keeps, and the newest one that it prunes.
+        assert!(within_bal_retention(tip - window, tip));
+        assert!(!within_bal_retention(tip - window - 1, tip));
+        assert!(within_bal_retention(tip, tip));
+        // A chain shorter than the window keeps every block.
+        assert!(within_bal_retention(0, window - 1));
+    }
     use crate::{stages::MERKLE_STAGE_DEFAULT_REBUILD_THRESHOLD, test_utils::TestStageDB};
     use alloy_primitives::{address, hex_literal::hex, keccak256, Address, B256, U256};
     use alloy_rlp::Decodable;
@@ -843,7 +868,7 @@ mod tests {
         StaticFileProviderFactory,
     };
     use reth_prune::PruneModes;
-    use reth_prune_types::{PruneMode, ReceiptsLogPruneConfig};
+    use reth_prune_types::ReceiptsLogPruneConfig;
     use reth_revm::revm::database::{AccountStatus, BundleAccount};
     use reth_stages_api::StageUnitCheckpoint;
     use reth_testing_utils::generators;
