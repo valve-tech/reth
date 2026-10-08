@@ -6,6 +6,7 @@ use crate::common::{
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, TxReceipt};
 use alloy_eip7928::bal::Bal;
+use alloy_eips::NumHash;
 use alloy_primitives::{Address, B256, U256};
 use clap::Parser;
 use eyre::WrapErr;
@@ -17,8 +18,10 @@ use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_node_core::args::JitArgs;
 use reth_primitives_traits::{format_gas_throughput, Account, BlockBody, GotExpected};
 use reth_provider::{
-    providers::BlockchainProvider, BlockHashReader, BlockNumReader, BlockReader, ChainSpecProvider,
-    DatabaseProviderFactory, ReceiptProvider, StaticFileProviderFactory, TransactionVariant,
+    providers::{BlockchainProvider, RocksDBProvider},
+    BalStoreHandle, BlockHashReader, BlockNumReader, BlockReader, ChainSpecProvider,
+    DatabaseProviderFactory, RawBal, ReceiptProvider, RocksDBBalStore, StaticFileProviderFactory,
+    TransactionVariant,
 };
 use reth_revm::{
     database::StateProviderDatabase,
@@ -68,6 +71,13 @@ pub struct Command<C: ChainSpecParser> {
     #[arg(long)]
     skip_invalid_blocks: bool,
 
+    /// Stores each rebuilt BAL whose hash matches the block header in the BAL store.
+    ///
+    /// The chain database stays read-only. Only the BAL tables in `RocksDB` are written, so the
+    /// node must be stopped.
+    #[arg(long)]
+    store_bals: bool,
+
     #[command(flatten)]
     pub jit: JitArgs,
 }
@@ -93,6 +103,15 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
         if self.env.db.rocksdb_block_cache_size.is_none() {
             self.env.db.rocksdb_block_cache_size = Some(4 << 30);
         }
+
+        let bal_store = if self.store_bals {
+            let rocksdb_path =
+                self.env.datadir.clone().resolve_datadir(self.env.chain.chain()).rocksdb();
+            Some(open_bal_store_rw(&rocksdb_path)?)
+        } else {
+            None
+        };
+        let stored_bals = Arc::new(AtomicU64::new(0));
 
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RO, runtime)?;
 
@@ -146,6 +165,8 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
             let info_tx = info_tx.clone();
             let cancellation = cancellation.clone();
             let next_block = Arc::clone(&next_block);
+            let bal_store = bal_store.clone();
+            let stored_bals = Arc::clone(&stored_bals);
             tasks.spawn_blocking(move || {
                 let evm_config = evm_config.with_jit_support();
                 let executor_lifetime = Duration::from_secs(600);
@@ -184,6 +205,8 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
 
                     let mut executor = evm_config.batch_executor(db_at(chunk_start - 1));
                     let mut executor_created = Instant::now();
+                    // BALs that matched their headers, stored after the chunk verifies.
+                    let mut chunk_bals = Vec::new();
 
                     'blocks: for block in chunk_start..chunk_end {
                         if cancellation.is_cancelled() {
@@ -208,9 +231,9 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                             }
                         };
 
-                        let bal_hash = executor
-                            .take_bal()
-                            .map(|bal| Bal::from(bal).compute_hash_with_buf(&mut bal_buf));
+                        let built_bal = executor.take_bal().map(Bal::from);
+                        let bal_hash =
+                            built_bal.as_ref().map(|bal| bal.compute_hash_with_buf(&mut bal_buf));
 
                         if let Err(err) = consensus
                             .validate_block_post_execution(&block, &result, None, bal_hash)
@@ -283,6 +306,23 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                         }
                         let _ = stats_tx.send((block.number(), block.gas_used()));
 
+                        if bal_store.is_some() &&
+                            let Some(bal) = built_bal
+                        {
+                            match checked_bal(
+                                block.header().block_access_list_hash(),
+                                bal,
+                                &mut bal_buf,
+                            ) {
+                                Some(raw) => chunk_bals.push((block.num_hash(), raw)),
+                                None => eyre::bail!(
+                                    "rebuilt BAL hash does not match header of block {} {}",
+                                    block.number(),
+                                    block.hash()
+                                ),
+                            }
+                        }
+
                         // Reset DB once in a while to avoid OOM or read tx timeouts
                         if executor.size_hint() > 5_000_000 ||
                             executor_created.elapsed() > executor_lifetime
@@ -309,6 +349,13 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                         &bundle,
                         chunk_end - 1,
                     )?;
+
+                    if let Some(bal_store) = &bal_store {
+                        let count = chunk_bals.len() as u64;
+                        store_bals(bal_store, std::mem::take(&mut chunk_bals))?;
+                        stored_bals.fetch_add(count, Ordering::Relaxed);
+                        info!(chunk_start, chunk_end, count, "Stored rebuilt BALs");
+                    }
                 }
 
                 eyre::Ok(())
@@ -368,6 +415,13 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                     last_logged_time = Instant::now();
                 }
             }
+        }
+
+        if self.store_bals {
+            info!(
+                stored_bals = stored_bals.load(Ordering::Relaxed),
+                "Stored rebuilt BALs in total"
+            );
         }
 
         if invalid_blocks.is_empty() {
@@ -494,4 +548,84 @@ where
     }
 
     Ok(())
+}
+
+/// Opens a read-write BAL store on the node's `RocksDB` directory.
+///
+/// `RocksDB` allows one writer, so this fails while a node holds the database. The returned
+/// store writes only the two BAL tables.
+fn open_bal_store_rw(rocksdb_path: &std::path::Path) -> eyre::Result<BalStoreHandle> {
+    let rocksdb = RocksDBProvider::builder(rocksdb_path)
+        .with_default_tables()
+        .build()
+        .wrap_err("cannot open RocksDB read-write; stop the node first")?;
+    Ok(BalStoreHandle::new(RocksDBBalStore::new(rocksdb)))
+}
+
+/// Returns the BAL to store, only when its hash matches the hash in the block header.
+fn checked_bal(header_bal_hash: Option<B256>, bal: Bal, buf: &mut Vec<u8>) -> Option<RawBal> {
+    let hash = bal.compute_hash_with_buf(buf);
+    (header_bal_hash == Some(hash)).then(|| RawBal::new(alloy_rlp::encode(&bal).into()))
+}
+
+/// Writes validated BALs to the store and flushes them to disk.
+fn store_bals(bal_store: &BalStoreHandle, bals: Vec<(NumHash, RawBal)>) -> eyre::Result<()> {
+    if bals.is_empty() {
+        return Ok(())
+    }
+    let blocks: Vec<NumHash> = bals.iter().map(|(block, _)| *block).collect();
+    bal_store.insert_many(bals)?;
+    bal_store.flush(&blocks)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reth_db::tables;
+    use reth_provider::providers::RocksDBProvider;
+
+    fn sample_bal() -> Bal {
+        Bal::default()
+    }
+
+    #[test]
+    fn bal_store_open_fails_while_another_writer_holds_the_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let _node = RocksDBProvider::builder(dir.path()).with_default_tables().build().unwrap();
+        let err = open_bal_store_rw(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").to_lowercase().contains("lock"), "{err:#}");
+    }
+
+    #[test]
+    fn bal_is_kept_only_when_its_hash_matches_the_header() {
+        let mut buf = Vec::new();
+        let hash = sample_bal().compute_hash_with_buf(&mut buf);
+        let kept = checked_bal(Some(hash), sample_bal(), &mut buf).expect("matching hash");
+        assert_eq!(kept.as_raw().as_ref(), alloy_rlp::encode(sample_bal()).as_slice());
+        assert!(checked_bal(Some(B256::repeat_byte(1)), sample_bal(), &mut buf).is_none());
+        assert!(checked_bal(None, sample_bal(), &mut buf).is_none());
+    }
+
+    #[test]
+    fn stored_bals_are_readable_and_other_tables_are_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let tx_hash = B256::repeat_byte(7);
+        {
+            let node = RocksDBProvider::builder(dir.path()).with_default_tables().build().unwrap();
+            node.put::<tables::TransactionHashNumbers>(tx_hash, &42).unwrap();
+        }
+        let block = NumHash::new(11_846_000, B256::repeat_byte(9));
+        let mut buf = Vec::new();
+        let hash = sample_bal().compute_hash_with_buf(&mut buf);
+        let raw = checked_bal(Some(hash), sample_bal(), &mut buf).unwrap();
+        {
+            let store = open_bal_store_rw(dir.path()).unwrap();
+            store_bals(&store, vec![(block, raw.clone())]).unwrap();
+        }
+        let node = RocksDBProvider::builder(dir.path()).with_default_tables().build().unwrap();
+        assert_eq!(node.get::<tables::TransactionHashNumbers>(tx_hash).unwrap(), Some(42));
+        let store = BalStoreHandle::new(RocksDBBalStore::new(node));
+        assert_eq!(store.get_by_hashes(&[block.hash]).unwrap(), vec![Some(raw.as_raw().clone())]);
+    }
 }
