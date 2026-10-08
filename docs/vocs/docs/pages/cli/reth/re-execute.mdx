@@ -150,6 +150,11 @@ Storage:
       --skip-invalid-blocks
           Continues with execution when an invalid block is encountered and collects these blocks
 
+      --store-bals
+          Stores each rebuilt BAL whose hash matches the block header in the BAL store.
+
+          The chain database stays read-only. Only the BAL tables in `RocksDB` are written, so the node must be stopped.
+
 JIT:
       --jit
           Enable JIT compilation of EVM bytecode
