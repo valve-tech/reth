@@ -412,6 +412,81 @@ async fn test_debug_trace_eip8037_gas() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A value transfer to an empty account pays the EIP-2780 new-account state gas before its first
+/// frame opens. When that charge runs out of gas, revm includes the transaction as an out-of-gas
+/// halt without entering execution. Every trace must still report the root call from the sender
+/// to the recipient, not a placeholder from and to the zero address.
+#[tokio::test]
+async fn test_trace_transfer_halted_before_first_frame() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let chain_spec =
+        Arc::new(test_chain_spec_builder().osaka_activated().with_amsterdam_at(0).build());
+    let (mut node, wallet) = EthereumNode::test_setup(1, chain_spec).build_single().await?;
+    let sender = wallet.signer(0).address();
+    let provider = node.rpc_provider_with_wallet(wallet.signer(0));
+
+    let recipient = Address::repeat_byte(0x7e);
+    let value = U256::from(1_000_000_000u64);
+    let pending = provider
+        .send_transaction(
+            TransactionRequest::default().to(recipient).value(value).gas_limit(30_000),
+        )
+        .await?;
+    let hash = *pending.tx_hash();
+    node.advance_block().await?;
+    let receipt = pending.get_receipt().await?;
+    assert!(!receipt.status(), "the transfer must halt out of new-account state gas");
+    assert_eq!(receipt.gas_used, 30_000);
+
+    let check_parity = |trace: &serde_json::Value| {
+        assert_eq!(trace["action"]["from"], serde_json::json!(sender), "{trace}");
+        assert_eq!(trace["action"]["to"], serde_json::json!(recipient), "{trace}");
+        assert_eq!(trace["action"]["value"], serde_json::json!(value), "{trace}");
+        assert_eq!(trace["action"]["gas"], serde_json::json!("0x2328"), "{trace}");
+        assert_eq!(trace["error"], serde_json::json!("Out of gas"), "{trace}");
+        assert_eq!(trace["traceAddress"], serde_json::json!([]), "{trace}");
+    };
+
+    let traces: Vec<serde_json::Value> =
+        provider.raw_request("trace_transaction".into(), (hash,)).await?;
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    check_parity(&traces[0]);
+
+    let block: Vec<serde_json::Value> =
+        provider.raw_request("trace_block".into(), (receipt.block_hash.unwrap(),)).await?;
+    let in_block: Vec<_> =
+        block.iter().filter(|t| t["transactionHash"] == serde_json::json!(hash)).collect();
+    assert_eq!(in_block.len(), 1, "{block:?}");
+    check_parity(in_block[0]);
+
+    let replay: serde_json::Value =
+        provider.raw_request("trace_replayTransaction".into(), (hash, ["trace"])).await?;
+    check_parity(&replay["trace"][0]);
+
+    let call: serde_json::Value = provider
+        .raw_request(
+            "debug_traceTransaction".into(),
+            (hash, serde_json::json!({"tracer": "callTracer"})),
+        )
+        .await?;
+    assert_eq!(call["from"], serde_json::json!(sender), "{call}");
+    assert_eq!(call["to"], serde_json::json!(recipient), "{call}");
+    assert_eq!(call["value"], serde_json::json!(value), "{call}");
+    assert_eq!(call["error"], serde_json::json!("out of gas"), "{call}");
+
+    let flat: Vec<serde_json::Value> = provider
+        .raw_request(
+            "debug_traceTransaction".into(),
+            (hash, serde_json::json!({"tracer": "flatCallTracer"})),
+        )
+        .await?;
+    assert_eq!(flat[0]["action"]["from"], serde_json::json!(sender), "{flat:?}");
+    assert_eq!(flat[0]["action"]["to"], serde_json::json!(recipient), "{flat:?}");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_flashbots_validate_v3() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();

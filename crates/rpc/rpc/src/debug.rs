@@ -31,7 +31,7 @@ use reth_rpc_eth_api::{
     helpers::{EthTransactions, TraceExt},
     AsEthApiError, FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore,
 };
-use reth_rpc_eth_types::{EthApiError, StateCacheDb};
+use reth_rpc_eth_types::{trace_root::fill_unentered_debug_root, EthApiError, StateCacheDb};
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
 use reth_storage_api::{
     BlockIdReader, BlockReaderIdExt, HashedPostStateProvider, HeaderProvider, ProviderBlock,
@@ -127,6 +127,7 @@ where
                 eth_api.apply_pre_execution_changes(&block, &mut db)?;
 
                 let block_env = evm_env.block_env.clone();
+                let cfg = evm_env.cfg_env.clone();
 
                 let mut transactions = block.transactions_recovered().enumerate().peekable();
                 let inspector = DebugInspector::new(opts).map_err(Eth::Error::from_eth_err)?;
@@ -138,6 +139,7 @@ where
                     let res = evm.transact(tx_env.clone()).map_err(Eth::Error::from_evm_err)?;
 
                     let (db, inspector, _) = evm.components_mut();
+                    fill_unentered_debug_root(inspector, &tx_env, &cfg, &res.result);
                     let result = inspector
                         .get_result(
                             Some(TransactionContext {
@@ -183,6 +185,7 @@ where
                 eth_api.apply_pre_execution_changes(&block, &mut db)?;
 
                 let block_env = evm_env.block_env.clone();
+                let cfg = evm_env.cfg_env.clone();
                 let mut transactions = block.transactions_recovered().enumerate().peekable();
                 let inspector = match DebugInspector::new(opts) {
                     Ok(inspector) => inspector,
@@ -215,6 +218,7 @@ where
                     };
 
                     let (db, inspector, _) = evm.components_mut();
+                    fill_unentered_debug_root(inspector, &tx_env, &cfg, &res.result);
                     let result = match inspector.get_result(
                         Some(TransactionContext {
                             block_hash: Some(block.hash()),
@@ -343,6 +347,7 @@ where
                     tx_env.clone(),
                     bal.as_deref(),
                 )?;
+                fill_unentered_debug_root(&mut inspector, &tx_env, &evm_env.cfg_env, &res.result);
 
                 let trace = inspector
                     .get_result(
@@ -405,6 +410,7 @@ where
                     tx_env.clone(),
                     &mut inspector,
                 )?;
+                fill_unentered_debug_root(&mut inspector, &tx_env, &evm_env.cfg_env, &res.result);
                 let trace = inspector
                     .get_result(None, &tx_env, &evm_env.block_env, &res, db)
                     .map_err(Eth::Error::from_eth_err)?;
@@ -467,6 +473,7 @@ where
                     DebugInspector::new(tracing_options).map_err(Eth::Error::from_eth_err)?;
                 let res =
                     eth_api.inspect(&mut db, evm_env.clone(), tx_env.clone(), &mut inspector)?;
+                fill_unentered_debug_root(&mut inspector, &tx_env, &evm_env.cfg_env, &res.result);
                 let trace = inspector
                     .get_result(None, &tx_env, &evm_env.block_env, &res, &mut db)
                     .map_err(Eth::Error::from_eth_err)?;
@@ -559,6 +566,12 @@ where
                             tx_env.clone(),
                             &mut inspector,
                         )?;
+                        fill_unentered_debug_root(
+                            &mut inspector,
+                            &tx_env,
+                            &evm_env.cfg_env,
+                            &res.result,
+                        );
                         let trace = inspector
                             .get_result(None, &tx_env, &evm_env.block_env, &res, &mut db)
                             .map_err(Eth::Error::from_eth_err)?;
