@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
+use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{BlockBody, BlockHeader};
 use reth_rpc_api::{ParityLocalizedTrace, TraceApiServer};
 use reth_rpc_convert::RpcTxReq;
@@ -26,7 +27,7 @@ use reth_rpc_eth_api::{
     helpers::{Call, LoadPendingBlock, LoadTransaction, Trace, TraceExt},
     FromEthApiError, RpcNodeCore,
 };
-use reth_rpc_eth_types::{error::EthApiError, EthConfig};
+use reth_rpc_eth_types::{error::EthApiError, trace_root::fill_unentered_root_trace, EthConfig};
 use reth_storage_api::{BlockNumReader, BlockReader};
 use reth_tasks::pool::BlockingTaskGuard;
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
@@ -106,7 +107,10 @@ where
         let this = self.clone();
         self.eth_api()
             .spawn_with_call_at(trace_request.call, at, overrides, move |db, evm_env, tx_env| {
-                let res = this.eth_api().inspect(&mut *db, evm_env, tx_env, &mut inspector)?;
+                let cfg = evm_env.cfg_env.clone();
+                let res =
+                    this.eth_api().inspect(&mut *db, evm_env, tx_env.clone(), &mut inspector)?;
+                fill_unentered_root_trace(inspector.traces_mut(), &tx_env, &cfg, &res.result);
                 let trace_res = inspector
                     .into_parity_builder()
                     .into_trace_results_with_state(&res, &trace_request.trace_types, &db)
@@ -135,7 +139,10 @@ where
             .spawn_with_state_at_block(at, move |this, mut db| {
                 let mut inspector =
                     TracingInspector::new(TracingInspectorConfig::from_parity_config(&trace_types));
-                let res = this.inspect(&mut db, evm_env, tx, &mut inspector)?;
+                let cfg = evm_env.cfg_env.clone();
+                let tx_env = this.evm_config().tx_env(tx);
+                let res = this.inspect(&mut db, evm_env, tx_env.clone(), &mut inspector)?;
+                fill_unentered_root_trace(inspector.traces_mut(), &tx_env, &cfg, &res.result);
 
                 inspector
                     .into_parity_builder()
@@ -172,7 +179,9 @@ where
                     )?;
                     let config = TracingInspectorConfig::from_parity_config(&trace_types);
                     let mut inspector = TracingInspector::new(config);
-                    let res = eth_api.inspect(&mut db, evm_env, tx_env, &mut inspector)?;
+                    let cfg = evm_env.cfg_env.clone();
+                    let res = eth_api.inspect(&mut db, evm_env, tx_env.clone(), &mut inspector)?;
+                    fill_unentered_root_trace(inspector.traces_mut(), &tx_env, &cfg, &res.result);
 
                     let trace_res = inspector
                         .into_parity_builder()

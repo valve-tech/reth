@@ -26,6 +26,7 @@ pub mod send_raw_rejected;
 pub mod settings;
 pub mod simulate;
 pub mod transaction;
+pub mod trace_root;
 pub mod tx_forward;
 pub mod utils;
 
