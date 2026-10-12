@@ -13,7 +13,10 @@ use reth_evm::{
     EvmFor, HaltReasonFor, InspectorFor, IntoTxEnv, TxEnvFor,
 };
 use reth_primitives_traits::{BlockBody, BlockTy, Recovered, RecoveredBlock};
-use reth_rpc_eth_types::cache::db::{attach_bal_before_tx, StateCacheDb};
+use reth_rpc_eth_types::{
+    cache::db::{attach_bal_before_tx, StateCacheDb},
+    trace_root::{fill_unentered_root_trace, is_unentered_root},
+};
 use reth_storage_api::{ProviderBlock, ProviderTx};
 use revm::{context::Block, context_interface::result::ResultAndState, state::bal::Bal as RevmBal};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
@@ -66,7 +69,42 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
             + 'static,
         R: Send + 'static,
     {
-        self.spawn_trace_transaction_in_block_with_inspector(hash, TracingInspector::new(config), f)
+        async move {
+            let (transaction, block, bal) =
+                match self.transaction_and_block_and_maybe_bal(hash).await? {
+                    None => return Ok(None),
+                    Some(res) => res,
+                };
+            let (tx, tx_info) = transaction.split();
+            let parent_block = block.parent_hash();
+
+            self.spawn_with_state_at_block(parent_block, move |this, mut db| {
+                // Keep the transaction environment: a transaction that halts before its first
+                // frame leaves no root call, and the root is rebuilt from it.
+                let tx_env = this.evm_config().tx_env(tx);
+                let mut inspector = TracingInspector::new(config);
+                let (res, evm_env) = this.inspect_transaction_in_block(
+                    &block,
+                    &mut db,
+                    &mut inspector,
+                    // index should always be available because `transaction_and_block` only
+                    // returns transactions included in a block
+                    tx_info.index.expect("transaction_and_block only returns block transactions")
+                        as usize,
+                    tx_env.clone(),
+                    bal.as_deref(),
+                )?;
+                fill_unentered_root_trace(
+                    inspector.traces_mut(),
+                    &tx_env,
+                    &evm_env.cfg_env,
+                    &res.result,
+                );
+                f(tx_info, inspector, res, db)
+            })
+            .await
+            .map(Some)
+        }
     }
 
     /// Retrieves the transaction if it exists and returns its trace.
@@ -234,13 +272,35 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
             + 'static,
         R: Send + 'static,
     {
-        self.trace_block_until_with_inspector(
-            block_id,
-            block,
-            highest_index,
-            move || TracingInspector::new(config),
-            f,
-        )
+        async move {
+            let block =
+                if block.is_some() { block } else { self.recovered_block(block_id).await? };
+            let Some(block) = block else { return Ok(None) };
+            let cfg = self.evm_env_for_header(block.sealed_block().sealed_header())?.cfg_env;
+            let evm_config = self.evm_config().clone();
+
+            self.trace_block_until_with_inspector(
+                block_id,
+                Some(block),
+                highest_index,
+                move || TracingInspector::new(config),
+                move |tx_info, ctx| {
+                    // A transaction that halts before its first frame leaves no root call;
+                    // rebuild it from the transaction.
+                    if is_unentered_root(ctx.inspector.traces(), &ctx.result) {
+                        let tx_env = evm_config.tx_env(ctx.tx);
+                        fill_unentered_root_trace(
+                            ctx.inspector.traces_mut(),
+                            &tx_env,
+                            &cfg,
+                            &ctx.result,
+                        );
+                    }
+                    f(tx_info, ctx)
+                },
+            )
+            .await
+        }
     }
 
     /// Executes all transactions of a block.
