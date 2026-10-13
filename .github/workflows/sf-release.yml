@@ -212,9 +212,18 @@ jobs:
             --github-output="changelog:$GITHUB_OUTPUT"
 
       - name: Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          body: ${{ steps.changelog.outputs.changelog }}
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
-          files: |
-            ./reth_linux_amd64
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NOTES: ${{ steps.changelog.outputs.changelog }}
+          PRERELEASE: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF#refs/tags/}
+          printf '%s\n' "$NOTES" > notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --notes-file notes.md --prerelease="$PRERELEASE"
+            gh release upload "$tag" ./reth_linux_amd64 --clobber
+          else
+            gh release create "$tag" ./reth_linux_amd64 --verify-tag --title "$tag" --notes-file notes.md --prerelease="$PRERELEASE"
+          fi

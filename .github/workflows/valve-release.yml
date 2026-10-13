@@ -186,23 +186,34 @@ jobs:
           set -euo pipefail
           cd dist && cat ./*.sha256 > SHA256SUMS && rm -f ./*.sha256 && cat SHA256SUMS
 
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          tag_name: ${{ steps.vars.outputs.tag }}
-          files: dist/*
-          body: |
-            Firehose-instrumented PulseChain reth, `${{ steps.vars.outputs.tag }}`.
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cat > notes.tmpl <<'EOF'
+          Firehose-instrumented PulseChain reth, `@TAG@`.
 
-            Built `--release --bin reth` on native runners per target — the same
-            build `rpc-cargo-rebuild` performs on the box.
+          Built `--release --bin reth` on native runners per target — the same
+          build `rpc-cargo-rebuild` performs on the box.
 
-            | target | platform |
-            |---|---|
-            | `x86_64-unknown-linux-gnu` | the fleet, and most self-hosters |
-            | `aarch64-unknown-linux-gnu` | ARM servers |
-            | `aarch64-apple-darwin` | Apple Silicon (valve-node local setup) |
+          | target | platform |
+          |---|---|
+          | `x86_64-unknown-linux-gnu` | the fleet, and most self-hosters |
+          | `aarch64-unknown-linux-gnu` | ARM servers |
+          | `aarch64-apple-darwin` | Apple Silicon (valve-node local setup) |
 
-            Verify:
-            ```
-            sha256sum -c SHA256SUMS --ignore-missing
-            ```
+          Verify:
+          ```
+          sha256sum -c SHA256SUMS --ignore-missing
+          ```
+          EOF
+          sed "s/@TAG@/${TAG}/g" notes.tmpl > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file notes.md
+          fi
