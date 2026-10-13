@@ -37,7 +37,7 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: valve-release-${{ github.ref }}
@@ -85,16 +85,20 @@ jobs:
           esac
           printf 'tag=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.vars.outputs.tag }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
+      # No rust-cache here: release artifacts are built cold so a poisoned
+      # Actions cache can never end up in a published binary.
 
       - name: Build reth
         env:
@@ -150,7 +154,7 @@ jobs:
           cd dist && $SHA256 "reth-${TAG}-${TARGET}.tar.gz" > "reth-${TAG}-${TARGET}.tar.gz.sha256"
           ls -la
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: reth-${{ matrix.target }}
           path: dist/*
@@ -158,6 +162,8 @@ jobs:
 
   publish:
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     steps:
       - name: Re-validate tag
@@ -170,7 +176,7 @@ jobs:
           case "$RAW_TAG" in *[!A-Za-z0-9._-]*) echo "::error::bad tag"; exit 1 ;; esac
           printf 'tag=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
@@ -180,23 +186,34 @@ jobs:
           set -euo pipefail
           cd dist && cat ./*.sha256 > SHA256SUMS && rm -f ./*.sha256 && cat SHA256SUMS
 
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.vars.outputs.tag }}
-          files: dist/*
-          body: |
-            Firehose-instrumented PulseChain reth, `${{ steps.vars.outputs.tag }}`.
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cat > notes.tmpl <<'EOF'
+          Firehose-instrumented PulseChain reth, `@TAG@`.
 
-            Built `--release --bin reth` on native runners per target — the same
-            build `rpc-cargo-rebuild` performs on the box.
+          Built `--release --bin reth` on native runners per target — the same
+          build `rpc-cargo-rebuild` performs on the box.
 
-            | target | platform |
-            |---|---|
-            | `x86_64-unknown-linux-gnu` | the fleet, and most self-hosters |
-            | `aarch64-unknown-linux-gnu` | ARM servers |
-            | `aarch64-apple-darwin` | Apple Silicon (valve-node local setup) |
+          | target | platform |
+          |---|---|
+          | `x86_64-unknown-linux-gnu` | the fleet, and most self-hosters |
+          | `aarch64-unknown-linux-gnu` | ARM servers |
+          | `aarch64-apple-darwin` | Apple Silicon (valve-node local setup) |
 
-            Verify:
-            ```
-            sha256sum -c SHA256SUMS --ignore-missing
-            ```
+          Verify:
+          ```
+          sha256sum -c SHA256SUMS --ignore-missing
+          ```
+          EOF
+          sed "s/@TAG@/${TAG}/g" notes.tmpl > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file notes.md
+          fi
