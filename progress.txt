@@ -150,7 +150,7 @@ FLEET DEPLOY 2026-08-07 — 5 of 6 boxes now on 2.4.1 @ 6fa9aa1bbd
     is absent, which is exactly what a firehose-disabled node looks like.
 
   COSMETIC: 369a, 369b and 943b report `2.4.1-pulse-dev` rather than
-  `2.4.1-pulse` — an untracked `.claude/` directory in /root/reth makes the
+  `2.4.1-pulse` — an untracked local tooling directory in /root/reth makes the
   tree dirty, and vergen appends -dev. Harmless, but it means the version
   string is not a reliable deploy identity; use the embedded Commit SHA.
 

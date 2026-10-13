@@ -52,7 +52,7 @@ This avoids polluting the Ethereum-centric `TraceContext` with OP fields.
 
 #### `lib.rs` changes in `reth-firehose-tests`
 
-Add re-exports of the newly-public items following AGENTS.md conventions:
+Add re-exports of the newly-public items following the repository conventions:
 
 ```rust
 // existing
