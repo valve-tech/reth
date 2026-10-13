@@ -196,7 +196,8 @@ jobs:
         run: |
           # The --platform is not strictly needed for a single-arch image, but it
           # silences the buildx warning.
-          docker cp $(docker create --platform=linux/amd64 "$IMAGE_ID"):/usr/local/bin/reth ./reth_linux_amd64
+          container=$(docker create --platform=linux/amd64 "$IMAGE_ID")
+          docker cp "${container}:/usr/local/bin/reth" ./reth_linux_amd64
 
       - name: Extract Changelog
         id: changelog
@@ -208,7 +209,7 @@ jobs:
           chmod +x sfreleaser
 
           ./sfreleaser changelog extract-section \
-            github://token:${GH_TOKEN}@${REPO}/$GITHUB_SHA/CHANGELOG.md \
+            "github://token:${GH_TOKEN}@${REPO}/${GITHUB_SHA}/CHANGELOG.md" \
             --github-output="changelog:$GITHUB_OUTPUT"
 
       - name: Release
