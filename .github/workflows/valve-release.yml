@@ -37,7 +37,7 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: valve-release-${{ github.ref }}
@@ -85,16 +85,17 @@ jobs:
           esac
           printf 'tag=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.vars.outputs.tag }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          key: ${{ matrix.target }}
+          toolchain: stable
+
+      # No rust-cache here: release artifacts are built cold so a poisoned
+      # Actions cache can never end up in a published binary.
 
       - name: Build reth
         env:
@@ -150,7 +151,7 @@ jobs:
           cd dist && $SHA256 "reth-${TAG}-${TARGET}.tar.gz" > "reth-${TAG}-${TARGET}.tar.gz.sha256"
           ls -la
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: reth-${{ matrix.target }}
           path: dist/*
@@ -158,6 +159,8 @@ jobs:
 
   publish:
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     steps:
       - name: Re-validate tag
@@ -170,7 +173,7 @@ jobs:
           case "$RAW_TAG" in *[!A-Za-z0-9._-]*) echo "::error::bad tag"; exit 1 ;; esac
           printf 'tag=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
@@ -180,7 +183,7 @@ jobs:
           set -euo pipefail
           cd dist && cat ./*.sha256 > SHA256SUMS && rm -f ./*.sha256 && cat SHA256SUMS
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
           files: dist/*
