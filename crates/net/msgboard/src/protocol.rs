@@ -326,7 +326,12 @@ fn honest_inbound_burst(cfg: &MsgboardConfig) -> (usize, usize) {
 fn inbound_limits_for(cfg: &MsgboardConfig) -> ProtocolIngressLimits {
     let (frames, bytes) = honest_inbound_burst(cfg);
     let bytes = bytes.clamp(MIN_INBOUND_QUEUED_BYTES, MUX_CONNECTION_IN_BUFFER_BYTES);
-    ProtocolIngressLimits::default()
+    // The frame ceiling is declared to the multiplexer as well as checked in
+    // `handle_incoming`. The multiplexer reads the decompressed length from the
+    // snappy header and cuts the session before it allocates the frame, so an
+    // oversized one is never buffered. The check in `handle_incoming` stays as
+    // the second line.
+    ProtocolIngressLimits::new(MAX_INBOUND_FRAME_SIZE)
         .with_max_buffered_messages(frames.max(MIN_INBOUND_QUEUED_FRAMES))
         .with_max_buffered_bytes(bytes)
 }
