@@ -83,6 +83,11 @@ impl BlockFilter {
         self.head
     }
 
+    /// Width of the live window, after clamping to `1..=MAX_BLOCK_RANGE`.
+    pub const fn limit(&self) -> u64 {
+        self.limit
+    }
+
     /// Lower bound of the live window.
     pub const fn lower(&self) -> u64 {
         self.lower

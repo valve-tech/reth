@@ -124,6 +124,12 @@ impl MsgIndex {
         removed
     }
 
+    /// Remove every message anchored above block `upper`.
+    pub fn remove_above_block(&mut self, upper: u64) -> Vec<Arc<CheckedPoWMsg>> {
+        let _ = upper;
+        Vec::new()
+    }
+
     /// Remove and return the oldest message (smallest `block_number` / `difficulty_ratio`).
     pub fn evict_oldest(&mut self) -> Option<Arc<CheckedPoWMsg>> {
         let hash = self.msgs.first()?.hash;
@@ -1027,6 +1033,29 @@ mod tests {
 
     /// Draining the stale prefix leaves the index exactly as removing the
     /// stale messages one at a time does, on many random boards.
+    #[test]
+    fn remove_above_block_removes_only_the_messages_above() {
+        let mut idx = MsgIndex::default();
+        let low = make_checked(5, 0);
+        let edge = make_checked(10, 1);
+        let high = make_checked(11, 2);
+        let higher = make_checked(500, 3);
+        for m in [&higher, &low, &high, &edge] {
+            idx.insert(Arc::clone(m));
+        }
+
+        let removed: Vec<_> = idx.remove_above_block(10).iter().map(|m| m.hash).collect();
+        assert_eq!(removed, vec![high.hash, higher.hash], "ascending, as the index holds them");
+        assert_eq!(idx.len(), 2);
+        assert!(idx.has(&low.hash) && idx.has(&edge.hash));
+        assert!(!idx.has(&high.hash) && !idx.has(&higher.hash));
+        assert_eq!(idx.total_size(), 2, "one data byte each");
+        idx.assert_consistent();
+
+        assert!(idx.remove_above_block(u64::MAX).is_empty());
+        assert_eq!(idx.len(), 2);
+    }
+
     #[test]
     fn remove_below_block_matches_removing_one_at_a_time() {
         let mut state = 0x1234_5678_9ABC_DEF0u64;

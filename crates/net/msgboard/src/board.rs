@@ -2524,4 +2524,59 @@ mod tests {
         assert!(board.fetchable(&[id]).is_empty());
         assert!(board.filter_wanted(PeerId::repeat_byte(7), &[id]).is_empty());
     }
+
+    /// A row stored under a block far above the head cannot belong to this
+    /// chain, and nothing else would ever expire it: expiry only looks below the
+    /// window. It would sit on the board, be announced to every peer, and
+    /// never be pruned. Seeding the window drops it, with its row on disk.
+    ///
+    /// A row up to one window above the head stays, so the head that moved back
+    /// a few blocks across a restart does not cost the board its newest
+    /// messages.
+    #[test]
+    fn a_row_anchored_above_the_head_window_is_dropped_when_the_window_is_seeded() {
+        use alloy_rlp::Encodable;
+        use reth_libmdbx::WriteFlags;
+
+        let head = 100;
+        let window = easy_cfg().block_range;
+        let rows = [
+            (b"at the head".as_slice(), head),
+            (b"one window above".as_slice(), head + window),
+            (b"just past that".as_slice(), head + window + 1),
+            (b"far in the future".as_slice(), 5_000_000),
+        ];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = crate::db::open_msgboard_db(dir.path()).expect("open db");
+        let mut hashes = Vec::new();
+        {
+            let tx = env.begin_rw_txn().expect("rw txn");
+            let db = tx.open_db(Some("BoardMessage")).expect("open table");
+            for (data, block) in rows {
+                let checked =
+                    make_pow_msg(find_nonce(data), data).to_checked(block, 0).expect("valid");
+                let mut enc = Vec::new();
+                checked.encode(&mut enc);
+                tx.put(db.dbi(), checked.hash.as_slice(), &enc, WriteFlags::empty()).expect("put");
+                hashes.push(checked.hash);
+            }
+            tx.commit().expect("commit");
+        }
+
+        let board = MsgBoard::with_db(easy_cfg(), env);
+        assert_eq!(board.load_from_db().expect("load"), 4, "the window is not known yet");
+        board.seed_window(head, [(head, block_hash_one())]);
+
+        let kept: HashSet<B256> = board.all_messages().iter().map(|m| m.hash).collect();
+        assert_eq!(kept, hashes[..2].iter().copied().collect::<HashSet<_>>());
+        let announced: HashSet<B256> =
+            board.all_message_ids().iter().map(|id| id.message_hash()).collect();
+        assert_eq!(announced, kept, "a dropped row is not announced either");
+
+        board.flush_to_db().expect("flush");
+        let (on_disk, _) = crate::db::db_load_all(board.db.as_ref().unwrap()).expect("reload");
+        let on_disk: HashSet<B256> = on_disk.iter().map(|m| m.hash).collect();
+        assert_eq!(on_disk, kept, "the dropped rows leave the disk with them");
+    }
 }
