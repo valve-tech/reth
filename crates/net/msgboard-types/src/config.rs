@@ -86,7 +86,15 @@ impl MsgboardConfig {
     }
 
     /// Returns `true` if the work ratio `mult/div` meets the minimum threshold.
+    ///
+    /// A zero multiplier or a zero divisor is not a ratio and never passes. The
+    /// cross-multiplied comparison alone would accept any multiplier over a zero
+    /// divisor, and every message body with either value is refused at decode,
+    /// so accepting one here only announces work nobody can deliver.
     pub const fn is_work_acceptable(&self, multiplier: u64, divisor: u64) -> bool {
+        if multiplier == 0 || divisor == 0 {
+            return false;
+        }
         // Compare mult/div ≥ cfg.mult/cfg.div  ⟺  mult × cfg.div ≥ cfg.mult × div
         // Use u128 to avoid overflow for reasonable field values.
         (multiplier as u128) * (self.work_divisor as u128) >=
