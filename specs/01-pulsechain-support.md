@@ -287,7 +287,7 @@ Sacrifice credits are stored in binary files containing compressed allocation da
 - `sacrifice_credits_mainnet.bin` — for chain ID 369
 - `sacrifice_credits_testnet_v4.bin` — for chain ID 943
 
-Source: `https://gitlab.com/pulsechaincom/compressed-allocations`
+Source: the `compressed-allocations` repository.
 
 ### 5.2 Algorithm
 
