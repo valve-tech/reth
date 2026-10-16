@@ -101,6 +101,7 @@ impl MsgboardLauncher {
                         tracing::debug!(target: "msgboard", count, "restored persisted messages");
                     }
                     Err(e) => {
+                        b.record_persistence_failure();
                         tracing::warn!(
                             target: "msgboard",
                             %e,
@@ -117,7 +118,9 @@ impl MsgboardLauncher {
                     %e,
                     "failed to open msgboard DB; running in-memory only",
                 );
-                Arc::new(MsgBoard::new(self.config.clone()))
+                let b = Arc::new(MsgBoard::new(self.config.clone()));
+                b.record_persistence_failure();
+                b
             }
         };
 

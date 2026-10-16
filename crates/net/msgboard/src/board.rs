@@ -129,6 +129,9 @@ pub struct MsgBoard {
     flush_lock: Mutex<()>,
     /// Flushes that failed since the last one that succeeded.
     consecutive_flush_failures: AtomicU64,
+    /// Failures to open or load the database; see
+    /// [`record_persistence_failure`](Self::record_persistence_failure).
+    persistence_failures: AtomicU64,
     /// Whether the node has finished initial sync and the board is accepting
     /// messages. Starts `false`; flips to `true` exactly once when the caller
     /// signals sync completion via [`MsgBoard::set_ready`].
@@ -184,6 +187,7 @@ impl MsgBoard {
             db,
             flush_lock: Mutex::new(()),
             consecutive_flush_failures: AtomicU64::new(0),
+            persistence_failures: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             metrics: MsgboardMetrics::default(),
@@ -193,11 +197,14 @@ impl MsgBoard {
     }
 
     /// Count a failure to open or load the persistent database.
-    pub fn record_persistence_failure(&self) {}
+    pub fn record_persistence_failure(&self) {
+        self.persistence_failures.fetch_add(1, Ordering::Relaxed);
+        self.metrics.persistence_failures.increment(1);
+    }
 
     /// Failures to open or load the persistent database since start.
     pub fn persistence_failures(&self) -> u64 {
-        0
+        self.persistence_failures.load(Ordering::Relaxed)
     }
 
     /// Returns a clone of the metrics handle so callers (e.g. protocol handler)
