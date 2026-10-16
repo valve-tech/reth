@@ -2403,4 +2403,41 @@ mod tests {
         check(&board);
         assert!(board.all_messages().is_empty(), "seed_window expired the rest");
     }
+
+    /// A database holding one message twice, once under a wrong key and once
+    /// under its hash, keeps that message's row across a flush.
+    ///
+    /// The misfiled copy is moved onto the hash key before the board sees it,
+    /// so the second copy is a duplicate of the one the board kept. Discarding
+    /// it queued the hash key for deletion, and the next flush deleted the row
+    /// of the message the board was serving.
+    #[test]
+    fn a_duplicate_row_does_not_delete_the_row_of_the_kept_message() {
+        use alloy_rlp::Encodable;
+        use reth_libmdbx::WriteFlags;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = crate::db::open_msgboard_db(dir.path()).expect("open db");
+        let checked = make_pow_msg(find_nonce(b"persist me"), b"persist me")
+            .to_checked(100, 0)
+            .expect("valid");
+        let mut enc = Vec::new();
+        checked.encode(&mut enc);
+        {
+            let tx = env.begin_rw_txn().expect("rw txn");
+            let db = tx.open_db(Some("BoardMessage")).expect("open table");
+            tx.put(db.dbi(), [0xEEu8; 32].as_slice(), &enc, WriteFlags::empty()).expect("put");
+            tx.put(db.dbi(), checked.hash.as_slice(), &enc, WriteFlags::empty()).expect("put");
+            tx.commit().expect("commit");
+        }
+
+        let board = MsgBoard::with_db(easy_cfg(), env);
+        assert_eq!(board.load_from_db().expect("load"), 1, "one message, loaded once");
+        board.flush_to_db().expect("flush");
+        assert_eq!(board.all_messages().len(), 1);
+
+        let (rows, _) = crate::db::db_load_all(board.db.as_ref().unwrap()).expect("reload");
+        assert_eq!(rows.len(), 1, "the kept message keeps its row on disk");
+        assert_eq!(rows[0].hash, checked.hash);
+    }
 }
