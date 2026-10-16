@@ -963,6 +963,29 @@ mod tests {
         );
     }
 
+    /// A database that cannot be opened leaves the board in memory only. That
+    /// has to show up as a number, not just a log line: nothing else tells an
+    /// operator that every message is lost at the next restart.
+    #[tokio::test]
+    async fn an_unopenable_database_is_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A regular file where the database directory should be.
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"x").expect("write");
+        let launcher = launcher_with_db_dir(blocked.to_str());
+
+        let board = launcher.init_board(dir.path().to_path_buf());
+        assert_eq!(board.persistence_failures(), 1);
+    }
+
+    /// The healthy path counts nothing, so any rise is a real failure.
+    #[tokio::test]
+    async fn a_healthy_database_is_not_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = launcher_with_db_dir(None).init_board(dir.path().to_path_buf());
+        assert_eq!(board.persistence_failures(), 0);
+    }
+
     /// A work divisor that makes mining cost one or two hashes.
     const CHEAP_WORK_DIVISOR: u64 = 1 << 24;
 

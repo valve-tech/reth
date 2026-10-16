@@ -192,6 +192,14 @@ impl MsgBoard {
         }
     }
 
+    /// Count a failure to open or load the persistent database.
+    pub fn record_persistence_failure(&self) {}
+
+    /// Failures to open or load the persistent database since start.
+    pub fn persistence_failures(&self) -> u64 {
+        0
+    }
+
     /// Returns a clone of the metrics handle so callers (e.g. protocol handler)
     /// can record send-side timings.
     pub fn metrics(&self) -> MsgboardMetrics {

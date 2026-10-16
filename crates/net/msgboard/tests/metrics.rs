@@ -180,6 +180,7 @@ fn every_metric_is_instantiated_and_moves() {
             "msgboard.peer_sessions_opened",
             "msgboard.peer_unsupported",
             "msgboard.pending_requests",
+            "msgboard.persistence_failures",
             "msgboard.rejected_insufficient_work",
             "msgboard.rejected_invalid_difficulty",
             "msgboard.rejected_invalid_pow",
@@ -308,6 +309,16 @@ fn every_metric_is_instantiated_and_moves() {
         "an undefined difficulty must be counted separately from ordinary bad PoW",
     );
     assert_eq!(snap.counter("msgboard.rejected_invalid_pow"), 0);
+
+    // ── persistence failures are counted ─────────────────────────────────────
+    //
+    // A board that could not open or load its database runs on, in memory, with
+    // only a log line to say so.
+    lax.record_persistence_failure();
+    lax.record_persistence_failure();
+    let snap = Snap::take(&snapshotter);
+    assert_eq!(snap.counter("msgboard.persistence_failures"), 2);
+    assert_eq!(lax.persistence_failures(), 2);
 
     // ── phase 5: eviction at count_limit is its own counter ──────────────────
     let cfg = MsgboardConfig { count_limit: 2, ..easy_cfg() };
