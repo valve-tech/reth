@@ -85,6 +85,13 @@ pub struct MsgboardMetrics {
     /// Any rise means the board is ahead of its database. A restart in that
     /// state loses every message accepted since the last successful flush.
     pub flush_failures: Counter,
+    /// Times the persistent database could not be opened or loaded at start.
+    ///
+    /// Any rise means the board is running without its database, or started
+    /// empty although the database holds rows. Both are only logged otherwise,
+    /// and the node looks healthy while every message it accepts is lost at the
+    /// next restart.
+    pub persistence_failures: Counter,
 
     // ── peer sessions ────────────────────────────────────────────────────────
     /// Peers with a live `msg/1` session right now.

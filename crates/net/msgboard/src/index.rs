@@ -124,6 +124,30 @@ impl MsgIndex {
         removed
     }
 
+    /// Remove every message anchored above block `upper`.
+    ///
+    /// The comparator orders by block first, so those messages form a suffix of
+    /// `msgs`, and one `split_off` takes it.
+    pub fn remove_above_block(&mut self, upper: u64) -> Vec<Arc<CheckedPoWMsg>> {
+        debug_assert!(
+            self.msgs.windows(2).all(|w| w[0].block_number <= w[1].block_number),
+            "the index must be sorted by block",
+        );
+        let start = self.msgs.partition_point(|m| m.block_number <= upper);
+        let removed = self.msgs.split_off(start);
+        for msg in &removed {
+            self.by_hash.remove(&msg.hash);
+            self.total_size = self.total_size.saturating_sub(msg.msg.data.len() as u64);
+            if let Some(cat_map) = self.categories.get_mut(&msg.msg.category) {
+                cat_map.remove(&msg.hash);
+                if cat_map.is_empty() {
+                    self.categories.remove(&msg.msg.category);
+                }
+            }
+        }
+        removed
+    }
+
     /// Remove and return the oldest message (smallest `block_number` / `difficulty_ratio`).
     pub fn evict_oldest(&mut self) -> Option<Arc<CheckedPoWMsg>> {
         let hash = self.msgs.first()?.hash;
@@ -1027,6 +1051,29 @@ mod tests {
 
     /// Draining the stale prefix leaves the index exactly as removing the
     /// stale messages one at a time does, on many random boards.
+    #[test]
+    fn remove_above_block_removes_only_the_messages_above() {
+        let mut idx = MsgIndex::default();
+        let low = make_checked(5, 0);
+        let edge = make_checked(10, 1);
+        let high = make_checked(11, 2);
+        let higher = make_checked(500, 3);
+        for m in [&higher, &low, &high, &edge] {
+            idx.insert(Arc::clone(m));
+        }
+
+        let removed: Vec<_> = idx.remove_above_block(10).iter().map(|m| m.hash).collect();
+        assert_eq!(removed, vec![high.hash, higher.hash], "ascending, as the index holds them");
+        assert_eq!(idx.len(), 2);
+        assert!(idx.has(&low.hash) && idx.has(&edge.hash));
+        assert!(!idx.has(&high.hash) && !idx.has(&higher.hash));
+        assert_eq!(idx.total_size(), 2, "one data byte each");
+        idx.assert_consistent();
+
+        assert!(idx.remove_above_block(u64::MAX).is_empty());
+        assert_eq!(idx.len(), 2);
+    }
+
     #[test]
     fn remove_below_block_matches_removing_one_at_a_time() {
         let mut state = 0x1234_5678_9ABC_DEF0u64;

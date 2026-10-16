@@ -129,6 +129,9 @@ pub struct MsgBoard {
     flush_lock: Mutex<()>,
     /// Flushes that failed since the last one that succeeded.
     consecutive_flush_failures: AtomicU64,
+    /// Failures to open or load the database; see
+    /// [`record_persistence_failure`](Self::record_persistence_failure).
+    persistence_failures: AtomicU64,
     /// Whether the node has finished initial sync and the board is accepting
     /// messages. Starts `false`; flips to `true` exactly once when the caller
     /// signals sync completion via [`MsgBoard::set_ready`].
@@ -184,12 +187,24 @@ impl MsgBoard {
             db,
             flush_lock: Mutex::new(()),
             consecutive_flush_failures: AtomicU64::new(0),
+            persistence_failures: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             metrics: MsgboardMetrics::default(),
             #[cfg(test)]
             wire_lookups: AtomicU64::new(0),
         }
+    }
+
+    /// Count a failure to open or load the persistent database.
+    pub fn record_persistence_failure(&self) {
+        self.persistence_failures.fetch_add(1, Ordering::Relaxed);
+        self.metrics.persistence_failures.increment(1);
+    }
+
+    /// Failures to open or load the persistent database since start.
+    pub fn persistence_failures(&self) -> u64 {
+        self.persistence_failures.load(Ordering::Relaxed)
     }
 
     /// Returns a clone of the metrics handle so callers (e.g. protocol handler)
@@ -404,6 +419,8 @@ impl MsgBoard {
     /// See [`BlockFilter::seed`]. A reader never sees a partly loaded window,
     /// so an announcement anchored in the window is never wrongly rejected
     /// while the window loads.
+    ///
+    /// Messages anchored more than one window above `head` are dropped too.
     pub fn seed_window(&self, head: u64, blocks: impl IntoIterator<Item = (u64, B256)>) {
         let mut state = self.state.lock();
         state.block_filter.seed(head, blocks);
@@ -411,6 +428,24 @@ impl MsgBoard {
         let stale = state.index.remove_below_block(lower);
         self.metrics.expired.increment(stale.len() as u64);
         for evicted in stale {
+            state.discard(evicted);
+        }
+
+        // Expiry only looks below the window, so a message anchored above the
+        // head would never leave on its own. A row read from the database can
+        // be one: it was written by a node on another chain, or after the head
+        // moved back. One window of slack keeps what a shallow rewind leaves.
+        let upper = head.saturating_add(state.block_filter.limit());
+        let future = state.index.remove_above_block(upper);
+        if !future.is_empty() {
+            tracing::warn!(
+                target: "msgboard",
+                count = future.len(),
+                head,
+                "dropped stored messages anchored above the chain head",
+            );
+        }
+        for evicted in future {
             state.discard(evicted);
         }
         self.metrics.msg_count.set(state.index.len() as f64);
@@ -2508,5 +2543,60 @@ mod tests {
         // wrapped sum would put the cutoff near zero and request everything.
         assert!(board.fetchable(&[id]).is_empty());
         assert!(board.filter_wanted(PeerId::repeat_byte(7), &[id]).is_empty());
+    }
+
+    /// A row stored under a block far above the head cannot belong to this
+    /// chain, and nothing else would ever expire it: expiry only looks below the
+    /// window. It would sit on the board, be announced to every peer, and
+    /// never be pruned. Seeding the window drops it, with its row on disk.
+    ///
+    /// A row up to one window above the head stays, so the head that moved back
+    /// a few blocks across a restart does not cost the board its newest
+    /// messages.
+    #[test]
+    fn a_row_anchored_above_the_head_window_is_dropped_when_the_window_is_seeded() {
+        use alloy_rlp::Encodable;
+        use reth_libmdbx::WriteFlags;
+
+        let head = 100;
+        let window = easy_cfg().block_range;
+        let rows = [
+            (b"at the head".as_slice(), head),
+            (b"one window above".as_slice(), head + window),
+            (b"just past that".as_slice(), head + window + 1),
+            (b"far in the future".as_slice(), 5_000_000),
+        ];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = crate::db::open_msgboard_db(dir.path()).expect("open db");
+        let mut hashes = Vec::new();
+        {
+            let tx = env.begin_rw_txn().expect("rw txn");
+            let db = tx.open_db(Some("BoardMessage")).expect("open table");
+            for (data, block) in rows {
+                let checked =
+                    make_pow_msg(find_nonce(data), data).to_checked(block, 0).expect("valid");
+                let mut enc = Vec::new();
+                checked.encode(&mut enc);
+                tx.put(db.dbi(), checked.hash.as_slice(), &enc, WriteFlags::empty()).expect("put");
+                hashes.push(checked.hash);
+            }
+            tx.commit().expect("commit");
+        }
+
+        let board = MsgBoard::with_db(easy_cfg(), env);
+        assert_eq!(board.load_from_db().expect("load"), 4, "the window is not known yet");
+        board.seed_window(head, [(head, block_hash_one())]);
+
+        let kept: HashSet<B256> = board.all_messages().iter().map(|m| m.hash).collect();
+        assert_eq!(kept, hashes[..2].iter().copied().collect::<HashSet<_>>());
+        let announced: HashSet<B256> =
+            board.all_message_ids().iter().map(|id| id.message_hash()).collect();
+        assert_eq!(announced, kept, "a dropped row is not announced either");
+
+        board.flush_to_db().expect("flush");
+        let (on_disk, _) = crate::db::db_load_all(board.db.as_ref().unwrap()).expect("reload");
+        let on_disk: HashSet<B256> = on_disk.iter().map(|m| m.hash).collect();
+        assert_eq!(on_disk, kept, "the dropped rows leave the disk with them");
     }
 }
