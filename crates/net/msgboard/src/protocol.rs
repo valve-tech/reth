@@ -305,8 +305,8 @@ fn honest_inbound_burst(cfg: &MsgboardConfig) -> (usize, usize) {
     let announce_frames = cfg.count_limit.div_ceil(MAX_IDS_PER_FRAME);
     let bodies_per_frame = (P2P_MSG_PACKET_LIMIT / max_wire_body_len(cfg.size_limit)).max(1);
     let reply_frames = MAX_WANT_PER_PEER.div_ceil(bodies_per_frame);
-    let frames = announce_frames + reply_frames;
-    (frames, frames * MAX_INBOUND_FRAME_SIZE)
+    let frames = announce_frames.saturating_add(reply_frames);
+    (frames, frames.saturating_mul(MAX_INBOUND_FRAME_SIZE))
 }
 
 /// The ingress limits for a board with `cfg`: the honest burst, or the

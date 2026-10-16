@@ -451,7 +451,7 @@ impl MsgBoard {
     ) -> Vec<MsgID> {
         let now = tokio::time::Instant::now();
         let mut state = self.state.lock();
-        let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
+        let stale_lower = state.block_filter.lower().saturating_add(self.cfg.stale_block_buffer);
 
         // The map can only grow on this path, so it is trimmed here without a
         // background task. The sweep is rate-limited, so a flood of
@@ -493,7 +493,7 @@ impl MsgBoard {
     /// `filter_wanted` once it can request them.
     pub fn fetchable(&self, ids: &[MsgID]) -> Vec<MsgID> {
         let state = self.state.lock();
-        let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
+        let stale_lower = state.block_filter.lower().saturating_add(self.cfg.stale_block_buffer);
         ids.iter()
             .filter(|id| self.is_fetchable(&state.index, &state.block_filter, stale_lower, id))
             .copied()
@@ -625,7 +625,7 @@ impl MsgBoard {
         state: &mut BoardState,
         now: tokio::time::Instant,
     ) -> (u64, Vec<ExhaustedClaim>) {
-        let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
+        let stale_lower = state.block_filter.lower().saturating_add(self.cfg.stale_block_buffer);
         let BoardState { index, block_filter, pending, .. } = state;
         pending.maybe_sweep(now, |id| index.has(&id.message_hash()));
         pending.settle_exhausted(now, |id| self.is_fetchable(index, block_filter, stale_lower, id))

@@ -5,7 +5,10 @@ use std::{path::PathBuf, time::Duration};
 use clap::Args;
 use reth_msgboard_types::MsgboardConfig;
 
-use crate::protocol::{MAX_SAFE_SIZE_LIMIT, P2P_MSG_PACKET_LIMIT};
+use crate::{
+    block_filter::MAX_BLOCK_RANGE,
+    protocol::{MAX_SAFE_SIZE_LIMIT, P2P_MSG_PACKET_LIMIT},
+};
 
 /// Default DB flush interval. Mirrors `CommitEvery = 15s` in
 /// `private-erigon-pulse/msgboardcfg/config.go`.
@@ -24,9 +27,18 @@ const MIN_COMMIT_EVERY: Duration = Duration::from_millis(100);
 const MIN_LOG_EVERY: Duration = Duration::from_secs(1);
 
 /// Largest accepted `--msgboard.stale-block-buffer`.
-pub(crate) const MAX_STALE_BLOCK_BUFFER: u64 = 1080;
+///
+/// The buffer is added to the bottom of the live window, which is never wider
+/// than [`MAX_BLOCK_RANGE`] blocks. A larger buffer would put the cutoff above
+/// every block that can be live and leave nothing to request.
+pub(crate) const MAX_STALE_BLOCK_BUFFER: u64 = MAX_BLOCK_RANGE;
 
-/// Largest accepted `--msgboard.count-limit`.
+/// Largest accepted `--msgboard.count-limit`: a hundred times the default.
+///
+/// The limit sizes the board, the announce traffic and the ingress budget
+/// derived from them. At this value a board of default-sized messages is about
+/// 8 GiB, so a larger figure is a typo or an attempt to exhaust memory, not a
+/// configuration.
 pub(crate) const MAX_COUNT_LIMIT: usize = 1_000_000;
 
 /// Parse a humantime duration and refuse one below `min`.
@@ -47,6 +59,56 @@ fn parse_commit_every(raw: &str) -> Result<Duration, String> {
 
 fn parse_log_every(raw: &str) -> Result<Duration, String> {
     parse_min_duration(raw, "--msgboard.log-every", MIN_LOG_EVERY)
+}
+
+/// Parse a `u64` flag and refuse a value outside `min..=max`, naming the flag.
+fn parse_u64_in(raw: &str, flag: &str, min: u64, max: u64, why: &str) -> Result<u64, String> {
+    let value: u64 = raw.parse().map_err(|_| format!("{flag}: `{raw}` is not a whole number"))?;
+    if !(min..=max).contains(&value) {
+        return Err(format!("{flag} must be between {min} and {max}, not {value}: {why}"));
+    }
+    Ok(value)
+}
+
+fn parse_work_multiplier(raw: &str) -> Result<u64, String> {
+    parse_u64_in(
+        raw,
+        "--msgboard.work-multiplier",
+        1,
+        u64::MAX,
+        "a zero multiplier lets every message clear the minimum work, which turns the check off",
+    )
+}
+
+fn parse_work_divisor(raw: &str) -> Result<u64, String> {
+    parse_u64_in(
+        raw,
+        "--msgboard.work-divisor",
+        1,
+        u64::MAX,
+        "a zero divisor is not a work ratio and would reject every message",
+    )
+}
+
+fn parse_stale_block_buffer(raw: &str) -> Result<u64, String> {
+    parse_u64_in(
+        raw,
+        "--msgboard.stale-block-buffer",
+        0,
+        MAX_STALE_BLOCK_BUFFER,
+        "the buffer is counted from the bottom of a live window that is never wider than that",
+    )
+}
+
+fn parse_count_limit(raw: &str) -> Result<usize, String> {
+    let limit = parse_u64_in(
+        raw,
+        "--msgboard.count-limit",
+        0,
+        MAX_COUNT_LIMIT as u64,
+        "the limit sizes the board and its network buffers",
+    )?;
+    Ok(limit as usize)
 }
 
 /// Parse `--msgboard.size-limit`, refusing a value that would make us emit a
@@ -91,11 +153,23 @@ fn parse_size_limit(raw: &str) -> Result<usize, String> {
 #[command(next_help_heading = "Msgboard")]
 pub struct MsgboardArgs {
     /// Minimum accepted `work_multiplier` value.
-    #[arg(long = "msgboard.work-multiplier", default_value_t = 10_000)]
+    ///
+    /// Must be at least 1: a zero multiplier turns the check off.
+    #[arg(
+        long = "msgboard.work-multiplier",
+        default_value_t = 10_000,
+        value_parser = parse_work_multiplier,
+    )]
     pub msgboard_work_multiplier: u64,
 
     /// Maximum accepted `work_divisor` value.
-    #[arg(long = "msgboard.work-divisor", default_value_t = 1_000_000)]
+    ///
+    /// Must be at least 1.
+    #[arg(
+        long = "msgboard.work-divisor",
+        default_value_t = 1_000_000,
+        value_parser = parse_work_divisor,
+    )]
     pub msgboard_work_divisor: u64,
 
     /// Maximum allowed byte length of a single message's data field.
@@ -109,7 +183,13 @@ pub struct MsgboardArgs {
     pub msgboard_size_limit: usize,
 
     /// Maximum number of messages retained in the board.
-    #[arg(long = "msgboard.count-limit", default_value_t = 10_000)]
+    ///
+    /// At most 1,000,000.
+    #[arg(
+        long = "msgboard.count-limit",
+        default_value_t = 10_000,
+        value_parser = parse_count_limit,
+    )]
     pub msgboard_count_limit: usize,
 
     /// Number of blocks a message remains live before expiry.
@@ -117,7 +197,13 @@ pub struct MsgboardArgs {
     pub msgboard_block_range: u64,
 
     /// Stale block buffer for peer filtering (avoid requesting nearly-expired messages).
-    #[arg(long = "msgboard.stale-block-buffer", default_value_t = 3)]
+    ///
+    /// At most 1080, the widest live window.
+    #[arg(
+        long = "msgboard.stale-block-buffer",
+        default_value_t = 3,
+        value_parser = parse_stale_block_buffer,
+    )]
     pub msgboard_stale_block_buffer: u64,
 
     /// Database directory for persistent message storage.
