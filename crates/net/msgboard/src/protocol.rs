@@ -5651,4 +5651,18 @@ mod tests {
             );
         }
     }
+
+    /// An extreme `count_limit` must not overflow the ingress budget. Bytes
+    /// land on the multiplexer's per-connection ceiling.
+    #[test]
+    fn extreme_count_limits_do_not_overflow_the_ingress_budget() {
+        for count_limit in [0usize, 1, 10_000, usize::MAX / 1000, usize::MAX] {
+            let cfg = MsgboardConfig { count_limit, ..MsgboardConfig::default() };
+            let (frames, bytes) = honest_inbound_burst(&cfg);
+            assert!(frames > 0 && bytes > 0, "count_limit {count_limit}");
+            let _ = inbound_limits_for(&cfg);
+        }
+        let huge = MsgboardConfig { count_limit: usize::MAX, ..MsgboardConfig::default() };
+        assert_eq!(honest_inbound_burst(&huge).1, usize::MAX, "saturates instead of wrapping");
+    }
 }

@@ -23,6 +23,12 @@ const MIN_COMMIT_EVERY: Duration = Duration::from_millis(100);
 /// between INFO lines, so `0s` would flood the journal.
 const MIN_LOG_EVERY: Duration = Duration::from_secs(1);
 
+/// Largest accepted `--msgboard.stale-block-buffer`.
+pub(crate) const MAX_STALE_BLOCK_BUFFER: u64 = 1080;
+
+/// Largest accepted `--msgboard.count-limit`.
+pub(crate) const MAX_COUNT_LIMIT: usize = 1_000_000;
+
 /// Parse a humantime duration and refuse one below `min`.
 fn parse_min_duration(raw: &str, flag: &str, min: Duration) -> Result<Duration, String> {
     let d = humantime::parse_duration(raw).map_err(|e| format!("`{raw}`: {e}"))?;
@@ -371,5 +377,71 @@ mod tests {
             };
             assert_eq!(got, expected, "{arg} is the minimum and must be accepted");
         }
+    }
+
+    fn parse_err(argv: &[&str]) -> String {
+        match CommandParser::<MsgboardArgs>::try_parse_from(argv) {
+            Ok(_) => panic!("{argv:?} must not start the node"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// A zero multiplier makes every work ratio clear the minimum, which turns
+    /// the work gate off, and a zero divisor is not a ratio. Both are refused
+    /// at launch with the flag named.
+    #[test]
+    fn a_zero_work_threshold_is_refused() {
+        let err = parse_err(&["reth", "--msgboard.work-multiplier=0"]);
+        assert!(err.contains("--msgboard.work-multiplier"), "{err}");
+        let err = parse_err(&["reth", "--msgboard.work-divisor=0"]);
+        assert!(err.contains("--msgboard.work-divisor"), "{err}");
+
+        let args = parse(&["reth", "--msgboard.work-multiplier=1", "--msgboard.work-divisor=1"]);
+        assert_eq!((args.msgboard_work_multiplier, args.msgboard_work_divisor), (1, 1));
+    }
+
+    /// The stale buffer is added to the bottom of the live window, which is at
+    /// most `MAX_BLOCK_RANGE` blocks wide. A larger buffer leaves nothing to
+    /// request, and a `u64::MAX` one overflows the sum.
+    #[test]
+    fn the_stale_block_buffer_is_capped_at_the_window_size() {
+        let at = format!("--msgboard.stale-block-buffer={MAX_STALE_BLOCK_BUFFER}");
+        assert_eq!(parse(&["reth", &at]).msgboard_stale_block_buffer, MAX_STALE_BLOCK_BUFFER);
+
+        for over in [MAX_STALE_BLOCK_BUFFER + 1, u64::MAX] {
+            let flag = format!("--msgboard.stale-block-buffer={over}");
+            let err = parse_err(&["reth", &flag]);
+            assert!(err.contains("--msgboard.stale-block-buffer"), "{err}");
+            assert!(err.contains(&MAX_STALE_BLOCK_BUFFER.to_string()), "names the maximum: {err}");
+        }
+        assert_eq!(
+            parse(&["reth", "--msgboard.stale-block-buffer=0"]).msgboard_stale_block_buffer,
+            0
+        );
+    }
+
+    /// The count limit sizes the ingress budget and the board itself, so an
+    /// absurd value is refused instead of wrapping the arithmetic built on it.
+    #[test]
+    fn the_count_limit_is_capped() {
+        let at = format!("--msgboard.count-limit={MAX_COUNT_LIMIT}");
+        assert_eq!(parse(&["reth", &at]).msgboard_count_limit, MAX_COUNT_LIMIT);
+
+        for over in [MAX_COUNT_LIMIT + 1, usize::MAX] {
+            let flag = format!("--msgboard.count-limit={over}");
+            let err = parse_err(&["reth", &flag]);
+            assert!(err.contains("--msgboard.count-limit"), "{err}");
+            assert!(err.contains(&MAX_COUNT_LIMIT.to_string()), "names the maximum: {err}");
+        }
+    }
+
+    /// The new bounds sit well clear of the defaults, so no existing
+    /// configuration is refused.
+    #[test]
+    fn the_defaults_are_inside_the_new_bounds() {
+        let args = MsgboardArgs::default();
+        assert!(args.msgboard_work_multiplier >= 1 && args.msgboard_work_divisor >= 1);
+        assert!(args.msgboard_stale_block_buffer <= MAX_STALE_BLOCK_BUFFER);
+        assert!(args.msgboard_count_limit <= MAX_COUNT_LIMIT);
     }
 }

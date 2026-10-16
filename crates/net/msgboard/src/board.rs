@@ -2485,4 +2485,28 @@ mod tests {
         }
         assert_eq!(board.filter_wanted(PeerId::repeat_byte(7), &[good]), vec![good]);
     }
+
+    /// Config values from outside the CLI parser still must not overflow the
+    /// window arithmetic, in a debug build or a release one.
+    #[test]
+    fn an_extreme_stale_block_buffer_does_not_overflow() {
+        let cfg = MsgboardConfig { stale_block_buffer: u64::MAX, ..easy_cfg() };
+        let board = MsgBoard::new(cfg);
+        board.set_ready();
+        board.set_head(100, block_hash_one());
+        let id = reth_msgboard_types::MsgID::from_checked(
+            VERSION_V1,
+            &block_hash_one(),
+            1,
+            1,
+            1_000_000,
+            &category_hash(),
+            &hash_byte(9),
+        );
+
+        // Every block is inside the buffer, so nothing is worth requesting. A
+        // wrapped sum would put the cutoff near zero and request everything.
+        assert!(board.fetchable(&[id]).is_empty());
+        assert!(board.filter_wanted(PeerId::repeat_byte(7), &[id]).is_empty());
+    }
 }
