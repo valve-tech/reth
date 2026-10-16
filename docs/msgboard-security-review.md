@@ -65,6 +65,22 @@ Round 2 reviewed `main` at `0b46d7d398` with four read-only reviewers: the chang
 | 33 | Info | Further erigon differences to document as intentional: `getMessage` miss returns `null` (erigon errors), `addMessage` decode errors return -32602 (erigon -32000), status difficulty shown as 10000/1000000 (erigon 1/100, same ratio), subscription filter `{}` means all categories, lenient penalty for unknown-block bodies. Two parity-gaps entries are stale. | `docs/msgboard-parity-gaps.md` | `fix/msgboard-r2-rpc` | documented in parity-gaps §28-29 (!18, !19) |
 | 34 | Info | Test quality: six tests would still pass if the behaviour they test broke (claim release on a dropped send, the session gauge in the connection loop, subscription gauge decrement, two sleep-based tests, an eviction test with no upper bound); ten important behaviours have no test. | test modules | `fix/msgboard-r2-p2p` | fixed in !20 (8ffb6c12ad) |
 
+## Round 3 findings (2026-10-15)
+
+Round 3 was a read-only review of `crates/net/msgboard` and `crates/net/msgboard-types` at the audit commit. It found no Critical or High issue and no panic reachable from network input.
+
+| # | Severity | Finding | Where | Status |
+|---|---|---|---|---|
+| 35 | Low | `load_from_db` queued the hash key for deletion when it met a duplicate row, which is the row of the copy it kept. | `board.rs` `load_from_db` | fixed (PR 54) |
+| 36 | Low | An announced ID with a zero divisor or multiplier passed the work gate and was claimed and requested. | `config.rs` `is_work_acceptable` | fixed (PR 54) |
+| 37 | Low | Operator limits were not validated, and extreme values overflowed the window and ingress arithmetic. | `args.rs`, `board.rs`, `protocol.rs` | fixed (PR 54) |
+| 38 | Low | `msgboard_content` built the whole response before `--rpc.max-response-size` could refuse it. At the largest `--msgboard.size-limit` that is about 2 GB. | `rpc.rs` | fixed: a call whose estimated response is past 200 MiB is refused before the build |
+| 39 | Low | The `msg/1` frame ceiling was checked only after the multiplexer had buffered the frame. | `protocol.rs` `inbound_limits_for` | fixed: the ceiling is declared to the multiplexer |
+| 40 | Info | A failure to open or load the database was only logged. | `launch.rs` | fixed: `msgboard.persistence_failures` counts it |
+| 41 | Info | A stored row anchored far above the head was kept, announced and never expired. | `board.rs` `seed_window` | fixed: `seed_window` drops messages more than one window above the head |
+| 42 | Info | Claims are keyed by the full 121-byte ID, so one work hash announced with different non-hash fields takes several claim slots. | `pending.rs` | open: bounded by the per-peer and global claim caps; changing the key changes how alternates and exhaustion count, so it needs its own change |
+| 43 | Info | `MsgIndex::content_page` with `limit` 0 returns an empty page with no cursor. | `index.rs` | open: the RPC layer rejects `limit` 0, so it is not reachable |
+
 ## Residual risks
 
 These risks stay after the fixes. We accept them on purpose, and the auditor should see them stated.
@@ -106,3 +122,4 @@ The reviewers verified these. The auditor can use this list to see what we cover
 | 2026-10-01 | Round 2 review: findings 20-34 recorded, R7 and R8 added. R1, R1b, R5 and R6 are understated until findings 20, 23 and 26 are fixed. |
 | 2026-10-01 | Round 2 fixes merged: !18 (block window), !19 (RPC), !20 (p2p). Findings 20-31, 33 and 34 closed; 26 partly (R6a); 32 open (R8). R1 rewritten for the per-subnet bound. |
 | 2026-10-01 | !22 hash-ordered index (finding 32, msgboard half). !23 R1 mitigations: session rejoin, trusted first, rescue fetch from non-announcers, exhaustion metrics. R1 and R8 rewritten. |
+| 2026-10-15 | Round 3 review: findings 35-43 recorded. 35-37 fixed in PR 54; 38-41 fixed in the follow-up; 42 and 43 open. |
