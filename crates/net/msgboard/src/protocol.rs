@@ -5534,6 +5534,15 @@ mod tests {
         /// ended: `Some(err)` when the multiplexer cut it, `None` when it was
         /// still open and holding the flood.
         async fn flood_a_stalled_node(flood_bytes: usize) -> Option<P2PStreamError> {
+            send_to_a_stalled_node(full_request(), flood_bytes).await
+        }
+
+        /// [`flood_a_stalled_node`] with a chosen frame, whose first byte is the
+        /// opcode. It is sent until `flood_bytes` have gone out, and at least once.
+        async fn send_to_a_stalled_node(
+            request: Vec<u8>,
+            flood_bytes: usize,
+        ) -> Option<P2PStreamError> {
             let handler = MsgboardProtocolHandler::new(Arc::new(MsgBoard::new(easy_cfg())))
                 .on_incoming("127.0.0.1:0".parse().unwrap())
                 .unwrap();
@@ -5574,16 +5583,19 @@ mod tests {
                 .find(&MSG_CAPABILITY)
                 .expect("both sides speak msg/1")
                 .relative_message_id_offset();
-            let mut request = full_request();
+            let mut request = request;
             request[0] += offset;
             let request = Bytes::from(request);
             let mut sent = 0;
-            while sent < flood_bytes {
+            loop {
                 // A cut session fails the send. The victim's result says why.
                 if attacker.send(request.clone()).await.is_err() {
                     break;
                 }
                 sent += request.len();
+                if sent >= flood_bytes {
+                    break;
+                }
             }
             let outcome = victim.await.unwrap();
             drop(attacker);
@@ -5635,6 +5647,54 @@ mod tests {
                 MUX_CONNECTION_IN_BUFFER_BYTES,
                 "no protocol can buffer past the multiplexer's per-connection budget",
             );
+        }
+
+        /// A frame of `len` bytes, opcode included, that no decoder would
+        /// accept, so a session that survives it did so on size alone.
+        fn frame_of(len: usize) -> Vec<u8> {
+            let mut raw = vec![0u8; len];
+            raw[0] = GET_BOARD_MESSAGES;
+            raw
+        }
+
+        /// A frame over the inbound ceiling is cut by the multiplexer, before
+        /// it is buffered or read, with the session closed as for any other
+        /// oversized sub-protocol frame. The app-level check in
+        /// `handle_incoming` only runs once the read loop takes a frame, so
+        /// with the read loop stalled it never runs at all.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_frame_over_the_ceiling_is_cut_before_it_is_buffered() {
+            let outcome = send_to_a_stalled_node(frame_of(MAX_INBOUND_FRAME_SIZE + 1), 1).await;
+            assert!(
+                matches!(
+                    outcome,
+                    Some(P2PStreamError::SubprotocolMessageTooBig { max_size, .. })
+                        if max_size == MAX_INBOUND_FRAME_SIZE
+                ),
+                "an oversized frame was buffered: {outcome:?}",
+            );
+        }
+
+        /// The ceiling itself is legal, so the cut must not move below it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_frame_at_the_ceiling_is_buffered() {
+            let outcome = send_to_a_stalled_node(frame_of(MAX_INBOUND_FRAME_SIZE), 1).await;
+            assert!(outcome.is_none(), "a frame of exactly the ceiling was refused: {outcome:?}");
+        }
+
+        /// Every config declares the same frame ceiling, whatever the burst.
+        #[test]
+        fn the_ingress_limits_declare_the_frame_ceiling() {
+            for cfg in [
+                MsgboardConfig::default(),
+                MsgboardConfig { size_limit: MAX_SAFE_SIZE_LIMIT, ..Default::default() },
+                MsgboardConfig { count_limit: 1, ..Default::default() },
+            ] {
+                assert_eq!(
+                    inbound_limits_for(&cfg).max_frame_bytes(),
+                    Some(MAX_INBOUND_FRAME_SIZE),
+                );
+            }
         }
 
         /// A peer that requests at line rate but reads slowly holds our read
