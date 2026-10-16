@@ -79,6 +79,9 @@ pub struct MsgboardApi {
     /// Bounds concurrent `msgboard_addMessage` verifications; see
     /// [`ADD_MESSAGE_CONCURRENT_VERIFIES`].
     add_permits: Arc<Semaphore>,
+    /// Largest estimated `msgboard_content` response; see
+    /// [`CONTENT_MAX_RESPONSE_BYTES`].
+    content_budget: u64,
     #[cfg(test)]
     probe: Arc<tests::BuildProbe>,
 }
@@ -91,9 +94,18 @@ impl MsgboardApi {
             content_permits: Arc::new(Semaphore::new(CONTENT_CONCURRENT_BUILDS)),
             page_permits: Arc::new(Semaphore::new(CONTENT_PAGE_CONCURRENT_BUILDS)),
             add_permits: Arc::new(Semaphore::new(ADD_MESSAGE_CONCURRENT_VERIFIES)),
+            content_budget: CONTENT_MAX_RESPONSE_BYTES,
             #[cfg(test)]
             probe: Default::default(),
         }
+    }
+
+    /// Replace the largest estimated `msgboard_content` response, in bytes.
+    ///
+    /// The default is [`CONTENT_MAX_RESPONSE_BYTES`].
+    pub const fn with_content_budget(mut self, bytes: u64) -> Self {
+        self.content_budget = bytes;
+        self
     }
 
     /// Waits for one of `permits`, then runs `f` on the blocking pool and
@@ -164,6 +176,11 @@ impl MsgboardApi {
         payload
     }
 }
+
+/// Largest `msgboard_content` response the node agrees to build, in estimated
+/// JSON bytes. The default is the `--rpc.max-response-size` default of 200 MiB
+/// that this build sets.
+pub const CONTENT_MAX_RESPONSE_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Most `msgboard_content` responses the node holds at once.
 ///
@@ -1323,6 +1340,81 @@ mod tests {
     async fn content_rejects_a_zero_limit() {
         let m = module(filled_board(3, 8));
         assert_eq!(call_err_code(&m, "msgboard_content", vec![json!({"limit": 0})]).await, -32602);
+    }
+
+    // ── content response budget ──────────────────────────────────────────────
+
+    /// The estimate behind the budget: two hex characters per `data` byte plus
+    /// the fixed fields, counted at 500 bytes a message.
+    fn content_estimate(count: u64, data_len: u64) -> u64 {
+        count * (2 * data_len + 500)
+    }
+
+    /// A call that would build a response past the budget is refused before
+    /// the build. The only other outcome is a multi-gigabyte response that
+    /// `--rpc.max-response-size` rejects after it has been built and held.
+    #[tokio::test]
+    async fn content_past_the_budget_is_refused_and_names_the_page_method() {
+        let api = MsgboardApi::new(filled_board(10, 1_000)).with_content_budget(20_000);
+        let m = api.into_rpc();
+
+        match m.call::<_, Value>("msgboard_content", rpc_params_none()).await {
+            Err(MethodsError::JsonRpc(e)) => {
+                assert_eq!(e.code(), -32602);
+                let text = e.message();
+                assert!(text.contains("msgboard_contentPage"), "{text}");
+                assert!(text.contains("limit"), "{text}");
+            }
+            other => panic!("expected -32602, got {other:?}"),
+        }
+    }
+
+    /// Narrowing the call, or paging, gets the same messages through.
+    #[tokio::test]
+    async fn content_inside_the_budget_is_unchanged() {
+        let api = MsgboardApi::new(filled_board(10, 1_000)).with_content_budget(20_000);
+        let m = api.into_rpc();
+
+        let v: Value = m.call("msgboard_content", vec![json!({"limit": 5})]).await.unwrap();
+        assert_eq!(total_msgs(&v), 5, "5 messages estimate to 12_500, inside 20_000");
+
+        let v: Value = m.call("msgboard_contentPage", vec![json!({"limit": 10})]).await.unwrap();
+        assert_eq!(total_msgs(&v["content"]), 10, "paging has its own cap and no byte budget");
+    }
+
+    /// The budget is inclusive: a response that estimates to exactly the
+    /// budget is built, one byte more is not.
+    #[tokio::test]
+    async fn content_budget_is_inclusive() {
+        let exact = content_estimate(10, 1_000);
+        let board = filled_board(10, 1_000);
+
+        let m = MsgboardApi::new(Arc::clone(&board)).with_content_budget(exact).into_rpc();
+        let v: Value = m.call("msgboard_content", rpc_params_none()).await.unwrap();
+        assert_eq!(total_msgs(&v), 10);
+
+        let m = MsgboardApi::new(board).with_content_budget(exact - 1).into_rpc();
+        assert_eq!(call_err_code(&m, "msgboard_content", vec![]).await, -32602);
+    }
+
+    /// The budget counts the messages the call returns, not the board. A
+    /// category with few messages on a large board still answers whole.
+    #[tokio::test]
+    async fn content_budget_counts_only_the_matching_messages() {
+        let m = MsgboardApi::new(filled_board(10, 1_000)).with_content_budget(2_600).into_rpc();
+        let none: Value =
+            m.call("msgboard_content", vec![json!({"category": category(0xBB)})]).await.unwrap();
+        assert_eq!(total_msgs(&none), 0);
+        let one: Value = m.call("msgboard_content", vec![json!({"limit": 1})]).await.unwrap();
+        assert_eq!(total_msgs(&one), 1);
+    }
+
+    /// The default budget must admit the largest board the defaults allow, or
+    /// the budget would break the call it is meant to protect.
+    #[test]
+    fn the_default_budget_admits_a_full_default_board() {
+        let full = content_estimate(10_000, 8 * 1024);
+        assert!(full <= CONTENT_MAX_RESPONSE_BYTES, "{full} > {CONTENT_MAX_RESPONSE_BYTES}");
     }
 
     // ── subscribe: the server's own cap ──────────────────────────────────────
