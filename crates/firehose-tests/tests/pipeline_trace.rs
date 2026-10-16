@@ -37,7 +37,6 @@ fn pipeline_executor_matches_golden() {
     // The pipeline path must also route pre-execution system calls through the inspector.
     assert!(
         !outcome.block.system_calls.is_empty(),
-        "pipeline path produced no system calls — the alloy-evm inspector patch may not be active \
-         (see progress.txt)",
+        "pipeline path produced no system calls — the alloy-evm inspector patch may not be active",
     );
 }

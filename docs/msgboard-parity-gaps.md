@@ -1,7 +1,7 @@
 # MsgBoard Parity Gaps — reth `extension-model` vs erigon-pulse `v3.0.0-RC8`
 
 **Audit date:** 2026-04-27
-**Reference source:** `~/go/src/gitlab.com/pulsechaincom/erigon-pulse` @ `v3.0.0-RC8` = `48cdb29e35` (commit message: *Prepare release candidate 8*), package `msgboard/`
+**Reference source:** the erigon-pulse source tree @ `v3.0.0-RC8` = `48cdb29e35` (commit message: *Prepare release candidate 8*), package `msgboard/`
 
 > **Path corrected 2026-07-28.** This line previously read `private-erigon-pulse`.
 > The commit hash was right and the source was on disk the whole time under the
@@ -564,7 +564,7 @@ to chunk.
 > different directory name (see the header note).
 
 - The §11.5 O2 caveat is **unchanged**: erigon's `Content` ordering remains
-  unverified, and `~/go/src/gitlab.com/pulsechaincom/private-erigon-pulse` was
+  unverified, and `private-erigon-pulse` was
   not present on this machine either. Highest-value remaining parity item, and
   it now blocks §12.9 as well.
 - The unbounded request frame in §12.9.
@@ -583,7 +583,7 @@ to chunk.
 **Audit date:** 2026-07-28
 **Trigger:** §12.11 listed three items blocked on "erigon source not available on
 this machine". It is available — at
-`~/go/src/gitlab.com/pulsechaincom/erigon-pulse/msgboard/`, checked out at
+the `msgboard/` package of the erigon-pulse source tree, checked out at
 `v3.0.0-RC8`. Rounds 3 and 4 looked for `private-erigon-pulse` and, not finding
 it, reasoned from the prose in this document instead. Everything below follows
 from twenty minutes of reading `message_index.go`.
@@ -1237,7 +1237,7 @@ request, not 6.6 MiB. The message bodies are never copied. No change made.
 > currently return empty, so they can fire but are not firing.
 >
 > `direct-b-evm-1` is absent from those five: it still runs a build predating
-> the counters (added in `5d238f5f85`). See `progress.txt`.
+> the counters (added in `5d238f5f85`).
 >
 > Re-announcement (fourth bullet) got a partial answer too: `943a` shows 428
 > `announcements_received` against 5 `requests_sent`, so `filter_wanted` is
@@ -1564,7 +1564,7 @@ it has not been written. Three independent checks agree:
   any of them;
 - every published `@pulsechain/msgboard` release, 0.0.17 through 0.0.28,
   implements the old construction — `challenge.getX()`, `hash % difficulty === 0n`;
-- `gitlab.com/pulsechaincom/msgboard`, which the spec names as the TypeScript
+- the TypeScript msgboard repository, which the spec names as the TypeScript
   reference, has had **no push in four months** (checked by the team, 2026-08-19).
 
 So the spec is a **design document, not a description of shipped code**. Its
@@ -2568,7 +2568,7 @@ upgrade should keep the window short.
 
 These two differences are deliberate. They are here so a later audit does not
 read them as parity bugs. The erigon references are to
-`~/go/src/gitlab.com/pulsechaincom/erigon-pulse` at `v3.0.0-RC8`
+the erigon-pulse source tree at `v3.0.0-RC8`
 (`48cdb29e35`), package `msgboard/`.
 
 ### 27.1 A zero difficulty rejects the whole frame, not one message
@@ -2623,7 +2623,7 @@ current when ready comes.
 
 ## 29. RPC parity, review round 2 (2026-10-01)
 
-The erigon references are to `~/go/src/gitlab.com/pulsechaincom/erigon-pulse`,
+The erigon references are to the erigon-pulse source tree,
 files `rpc/jsonrpc/msgboard_api.go`, `rpc/types.go` and `msgboard/`.
 
 ### 29.1 Fixed
@@ -2698,7 +2698,7 @@ so reth keeps it.
 
 These behaviours are reth-only and change only whom reth asks for a message.
 They add no message type and no field, so they are wire-compatible with erigon.
-The erigon references are to `~/go/src/gitlab.com/pulsechaincom/erigon-pulse`,
+The erigon references are to the erigon-pulse source tree,
 package `msgboard/`.
 
 ### 30.1 Trusted peers are asked first, and peers that did not announce are asked last

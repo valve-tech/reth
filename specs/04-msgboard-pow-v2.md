@@ -583,4 +583,4 @@ Posters iterate on `nonce` until the work hash falls below a difficulty target. 
 
 2. A fixed worked example (inputs and expected digests for every PoW step) is locked in [`TestPoWGoldenVector`](./pow_message_test.go). Client implementations should match those hex values byte-for-byte.
 
-3. A typescript reference implementation is available here: https://gitlab.com/pulsechaincom/msgboard.
+3. A TypeScript reference implementation exists in the `msgboard` repository.

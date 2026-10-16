@@ -118,7 +118,6 @@ Regenerate the table with:
 - `docs/msgboard-spec-feedback.md` and `docs/msgboard-rpc.md`.
 - `PULSE-PARITY-AUDIT.md`: PulseChain parity checklist.
 - `specs/`: PulseChain support and msgboard PoW v2 specs.
-- `progress.txt` and `.dev/todo/`: internal working notes (not a specification).
 
 ## Build and test
 
@@ -138,4 +137,4 @@ CI definitions are in `.github/workflows/valve-ci.yml` and `valve-release.yml`. 
 - Upstream paradigmxyz/reth code that is unchanged from `v2.7.0`.
 - StreamingFast Firehose code that is unchanged from `reth-v2.7.0-fh3.1-2`, except where valve code changes it (see the second LOC column).
 - Third-party dependencies, including `firehose-tracer` 5.5.0. The valve-tech/evm (`alloy-evm`) fork is out of scope unless agreed separately.
-- Deployment files under `deploy/`, docs, and CI configuration. These can be reviewed for information only.
+- Docs and CI configuration. These can be reviewed for information only.
