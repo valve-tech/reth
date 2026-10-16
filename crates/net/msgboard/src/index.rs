@@ -125,9 +125,27 @@ impl MsgIndex {
     }
 
     /// Remove every message anchored above block `upper`.
+    ///
+    /// The comparator orders by block first, so those messages form a suffix of
+    /// `msgs`, and one `split_off` takes it.
     pub fn remove_above_block(&mut self, upper: u64) -> Vec<Arc<CheckedPoWMsg>> {
-        let _ = upper;
-        Vec::new()
+        debug_assert!(
+            self.msgs.windows(2).all(|w| w[0].block_number <= w[1].block_number),
+            "the index must be sorted by block",
+        );
+        let start = self.msgs.partition_point(|m| m.block_number <= upper);
+        let removed = self.msgs.split_off(start);
+        for msg in &removed {
+            self.by_hash.remove(&msg.hash);
+            self.total_size = self.total_size.saturating_sub(msg.msg.data.len() as u64);
+            if let Some(cat_map) = self.categories.get_mut(&msg.msg.category) {
+                cat_map.remove(&msg.hash);
+                if cat_map.is_empty() {
+                    self.categories.remove(&msg.msg.category);
+                }
+            }
+        }
+        removed
     }
 
     /// Remove and return the oldest message (smallest `block_number` / `difficulty_ratio`).

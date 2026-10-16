@@ -419,6 +419,8 @@ impl MsgBoard {
     /// See [`BlockFilter::seed`]. A reader never sees a partly loaded window,
     /// so an announcement anchored in the window is never wrongly rejected
     /// while the window loads.
+    ///
+    /// Messages anchored more than one window above `head` are dropped too.
     pub fn seed_window(&self, head: u64, blocks: impl IntoIterator<Item = (u64, B256)>) {
         let mut state = self.state.lock();
         state.block_filter.seed(head, blocks);
@@ -426,6 +428,24 @@ impl MsgBoard {
         let stale = state.index.remove_below_block(lower);
         self.metrics.expired.increment(stale.len() as u64);
         for evicted in stale {
+            state.discard(evicted);
+        }
+
+        // Expiry only looks below the window, so a message anchored above the
+        // head would never leave on its own. A row read from the database can
+        // be one: it was written by a node on another chain, or after the head
+        // moved back. One window of slack keeps what a shallow rewind leaves.
+        let upper = head.saturating_add(state.block_filter.limit());
+        let future = state.index.remove_above_block(upper);
+        if !future.is_empty() {
+            tracing::warn!(
+                target: "msgboard",
+                count = future.len(),
+                head,
+                "dropped stored messages anchored above the chain head",
+            );
+        }
+        for evicted in future {
             state.discard(evicted);
         }
         self.metrics.msg_count.set(state.index.len() as f64);
