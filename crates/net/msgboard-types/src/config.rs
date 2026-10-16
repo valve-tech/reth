@@ -86,7 +86,15 @@ impl MsgboardConfig {
     }
 
     /// Returns `true` if the work ratio `mult/div` meets the minimum threshold.
+    ///
+    /// A zero multiplier or a zero divisor is not a ratio and never passes. The
+    /// cross-multiplied comparison alone would accept any multiplier over a zero
+    /// divisor, and every message body with either value is refused at decode,
+    /// so accepting one here only announces work nobody can deliver.
     pub const fn is_work_acceptable(&self, multiplier: u64, divisor: u64) -> bool {
+        if multiplier == 0 || divisor == 0 {
+            return false;
+        }
         // Compare mult/div ≥ cfg.mult/cfg.div  ⟺  mult × cfg.div ≥ cfg.mult × div
         // Use u128 to avoid overflow for reasonable field values.
         (multiplier as u128) * (self.work_divisor as u128) >=
@@ -125,5 +133,30 @@ mod tests {
         assert!(cfg.is_work_acceptable(20_000, 1_000_000));
         // Lower ratio: 9_999 / 1_000_000 < 10_000 / 1_000_000
         assert!(!cfg.is_work_acceptable(9_999, 1_000_000));
+    }
+
+    /// A zero divisor or a zero multiplier is not a work ratio. Neither passes
+    /// the gate, whatever the other value is.
+    #[test]
+    fn is_work_acceptable_rejects_a_zero_multiplier_or_divisor() {
+        let cfg = MsgboardConfig::default();
+        for (m, d) in [(1, 0), (0, 0), (u64::MAX, 0), (0, 1), (0, u64::MAX)] {
+            assert!(!cfg.is_work_acceptable(m, d), "{m}/{d} must be rejected");
+        }
+        // A permissive minimum does not change that.
+        let lax = MsgboardConfig { work_multiplier: 1, work_divisor: u64::MAX, ..cfg };
+        assert!(!lax.is_work_acceptable(1, 0));
+        assert!(!lax.is_work_acceptable(0, 1));
+    }
+
+    /// The comparison is exact at both ends of the u64 range.
+    #[test]
+    fn is_work_acceptable_is_exact_for_extreme_ratios() {
+        let cfg = MsgboardConfig::default();
+        assert!(cfg.is_work_acceptable(10_000, 1_000_000), "exactly the minimum is accepted");
+        assert!(!cfg.is_work_acceptable(9_999, 1_000_000));
+        assert!(cfg.is_work_acceptable(u64::MAX, 1));
+        assert!(cfg.is_work_acceptable(u64::MAX, u64::MAX - 1));
+        assert!(!cfg.is_work_acceptable(1, u64::MAX));
     }
 }

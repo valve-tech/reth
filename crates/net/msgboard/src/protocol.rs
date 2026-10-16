@@ -305,8 +305,8 @@ fn honest_inbound_burst(cfg: &MsgboardConfig) -> (usize, usize) {
     let announce_frames = cfg.count_limit.div_ceil(MAX_IDS_PER_FRAME);
     let bodies_per_frame = (P2P_MSG_PACKET_LIMIT / max_wire_body_len(cfg.size_limit)).max(1);
     let reply_frames = MAX_WANT_PER_PEER.div_ceil(bodies_per_frame);
-    let frames = announce_frames + reply_frames;
-    (frames, frames * MAX_INBOUND_FRAME_SIZE)
+    let frames = announce_frames.saturating_add(reply_frames);
+    (frames, frames.saturating_mul(MAX_INBOUND_FRAME_SIZE))
 }
 
 /// The ingress limits for a board with `cfg`: the honest burst, or the
@@ -5650,5 +5650,19 @@ mod tests {
                 "the session held {flood} bytes of unread requests and stayed open: {outcome:?}",
             );
         }
+    }
+
+    /// An extreme `count_limit` must not overflow the ingress budget. Bytes
+    /// land on the multiplexer's per-connection ceiling.
+    #[test]
+    fn extreme_count_limits_do_not_overflow_the_ingress_budget() {
+        for count_limit in [0usize, 1, 10_000, usize::MAX / 1000, usize::MAX] {
+            let cfg = MsgboardConfig { count_limit, ..MsgboardConfig::default() };
+            let (frames, bytes) = honest_inbound_burst(&cfg);
+            assert!(frames > 0 && bytes > 0, "count_limit {count_limit}");
+            let _ = inbound_limits_for(&cfg);
+        }
+        let huge = MsgboardConfig { count_limit: usize::MAX, ..MsgboardConfig::default() };
+        assert_eq!(honest_inbound_burst(&huge).1, usize::MAX, "saturates instead of wrapping");
     }
 }

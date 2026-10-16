@@ -244,7 +244,8 @@ impl MsgBoard {
     /// checks (mirrors `loadAndRepairDbLocked` in erigon-pulse), so messages
     /// that were valid under an older config but no longer satisfy a tightened
     /// one are pushed onto `discarded` for the next flush to delete from disk.
-    /// Duplicate hashes already present in the index follow the same path.
+    /// A duplicate of a message already in the index is dropped without a
+    /// deletion, since its hash names the row of the copy that was kept.
     pub fn load_from_db(&self) -> eyre::Result<u64> {
         let Some(ref env) = self.db else { return Ok(0) };
         // `db_load_all` reports the skipped rows itself, with the decode error,
@@ -286,9 +287,12 @@ impl MsgBoard {
             if state.index.insert(Arc::clone(&arc)) {
                 loaded += 1;
             } else {
-                // Duplicate hash on disk — schedule for deletion to keep the
-                // table clean across restarts.
-                state.discard(arc);
+                // The same message was read from a second row. Nothing is
+                // scheduled for deletion: a row is deleted by message hash, and
+                // this copy's hash is the key of the row belonging to the copy
+                // already kept. A second row filed under another key was moved
+                // onto the hash key by `db_load_all`, so no separate row is
+                // left to clean up either.
                 dropped_duplicate += 1;
             }
             // Don't broadcast loaded messages — peers will learn about them
@@ -447,7 +451,7 @@ impl MsgBoard {
     ) -> Vec<MsgID> {
         let now = tokio::time::Instant::now();
         let mut state = self.state.lock();
-        let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
+        let stale_lower = state.block_filter.lower().saturating_add(self.cfg.stale_block_buffer);
 
         // The map can only grow on this path, so it is trimmed here without a
         // background task. The sweep is rate-limited, so a flood of
@@ -489,7 +493,7 @@ impl MsgBoard {
     /// `filter_wanted` once it can request them.
     pub fn fetchable(&self, ids: &[MsgID]) -> Vec<MsgID> {
         let state = self.state.lock();
-        let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
+        let stale_lower = state.block_filter.lower().saturating_add(self.cfg.stale_block_buffer);
         ids.iter()
             .filter(|id| self.is_fetchable(&state.index, &state.block_filter, stale_lower, id))
             .copied()
@@ -621,7 +625,7 @@ impl MsgBoard {
         state: &mut BoardState,
         now: tokio::time::Instant,
     ) -> (u64, Vec<ExhaustedClaim>) {
-        let stale_lower = state.block_filter.lower() + self.cfg.stale_block_buffer;
+        let stale_lower = state.block_filter.lower().saturating_add(self.cfg.stale_block_buffer);
         let BoardState { index, block_filter, pending, .. } = state;
         pending.maybe_sweep(now, |id| index.has(&id.message_hash()));
         pending.settle_exhausted(now, |id| self.is_fetchable(index, block_filter, stale_lower, id))
@@ -2402,5 +2406,107 @@ mod tests {
         board.seed_window(200 + range, [(200 + range, block(10))]);
         check(&board);
         assert!(board.all_messages().is_empty(), "seed_window expired the rest");
+    }
+
+    /// A database holding one message twice, once under a wrong key and once
+    /// under its hash, keeps that message's row across a flush.
+    ///
+    /// The misfiled copy is moved onto the hash key before the board sees it,
+    /// so the second copy is a duplicate of the one the board kept. Discarding
+    /// it queued the hash key for deletion, and the next flush deleted the row
+    /// of the message the board was serving.
+    #[test]
+    fn a_duplicate_row_does_not_delete_the_row_of_the_kept_message() {
+        use alloy_rlp::Encodable;
+        use reth_libmdbx::WriteFlags;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = crate::db::open_msgboard_db(dir.path()).expect("open db");
+        let checked = make_pow_msg(find_nonce(b"persist me"), b"persist me")
+            .to_checked(100, 0)
+            .expect("valid");
+        let mut enc = Vec::new();
+        checked.encode(&mut enc);
+        {
+            let tx = env.begin_rw_txn().expect("rw txn");
+            let db = tx.open_db(Some("BoardMessage")).expect("open table");
+            tx.put(db.dbi(), [0xEEu8; 32].as_slice(), &enc, WriteFlags::empty()).expect("put");
+            tx.put(db.dbi(), checked.hash.as_slice(), &enc, WriteFlags::empty()).expect("put");
+            tx.commit().expect("commit");
+        }
+
+        let board = MsgBoard::with_db(easy_cfg(), env);
+        assert_eq!(board.load_from_db().expect("load"), 1, "one message, loaded once");
+        board.flush_to_db().expect("flush");
+        assert_eq!(board.all_messages().len(), 1);
+
+        let (rows, _) = crate::db::db_load_all(board.db.as_ref().unwrap()).expect("reload");
+        assert_eq!(rows.len(), 1, "the kept message keeps its row on disk");
+        assert_eq!(rows[0].hash, checked.hash);
+    }
+
+    /// An announced ID whose work ratio has a zero divisor or a zero
+    /// multiplier is neither fetchable nor claimed.
+    ///
+    /// A message body with either value is refused at decode, so a request for
+    /// one can only waste a claim, a want-list slot and a round trip. The ratio
+    /// `m/0` compared as larger than any minimum.
+    #[test]
+    fn a_degenerate_work_ratio_announcement_is_not_requested() {
+        let board = board_with_block(100);
+        let announce = |multiplier: u64, divisor: u64, seed: u8| {
+            reth_msgboard_types::MsgID::from_checked(
+                VERSION_V1,
+                &block_hash_one(),
+                1,
+                multiplier,
+                divisor,
+                &category_hash(),
+                &hash_byte(seed),
+            )
+        };
+
+        // The control: the same announcement with a real ratio is requested.
+        let good = announce(1, 1_000_000, 0x10);
+        assert_eq!(board.fetchable(&[good]), vec![good], "a valid announcement is fetchable");
+
+        for (i, (multiplier, divisor)) in
+            [(1u64, 0u64), (0, 0), (u64::MAX, 0), (0, 1_000_000), (0, 1)].into_iter().enumerate()
+        {
+            let id = announce(multiplier, divisor, 0x20 + i as u8);
+            assert!(
+                board.fetchable(&[id]).is_empty(),
+                "{multiplier}/{divisor} must not be fetchable"
+            );
+            assert!(
+                board.filter_wanted(PeerId::repeat_byte(7), &[id]).is_empty(),
+                "{multiplier}/{divisor} must not be claimed"
+            );
+        }
+        assert_eq!(board.filter_wanted(PeerId::repeat_byte(7), &[good]), vec![good]);
+    }
+
+    /// Config values from outside the CLI parser still must not overflow the
+    /// window arithmetic, in a debug build or a release one.
+    #[test]
+    fn an_extreme_stale_block_buffer_does_not_overflow() {
+        let cfg = MsgboardConfig { stale_block_buffer: u64::MAX, ..easy_cfg() };
+        let board = MsgBoard::new(cfg);
+        board.set_ready();
+        board.set_head(100, block_hash_one());
+        let id = reth_msgboard_types::MsgID::from_checked(
+            VERSION_V1,
+            &block_hash_one(),
+            1,
+            1,
+            1_000_000,
+            &category_hash(),
+            &hash_byte(9),
+        );
+
+        // Every block is inside the buffer, so nothing is worth requesting. A
+        // wrapped sum would put the cutoff near zero and request everything.
+        assert!(board.fetchable(&[id]).is_empty());
+        assert!(board.filter_wanted(PeerId::repeat_byte(7), &[id]).is_empty());
     }
 }

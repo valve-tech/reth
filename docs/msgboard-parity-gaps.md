@@ -911,23 +911,29 @@ it is the function used by *both* gates: `filter_wanted` (the announce filter,
 erigon's line 233) and the board's add path (erigon's line 392). So the float
 comparison the team asked about is not in reth's accept/reject path at all.
 
-Float survives in exactly one place: `PoWMsg::difficulty_ratio`, used by the
-insert comparator. That one is **parity-required** — erigon's `DifficultyRatio()`
-is `float64`, and the comparator's output is wire-observable through eviction
-(§13.1). Rust and Go both do IEEE-754 round-to-nearest-even for `u64 → f64` and
-for division, so the values are bit-identical and this introduces no divergence.
+**Update.** The insert comparator no longer uses a float either. When this
+section was written it compared `PoWMsg::difficulty_ratio` (`f64`), which was
+parity-required because erigon's `DifficultyRatio()` was `float64`. Erigon has
+since moved to an exact `cmpRatio` (§26.2), and reth follows it:
+`erigon_insert_pos` calls `cmp_ratio` (`crates/net/msgboard/src/index.rs`), which
+cross-multiplies in `u128` like the gate does:
 
-Residual risk is confined to ordering: two distinct `(mult, div)` pairs above
-`2^53` can round to the same `f64` and compare equal where exact rational
-arithmetic would order them. That is erigon's behavior too, so changing it would
-be a divergence. Worth noting only because it interacts with §14.1 — an attacker
-exploiting the overflow gets an enormous ratio, and where it lands among other
-enormous ratios is float-determined.
+```rust
+let left = (a as u128) * (d as u128);
+let right = (b as u128) * (c as u128);
+left.cmp(&right)
+```
 
-No change made. The reth-vs-erigon difference in `is_work_acceptable` (exact vs
-float) is a pre-existing divergence in reth's favour; it can only ever *reject*
-a message erigon accepts by a margin under one `f64` ulp, which no honest client
-produces.
+So no accept/reject decision and no ordering decision in reth compares floats.
+The `2^53` cliff described in the original text, where two distinct pairs round
+to the same ratio and compare equal, does not apply to board ordering.
+`PoWMsg::difficulty_ratio` and `MsgID::difficulty_ratio` still return `f64`, but
+they are informational accessors. Neither is used by the gate or the comparator.
+
+`is_work_acceptable` also refuses a zero multiplier and a zero divisor outright.
+The bare cross-multiplication accepted any multiplier over a zero divisor, and
+no message body with either value gets past decode, so an announced ID carrying
+one could only cost a wasted request.
 
 ### 14.3 Unlimited `GetBoardMessages` requests — 68× reflection amplification — ✅ FIXED
 

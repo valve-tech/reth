@@ -251,10 +251,9 @@ fn every_metric_is_instantiated_and_moves() {
     let oversized = PoWMsg { data: Bytes::from(vec![0u8; 9 * 1024]), ..base };
 
     let weak = PoWMsg { work_divisor: 2_000_000, ..base.clone() };
-    // A zero divisor clears the minimum-work gate — `M × cfg.divisor >=
-    // cfg.multiplier × 0` holds for every `M` — and then leaves `D` undefined.
-    // It is the only input that still reaches `to_checked` with no usable
-    // difficulty, so it is what separates the two rejection counters.
+    // A zero divisor is not a work ratio and stops at the minimum-work gate,
+    // so it is counted with the insufficient work, not as an undefined
+    // difficulty.
     let no_difficulty = PoWMsg { work_divisor: 0, ..base.clone() };
     let bad_work = bad_pow(&[7], 10);
     let unknown_block = PoWMsg { block_hash: B256::repeat_byte(0xEE), ..base.clone() };
@@ -274,12 +273,12 @@ fn every_metric_is_instantiated_and_moves() {
     let snap = Snap::take(&snapshotter);
     assert_eq!(snap.counter("msgboard.accepted_remote"), 1);
     assert_eq!(snap.counter("msgboard.rejected_oversized"), 1);
-    assert_eq!(snap.counter("msgboard.rejected_insufficient_work"), 1);
     assert_eq!(
-        snap.counter("msgboard.rejected_invalid_difficulty"),
-        1,
-        "an undefined difficulty must be counted separately from ordinary bad PoW",
+        snap.counter("msgboard.rejected_insufficient_work"),
+        2,
+        "the weak message and the zero-divisor one",
     );
+    assert_eq!(snap.counter("msgboard.rejected_invalid_difficulty"), 0);
     assert_eq!(snap.counter("msgboard.rejected_invalid_pow"), 1);
     assert_eq!(snap.counter("msgboard.skipped_unknown_block"), 1);
     assert_eq!(snap.counter("msgboard.skipped_duplicate"), 1);
@@ -288,6 +287,27 @@ fn every_metric_is_instantiated_and_moves() {
         0,
         "no rejection should fall through to the catch-all",
     );
+
+    // A minimum that is as lax as the ratio allows lets through a message whose
+    // difficulty rounds to zero. That is the one way to reach `to_checked` with
+    // no usable threshold, and it must not be lumped in with ordinary bad PoW.
+    let lax = Arc::new(MsgBoard::new(MsgboardConfig {
+        work_multiplier: 1,
+        work_divisor: u64::MAX,
+        ..easy_cfg()
+    }));
+    lax.set_ready();
+    lax.set_head(10, block_hash_one());
+    let no_difficulty = PoWMsg { work_multiplier: 1, work_divisor: u64::MAX, ..pow_msg(1, &[7]) };
+    let (added, kickable) = lax.add_remote_msgs(vec![no_difficulty]);
+    assert_eq!((added, kickable), (0, 1));
+    let snap = Snap::take(&snapshotter);
+    assert_eq!(
+        snap.counter("msgboard.rejected_invalid_difficulty"),
+        1,
+        "an undefined difficulty must be counted separately from ordinary bad PoW",
+    );
+    assert_eq!(snap.counter("msgboard.rejected_invalid_pow"), 0);
 
     // ── phase 5: eviction at count_limit is its own counter ──────────────────
     let cfg = MsgboardConfig { count_limit: 2, ..easy_cfg() };

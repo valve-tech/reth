@@ -7,9 +7,9 @@
 | Repository | https://github.com/valve-tech/reth |
 | Tag | `audit-2026-10` (annotated) |
 | Release | `v2.7.0.13-pulse` (GitHub release published 2026-10-12) |
-| Commit | `c6ce6bd6679cfb7046e57d560e33668bec85c8b1` |
+| Commit | The commit the tag points at. Resolve it with `git rev-parse audit-2026-10^{commit}`, or read it from the audit handoff. |
 
-`audit-2026-10` and `v2.7.0.13-pulse` point at the same commit. That commit was also the tip of `main` when the tag was cut.
+`audit-2026-10` is the audit tag, and the commit it names is the one under audit. Changes merged to `main` after that commit are not part of the audit unless the handoff says so. The release tag is listed for reference. Take the commit under audit from the audit tag, not from the release tag.
 
 ## Upstream bases
 
