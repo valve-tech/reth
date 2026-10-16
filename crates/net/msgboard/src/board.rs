@@ -244,7 +244,8 @@ impl MsgBoard {
     /// checks (mirrors `loadAndRepairDbLocked` in erigon-pulse), so messages
     /// that were valid under an older config but no longer satisfy a tightened
     /// one are pushed onto `discarded` for the next flush to delete from disk.
-    /// Duplicate hashes already present in the index follow the same path.
+    /// A duplicate of a message already in the index is dropped without a
+    /// deletion, since its hash names the row of the copy that was kept.
     pub fn load_from_db(&self) -> eyre::Result<u64> {
         let Some(ref env) = self.db else { return Ok(0) };
         // `db_load_all` reports the skipped rows itself, with the decode error,
@@ -286,9 +287,12 @@ impl MsgBoard {
             if state.index.insert(Arc::clone(&arc)) {
                 loaded += 1;
             } else {
-                // Duplicate hash on disk — schedule for deletion to keep the
-                // table clean across restarts.
-                state.discard(arc);
+                // The same message was read from a second row. Nothing is
+                // scheduled for deletion: a row is deleted by message hash, and
+                // this copy's hash is the key of the row belonging to the copy
+                // already kept. A second row filed under another key was moved
+                // onto the hash key by `db_load_all`, so no separate row is
+                // left to clean up either.
                 dropped_duplicate += 1;
             }
             // Don't broadcast loaded messages — peers will learn about them
