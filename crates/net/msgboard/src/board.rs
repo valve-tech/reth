@@ -2444,4 +2444,45 @@ mod tests {
         assert_eq!(rows.len(), 1, "the kept message keeps its row on disk");
         assert_eq!(rows[0].hash, checked.hash);
     }
+
+    /// An announced ID whose work ratio has a zero divisor or a zero
+    /// multiplier is neither fetchable nor claimed.
+    ///
+    /// A message body with either value is refused at decode, so a request for
+    /// one can only waste a claim, a want-list slot and a round trip. The ratio
+    /// `m/0` compared as larger than any minimum.
+    #[test]
+    fn a_degenerate_work_ratio_announcement_is_not_requested() {
+        let board = board_with_block(100);
+        let announce = |multiplier: u64, divisor: u64, seed: u8| {
+            reth_msgboard_types::MsgID::from_checked(
+                VERSION_V1,
+                &block_hash_one(),
+                1,
+                multiplier,
+                divisor,
+                &category_hash(),
+                &hash_byte(seed),
+            )
+        };
+
+        // The control: the same announcement with a real ratio is requested.
+        let good = announce(1, 1_000_000, 0x10);
+        assert_eq!(board.fetchable(&[good]), vec![good], "a valid announcement is fetchable");
+
+        for (i, (multiplier, divisor)) in
+            [(1u64, 0u64), (0, 0), (u64::MAX, 0), (0, 1_000_000), (0, 1)].into_iter().enumerate()
+        {
+            let id = announce(multiplier, divisor, 0x20 + i as u8);
+            assert!(
+                board.fetchable(&[id]).is_empty(),
+                "{multiplier}/{divisor} must not be fetchable"
+            );
+            assert!(
+                board.filter_wanted(PeerId::repeat_byte(7), &[id]).is_empty(),
+                "{multiplier}/{divisor} must not be claimed"
+            );
+        }
+        assert_eq!(board.filter_wanted(PeerId::repeat_byte(7), &[good]), vec![good]);
+    }
 }

@@ -126,4 +126,29 @@ mod tests {
         // Lower ratio: 9_999 / 1_000_000 < 10_000 / 1_000_000
         assert!(!cfg.is_work_acceptable(9_999, 1_000_000));
     }
+
+    /// A zero divisor or a zero multiplier is not a work ratio. Neither passes
+    /// the gate, whatever the other value is.
+    #[test]
+    fn is_work_acceptable_rejects_a_zero_multiplier_or_divisor() {
+        let cfg = MsgboardConfig::default();
+        for (m, d) in [(1, 0), (0, 0), (u64::MAX, 0), (0, 1), (0, u64::MAX)] {
+            assert!(!cfg.is_work_acceptable(m, d), "{m}/{d} must be rejected");
+        }
+        // A permissive minimum does not change that.
+        let lax = MsgboardConfig { work_multiplier: 1, work_divisor: u64::MAX, ..cfg };
+        assert!(!lax.is_work_acceptable(1, 0));
+        assert!(!lax.is_work_acceptable(0, 1));
+    }
+
+    /// The comparison is exact at both ends of the u64 range.
+    #[test]
+    fn is_work_acceptable_is_exact_for_extreme_ratios() {
+        let cfg = MsgboardConfig::default();
+        assert!(cfg.is_work_acceptable(10_000, 1_000_000), "exactly the minimum is accepted");
+        assert!(!cfg.is_work_acceptable(9_999, 1_000_000));
+        assert!(cfg.is_work_acceptable(u64::MAX, 1));
+        assert!(cfg.is_work_acceptable(u64::MAX, u64::MAX - 1));
+        assert!(!cfg.is_work_acceptable(1, u64::MAX));
+    }
 }
