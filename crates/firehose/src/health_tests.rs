@@ -108,9 +108,9 @@ fn atomic_write_roundtrip() {
 
 #[test]
 fn replica_from_host_direct_and_evm_names() {
-    assert_eq!(replica_from_host("direct-b-evm-369").as_deref(), Some("b"));
-    assert_eq!(replica_from_host("direct-a-evm-1").as_deref(), Some("a"));
-    assert_eq!(replica_from_host("direct-b-evm-11155111.internal").as_deref(), Some("b"));
+    assert_eq!(replica_from_host("direct-b-node").as_deref(), Some("b"));
+    assert_eq!(replica_from_host("direct-a-node").as_deref(), Some("a"));
+    assert_eq!(replica_from_host("direct-b-node.example").as_deref(), Some("b"));
     assert_eq!(replica_from_host("evm943b").as_deref(), Some("b"));
     assert_eq!(replica_from_host("evm1b").as_deref(), Some("b"));
     assert_eq!(replica_from_host("evm369a").as_deref(), Some("a"));
@@ -128,7 +128,7 @@ fn resolve_replica_returns_nonempty() {
 fn resolve_replica_valve_wins_over_firehose() {
     let got = resolve_replica_from(
         env_map(&[("VALVE_REPLICA", Some("b")), ("FIREHOSE_REPLICA", Some("a"))]),
-        Some("direct-a-evm-369"),
+        Some("direct-a-node"),
     );
     assert_eq!(got, "b");
 }
@@ -137,7 +137,7 @@ fn resolve_replica_valve_wins_over_firehose() {
 fn resolve_replica_firehose_when_valve_unset() {
     let got = resolve_replica_from(
         env_map(&[("VALVE_REPLICA", None), ("FIREHOSE_REPLICA", Some("b"))]),
-        Some("direct-a-evm-369"),
+        Some("direct-a-node"),
     );
     assert_eq!(got, "b");
 }
@@ -147,14 +147,14 @@ fn resolve_replica_empty_and_whitespace_fall_through() {
     // Empty VALVE falls through to FIREHOSE.
     let got = resolve_replica_from(
         env_map(&[("VALVE_REPLICA", Some("")), ("FIREHOSE_REPLICA", Some("b"))]),
-        Some("direct-a-evm-369"),
+        Some("direct-a-node"),
     );
     assert_eq!(got, "b");
 
     // Whitespace-only values fall through to hostname.
     let got = resolve_replica_from(
         env_map(&[("VALVE_REPLICA", Some("  \t")), ("FIREHOSE_REPLICA", Some("   "))]),
-        Some("direct-b-evm-369"),
+        Some("direct-b-node"),
     );
     assert_eq!(got, "b");
 
@@ -168,14 +168,14 @@ fn resolve_replica_empty_and_whitespace_fall_through() {
 
 #[test]
 fn resolve_replica_hostname_when_env_unset() {
-    let got = resolve_replica_from(env_map(&[]), Some("direct-b-evm-369"));
+    let got = resolve_replica_from(env_map(&[]), Some("direct-b-node"));
     assert_eq!(got, "b");
 
     let got = resolve_replica_from(env_map(&[]), Some("evm369b"));
     assert_eq!(got, "b");
 
     // VALVE_HOST / HOSTNAME-style FQDN (same replica_from_host path).
-    let got = resolve_replica_from(env_map(&[]), Some("direct-b-evm-369.internal"));
+    let got = resolve_replica_from(env_map(&[]), Some("direct-b-node.internal"));
     assert_eq!(got, "b");
 }
 

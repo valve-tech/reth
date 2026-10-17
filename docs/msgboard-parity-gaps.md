@@ -1229,14 +1229,13 @@ request, not 6.6 MiB. The message bodies are never copied. No change made.
 > existing.
 >
 > The counters were previously unwatched, so "revisit if it goes non-zero" had
-> no mechanism. Two Prometheus alerts now carry it (monorepo
-> `deploy/monitoring/valve.rules.yml`, group `valve-fleet-reth`):
+> no mechanism. Two Prometheus alerts now carry it (in the fleet monitoring rules):
 > `MsgboardOutboundDropped` and `MsgboardBadProtocol`, both `warning` — a
 > non-zero counter means the queue bound *worked*, not that anything is down.
 > Verified against live Prometheus: the expressions match five real series and
 > currently return empty, so they can fire but are not firing.
 >
-> `direct-b-evm-1` is absent from those five: it still runs a build predating
+> `chain 1, replica b` is absent from those five: it still runs a build predating
 > the counters (added in `5d238f5f85`).
 >
 > Re-announcement (fourth bullet) got a partial answer too: `943a` shows 428
@@ -1357,9 +1356,9 @@ and left it there, because nothing measured it. The counters on the fleet
 
 | box | `requests_sent` | `accepted_remote` | `skipped_duplicate` | uptime |
 |---|---|---|---|---|
-| `direct-a-evm-943` | 445 | 45 | **400 (90%)** | 2h14m |
-| `direct-a-evm-1` | 65 | 1 | **64 (98%)** | 9m |
-| `direct-a-evm-369` | 0 | 0 | 0 | — |
+| `chain 943, replica a` | 445 | 45 | **400 (90%)** | 2h14m |
+| `chain 1, replica a` | 65 | 1 | **64 (98%)** | 9m |
+| `chain 369, replica a` | 0 | 0 | 0 | — |
 
 Nine out of ten messages the board asked for, it already had.
 
@@ -1547,8 +1546,8 @@ it exists today, independent of whether we adopt the new construction.
 
 | box | `accepted_remote` | `rejected_invalid_pow` |
 |---|---|---|
-| `direct-a-evm-943` | 45 | **0** |
-| `direct-a-evm-1` | 1 | **0** |
+| `chain 943, replica a` | 45 | **0** |
+| `chain 1, replica a` | 1 | **0** |
 
 We are accepting peer messages and rejecting none. If peers had switched, every
 message would fail our verification and `rejected_invalid_pow` would climb.
@@ -2164,7 +2163,7 @@ visible. Raised upstream as §2.2 of `docs/msgboard-spec-feedback.md`.
 ## 22. Round-14: no metric could tell "nobody is talking" from "nobody can"
 
 The fleet runbook
-(`monorepo/deploy/rpc/runbooks/msgboard-gossip-investigation.md`, 2026-08-21)
+(the fleet gossip investigation runbook, 2026-08-21)
 reports `announcements_received = 0` on all seven boxes while
 `announcements_sent` is 26 and 34. Nothing arrives from any peer.
 
@@ -2294,7 +2293,7 @@ one loads. Dropping the `verify` clause fails it.
 ### 23.2 What the fleet metrics actually said
 
 The runbook that opened this
-(`monorepo/deploy/rpc/runbooks/msgboard-gossip-investigation.md`) reports gossip
+(the fleet gossip investigation runbook) reports gossip
 as dead fleet-wide and reads `expired 31` on chain 369 as evidence of a
 regression. §22.3 already noted that `expired` cannot support that inference.
 Prometheus keeps 365 days of `reth_msgboard_*` (scraped since 2026-08-03), and
@@ -2302,19 +2301,19 @@ it separates two problems the runbook treats as one:
 
 | host | `accepted_remote`, 30d peak | last increase |
 |---|---|---|
-| direct-a-evm-369 | **0** | never |
-| direct-b-evm-369 | **0** | never |
+| chain 369, replica a | **0** | never |
+| chain 369, replica b | **0** | never |
 | indexer | **0** | never |
-| direct-a-evm-943 | 453 | 2026-08-21 16:56Z |
-| direct-b-evm-943 | 573 | 2026-08-21 16:56Z |
-| direct-a-evm-1 | 6 | 2026-08-21 18:56Z |
-| direct-b-evm-1 | 2016 | 2026-08-21 18:56Z |
+| chain 943, replica a | 453 | 2026-08-21 16:56Z |
+| chain 943, replica b | 573 | 2026-08-21 16:56Z |
+| chain 1, replica a | 6 | 2026-08-21 18:56Z |
+| chain 1, replica b | 2016 | 2026-08-21 18:56Z |
 
 **Chain 369 never received a single message**, across the whole retained window.
 That is not a regression and the roll did not cause it; it belongs with the
 peering question in the runbook's sub-problem A.
 
-**Chains 943 and 1 were receiving until the roll and stopped at it.** `direct-b-evm-1`
+**Chains 943 and 1 were receiving until the roll and stopped at it.** `chain 1, replica b`
 alone took 2016 messages in the preceding week. Both chains stopped at their own
 restart and have not resumed since — which is the regression, and §23 is its
 most likely mechanism.
@@ -2328,7 +2327,7 @@ next thing to read is the new `msgboard_peer_sessions` gauge from §22.
 
 ## 24. Round-16: the subscription notification carried the wrong method name
 
-`msgboard_subscribe` works end to end — verified live on `direct-a-evm-943`,
+`msgboard_subscribe` works end to end — verified live on `chain 943, replica a`,
 where a held subscription delivered real arcade and provecash messages as they
 were posted. But the notification frames named the wrong method:
 
@@ -2372,12 +2371,12 @@ earlier in this document.
 
 ```
                      peer_sessions   opened/hr   peer_unsupported   accepted_local/hr
-direct-a-evm-369           1            83            7,900               0
-direct-b-evm-369           0           186           14,411               0
-direct-a-evm-943           0             0           11,177             127
-direct-b-evm-943           0             0           12,698             139
-direct-a-evm-1             0             0           13,268               0
-direct-b-evm-1             0             0           27,112               0
+chain 369, replica a           1            83            7,900               0
+chain 369, replica b           0           186           14,411               0
+chain 943, replica a           0             0           11,177             127
+chain 943, replica b           0             0           12,698             139
+chain 1, replica a             0             0           13,268               0
+chain 1, replica b             0             0           27,112               0
 ```
 
 ### 25.1 Two different faults, neither the one that was assumed
@@ -2431,16 +2430,11 @@ Static peering fixes it outright, because on testnet there is no third party to
 depend on:
 
 ```
-direct-a-evm-943  116.202.173.179:30303
-  enode://c6b52cf99ec0bdecec6b1ca58c42c59358c7f9aabe0369aca5c73d51c5efdfb0
-         1aeeec069aa52b0a70386682a0cc6fd5c0c8c3714ce5100011c0df2b311a43b2
-
-direct-b-evm-943  157.90.179.40:30303
-  enode://8d094139bc456c134f5d397bd5320dd40faecf6d6f586a57ce2141147599ce7f
-         6f4365e10114856aa7c467ed995db84e55ced6a598d137377a2693f1b1ad5e64
+chain 943, replica a  <its address>:30303 and node ID
+chain 943, replica b  <its address>:30303 and node ID
 ```
 
-That is a deploy change in the monorepo, not a reth change. Nothing in reth
+That is a deploy change, not a reth change. Nothing in reth
 needs to move for it.
 
 ### 25.4 What the metrics will say when it works

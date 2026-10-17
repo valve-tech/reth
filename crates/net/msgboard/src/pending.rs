@@ -13,10 +13,10 @@
 //!
 //! Measured on the production fleet before this existed (2026-08-17):
 //!
-//! | box | `requests_sent` | `accepted_remote` | `skipped_duplicate` |
+//! | node | `requests_sent` | `accepted_remote` | `skipped_duplicate` |
 //! |---|---|---|---|
-//! | `direct-a-evm-943` | 445 | 45 | 400 (90%) |
-//! | `direct-a-evm-1` | 65 | 1 | 64 (98%) |
+//! | chain 943, replica a | 445 | 45 | 400 (90%) |
+//! | chain 1, replica a | 65 | 1 | 64 (98%) |
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},

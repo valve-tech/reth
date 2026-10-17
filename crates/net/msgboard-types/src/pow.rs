@@ -692,7 +692,7 @@ mod tests {
         }
     }
 
-    /// A message taken off the live `PulseChain` testnet board (`direct-a-evm-943`,
+    /// A message taken off the live `PulseChain` testnet board (chain 943,
     /// 2026-08-19), mined under the construction this replaced.
     ///
     /// It is pinned here as a negative control. The golden vectors are mined by
