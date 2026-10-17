@@ -981,6 +981,20 @@ mod tests {
         assert_eq!(board.persistence_failures(), 1);
     }
 
+    /// A database that opens but cannot be read starts the node with an empty
+    /// board. That is the same silent loss as a database that will not open,
+    /// so it has to be counted the same way.
+    #[tokio::test]
+    async fn a_database_that_fails_to_load_is_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::db::FAIL_LOAD.with(|f| f.set(true));
+        let board = launcher_with_db_dir(None).init_board(dir.path().to_path_buf());
+        crate::db::FAIL_LOAD.with(|f| f.set(false));
+
+        assert_eq!(board.persistence_failures(), 1);
+        assert_eq!(board.status().2, 0, "the board starts empty");
+    }
+
     /// The healthy path counts nothing, so any rise is a real failure.
     #[tokio::test]
     async fn a_healthy_database_is_not_counted() {

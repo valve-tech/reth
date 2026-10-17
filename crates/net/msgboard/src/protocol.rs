@@ -528,9 +528,9 @@ impl ConnectionHandler for MsgboardConnectionHandler {
         MSG_PROTOCOL
     }
 
-    /// No frame-size limit here: [`handle_incoming`] refuses an oversized
-    /// frame itself and bans its sender, which is stronger than the session
-    /// error a multiplexer limit would raise.
+    /// The frame ceiling is declared to the multiplexer, which cuts an
+    /// oversized frame before it buffers it. [`handle_incoming`] checks the same
+    /// ceiling again and bans the sender, for a frame the multiplexer let by.
     fn inbound_limits(&self) -> ProtocolIngressLimits {
         inbound_limits_for(self.board.config())
     }

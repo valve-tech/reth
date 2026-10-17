@@ -76,7 +76,7 @@ Round 3 was a read-only review of `crates/net/msgboard` and `crates/net/msgboard
 | 37 | Low | Operator limits were not validated, and extreme values overflowed the window and ingress arithmetic. | `args.rs`, `board.rs`, `protocol.rs` | fixed (PR 54) |
 | 38 | Low | `msgboard_content` built the whole response before `--rpc.max-response-size` could refuse it. At the largest `--msgboard.size-limit` that is about 2 GB. | `rpc.rs` | fixed: a call whose estimated response is past 200 MiB is refused before the build |
 | 39 | Low | The `msg/1` frame ceiling was checked only after the multiplexer had buffered the frame. | `protocol.rs` `inbound_limits_for` | fixed: the ceiling is declared to the multiplexer |
-| 40 | Info | A failure to open or load the database was only logged. | `launch.rs` | fixed: `msgboard.persistence_failures` counts it |
+| 40 | Info | A failure to open or load the database was only logged. | `launch.rs` | fixed: `msgboard.persistence_failures` counts a failure to open, a load that errors, and a load that cannot decode half or more of its rows |
 | 41 | Info | A stored row anchored far above the head was kept, announced and never expired. | `board.rs` `seed_window` | fixed: `seed_window` drops messages more than one window above the head |
 | 42 | Info | Claims are keyed by the full 121-byte ID, so one work hash announced with different non-hash fields takes several claim slots. | `pending.rs` | open: bounded by the per-peer and global claim caps; changing the key changes how alternates and exhaustion count, so it needs its own change |
 | 43 | Info | `MsgIndex::content_page` with `limit` 0 returns an empty page with no cursor. | `index.rs` | open: the RPC layer rejects `limit` 0, so it is not reachable |
