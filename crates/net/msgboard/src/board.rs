@@ -146,6 +146,10 @@ pub struct MsgBoard {
     /// reply did no work.
     #[cfg(test)]
     wire_lookups: AtomicU64,
+    /// The thread that last ran the remote-ingest path, so a test can prove
+    /// the proof-of-work check does not run on an async worker.
+    #[cfg(test)]
+    remote_add_thread: Mutex<Option<std::thread::ThreadId>>,
 }
 
 impl MsgBoard {
@@ -193,6 +197,8 @@ impl MsgBoard {
             metrics: MsgboardMetrics::default(),
             #[cfg(test)]
             wire_lookups: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_add_thread: Mutex::new(None),
         }
     }
 
@@ -738,6 +744,12 @@ impl MsgBoard {
         self.wire_lookups.load(Ordering::Relaxed)
     }
 
+    /// The thread that last ran the remote-ingest path.
+    #[cfg(test)]
+    pub(crate) fn remote_add_thread(&self) -> Option<std::thread::ThreadId> {
+        *self.remote_add_thread.lock()
+    }
+
     /// Add `PoWMsg`s received from a remote peer.
     ///
     /// Inputs **must** already be field-validated — wire-side messages are
@@ -809,6 +821,10 @@ impl MsgBoard {
         msgs: impl IntoIterator<Item = (PoWMsg, B256)>,
         stop_at_kickable: bool,
     ) -> (usize, usize) {
+        #[cfg(test)]
+        {
+            *self.remote_add_thread.lock() = Some(std::thread::current().id());
+        }
         if self.cfg.gossip_disabled {
             return (0, 0);
         }

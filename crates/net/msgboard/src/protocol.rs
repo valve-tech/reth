@@ -4715,6 +4715,37 @@ mod tests {
         assert_eq!(board.status().2, 2, "both delivered messages must land");
     }
 
+    /// Verifying a delivered message is a secp256k1 scalar multiplication
+    /// (finding 8). It must run on the blocking pool, not on the async
+    /// connection task that read the frame.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delivery_is_verified_off_the_connection_task() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let (tx, _rx) = channel();
+
+        let msg = mined(&[9], 10);
+        let hash = msg.clone().to_checked(10, 0).expect("valid pow").hash;
+        let wire = vec![WirePoWMsg::new(msg, hash)];
+
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut authorised_for_hashes(&[hash]),
+            frame(BOARD_MESSAGES, &encode_wire_pow_msg_list(&wire)),
+            peer(),
+        )
+        .await;
+
+        assert_eq!(board.status().2, 1, "the delivered message must land");
+        let verified_on = board.remote_add_thread().expect("the ingest path ran");
+        assert_ne!(
+            verified_on,
+            std::thread::current().id(),
+            "the proof-of-work check ran on the connection task"
+        );
+    }
+
     /// A frame claiming the same hash twice is a protocol violation
     /// (`CheckUniqueHashes`, `msgboard/fetch.go:296-298`). Without it a peer
     /// buys one verification per copy from a single reservation's worth of

@@ -1101,6 +1101,31 @@ mod tests {
         assert_eq!(got.category, category(0xBB));
     }
 
+    /// An empty filter object is "every category", the same as no filter
+    /// (finding 33, parity-gaps §29.2). Erigon reads `{}` as the zero
+    /// category and delivers almost nothing, so a client that depends on
+    /// either reading would break if this one changed.
+    #[tokio::test]
+    async fn an_empty_subscription_filter_delivers_every_category() {
+        let board = ready_board(10);
+        let m = module(Arc::clone(&board));
+
+        let mut sub = m
+            .subscribe_unbounded("msgboard_subscribe", vec![json!("messages"), json!({})])
+            .await
+            .unwrap();
+
+        let first = board.add_local_msg(mined(&[1], category(0xAA), 10)).unwrap();
+        let second = board.add_local_msg(mined(&[2], category(0xBB), 10)).unwrap();
+
+        let (got, _id) =
+            sub.next::<MsgboardMsg>().await.expect("subscription yielded nothing").unwrap();
+        assert_eq!(got.hash, first.hash);
+        let (got, _id) =
+            sub.next::<MsgboardMsg>().await.expect("subscription yielded nothing").unwrap();
+        assert_eq!(got.hash, second.hash);
+    }
+
     // ── content paging ───────────────────────────────────────────────────────
 
     /// A no-argument call is the shape erigon clients use, and erigon answers
