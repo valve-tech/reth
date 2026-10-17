@@ -86,6 +86,8 @@ pub struct MsgboardMetrics {
     /// state loses every message accepted since the last successful flush.
     pub flush_failures: Counter,
     /// Times the persistent database could not be opened or loaded at start.
+    /// A load counts when it fails outright, or when half or more of the rows
+    /// cannot be read; fewer damaged rows are skipped and logged only.
     ///
     /// Any rise means the board is running without its database, or started
     /// empty although the database holds rows. Both are only logged otherwise,

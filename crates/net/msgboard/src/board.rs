@@ -196,7 +196,8 @@ impl MsgBoard {
         }
     }
 
-    /// Count a failure to open or load the persistent database.
+    /// Count a failure to open or load the persistent database, or a load that
+    /// could not read most of its rows.
     pub fn record_persistence_failure(&self) {
         self.persistence_failures.fetch_add(1, Ordering::Relaxed);
         self.metrics.persistence_failures.increment(1);
@@ -266,7 +267,13 @@ impl MsgBoard {
         // `db_load_all` reports the skipped rows itself, with the decode error,
         // the row's RLP shape and an ERROR when the whole table fails. Repeating
         // the bare count here only buried that line under a vaguer one.
-        let (msgs, _bad) = db::db_load_all(env)?;
+        let (msgs, bad) = db::db_load_all(env)?;
+        // Most of the table lost is a persistence failure, not a few damaged
+        // rows: the board starts nearly empty and the rows stay unread on disk.
+        // The same test raises the ERROR above, so the counter and the log agree.
+        if db::decode_failure_is_wholesale(msgs.len() as u64 + bad, bad) {
+            self.record_persistence_failure();
+        }
 
         let mut loaded = 0u64;
         let mut dropped_invalid = 0u64;
@@ -2084,6 +2091,51 @@ mod tests {
         assert_eq!(loaded, 1, "only the message that still verifies may load");
         assert!(board.get_message(&good.hash).is_some(), "the valid one survives");
         assert!(board.get_message(&stale.hash).is_none(), "the stale one must not");
+    }
+
+    /// Write rows that decode to nothing straight into `board`'s database.
+    fn put_undecodable_rows(board: &MsgBoard, count: u8) {
+        let env = board.db.as_ref().expect("a board with a database");
+        let tx = env.begin_rw_txn().expect("rw txn");
+        let table = tx.open_db(Some(crate::db::TABLE_NAME)).expect("table");
+        for i in 0..count {
+            tx.put(
+                table.dbi(),
+                B256::repeat_byte(0xA0 + i).as_slice(),
+                b"not rlp",
+                reth_libmdbx::WriteFlags::empty(),
+            )
+            .expect("put");
+        }
+        tx.commit().expect("commit");
+    }
+
+    /// A table whose rows all fail to decode loads an empty board, and the
+    /// operator has to hear about it as a number, not only as a log line.
+    #[test]
+    fn a_table_of_undecodable_rows_is_counted_as_a_persistence_failure() {
+        let (_dir, board) = board_with_db(easy_cfg());
+        put_undecodable_rows(&board, 3);
+
+        assert_eq!(board.load_from_db().expect("a bad row is not a load error"), 0);
+        assert_eq!(board.persistence_failures(), 1);
+    }
+
+    /// Scattered damage costs a few rows and the board keeps the rest; that is
+    /// not the failure the counter reports, so a rise stays meaningful.
+    #[test]
+    fn a_few_undecodable_rows_among_healthy_ones_are_not_counted() {
+        let (_dir, board) = board_with_db(easy_cfg());
+        board.set_ready();
+        board.set_head(100, block_hash_one());
+        for data in [&[0x61u8][..], &[0x62][..], &[0x63][..]] {
+            board.add_local_msg(make_pow_msg(find_nonce(data), data)).expect("valid message");
+        }
+        board.flush_to_db().expect("flush");
+        put_undecodable_rows(&board, 1);
+
+        board.load_from_db().expect("load");
+        assert_eq!(board.persistence_failures(), 0);
     }
 
     /// A board with no database must not queue pruned messages.
