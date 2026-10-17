@@ -2840,6 +2840,42 @@ mod tests {
         );
     }
 
+    /// One message announced under many IDs is one request for one hash.
+    #[tokio::test]
+    async fn one_message_announced_under_many_ids_is_requested_once() {
+        let board = board_at(10);
+        let (tx, mut rx) = channel();
+        let hash = checked(&[1, 2, 3], 10).hash;
+        let ids: Vec<MsgID> = (1..=40u64)
+            .map(|size| {
+                MsgID::from_checked(
+                    VERSION_V1,
+                    &block_hash_one(),
+                    size,
+                    1,
+                    1_000_000,
+                    &category_hash(),
+                    &hash,
+                )
+            })
+            .collect();
+
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut WantList::default(),
+            frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&ids)),
+            peer(),
+        )
+        .await;
+
+        let frames = drain(&mut rx);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][0], GET_BOARD_MESSAGES);
+        assert_eq!(&frames[0][1..], hash.as_slice(), "the hash is requested once");
+    }
+
     #[tokio::test]
     async fn announced_ids_we_already_hold_produce_no_request() {
         let board = board_at(10);

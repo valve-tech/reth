@@ -514,7 +514,14 @@ impl MsgBoard {
                     return false;
                 }
                 // Claimed last, so an ID rejected above never occupies a slot.
-                if pending.claim_from(**id, peer, subnet, now) {
+                // A claim is one message. It keeps the first ID announced, until a
+                // later announcement of it names a longer-lived block.
+                let rank = |kept: &MsgID| {
+                    self.is_fetchable(index, block_filter, stale_lower, kept)
+                        .then(|| block_filter.block_number(&kept.block_hash()))
+                        .flatten()
+                };
+                if pending.claim_from_checked(**id, peer, subnet, now, rank) {
                     true
                 } else {
                     suppressed += 1;
@@ -1842,6 +1849,58 @@ mod tests {
         let id = checked.msg_id();
         let wanted = board.filter_wanted(PeerId::ZERO, &[id]);
         assert!(wanted.is_empty(), "already-known message should not be wanted");
+    }
+
+    /// An announced ID for message `hash`, anchored to `block`, claiming `size`
+    /// bytes of data.
+    fn announced(block: B256, size: u64, hash: u8) -> MsgID {
+        MsgID::from_checked(
+            VERSION_V1,
+            &block,
+            size,
+            1,
+            1_000_000,
+            &category_hash(),
+            &hash_byte(hash),
+        )
+    }
+
+    /// One message announced under many IDs is requested once, however many
+    /// IDs the announcer makes up for it.
+    #[test]
+    fn filter_wanted_returns_one_id_for_one_message() {
+        let board = board_with_block(100);
+        let ids: Vec<MsgID> =
+            (1..=40).map(|size| announced(block_hash_one(), size, 0x21)).collect();
+
+        let wanted = board.filter_wanted(PeerId::repeat_byte(1), &ids);
+
+        assert_eq!(wanted, vec![ids[0]], "one message, one request");
+        assert!(board.filter_wanted(PeerId::repeat_byte(2), &ids).is_empty());
+    }
+
+    /// The first owner's ID cannot be kept past the point where it is no
+    /// longer worth fetching: when it anchors to a block that has since aged
+    /// out, the next announcement of the message with a live anchor replaces it.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_replaces_an_id_whose_block_has_aged_out() {
+        let cfg = MsgboardConfig { block_range: 10, stale_block_buffer: 3, ..easy_cfg() };
+        let board = MsgBoard::new(cfg);
+        let aging = hash_byte(0x51);
+        // Window [91, 100] holds both blocks; stale_lower is 94.
+        board.set_head(95, aging);
+        board.set_head(100, block_hash_one());
+        let (first, second) = (PeerId::repeat_byte(1), PeerId::repeat_byte(2));
+        let stale_id = announced(aging, 100, 0x22);
+        let live_id = announced(block_hash_one(), 100, 0x22);
+
+        assert_eq!(board.filter_wanted(first, &[stale_id]), vec![stale_id]);
+        // The head moves on: block 95 is now below stale_lower (97).
+        board.set_head(103, hash_byte(0x52));
+        assert!(board.filter_wanted(second, &[live_id]).is_empty(), "the claim is still held");
+
+        tokio::time::advance(crate::pending::PENDING_REQUEST_TTL).await;
+        assert_eq!(board.take_retries(second), vec![live_id], "asked with the live ID");
     }
 
     #[test]
