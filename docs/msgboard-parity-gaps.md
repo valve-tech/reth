@@ -2722,13 +2722,14 @@ request correctly, and an empty answer costs it nothing.
 ### 30.2 A claim is one message, not one ID
 
 An announced ID is 121 bytes, and only its last 32 bytes name the message. The
-rest is the announcer's word. Reth claims by hash: one message announced under many IDs takes one claim,
-one request and one place in the per-peer and global caps, and is exhausted
-once.
+rest is the announcer's word. Reth claims by hash: one message announced under
+many IDs takes one claim, one request and one place in the per-peer and global
+caps, is queued once for the pacer, and is exhausted once.
 
-The claim keeps the first ID announced, while that ID is still worth fetching:
-it passes the version, size and work checks and names a block inside the window.
-When it no longer does, the next announcement of the message with an ID that
-does replaces it, so a first announcer cannot keep a stale ID in the claim.
-The ID only decides whether an exhausted claim is still wanted and what a retry
+The claim keeps the first ID announced until a later announcement of the message
+ranks higher. An ID that is not worth fetching (it fails the version, size, work
+or block-window checks) ranks below every one that is, and among fetchable IDs
+the one anchored to the later block ranks higher. A tie keeps the first. A first
+announcer therefore cannot keep a stale or early-anchored ID in the claim. The
+ID only decides whether an exhausted claim is still wanted and what a retry
 costs against the responder's reply budget. Every request names the hash.

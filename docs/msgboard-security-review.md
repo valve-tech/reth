@@ -78,7 +78,7 @@ Round 3 was a read-only review of `crates/net/msgboard` and `crates/net/msgboard
 | 39 | Low | The `msg/1` frame ceiling was checked only after the multiplexer had buffered the frame. | `protocol.rs` `inbound_limits_for` | fixed: the ceiling is declared to the multiplexer |
 | 40 | Info | A failure to open or load the database was only logged. | `launch.rs` | fixed: `msgboard.persistence_failures` counts a failure to open, a load that errors, and a load that cannot decode half or more of its rows |
 | 41 | Info | A stored row anchored far above the head was kept, announced and never expired. | `board.rs` `seed_window` | fixed: `seed_window` drops messages more than one window above the head |
-| 42 | Info | Claims are keyed by the full 121-byte ID, so one work hash announced with different non-hash fields takes several claim slots. | `pending.rs` | fixed: claims are keyed by the 32-byte message hash. A claim keeps the first ID announced while it is still worth fetching and takes a later one when it is not. Exhaustion and the rescue fetch count once per message |
+| 42 | Info | Claims are keyed by the full 121-byte ID, so one work hash announced with different non-hash fields takes several claim slots. | `pending.rs` | fixed: claims are keyed by the 32-byte message hash. A claim keeps the first ID announced until a later one ranks higher: a fetchable ID outranks one that is not, and a later block outranks an earlier one. Exhaustion and the rescue fetch count once per message |
 | 43 | Info | `MsgIndex::content_page` with `limit` 0 returns an empty page with no cursor. | `index.rs` | open: the RPC layer rejects `limit` 0, so it is not reachable |
 
 ## Verification of findings 1-34 (2026-10-16)

@@ -389,10 +389,9 @@ impl PendingRequests {
             if claim.alternates.is_empty() {
                 // An expired claim with nobody waiting is re-taken rather than
                 // left to the sweep, so a peer that went silent does not
-                // delay the retry past the TTL. The request goes out under the
-                // ID this peer announced, so that is the one the claim keeps.
+                // delay the retry past the TTL. The request names only the
+                // hash, so the claim keeps the better-ranked ID it has.
                 let previous = std::mem::replace(&mut claim.owner, peer);
-                claim.id = id;
                 claim.claimed_at = now;
                 claim.retry = false;
                 if claim.candidates < MAX_DRAW_CANDIDATES {
@@ -957,7 +956,9 @@ pub(crate) struct RequestPacer {
     ///
     /// [`MsgBoard::fetchable`]: crate::MsgBoard::fetchable
     deferred: VecDeque<MsgID>,
-    deferred_set: HashSet<MsgID>,
+    /// Message hashes in `deferred`: a message waits once, whatever IDs it
+    /// was announced under.
+    deferred_set: HashSet<B256>,
 }
 
 impl RequestPacer {
@@ -971,7 +972,7 @@ impl RequestPacer {
                 dropped += 1;
                 continue;
             }
-            if self.deferred_set.insert(id) {
+            if self.deferred_set.insert(id.message_hash()) {
                 self.deferred.push_back(id);
             }
         }
@@ -1002,7 +1003,7 @@ impl RequestPacer {
             }
             tokens = tokens.saturating_sub(c);
             let id = self.deferred.pop_front().expect("front exists");
-            self.deferred_set.remove(&id);
+            self.deferred_set.remove(&id.message_hash());
             out.push(id);
         }
         self.tokens = Some(tokens);
@@ -1623,6 +1624,33 @@ mod tests {
     }
 
     /// The global cap counts messages as well.
+    #[test]
+    fn a_waiting_message_is_queued_once_whatever_its_ids() {
+        let mut pacer = RequestPacer::default();
+
+        let dropped = pacer.defer((0..50).map(|v| variant(7, v)), 100);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(pacer.deferred(), 1, "one message waits once, not once per ID");
+    }
+
+    #[test]
+    fn a_retake_does_not_replace_a_better_id_with_a_worse_one() {
+        let mut pending = PendingRequests::new(Duration::from_secs(10), 16);
+        let now = Instant::now();
+        let good = variant(7, 1);
+        let bad = variant(7, 2);
+        let rank = |id: &MsgID| (*id == good).then_some(5);
+
+        assert!(pending.claim_from_checked(good, p(1), None, now, rank));
+        // The claim expires with no alternate, and a peer announcing the
+        // unfetchable ID takes it over.
+        let later = now + Duration::from_secs(11);
+        assert!(pending.claim_from_checked(bad, p(2), None, later, rank));
+
+        assert_eq!(pending.claims[&good.message_hash()].id, good);
+    }
+
     #[test]
     fn the_global_cap_counts_messages() {
         let mut pending = PendingRequests::new(Duration::from_secs(10), 4);
