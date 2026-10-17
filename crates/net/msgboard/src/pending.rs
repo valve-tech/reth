@@ -55,9 +55,9 @@ pub(crate) const PENDING_REQUEST_TTL: Duration = Duration::from_secs(10);
 
 /// Maximum number of simultaneously claimed IDs.
 ///
-/// The map is keyed by peer-supplied IDs, so it needs a bound: an ID passes
+/// The map is keyed by peer-supplied hashes, so it needs a bound: an ID passes
 /// `filter_wanted` on its declared fields alone, and a peer can mint unlimited
-/// IDs that carry a live block hash but correspond to no real message.
+/// hashes that carry a live block hash but correspond to no real message.
 ///
 /// 8192 entries is roughly 1.3 MB at `MSG_ID_SIZE` = 121 plus map overhead,
 /// and sits far above any honest in-flight count — one announcement frame
@@ -217,7 +217,10 @@ const MAX_EXHAUSTED_AGE: Duration = Duration::from_secs(60);
 /// the state mutex that `filter_wanted` already holds.
 #[derive(Debug)]
 pub(crate) struct PendingRequests {
-    claims: HashMap<MsgID, Claim>,
+    /// Live claims, keyed by the message's work hash: the last 32 bytes of the ID.
+    /// Everything else in an ID is the announcer's word, and one message announced
+    /// under many IDs must take one claim.
+    claims: HashMap<B256, Claim>,
     /// Claims owned per peer, for [`MAX_CLAIMS_PER_PEER`].
     owned: HashMap<PeerId, usize>,
     /// IDs the sweep moved to a peer that its connection task has not yet
@@ -313,6 +316,7 @@ impl PendingRequests {
     /// [`claim`](Self::claim) for an announcer whose remote address is in
     /// `subnet` (see [`subnet_of`]). Announcers with no known subnet are
     /// never capped per subnet.
+    #[cfg(test)]
     pub(crate) fn claim_from(
         &mut self,
         id: MsgID,
@@ -320,15 +324,46 @@ impl PendingRequests {
         subnet: Option<u64>,
         now: Instant,
     ) -> bool {
+        self.claim_from_checked(id, peer, subnet, now, |_| Some(0))
+    }
+
+    /// [`claim_from`](Self::claim_from) for a caller that can tell how long an
+    /// ID stays worth fetching.
+    ///
+    /// `rank` is `None` for an ID that is not worth fetching now (a version we
+    /// do not speak, limits it fails, a block outside the window or about to
+    /// leave it) and otherwise the number of the block it names, so a larger
+    /// rank lives longer.
+    ///
+    /// A claim is one message, whatever IDs announce it, and it keeps one ID:
+    /// the first announced, until a later announcement of the message has a
+    /// better rank. An ID that is not worth fetching ranks below every one that
+    /// is, and a later block ranks above an earlier one. A first announcer
+    /// therefore cannot keep a stale or short-lived ID in the claim, and with it
+    /// the rescue fetch (see [`settle_exhausted`](Self::settle_exhausted)),
+    /// which asks whether the ID the claim kept is still wanted. A later
+    /// announcer can raise the rank by naming a later block, which only keeps
+    /// the rescue going for as long as that block stays in the window, at the
+    /// rescue's own rate limit. The caller has already checked `id` itself.
+    pub(crate) fn claim_from_checked(
+        &mut self,
+        id: MsgID,
+        peer: PeerId,
+        subnet: Option<u64>,
+        now: Instant,
+        rank: impl Fn(&MsgID) -> Option<u64>,
+    ) -> bool {
         let Self { claims, owned, retries, struck, rng, ttl, capacity, seen_key, sessions, .. } =
             self;
         let keys = AnnouncerKeys::of(seen_key, sessions, peer);
-        let Some(claim) = claims.get_mut(&id) else {
+        let hash = id.message_hash();
+        let Some(claim) = claims.get_mut(&hash) else {
             let held = owned.get(&peer).copied().unwrap_or_default();
             if claims.len() < *capacity && held < MAX_CLAIMS_PER_PEER {
                 claims.insert(
-                    id,
+                    hash,
                     Claim {
+                        id,
                         claimed_at: now,
                         owner: peer,
                         alternates: Vec::new(),
@@ -347,11 +382,15 @@ impl PendingRequests {
             }
             return true;
         };
+        if claim.id != id && rank(&id) > rank(&claim.id) {
+            claim.id = id;
+        }
         if now.duration_since(claim.claimed_at) >= *ttl {
             if claim.alternates.is_empty() {
                 // An expired claim with nobody waiting is re-taken rather than
                 // left to the sweep, so a peer that went silent does not
-                // delay the retry past the TTL.
+                // delay the retry past the TTL. The request names only the
+                // hash, so the claim keeps the better-ranked ID it has.
                 let previous = std::mem::replace(&mut claim.owner, peer);
                 claim.claimed_at = now;
                 claim.retry = false;
@@ -367,7 +406,7 @@ impl PendingRequests {
             // Peers are waiting. Do what the sweep would do, so an announcer
             // that arrives just after expiry cannot jump the queue.
             decrement(owned, claim.owner);
-            claim.hand_to_next_alternate(now, struck, sessions, owned, retries, id);
+            claim.hand_to_next_alternate(now, struck, sessions, owned, retries);
         }
         claim.admit(peer, keys, subnet, sessions, rng);
         false
@@ -384,13 +423,14 @@ impl PendingRequests {
     /// wait longer than the TTL before it is dropped, and by then the claim may
     /// belong to another peer.
     pub(crate) fn release(&mut self, id: &MsgID, peer: PeerId, now: Instant) {
-        let Some(claim) = self.claims.get_mut(id) else { return };
+        let hash = id.message_hash();
+        let Some(claim) = self.claims.get_mut(&hash) else { return };
         if claim.owner != peer {
             return;
         }
         let previous = claim.owner;
         if claim.alternates.is_empty() {
-            self.claims.remove(id);
+            self.claims.remove(&hash);
         } else {
             claim.hand_to_next_alternate(
                 now,
@@ -398,7 +438,6 @@ impl PendingRequests {
                 &self.sessions,
                 &mut self.owned,
                 &mut self.retries,
-                *id,
             );
         }
         decrement(&mut self.owned, previous);
@@ -434,19 +473,19 @@ impl PendingRequests {
         self.strikes.prune(now);
         let Self { claims, owned, retries, struck, sessions, exhausted, exhausted_count, .. } =
             self;
-        claims.retain(|id, claim| {
+        claims.retain(|_, claim| {
             if now.duration_since(claim.claimed_at) < ttl {
                 return true;
             }
             decrement(owned, claim.owner);
-            if is_held(id) {
+            if is_held(&claim.id) {
                 return false;
             }
             if claim.alternates.is_empty() {
                 // Every announcer the claim kept was asked, and none delivered.
                 *exhausted_count += 1;
                 let entry = Exhausted {
-                    id: *id,
+                    id: claim.id,
                     tried: claim.tried,
                     announcers: std::mem::replace(&mut claim.announcers, SeenFilter::empty()),
                     priority: claim.trusted_announcer || claim.tried_subnets.len() >= 2,
@@ -457,13 +496,15 @@ impl PendingRequests {
                 queue_exhausted(exhausted, entry);
                 return false;
             }
-            claim.hand_to_next_alternate(now, struck, sessions, owned, retries, *id);
+            claim.hand_to_next_alternate(now, struck, sessions, owned, retries);
             true
         });
         // A retry goes stale when its claim moves on, for example to a later
         // alternate because the peer it was queued for has disconnected.
         retries.retain(|peer, ids| {
-            ids.retain(|id| claims.get(id).is_some_and(|c| c.retry && c.owner == *peer));
+            ids.retain(|id| {
+                claims.get(&id.message_hash()).is_some_and(|c| c.retry && c.owner == *peer)
+            });
             !ids.is_empty()
         });
     }
@@ -486,14 +527,17 @@ impl PendingRequests {
     /// with [`release`](Self::release).
     pub(crate) fn take_retries(&mut self, peer: PeerId, now: Instant) -> Vec<MsgID> {
         let Some(ids) = self.retries.remove(&peer) else { return Vec::new() };
+        // A claim can have kept a better ID since the retry was queued, so the
+        // ID returned is the claim's, not the queued one. A claim is returned
+        // once, however many entries name it.
         ids.into_iter()
-            .filter(|id| match self.claims.get_mut(id) {
+            .filter_map(|id| match self.claims.get_mut(&id.message_hash()) {
                 Some(claim) if claim.retry && claim.owner == peer => {
                     claim.retry = false;
                     claim.claimed_at = now;
-                    true
+                    Some(claim.id)
                 }
-                _ => false,
+                _ => None,
             })
             .collect()
     }
@@ -912,7 +956,9 @@ pub(crate) struct RequestPacer {
     ///
     /// [`MsgBoard::fetchable`]: crate::MsgBoard::fetchable
     deferred: VecDeque<MsgID>,
-    deferred_set: HashSet<MsgID>,
+    /// Message hashes in `deferred`: a message waits once, whatever IDs it
+    /// was announced under.
+    deferred_set: HashSet<B256>,
 }
 
 impl RequestPacer {
@@ -926,7 +972,7 @@ impl RequestPacer {
                 dropped += 1;
                 continue;
             }
-            if self.deferred_set.insert(id) {
+            if self.deferred_set.insert(id.message_hash()) {
                 self.deferred.push_back(id);
             }
         }
@@ -957,7 +1003,7 @@ impl RequestPacer {
             }
             tokens = tokens.saturating_sub(c);
             let id = self.deferred.pop_front().expect("front exists");
-            self.deferred_set.remove(&id);
+            self.deferred_set.remove(&id.message_hash());
             out.push(id);
         }
         self.tokens = Some(tokens);
@@ -1055,6 +1101,8 @@ impl WithholdStrikes {
 /// One claimed ID: who was asked, when, and who else announced it.
 #[derive(Debug)]
 struct Claim {
+    /// The ID the claim keeps; see [`PendingRequests::claim_from_checked`].
+    id: MsgID,
     claimed_at: Instant,
     owner: PeerId,
     /// Later announcers, in announcement order.
@@ -1199,7 +1247,6 @@ impl Claim {
         sessions: &HashMap<PeerId, PeerSession>,
         owned: &mut HashMap<PeerId, usize>,
         retries: &mut HashMap<PeerId, Vec<MsgID>>,
-        id: MsgID,
     ) {
         let pick = self
             .alternates
@@ -1211,7 +1258,8 @@ impl Claim {
         if self.retry &&
             let std::collections::hash_map::Entry::Occupied(mut e) = retries.entry(self.owner)
         {
-            e.get_mut().retain(|queued| *queued != id);
+            let hash = self.id.message_hash();
+            e.get_mut().retain(|queued| queued.message_hash() != hash);
             if e.get().is_empty() {
                 e.remove();
             }
@@ -1221,7 +1269,7 @@ impl Claim {
         self.retry = true;
         self.note_tried(sessions.get(&next).and_then(|s| s.subnet));
         *owned.entry(next).or_default() += 1;
-        retries.entry(next).or_default().push(id);
+        retries.entry(next).or_default().push(self.id);
     }
 
     /// Count one more owner asked, from `subnet`.
@@ -1405,13 +1453,21 @@ struct Exhausted {
     at: Instant,
 }
 
-/// Add `entry` to the exhausted queue, keeping one claim per group and at
-/// most [`MAX_QUEUED_EXHAUSTED`] claims.
+/// Add `entry` to the exhausted queue, keeping one claim per message, one per
+/// group and at most [`MAX_QUEUED_EXHAUSTED`] claims.
 ///
 /// A newer claim replaces its group's queued one, unless only the older one
 /// has priority. When the queue is full, a priority claim replaces the oldest
 /// claim without priority; any other claim is dropped. It is still counted.
 fn queue_exhausted(queue: &mut Vec<Exhausted>, entry: Exhausted) {
+    // A message waits once, whichever subnet's claim it was exhausted under.
+    let hash = entry.id.message_hash();
+    if let Some(old) = queue.iter_mut().find(|e| e.id.message_hash() == hash) {
+        if entry.priority || !old.priority {
+            *old = entry;
+        }
+        return;
+    }
     if let Some(old) = queue.iter_mut().find(|e| e.group == entry.group) {
         if entry.priority || !old.priority {
             *old = entry;
@@ -1515,11 +1571,391 @@ mod tests {
     fn id(n: u8) -> MsgID {
         let mut raw = [0u8; reth_msgboard_types::MSG_ID_SIZE];
         raw[0] = n;
+        // The last 32 bytes name the message; a claim is one message.
+        raw[89] = n;
         MsgID::decode_list(&raw).expect("one id-sized record")[0]
     }
 
     fn p(n: u8) -> PeerId {
         PeerId::repeat_byte(n)
+    }
+
+    // ── claims keyed by message hash ─────────────────────────────────────────
+
+    /// An ID for message `hash` that differs from `variant(hash, other)` in a
+    /// declared field. Only the last 32 bytes name the message.
+    fn variant(hash: u8, variant: u8) -> MsgID {
+        let mut raw = [0u8; reth_msgboard_types::MSG_ID_SIZE];
+        raw[0] = 1;
+        raw[40] = variant;
+        raw[89] = hash;
+        MsgID::decode_list(&raw).expect("one id-sized record")[0]
+    }
+
+    /// The same message announced under many IDs takes one claim and gets one
+    /// request, not one per ID.
+    #[test]
+    fn many_ids_for_one_message_take_one_claim() {
+        let mut pending = PendingRequests::default();
+        let now = Instant::now();
+
+        let sent: Vec<bool> =
+            (0..50).map(|v| pending.claim_from(variant(7, v), p(1), None, now)).collect();
+
+        assert_eq!(sent.iter().filter(|s| **s).count(), 1, "one request for one message");
+        assert!(sent[0], "the first announcement is the one asked");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.owned.get(&p(1)).copied(), Some(1));
+    }
+
+    /// The per-peer cap counts messages, not the IDs that announce them.
+    #[test]
+    fn the_per_peer_cap_counts_messages() {
+        let mut pending = PendingRequests::default();
+        let now = Instant::now();
+
+        for hash in 0..=255u8 {
+            for v in 0..3 {
+                pending.claim_from(variant(hash, v), p(1), None, now);
+            }
+        }
+        assert_eq!(pending.len(), 256, "three IDs per message must not take three slots");
+        assert_eq!(pending.owned.get(&p(1)).copied(), Some(256));
+    }
+
+    /// The global cap counts messages as well.
+    #[test]
+    fn a_waiting_message_is_queued_once_whatever_its_ids() {
+        let mut pacer = RequestPacer::default();
+
+        let dropped = pacer.defer((0..50).map(|v| variant(7, v)), 100);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(pacer.deferred(), 1, "one message waits once, not once per ID");
+    }
+
+    #[test]
+    fn a_retake_does_not_replace_a_better_id_with_a_worse_one() {
+        let mut pending = PendingRequests::new(Duration::from_secs(10), 16);
+        let now = Instant::now();
+        let good = variant(7, 1);
+        let bad = variant(7, 2);
+        let rank = |id: &MsgID| (*id == good).then_some(5);
+
+        assert!(pending.claim_from_checked(good, p(1), None, now, rank));
+        // The claim expires with no alternate, and a peer announcing the
+        // unfetchable ID takes it over.
+        let later = now + Duration::from_secs(11);
+        assert!(pending.claim_from_checked(bad, p(2), None, later, rank));
+
+        assert_eq!(pending.claims[&good.message_hash()].id, good);
+    }
+
+    #[test]
+    fn the_global_cap_counts_messages() {
+        let mut pending = PendingRequests::new(Duration::from_secs(10), 4);
+        let now = Instant::now();
+
+        for hash in 0..4u8 {
+            for v in 0..3 {
+                pending.claim_from(variant(hash, v), p(hash), None, now);
+            }
+        }
+        assert_eq!(pending.len(), 4, "four messages fit a four-claim map");
+        assert!(!pending.claim_from(variant(0, 9), p(9), None, now), "and each still deduplicates");
+    }
+
+    /// An announcer whose ID differs is still an announcer of the message: it
+    /// is asked when the first owner withholds.
+    #[test]
+    fn an_announcer_with_another_id_is_asked_when_the_owner_withholds() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+
+        assert!(pending.claim_from(variant(7, 0), p(1), None, t0));
+        assert!(!pending.claim_from(variant(7, 1), p(2), None, t0));
+        pending.sweep(t0 + ttl, |_| false);
+
+        let retries = pending.take_retries(p(2), t0 + ttl);
+        assert_eq!(retries.len(), 1, "the other announcer is asked once");
+        assert_eq!(retries[0].message_hash(), variant(7, 0).message_hash());
+    }
+
+    /// A claim keeps the ID that was announced first while a later one is no
+    /// better. An ID of the same rank does not replace it.
+    #[test]
+    fn a_fetchable_retained_id_is_not_replaced() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let (first, later) = (variant(7, 0), variant(7, 1));
+
+        assert!(pending.claim_from_checked(first, p(1), None, t0, |_| Some(5)));
+        assert!(!pending.claim_from_checked(later, p(2), None, t0, |_| Some(5)));
+        pending.sweep(t0 + ttl, |_| false);
+
+        assert_eq!(pending.take_retries(p(2), t0 + ttl), vec![first]);
+    }
+
+    /// An owner whose ID has gone stale cannot pin it: the next announcement
+    /// of the message with an ID that is worth fetching replaces it.
+    #[test]
+    fn a_stale_retained_id_is_replaced_by_one_worth_fetching() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let (stale, good) = (variant(7, 0), variant(7, 1));
+
+        assert!(pending.claim_from_checked(stale, p(1), None, t0, |_| Some(5)));
+        assert!(!pending.claim_from_checked(good, p(2), None, t0, |id| (*id != stale).then_some(5)));
+        pending.sweep(t0 + ttl, |_| false);
+
+        assert_eq!(pending.take_retries(p(2), t0 + ttl), vec![good]);
+    }
+
+    /// A claim takes the ID that names the later block: it lives longer, and an
+    /// earlier one cannot be pinned by announcing it first.
+    #[test]
+    fn a_later_block_replaces_an_earlier_one_and_not_the_reverse() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let (early, late) = (variant(7, 0), variant(7, 1));
+        let block = |id: &MsgID| Some(if *id == early { 90 } else { 95 });
+
+        assert!(pending.claim_from_checked(early, p(1), None, t0, block));
+        assert!(!pending.claim_from_checked(late, p(2), None, t0, block));
+        assert!(!pending.claim_from_checked(early, p(3), None, t0, block));
+        pending.sweep(t0 + ttl, |_| false);
+
+        assert_eq!(pending.take_retries(p(2), t0 + ttl), vec![late], "the later block is kept");
+    }
+
+    /// The ID a claim keeps decides whether an exhausted claim is still wanted,
+    /// so a stale one pinned by the first owner would stop the rescue fetch.
+    #[test]
+    fn a_stale_id_does_not_stop_the_rescue_of_an_exhausted_claim() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        let (stale, good) = (variant(7, 0), variant(7, 1));
+        for n in 1..=6u8 {
+            pending.open_session(p(n), Some(u64::from(n)));
+        }
+
+        assert!(pending.claim_from_checked(stale, p(1), Some(1), t0, |_| Some(5)));
+        assert!(
+            !pending.claim_from_checked(good, p(2), Some(2), t0, |id| (*id != stale).then_some(5))
+        );
+        // Both announcers are asked in turn and neither delivers.
+        pending.sweep(t0 + ttl, |_| false);
+        pending.take_retries(p(2), t0 + ttl);
+        pending.sweep(t0 + 2 * ttl, |_| false);
+        let (count, settled) = pending.settle_exhausted(t0 + 2 * ttl, |id| *id != stale);
+
+        assert_eq!(count, 1);
+        let claim = settled.iter().find(|c| c.id.message_hash() == good.message_hash());
+        assert!(claim.is_some_and(|c| c.id == good && c.asked > 0), "not rescued: {settled:?}");
+    }
+
+    /// One message announced under many IDs is exhausted once, and asks its
+    /// rescue peers once.
+    #[test]
+    fn a_message_under_many_ids_is_exhausted_once() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        for n in 1..=6u8 {
+            pending.open_session(p(n), Some(u64::from(n)));
+        }
+
+        for v in 0..20 {
+            pending.claim_from(variant(7, v), p(1), Some(1), t0);
+        }
+        pending.sweep(t0 + ttl, |_| false);
+        let (count, settled) = pending.settle_exhausted(t0 + ttl, |_| true);
+
+        assert_eq!(count, 1, "one message is one exhausted claim");
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].asked, SPECULATIVE_PEERS_PER_CLAIM);
+    }
+
+    /// A message that is exhausted again before the first round was settled,
+    /// under a claim from another subnet, waits in the queue once.
+    #[test]
+    fn a_message_exhausted_twice_is_queued_once() {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, MAX_PENDING_REQUESTS);
+        let t0 = Instant::now();
+        for n in 1..=8u8 {
+            pending.open_session(p(n), Some(u64::from(n)));
+        }
+
+        pending.claim_from(variant(7, 0), p(1), Some(1), t0);
+        pending.sweep(t0 + ttl, |_| false);
+        pending.claim_from(variant(7, 1), p(2), Some(2), t0 + ttl);
+        pending.sweep(t0 + 2 * ttl, |_| false);
+        let (count, settled) = pending.settle_exhausted(t0 + 2 * ttl, |_| true);
+
+        assert_eq!(count, 2, "both rounds are counted");
+        assert_eq!(settled.len(), 1, "one message is asked about once");
+    }
+
+    /// What must hold after every operation, whatever the order of announcements,
+    /// releases, expiries and sessions.
+    ///
+    /// `swept` is set right after a full sweep, which also withdraws every
+    /// stale retry.
+    fn assert_invariants(pending: &PendingRequests, capacity: usize, swept: bool) {
+        assert!(pending.claims.len() <= capacity, "the map outgrew its capacity");
+        let mut owners: HashMap<PeerId, usize> = HashMap::new();
+        for (hash, claim) in &pending.claims {
+            assert_eq!(*hash, claim.id.message_hash(), "a claim is keyed by its message hash");
+            *owners.entry(claim.owner).or_default() += 1;
+            assert!(claim.alternates.len() <= MAX_ALTERNATES);
+            assert!(!claim.alternates.contains(&claim.owner), "the owner is also an alternate");
+            let mut distinct = claim.alternates.clone();
+            distinct.sort();
+            distinct.dedup();
+            assert_eq!(distinct.len(), claim.alternates.len(), "an alternate is listed twice");
+            if claim.retry {
+                let queued = pending.retries.get(&claim.owner);
+                assert!(
+                    queued.is_some_and(|ids| ids.iter().any(|id| id.message_hash() == *hash)),
+                    "a claim waits for its owner's retry, which is not queued"
+                );
+            }
+        }
+        assert_eq!(pending.owned, owners, "the per-peer counts differ from the claims");
+        assert!(pending.owned.values().all(|n| (1..=MAX_CLAIMS_PER_PEER).contains(n)));
+        if swept {
+            for (peer, ids) in &pending.retries {
+                for id in ids {
+                    let claim = pending.claims.get(&id.message_hash());
+                    assert!(
+                        claim.is_some_and(|c| c.retry && c.owner == *peer),
+                        "a stale retry survived a sweep"
+                    );
+                }
+            }
+        }
+        assert!(pending.exhausted.len() <= MAX_QUEUED_EXHAUSTED);
+        let mut queued: Vec<B256> = pending.exhausted.iter().map(|e| e.id.message_hash()).collect();
+        queued.sort();
+        queued.dedup();
+        assert_eq!(queued.len(), pending.exhausted.len(), "a message is queued twice");
+        assert!(pending.speculative.values().all(|q| q.len() <= MAX_GET_BOARD_MESSAGES + 1));
+    }
+
+    /// A random walk over every operation on the tracker, checking the
+    /// invariants after each one. `hashes`, `capacity` and `step_ms` (how far a
+    /// time step may go) are chosen so a run reaches the per-peer cap or the
+    /// global cap. Returns the most claims held at once and the most one peer held.
+    fn walk(
+        seed: u64,
+        ops: usize,
+        hashes: u64,
+        capacity: usize,
+        peers: u8,
+        step_ms: u64,
+    ) -> (usize, usize) {
+        let ttl = Duration::from_secs(10);
+        let mut pending = PendingRequests::new(ttl, capacity);
+        let mut rng = seed | 1;
+        let mut now = Instant::now();
+        let mut epoch = 0u8;
+        let mut open: HashMap<PeerId, u64> = HashMap::new();
+        let mut claimed_by_peer: HashMap<PeerId, Vec<MsgID>> = HashMap::new();
+        let mut peak = 0usize;
+        let mut most_owned = 0usize;
+
+        for _ in 0..ops {
+            let r = next_random(&mut rng);
+            let peer = p(1 + (next_random(&mut rng) % u64::from(peers)) as u8);
+            let hash = (next_random(&mut rng) % hashes) as u16;
+            let id = {
+                let mut raw = [0u8; reth_msgboard_types::MSG_ID_SIZE];
+                raw[0] = 1;
+                raw[33..41].copy_from_slice(&(next_random(&mut rng) % 6).to_be_bytes());
+                raw[89..91].copy_from_slice(&hash.to_be_bytes());
+                MsgID::decode_list(&raw).expect("one id-sized record")[0]
+            };
+            let mut swept = false;
+            match r % 100 {
+                0..=59 => {
+                    let subnet = open.contains_key(&peer).then_some(u64::from(peer[0] % 4));
+                    let rank = |id: &MsgID| {
+                        ((id.size() as u8).wrapping_add(epoch) & 1 == 0).then_some(id.size())
+                    };
+                    if pending.claim_from_checked(id, peer, subnet, now, rank) {
+                        claimed_by_peer.entry(peer).or_default().push(id);
+                    }
+                }
+                60..=66 => {
+                    // The request frame never reached the peer.
+                    if let Some(ids) = claimed_by_peer.get_mut(&peer) &&
+                        let Some(id) = ids.pop()
+                    {
+                        pending.release(&id, peer, now);
+                    }
+                }
+                67..=78 => {
+                    now += Duration::from_millis(next_random(&mut rng) % step_ms);
+                    epoch = epoch.wrapping_add(1);
+                    pending.sweep(now, |id| id.message_hash()[31] % 7 == 0);
+                    let ok = |id: &MsgID| (id.size() as u8).wrapping_add(epoch) & 1 == 0;
+                    pending.settle_exhausted(now, ok);
+                    swept = true;
+                }
+                79..=90 => {
+                    let ids = pending.take_retries(peer, now);
+                    for id in ids {
+                        let claim = &pending.claims[&id.message_hash()];
+                        assert_eq!(claim.owner, peer);
+                        assert!(!claim.retry, "a returned retry is still marked queued");
+                        assert_eq!(claim.id, id, "the retry carries the ID the claim keeps");
+                    }
+                    pending.take_speculative(peer);
+                }
+                91..=95 => {
+                    let session = pending.open_session(peer, Some(u64::from(peer[0] % 4)));
+                    if r.is_multiple_of(3) {
+                        pending.set_trusted(peer, session);
+                    }
+                    open.insert(peer, session);
+                }
+                96..=98 => {
+                    if let Some(session) = open.remove(&peer) {
+                        pending.close_session(peer, session);
+                    }
+                }
+                _ => pending.note_withheld(peer, now),
+            }
+            peak = peak.max(pending.len());
+            most_owned = most_owned.max(pending.owned.values().copied().max().unwrap_or(0));
+            assert_invariants(&pending, capacity, swept);
+        }
+        (peak, most_owned)
+    }
+
+    /// Few messages and a small map: claims move, merge, expire and hit the
+    /// global cap constantly.
+    #[test]
+    fn a_random_walk_keeps_the_invariants_under_a_small_map() {
+        for seed in 1..=4u64 {
+            let (peak, _) =
+                walk(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), 20_000, 24, 20, 12, 12_000);
+            assert_eq!(peak, 20, "the walk never filled the map");
+        }
+    }
+
+    /// One peer announcing many messages reaches the per-peer cap before the
+    /// map is full.
+    #[test]
+    fn a_random_walk_keeps_the_invariants_at_the_per_peer_cap() {
+        let (_, most_owned) = walk(0xC0FFEE, 10_000, 6_000, 8_192, 2, 5);
+        assert_eq!(most_owned, MAX_CLAIMS_PER_PEER, "the walk must reach the per-peer cap");
     }
 
     /// A claim that expires with its message still missing moves to the next
@@ -1589,7 +2025,7 @@ mod tests {
                 for n in 1..=u8::try_from(2 * MAX_ALTERNATES).unwrap() {
                     pending.claim(id(1), p(n), now);
                 }
-                pending.claims[&id(1)].alternates.contains(&honest)
+                pending.claims[&id(1).message_hash()].alternates.contains(&honest)
             })
             .count();
         assert!(survived > 0, "the honest peer was evicted every time");
@@ -1612,7 +2048,7 @@ mod tests {
                 for n in 1..=u8::try_from(2 * MAX_ALTERNATES).unwrap() {
                     pending.claim(id(1), p(n), now);
                 }
-                pending.claims[&id(1)].alternates.contains(&honest)
+                pending.claims[&id(1).message_hash()].alternates.contains(&honest)
             })
             .count();
         // 33 distinct candidates for 16 slots: an unstruck peer survives with
@@ -1639,7 +2075,7 @@ mod tests {
                     pending.claim(id(1), p(n), now);
                 }
                 pending.claim(id(1), honest, now);
-                pending.claims[&id(1)].alternates.contains(&honest)
+                pending.claims[&id(1).message_hash()].alternates.contains(&honest)
             })
             .count();
         assert!(
@@ -1665,7 +2101,7 @@ mod tests {
                     pending.claim_from(id(1), sybil, sybil_net, now);
                 }
                 pending.claim_from(id(1), honest, honest_net, now);
-                pending.claims[&id(1)].alternates.contains(&honest)
+                pending.claims[&id(1).message_hash()].alternates.contains(&honest)
             })
             .count();
         assert_eq!(survived, 50, "the honest peer lost its slot in {} of 50 runs", 50 - survived);
@@ -1680,7 +2116,7 @@ mod tests {
         for n in 0..5000u64 {
             pending.claim(id(1), PeerId::left_padding_from(&n.to_be_bytes()), now);
         }
-        let claim = &pending.claims[&id(1)];
+        let claim = &pending.claims[&id(1).message_hash()];
         assert!(claim.candidates <= 1000, "{} candidates entered the draw", claim.candidates);
         let fresh = (0..2000u64)
             .filter(|n| {
@@ -1736,7 +2172,7 @@ mod tests {
                         pending.claim(id(1), p(n), now);
                     }
                 }
-                pending.claims[&id(1)].alternates.contains(&honest)
+                pending.claims[&id(1).message_hash()].alternates.contains(&honest)
             })
             .count();
         assert!(survived >= 170, "the honest peer survived {survived} of 200 runs; expected ~188");
@@ -1799,7 +2235,10 @@ mod tests {
         pending.sweep(t0 + 2 * ttl, |_| false);
         pending.claim(id(1), looping, t0 + 2 * ttl);
         pending.claim(id(1), looping, t0 + 2 * ttl);
-        assert!(pending.claims[&id(1)].alternates.is_empty(), "the looping peer re-entered");
+        assert!(
+            pending.claims[&id(1).message_hash()].alternates.is_empty(),
+            "the looping peer re-entered"
+        );
     }
 
     /// A rejoin from a subnet whose cap is full still re-enters: the peer was
@@ -1824,7 +2263,10 @@ mod tests {
 
         pending.open_session(honest, net);
         pending.claim_from(id(1), honest, net, t0 + 2 * ttl);
-        assert!(pending.claims[&id(1)].alternates.contains(&honest), "the subnet cap kept it out");
+        assert!(
+            pending.claims[&id(1).message_hash()].alternates.contains(&honest),
+            "the subnet cap kept it out"
+        );
     }
 
     /// After the first owner fails, a trusted announcer is asked before
@@ -1867,7 +2309,10 @@ mod tests {
             for n in 1..=100 {
                 pending.claim(id(1), p(n), now);
             }
-            assert!(pending.claims[&id(1)].alternates.contains(&trusted), "trusted was evicted");
+            assert!(
+                pending.claims[&id(1).message_hash()].alternates.contains(&trusted),
+                "trusted was evicted"
+            );
         }
     }
 
@@ -1888,7 +2333,10 @@ mod tests {
                 pending.claim(id(1), p(n), now);
             }
             pending.claim(id(1), trusted, now);
-            assert!(pending.claims[&id(1)].alternates.contains(&trusted), "trusted found no slot");
+            assert!(
+                pending.claims[&id(1).message_hash()].alternates.contains(&trusted),
+                "trusted found no slot"
+            );
         }
     }
 
@@ -2010,12 +2458,12 @@ mod tests {
                 pending.open_session(peer, Some(n << 8));
                 pending.claim_from(id(1), peer, Some(n << 8), now);
             }
-            let before = pending.claims[&id(1)].candidates;
+            let before = pending.claims[&id(1).message_hash()].candidates;
             for _ in 0..10 {
                 pending.open_session(member, net);
                 pending.claim_from(id(1), member, net, now);
             }
-            let tickets = pending.claims[&id(1)].candidates - before;
+            let tickets = pending.claims[&id(1).message_hash()].candidates - before;
             assert!(tickets <= 2, "one member bought {tickets} tickets by reconnecting");
         }
     }
@@ -2042,7 +2490,7 @@ mod tests {
         pending.open_session(p(3), net);
         pending.claim_from(id(1), p(2), net, t0 + 2 * ttl);
         pending.claim_from(id(1), p(3), net, t0 + 2 * ttl);
-        let alternates = &pending.claims[&id(1)].alternates;
+        let alternates = &pending.claims[&id(1).message_hash()].alternates;
         assert!(alternates.contains(&p(2)), "the member did not rejoin");
         assert!(!alternates.contains(&p(3)), "a new peer passed the full subnet");
     }
@@ -2097,6 +2545,7 @@ mod tests {
             let mut raw = [0u8; reth_msgboard_types::MSG_ID_SIZE];
             raw[..8].copy_from_slice(&(n + 1).to_be_bytes());
             raw[8] = 0xF0;
+            raw[89..97].copy_from_slice(&(n + 1).to_be_bytes());
             let fake = MsgID::decode_list(&raw).expect("one id-sized record")[0];
             pending.claim_from(fake, p(1), flood, t0);
         }
@@ -2159,7 +2608,7 @@ mod tests {
         for n in 0..=u8::try_from(MAX_ALTERNATES).unwrap() + 3 {
             pending.claim(id(1), p(n), now);
         }
-        assert_eq!(pending.claims[&id(1)].alternates.len(), MAX_ALTERNATES);
+        assert_eq!(pending.claims[&id(1).message_hash()].alternates.len(), MAX_ALTERNATES);
     }
 
     /// One peer's fabricated IDs cannot fill the map. Past its quota its
@@ -2173,6 +2622,7 @@ mod tests {
         for n in 0..MAX_CLAIMS_PER_PEER + 100 {
             let mut raw = [0u8; reth_msgboard_types::MSG_ID_SIZE];
             raw[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            raw[89..97].copy_from_slice(&(n as u64).to_be_bytes());
             let flood = MsgID::decode_list(&raw).expect("one id-sized record")[0];
             assert!(pending.claim(flood, p(9), now), "fail open: the request still goes out");
         }
