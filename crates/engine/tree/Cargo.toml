@@ -54,13 +54,13 @@ futures.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
-moka = { workspace = true, features = ["sync"] }
 
 # metrics
 metrics.workspace = true
 reth-metrics = { workspace = true, features = ["common"] }
 
 # misc
+dashmap.workspace = true
 indexmap.workspace = true
 schnellru.workspace = true
 rayon.workspace = true
@@ -104,6 +104,7 @@ rand.workspace = true
 rand_08.workspace = true
 alloy-rpc-types-eth.workspace = true
 firehose-tracer.workspace = true
+tracing-subscriber = { workspace = true, features = ["registry"] }
 
 [features]
 test-utils = [

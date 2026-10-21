@@ -43,7 +43,7 @@ pub struct SnapshotManifestCommand {
     ///
     /// If omitted, inferred as the span of the newest existing static file
     /// (falling back to the reth default when the datadir has none).
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     blocks_per_file: Option<u64>,
 }
 
