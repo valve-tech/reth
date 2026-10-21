@@ -94,9 +94,9 @@ impl AvailabilitySheet {
 /// Owns the storage and account proof worker pools and the channel their results arrive on.
 ///
 /// Every job queued by [`Self::dispatch`] sends exactly one [`ProofWorkerResult`] to
-/// [`Self::results`]. A worker that fails to start sends an error that belongs to no job instead,
-/// and jobs left queued when every worker of a pool has failed get no result. Workers shut down
-/// once the handle is dropped.
+/// [`Self::results`], unless the handle's [`ProofCancellationToken`] is cancelled first. A worker
+/// that fails to start sends an error that belongs to no job instead, and jobs left queued when
+/// every worker of a pool has failed get no result. Workers shut down once the handle is dropped.
 #[derive(Debug)]
 pub struct ProofWorkerHandle {
     /// Sender shared with the workers, kept so that [`Self::results`] never disconnects while the
@@ -118,6 +118,8 @@ pub struct ProofWorkerHandle {
     storage_worker_count: usize,
     /// Total number of account workers spawned
     account_worker_count: usize,
+    /// Cancellation state shared with the workers, which discard queued jobs once it is set.
+    cancellation: ProofCancellationToken,
 }
 
 impl ProofWorkerHandle {
@@ -132,6 +134,7 @@ impl ProofWorkerHandle {
     ///   request proofs with exact masks, as needed to produce trie updates from them.
     /// - `worker_counts`: How many workers of each pool to spawn for this block, with a minimum of
     ///   one worker of each kind
+    /// - `cancellation`: Token that makes workers discard queued jobs once the consumer is gone
     /// - `metrics`: Idle-time metric handles shared across blocks (with the metrics feature).
     #[instrument(
         name = "ProofWorkerHandle::new",
@@ -143,6 +146,7 @@ impl ProofWorkerHandle {
         runtime: &Runtime,
         task_ctx: ProofTaskCtx<Factory>,
         worker_counts: ProofWorkerCounts,
+        cancellation: ProofCancellationToken,
         #[cfg(feature = "metrics")] metrics: ProofWorkerIdleMetrics,
     ) -> Self
     where
@@ -177,6 +181,7 @@ impl ProofWorkerHandle {
                 work_rx: storage_work_rx,
                 result_tx: result_tx.clone(),
                 availability: storage_availability.clone(),
+                cancellation: cancellation.clone(),
                 #[cfg(feature = "metrics")]
                 metrics: metrics.clone(),
             },
@@ -192,6 +197,7 @@ impl ProofWorkerHandle {
                 work_rx: account_work_rx,
                 result_tx: result_tx.clone(),
                 availability: account_availability.clone(),
+                cancellation: cancellation.clone(),
                 #[cfg(feature = "metrics")]
                 metrics,
             },
@@ -207,6 +213,7 @@ impl ProofWorkerHandle {
             account_availability,
             storage_worker_count,
             account_worker_count,
+            cancellation,
         }
     }
 
@@ -230,6 +237,19 @@ impl ProofWorkerHandle {
         self.account_worker_count
     }
 
+    /// Marks the jobs of this handle as cancelled.
+    ///
+    /// Workers discard jobs still queued, and [`Self::dispatch`] queues nothing more. Discarded
+    /// jobs send no result.
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    /// Returns `true` once the jobs of this handle are cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
     /// Returns the receiver of job results.
     ///
     /// Results arrive in completion order. The receiver never disconnects while the handle is
@@ -245,9 +265,14 @@ impl ProofWorkerHandle {
     /// [`Self::results`]. A storage job without slot targets proves only the account's storage
     /// root node.
     ///
+    /// Queues nothing and returns zero once the handle is cancelled.
+    ///
     /// Fails once a worker pool has shut down, which only happens after its workers reported start
     /// failures on [`Self::results`].
     pub fn dispatch(&self, targets: MultiProofTargetsV2) -> Result<usize, ProofWorkersUnavailable> {
+        if self.is_cancelled() {
+            return Ok(0)
+        }
         let MultiProofTargetsV2 { account_targets, storage_targets } = targets;
         let dispatched_at = Instant::now();
         let mut jobs = 0;
@@ -265,6 +290,25 @@ impl ProofWorkerHandle {
         }
 
         Ok(jobs)
+    }
+}
+
+/// Shared cancellation state for proof work belonging to one state-root computation.
+///
+/// Proof worker queues outlive the sparse-trie task that submitted to them. Sharing this token
+/// with the workers lets them discard buffered work once its consumer has gone away.
+#[derive(Clone, Debug, Default)]
+pub struct ProofCancellationToken(Arc<AtomicBool>);
+
+impl ProofCancellationToken {
+    /// Marks all work associated with this token as cancelled.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Returns whether the associated state-root computation was cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -432,6 +476,8 @@ struct ProofWorker<Factory, J> {
     result_tx: CrossbeamSender<ProofWorkerResult>,
     /// Per-worker availability flags
     availability: Arc<AvailabilitySheet>,
+    /// Cancellation state of the handle; queued jobs are discarded once it is set.
+    cancellation: ProofCancellationToken,
     /// Metrics shared by all workers of the handle.
     #[cfg(feature = "metrics")]
     metrics: ProofWorkerIdleMetrics,
@@ -439,7 +485,8 @@ struct ProofWorker<Factory, J> {
 
 impl<Factory, J> ProofWorker<Factory, J> {
     /// Runs `process` for every job until the handle is dropped, advertising the worker as busy
-    /// while a job runs. Returns the total time spent waiting for jobs.
+    /// while a job runs. Jobs received after cancellation are discarded without a result. Returns
+    /// the total time spent waiting for jobs.
     fn process_jobs(&self, worker_id: usize, mut process: impl FnMut(J)) -> Duration {
         // Count this worker as available only after successful initialization.
         self.availability.mark_idle(worker_id);
@@ -449,6 +496,11 @@ impl<Factory, J> ProofWorker<Factory, J> {
 
         while let Ok(job) = self.work_rx.recv() {
             total_idle_time += idle_start.elapsed();
+            if self.cancellation.is_cancelled() {
+                trace!(target: "trie::proof_task", worker_id, "Discarding cancelled proof job");
+                idle_start = Instant::now();
+                continue
+            }
             self.availability.mark_busy(worker_id);
 
             #[cfg(feature = "trie-debug")]
@@ -682,6 +734,7 @@ mod tests {
             &runtime,
             ctx,
             ProofWorkerCounts::full(&runtime),
+            Default::default(),
             #[cfg(feature = "metrics")]
             Default::default(),
         );
@@ -732,6 +785,7 @@ mod tests {
                 &runtime,
                 ctx.clone(),
                 counts,
+                Default::default(),
                 #[cfg(feature = "metrics")]
                 Default::default(),
             );
@@ -780,5 +834,70 @@ mod tests {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected)
             ));
         }
+    }
+
+    /// Ensures a cancelled handle queues no jobs.
+    #[test]
+    fn cancelled_handle_queues_no_jobs() {
+        let provider_factory =
+            create_test_provider_factory_with_chain_spec(Arc::new(ChainSpec::default()));
+        let anchor_hash = reth_db_common::init::init_genesis(&provider_factory).unwrap();
+        let factory = reth_storage_overlay::OverlayStateProviderFactory::new(
+            provider_factory,
+            reth_storage_overlay::OverlayManager::<reth_ethereum_primitives::EthPrimitives>::default()
+                .overlay_builder(anchor_hash),
+        );
+        let runtime = reth_tasks::Runtime::test();
+        let cancellation = ProofCancellationToken::default();
+        let proof_worker_handle = ProofWorkerHandle::new(
+            &runtime,
+            test_ctx(factory),
+            ProofWorkerCounts::new(1, 1),
+            cancellation.clone(),
+            #[cfg(feature = "metrics")]
+            Default::default(),
+        );
+
+        cancellation.cancel();
+        assert!(proof_worker_handle.is_cancelled());
+        let targets = MultiProofTargetsV2 {
+            account_targets: vec![ProofV2Target::new(B256::ZERO)],
+            storage_targets: std::iter::once((B256::ZERO, vec![ProofV2Target::new(B256::ZERO)]))
+                .collect(),
+        };
+        assert_eq!(proof_worker_handle.dispatch(targets).unwrap(), 0);
+
+        let results = proof_worker_handle.results().clone();
+        drop(proof_worker_handle);
+        assert_eq!(
+            results.recv_timeout(Duration::from_secs(30)).unwrap_err(),
+            RecvTimeoutError::Disconnected
+        );
+    }
+
+    /// Ensures a worker discards jobs buffered before cancellation.
+    #[test]
+    fn worker_discards_buffered_jobs_after_cancellation() {
+        let (work_tx, work_rx) = unbounded();
+        let (result_tx, _result_rx) = unbounded();
+        let cancellation = ProofCancellationToken::default();
+        let worker = ProofWorker {
+            task_ctx: test_ctx(()),
+            work_rx,
+            result_tx,
+            availability: Arc::new(AvailabilitySheet::new(1)),
+            cancellation: cancellation.clone(),
+            #[cfg(feature = "metrics")]
+            metrics: Default::default(),
+        };
+        work_tx.send(()).unwrap();
+        work_tx.send(()).unwrap();
+        cancellation.cancel();
+        drop(work_tx);
+
+        let mut processed = 0;
+        worker.process_jobs(0, |()| processed += 1);
+
+        assert_eq!(processed, 0);
     }
 }

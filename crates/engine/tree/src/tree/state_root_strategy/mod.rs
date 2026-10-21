@@ -74,7 +74,8 @@ use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
 use reth_tasks::utils::increase_thread_priority;
 use reth_trie::{updates::TrieUpdates, HashedPostState};
 use reth_trie_parallel::proof_task::{
-    metrics::ProofWorkerIdleMetrics, ProofTaskCtx, ProofWorkerCounts, ProofWorkerHandle,
+    metrics::ProofWorkerIdleMetrics, ProofCancellationToken, ProofTaskCtx, ProofWorkerCounts,
+    ProofWorkerHandle,
 };
 pub use reth_trie_parallel::{
     error::StateRootTaskError,
@@ -554,6 +555,7 @@ impl DefaultStateRootStrategy {
         } = options;
         let (updates_tx, from_multi_proof) = crossbeam_channel::unbounded();
         let (cancel_guard, cancel_rx) = StateRootTaskCancelGuard::channel();
+        let proof_cancellation = cancel_guard.cancellation_token();
 
         let worker_counts = ProofWorkerCounts::new(
             Self::proof_worker_count(
@@ -581,6 +583,7 @@ impl DefaultStateRootStrategy {
             hashed_state_tx,
             from_multi_proof,
             cancel_rx,
+            proof_cancellation,
             SparseTrieTaskOptions {
                 parent_header,
                 preserved_sparse_trie,
@@ -619,6 +622,7 @@ impl DefaultStateRootStrategy {
         hashed_state_tx: mpsc::Sender<Arc<HashedPostState>>,
         from_multi_proof: CrossbeamReceiver<StateRootMessage>,
         cancel_rx: CrossbeamReceiver<()>,
+        proof_cancellation: ProofCancellationToken,
         options: SparseTrieTaskOptions<N>,
     ) where
         N: NodePrimitives,
@@ -718,8 +722,13 @@ impl DefaultStateRootStrategy {
             let task_ctx = ProofTaskCtx::new(factory);
             #[cfg(feature = "trie-debug")]
             let task_ctx = task_ctx.with_proof_jitter(proof_jitter);
-            let proof_worker_handle =
-                ProofWorkerHandle::new(&executor, task_ctx, worker_counts, worker_metrics);
+            let proof_worker_handle = ProofWorkerHandle::new(
+                &executor,
+                task_ctx,
+                worker_counts,
+                proof_cancellation,
+                worker_metrics,
+            );
             let mut task = SparseTrieCacheTask::new_with_trie(
                 &executor,
                 from_multi_proof,
