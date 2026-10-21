@@ -5,7 +5,7 @@
 //! firehose output depends on is actually in effect. The motivating regression: on
 //! the reth v2.3.0 upgrade the `[patch.crates-io] alloy-evm` override stopped
 //! version-matching the workspace requirement, so cargo silently dropped it and
-//! firehose stopped tracing pre-execution system calls. See `progress.txt`.
+//! firehose stopped tracing pre-execution system calls.
 
 use std::path::{Path, PathBuf};
 
@@ -42,7 +42,7 @@ fn cancun_block_emits_beacon_root_system_call() {
          certainly not in effect: stock alloy-evm's transact_system_call does not route \
          through the inspector. Check reth Cargo.toml's [patch.crates-io] alloy-evm — its \
          branch must version-match the workspace alloy-evm requirement, or cargo silently \
-         ignores it. See progress.txt for the full history.",
+         ignores it.",
     );
 }
 
@@ -70,7 +70,7 @@ fn alloy_evm_resolves_to_valve_fork() {
     let source = source.unwrap_or_else(|| {
         panic!(
             "could not find an `alloy-evm` package with a `source` in Cargo.lock — the firehose \
-             build depends on a patched alloy-evm. See progress.txt / [patch.crates-io] alloy-evm.",
+             build depends on a patched alloy-evm. See [patch.crates-io] alloy-evm in Cargo.toml.",
         )
     });
 
@@ -79,7 +79,7 @@ fn alloy_evm_resolves_to_valve_fork() {
         "alloy-evm resolves to `{source}`, NOT the valve-tech/evm fork. The system-call \
          inspector patch is not active, so firehose will not trace pre-execution system calls. \
          Re-point reth Cargo.toml's [patch.crates-io] alloy-evm at a valve-tech/evm branch that \
-         version-matches the workspace alloy-evm requirement. See progress.txt.",
+         version-matches the workspace alloy-evm requirement.",
     );
 }
 

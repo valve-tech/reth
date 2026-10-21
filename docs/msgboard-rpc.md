@@ -25,12 +25,12 @@ Other tunables (defaults shown):
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--msgboard.work-multiplier` | `10000` | Minimum accepted PoW multiplier |
-| `--msgboard.work-divisor` | `1000000` | Maximum accepted PoW divisor |
+| `--msgboard.work-multiplier` | `10000` | Minimum accepted PoW multiplier. At least `1`; `0` would turn the check off, so the node refuses to start with it. |
+| `--msgboard.work-divisor` | `1000000` | Maximum accepted PoW divisor. At least `1`; the node refuses to start with `0`. |
 | `--msgboard.size-limit` | `8192` | Max bytes of `data` per message. Capped at `102301`: a larger message travels in a `BoardMessages` frame of its own, over the `msg/1` packet limit every reth peer enforces, so serving it earns a ban. The node refuses to start above the cap. |
-| `--msgboard.count-limit` | `10000` | Max live messages on the board |
+| `--msgboard.count-limit` | `10000` | Max live messages on the board. At most `1000000`; the node refuses to start above it. |
 | `--msgboard.block-range` | `120` | Blocks before a message expires |
-| `--msgboard.stale-block-buffer` | `3` | Reject peer-announced messages within this many blocks of the lower bound |
+| `--msgboard.stale-block-buffer` | `3` | Reject peer-announced messages within this many blocks of the lower bound. At most `1080`, the widest live window; the node refuses to start above it. |
 | `--msgboard.commit-every` | `15s` | How often to flush in-memory messages to MDBX. Accepts `humantime` (`15s`, `2m`, `500ms`). Minimum `100ms`; the node refuses to start below it. |
 | `--msgboard.log-every` | `30s` | How often to emit a periodic stats line at INFO level. Set very large to effectively disable. Minimum `1s`; the node refuses to start below it. |
 | `--msgboard.gossip-disable` | `false` | Skip outbound P2P announcements (read-only / observer node). Inbound message acceptance is unaffected. |
@@ -133,6 +133,8 @@ A tag does **not** mean the current head. Erigon's category path gives the same 
 A full default board (10,000 messages of 8 KiB) makes a response of about 167.3 MB, and at most 168,600,045 bytes. Stock reth's default `--rpc.max-response-size` is 160 MiB (167,772,160 bytes), which is less. On a nearly full board, a no-limit call then fails with a response-too-large error. It never returns part of the board.
 
 This build of reth sets the `--rpc.max-response-size` default to 200 MiB, so a full default board fits and you need no flag. The default applies to every RPC method, not only `msgboard_*`: any response up to 200 MiB now goes out where stock reth refuses it above 160 MiB. An explicit `--rpc.max-response-size` still overrides it; do not set it below 200 on a node that serves `msgboard_content`. A stock reth, or any node on the 160 MiB default, needs `--rpc.max-response-size 200` (the value is in MiB). If you raise `--msgboard.count-limit` or `--msgboard.size-limit`, scale this up too: the response is about 2 × `count-limit` × `size-limit` bytes, plus up to about 500 bytes per message.
+
+**A call that would build more than 200 MiB is refused before it is built.** The node estimates the JSON from the messages the call selects, at two hex characters per `data` byte plus 500 bytes a message, and answers `-32602` if the estimate is past 200 MiB. The error says to narrow the call with `limit`, `category`, `fromBlock` or `toBlock`, or to use [`msgboard_contentPage`](#msgboard_contentpage-reth-extension). Nothing is truncated: a call either returns every message it selects or is refused. At the default `--msgboard.size-limit` and `--msgboard.count-limit` a full board estimates to about 169 MB, so no default call is affected. The limit matters when `--msgboard.size-limit` is raised: at the `102301` cap a full board is about 2 GB of JSON, and without the check the node would build all of it before `--rpc.max-response-size` rejected it. The limit is fixed at 200 MiB, so a node run with a larger `--rpc.max-response-size` still refuses calls past it.
 
 The node builds the response on a blocking thread, not on the async runtime. Building a full board takes seconds. The node holds at most two `msgboard_content` responses at once. A slot stays taken until jsonrpsee hands the response to the transport: on WebSocket and IPC, until the response enters the connection's send queue; on HTTP, until jsonrpsee gives the response to the HTTP layer. In a JSON-RPC batch, the slot comes back when jsonrpsee copies the response into the batch, so a batch of several content calls cannot deadlock; `--rpc.max-response-size` caps the batch. A further call waits its turn, and a caller that disconnects while it waits costs nothing.
 

@@ -305,8 +305,8 @@ fn honest_inbound_burst(cfg: &MsgboardConfig) -> (usize, usize) {
     let announce_frames = cfg.count_limit.div_ceil(MAX_IDS_PER_FRAME);
     let bodies_per_frame = (P2P_MSG_PACKET_LIMIT / max_wire_body_len(cfg.size_limit)).max(1);
     let reply_frames = MAX_WANT_PER_PEER.div_ceil(bodies_per_frame);
-    let frames = announce_frames + reply_frames;
-    (frames, frames * MAX_INBOUND_FRAME_SIZE)
+    let frames = announce_frames.saturating_add(reply_frames);
+    (frames, frames.saturating_mul(MAX_INBOUND_FRAME_SIZE))
 }
 
 /// The ingress limits for a board with `cfg`: the honest burst, or the
@@ -326,7 +326,12 @@ fn honest_inbound_burst(cfg: &MsgboardConfig) -> (usize, usize) {
 fn inbound_limits_for(cfg: &MsgboardConfig) -> ProtocolIngressLimits {
     let (frames, bytes) = honest_inbound_burst(cfg);
     let bytes = bytes.clamp(MIN_INBOUND_QUEUED_BYTES, MUX_CONNECTION_IN_BUFFER_BYTES);
-    ProtocolIngressLimits::default()
+    // The frame ceiling is declared to the multiplexer as well as checked in
+    // `handle_incoming`. The multiplexer reads the decompressed length from the
+    // snappy header and cuts the session before it allocates the frame, so an
+    // oversized one is never buffered. The check in `handle_incoming` stays as
+    // the second line.
+    ProtocolIngressLimits::new(MAX_INBOUND_FRAME_SIZE)
         .with_max_buffered_messages(frames.max(MIN_INBOUND_QUEUED_FRAMES))
         .with_max_buffered_bytes(bytes)
 }
@@ -523,9 +528,9 @@ impl ConnectionHandler for MsgboardConnectionHandler {
         MSG_PROTOCOL
     }
 
-    /// No frame-size limit here: [`handle_incoming`] refuses an oversized
-    /// frame itself and bans its sender, which is stronger than the session
-    /// error a multiplexer limit would raise.
+    /// The frame ceiling is declared to the multiplexer, which cuts an
+    /// oversized frame before it buffers it. [`handle_incoming`] checks the same
+    /// ceiling again and bans the sender, for a frame the multiplexer let by.
     fn inbound_limits(&self) -> ProtocolIngressLimits {
         inbound_limits_for(self.board.config())
     }
@@ -2835,6 +2840,42 @@ mod tests {
         );
     }
 
+    /// One message announced under many IDs is one request for one hash.
+    #[tokio::test]
+    async fn one_message_announced_under_many_ids_is_requested_once() {
+        let board = board_at(10);
+        let (tx, mut rx) = channel();
+        let hash = checked(&[1, 2, 3], 10).hash;
+        let ids: Vec<MsgID> = (1..=40u64)
+            .map(|size| {
+                MsgID::from_checked(
+                    VERSION_V1,
+                    &block_hash_one(),
+                    size,
+                    1,
+                    1_000_000,
+                    &category_hash(),
+                    &hash,
+                )
+            })
+            .collect();
+
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut WantList::default(),
+            frame(BOARD_MESSAGE_IDS, &MsgID::encode_list(&ids)),
+            peer(),
+        )
+        .await;
+
+        let frames = drain(&mut rx);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][0], GET_BOARD_MESSAGES);
+        assert_eq!(&frames[0][1..], hash.as_slice(), "the hash is requested once");
+    }
+
     #[tokio::test]
     async fn announced_ids_we_already_hold_produce_no_request() {
         let board = board_at(10);
@@ -4710,6 +4751,37 @@ mod tests {
         assert_eq!(board.status().2, 2, "both delivered messages must land");
     }
 
+    /// Verifying a delivered message is a secp256k1 scalar multiplication
+    /// (finding 8). It must run on the blocking pool, not on the async
+    /// connection task that read the frame.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delivery_is_verified_off_the_connection_task() {
+        let board = board_with_cfg(easy_cfg(), 10);
+        let (tx, _rx) = channel();
+
+        let msg = mined(&[9], 10);
+        let hash = msg.clone().to_checked(10, 0).expect("valid pow").hash;
+        let wire = vec![WirePoWMsg::new(msg, hash)];
+
+        handle_incoming(
+            &board,
+            None,
+            &tx,
+            &mut authorised_for_hashes(&[hash]),
+            frame(BOARD_MESSAGES, &encode_wire_pow_msg_list(&wire)),
+            peer(),
+        )
+        .await;
+
+        assert_eq!(board.status().2, 1, "the delivered message must land");
+        let verified_on = board.remote_add_thread().expect("the ingest path ran");
+        assert_ne!(
+            verified_on,
+            std::thread::current().id(),
+            "the proof-of-work check ran on the connection task"
+        );
+    }
+
     /// A frame claiming the same hash twice is a protocol violation
     /// (`CheckUniqueHashes`, `msgboard/fetch.go:296-298`). Without it a peer
     /// buys one verification per copy from a single reservation's worth of
@@ -5534,6 +5606,15 @@ mod tests {
         /// ended: `Some(err)` when the multiplexer cut it, `None` when it was
         /// still open and holding the flood.
         async fn flood_a_stalled_node(flood_bytes: usize) -> Option<P2PStreamError> {
+            send_to_a_stalled_node(full_request(), flood_bytes).await
+        }
+
+        /// [`flood_a_stalled_node`] with a chosen frame, whose first byte is the
+        /// opcode. It is sent until `flood_bytes` have gone out, and at least once.
+        async fn send_to_a_stalled_node(
+            request: Vec<u8>,
+            flood_bytes: usize,
+        ) -> Option<P2PStreamError> {
             let handler = MsgboardProtocolHandler::new(Arc::new(MsgBoard::new(easy_cfg())))
                 .on_incoming("127.0.0.1:0".parse().unwrap())
                 .unwrap();
@@ -5574,16 +5655,19 @@ mod tests {
                 .find(&MSG_CAPABILITY)
                 .expect("both sides speak msg/1")
                 .relative_message_id_offset();
-            let mut request = full_request();
+            let mut request = request;
             request[0] += offset;
             let request = Bytes::from(request);
             let mut sent = 0;
-            while sent < flood_bytes {
+            loop {
                 // A cut session fails the send. The victim's result says why.
                 if attacker.send(request.clone()).await.is_err() {
                     break;
                 }
                 sent += request.len();
+                if sent >= flood_bytes {
+                    break;
+                }
             }
             let outcome = victim.await.unwrap();
             drop(attacker);
@@ -5637,6 +5721,54 @@ mod tests {
             );
         }
 
+        /// A frame of `len` bytes, opcode included, that no decoder would
+        /// accept, so a session that survives it did so on size alone.
+        fn frame_of(len: usize) -> Vec<u8> {
+            let mut raw = vec![0u8; len];
+            raw[0] = GET_BOARD_MESSAGES;
+            raw
+        }
+
+        /// A frame over the inbound ceiling is cut by the multiplexer, before
+        /// it is buffered or read, with the session closed as for any other
+        /// oversized sub-protocol frame. The app-level check in
+        /// `handle_incoming` only runs once the read loop takes a frame, so
+        /// with the read loop stalled it never runs at all.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_frame_over_the_ceiling_is_cut_before_it_is_buffered() {
+            let outcome = send_to_a_stalled_node(frame_of(MAX_INBOUND_FRAME_SIZE + 1), 1).await;
+            assert!(
+                matches!(
+                    outcome,
+                    Some(P2PStreamError::SubprotocolMessageTooBig { max_size, .. })
+                        if max_size == MAX_INBOUND_FRAME_SIZE
+                ),
+                "an oversized frame was buffered: {outcome:?}",
+            );
+        }
+
+        /// The ceiling itself is legal, so the cut must not move below it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_frame_at_the_ceiling_is_buffered() {
+            let outcome = send_to_a_stalled_node(frame_of(MAX_INBOUND_FRAME_SIZE), 1).await;
+            assert!(outcome.is_none(), "a frame of exactly the ceiling was refused: {outcome:?}");
+        }
+
+        /// Every config declares the same frame ceiling, whatever the burst.
+        #[test]
+        fn the_ingress_limits_declare_the_frame_ceiling() {
+            for cfg in [
+                MsgboardConfig::default(),
+                MsgboardConfig { size_limit: MAX_SAFE_SIZE_LIMIT, ..Default::default() },
+                MsgboardConfig { count_limit: 1, ..Default::default() },
+            ] {
+                assert_eq!(
+                    inbound_limits_for(&cfg).max_frame_bytes(),
+                    Some(MAX_INBOUND_FRAME_SIZE),
+                );
+            }
+        }
+
         /// A peer that requests at line rate but reads slowly holds our read
         /// loop in `OutboundQueue::send`. Everything it sends meanwhile waits
         /// in the multiplexer. 5 MiB of full-size requests is 640 frames, which
@@ -5650,5 +5782,19 @@ mod tests {
                 "the session held {flood} bytes of unread requests and stayed open: {outcome:?}",
             );
         }
+    }
+
+    /// An extreme `count_limit` must not overflow the ingress budget. Bytes
+    /// land on the multiplexer's per-connection ceiling.
+    #[test]
+    fn extreme_count_limits_do_not_overflow_the_ingress_budget() {
+        for count_limit in [0usize, 1, 10_000, usize::MAX / 1000, usize::MAX] {
+            let cfg = MsgboardConfig { count_limit, ..MsgboardConfig::default() };
+            let (frames, bytes) = honest_inbound_burst(&cfg);
+            assert!(frames > 0 && bytes > 0, "count_limit {count_limit}");
+            let _ = inbound_limits_for(&cfg);
+        }
+        let huge = MsgboardConfig { count_limit: usize::MAX, ..MsgboardConfig::default() };
+        assert_eq!(honest_inbound_burst(&huge).1, usize::MAX, "saturates instead of wrapping");
     }
 }

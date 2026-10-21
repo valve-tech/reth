@@ -1,7 +1,7 @@
 # MsgBoard Parity Gaps — reth `extension-model` vs erigon-pulse `v3.0.0-RC8`
 
 **Audit date:** 2026-04-27
-**Reference source:** `~/go/src/gitlab.com/pulsechaincom/erigon-pulse` @ `v3.0.0-RC8` = `48cdb29e35` (commit message: *Prepare release candidate 8*), package `msgboard/`
+**Reference source:** the erigon-pulse source tree @ `v3.0.0-RC8` = `48cdb29e35` (commit message: *Prepare release candidate 8*), package `msgboard/`
 
 > **Path corrected 2026-07-28.** This line previously read `private-erigon-pulse`.
 > The commit hash was right and the source was on disk the whole time under the
@@ -564,7 +564,7 @@ to chunk.
 > different directory name (see the header note).
 
 - The §11.5 O2 caveat is **unchanged**: erigon's `Content` ordering remains
-  unverified, and `~/go/src/gitlab.com/pulsechaincom/private-erigon-pulse` was
+  unverified, and `private-erigon-pulse` was
   not present on this machine either. Highest-value remaining parity item, and
   it now blocks §12.9 as well.
 - The unbounded request frame in §12.9.
@@ -583,7 +583,7 @@ to chunk.
 **Audit date:** 2026-07-28
 **Trigger:** §12.11 listed three items blocked on "erigon source not available on
 this machine". It is available — at
-`~/go/src/gitlab.com/pulsechaincom/erigon-pulse/msgboard/`, checked out at
+the `msgboard/` package of the erigon-pulse source tree, checked out at
 `v3.0.0-RC8`. Rounds 3 and 4 looked for `private-erigon-pulse` and, not finding
 it, reasoned from the prose in this document instead. Everything below follows
 from twenty minutes of reading `message_index.go`.
@@ -911,23 +911,29 @@ it is the function used by *both* gates: `filter_wanted` (the announce filter,
 erigon's line 233) and the board's add path (erigon's line 392). So the float
 comparison the team asked about is not in reth's accept/reject path at all.
 
-Float survives in exactly one place: `PoWMsg::difficulty_ratio`, used by the
-insert comparator. That one is **parity-required** — erigon's `DifficultyRatio()`
-is `float64`, and the comparator's output is wire-observable through eviction
-(§13.1). Rust and Go both do IEEE-754 round-to-nearest-even for `u64 → f64` and
-for division, so the values are bit-identical and this introduces no divergence.
+**Update.** The insert comparator no longer uses a float either. When this
+section was written it compared `PoWMsg::difficulty_ratio` (`f64`), which was
+parity-required because erigon's `DifficultyRatio()` was `float64`. Erigon has
+since moved to an exact `cmpRatio` (§26.2), and reth follows it:
+`erigon_insert_pos` calls `cmp_ratio` (`crates/net/msgboard/src/index.rs`), which
+cross-multiplies in `u128` like the gate does:
 
-Residual risk is confined to ordering: two distinct `(mult, div)` pairs above
-`2^53` can round to the same `f64` and compare equal where exact rational
-arithmetic would order them. That is erigon's behavior too, so changing it would
-be a divergence. Worth noting only because it interacts with §14.1 — an attacker
-exploiting the overflow gets an enormous ratio, and where it lands among other
-enormous ratios is float-determined.
+```rust
+let left = (a as u128) * (d as u128);
+let right = (b as u128) * (c as u128);
+left.cmp(&right)
+```
 
-No change made. The reth-vs-erigon difference in `is_work_acceptable` (exact vs
-float) is a pre-existing divergence in reth's favour; it can only ever *reject*
-a message erigon accepts by a margin under one `f64` ulp, which no honest client
-produces.
+So no accept/reject decision and no ordering decision in reth compares floats.
+The `2^53` cliff described in the original text, where two distinct pairs round
+to the same ratio and compare equal, does not apply to board ordering.
+`PoWMsg::difficulty_ratio` and `MsgID::difficulty_ratio` still return `f64`, but
+they are informational accessors. Neither is used by the gate or the comparator.
+
+`is_work_acceptable` also refuses a zero multiplier and a zero divisor outright.
+The bare cross-multiplication accepted any multiplier over a zero divisor, and
+no message body with either value gets past decode, so an announced ID carrying
+one could only cost a wasted request.
 
 ### 14.3 Unlimited `GetBoardMessages` requests — 68× reflection amplification — ✅ FIXED
 
@@ -1223,15 +1229,14 @@ request, not 6.6 MiB. The message bodies are never copied. No change made.
 > existing.
 >
 > The counters were previously unwatched, so "revisit if it goes non-zero" had
-> no mechanism. Two Prometheus alerts now carry it (monorepo
-> `deploy/monitoring/valve.rules.yml`, group `valve-fleet-reth`):
+> no mechanism. Two Prometheus alerts now carry it (in the fleet monitoring rules):
 > `MsgboardOutboundDropped` and `MsgboardBadProtocol`, both `warning` — a
 > non-zero counter means the queue bound *worked*, not that anything is down.
 > Verified against live Prometheus: the expressions match five real series and
 > currently return empty, so they can fire but are not firing.
 >
-> `direct-b-evm-1` is absent from those five: it still runs a build predating
-> the counters (added in `5d238f5f85`). See `progress.txt`.
+> `chain 1, replica b` is absent from those five: it still runs a build predating
+> the counters (added in `5d238f5f85`).
 >
 > Re-announcement (fourth bullet) got a partial answer too: `943a` shows 428
 > `announcements_received` against 5 `requests_sent`, so `filter_wanted` is
@@ -1351,9 +1356,9 @@ and left it there, because nothing measured it. The counters on the fleet
 
 | box | `requests_sent` | `accepted_remote` | `skipped_duplicate` | uptime |
 |---|---|---|---|---|
-| `direct-a-evm-943` | 445 | 45 | **400 (90%)** | 2h14m |
-| `direct-a-evm-1` | 65 | 1 | **64 (98%)** | 9m |
-| `direct-a-evm-369` | 0 | 0 | 0 | — |
+| `chain 943, replica a` | 445 | 45 | **400 (90%)** | 2h14m |
+| `chain 1, replica a` | 65 | 1 | **64 (98%)** | 9m |
+| `chain 369, replica a` | 0 | 0 | 0 | — |
 
 Nine out of ten messages the board asked for, it already had.
 
@@ -1541,8 +1546,8 @@ it exists today, independent of whether we adopt the new construction.
 
 | box | `accepted_remote` | `rejected_invalid_pow` |
 |---|---|---|
-| `direct-a-evm-943` | 45 | **0** |
-| `direct-a-evm-1` | 1 | **0** |
+| `chain 943, replica a` | 45 | **0** |
+| `chain 1, replica a` | 1 | **0** |
 
 We are accepting peer messages and rejecting none. If peers had switched, every
 message would fail our verification and `rejected_invalid_pow` would climb.
@@ -1558,7 +1563,7 @@ it has not been written. Three independent checks agree:
   any of them;
 - every published `@pulsechain/msgboard` release, 0.0.17 through 0.0.28,
   implements the old construction — `challenge.getX()`, `hash % difficulty === 0n`;
-- `gitlab.com/pulsechaincom/msgboard`, which the spec names as the TypeScript
+- the TypeScript msgboard repository, which the spec names as the TypeScript
   reference, has had **no push in four months** (checked by the team, 2026-08-19).
 
 So the spec is a **design document, not a description of shipped code**. Its
@@ -2158,7 +2163,7 @@ visible. Raised upstream as §2.2 of `docs/msgboard-spec-feedback.md`.
 ## 22. Round-14: no metric could tell "nobody is talking" from "nobody can"
 
 The fleet runbook
-(`monorepo/deploy/rpc/runbooks/msgboard-gossip-investigation.md`, 2026-08-21)
+(the fleet gossip investigation runbook, 2026-08-21)
 reports `announcements_received = 0` on all seven boxes while
 `announcements_sent` is 26 and 34. Nothing arrives from any peer.
 
@@ -2288,7 +2293,7 @@ one loads. Dropping the `verify` clause fails it.
 ### 23.2 What the fleet metrics actually said
 
 The runbook that opened this
-(`monorepo/deploy/rpc/runbooks/msgboard-gossip-investigation.md`) reports gossip
+(the fleet gossip investigation runbook) reports gossip
 as dead fleet-wide and reads `expired 31` on chain 369 as evidence of a
 regression. §22.3 already noted that `expired` cannot support that inference.
 Prometheus keeps 365 days of `reth_msgboard_*` (scraped since 2026-08-03), and
@@ -2296,19 +2301,19 @@ it separates two problems the runbook treats as one:
 
 | host | `accepted_remote`, 30d peak | last increase |
 |---|---|---|
-| direct-a-evm-369 | **0** | never |
-| direct-b-evm-369 | **0** | never |
+| chain 369, replica a | **0** | never |
+| chain 369, replica b | **0** | never |
 | indexer | **0** | never |
-| direct-a-evm-943 | 453 | 2026-08-21 16:56Z |
-| direct-b-evm-943 | 573 | 2026-08-21 16:56Z |
-| direct-a-evm-1 | 6 | 2026-08-21 18:56Z |
-| direct-b-evm-1 | 2016 | 2026-08-21 18:56Z |
+| chain 943, replica a | 453 | 2026-08-21 16:56Z |
+| chain 943, replica b | 573 | 2026-08-21 16:56Z |
+| chain 1, replica a | 6 | 2026-08-21 18:56Z |
+| chain 1, replica b | 2016 | 2026-08-21 18:56Z |
 
 **Chain 369 never received a single message**, across the whole retained window.
 That is not a regression and the roll did not cause it; it belongs with the
 peering question in the runbook's sub-problem A.
 
-**Chains 943 and 1 were receiving until the roll and stopped at it.** `direct-b-evm-1`
+**Chains 943 and 1 were receiving until the roll and stopped at it.** `chain 1, replica b`
 alone took 2016 messages in the preceding week. Both chains stopped at their own
 restart and have not resumed since — which is the regression, and §23 is its
 most likely mechanism.
@@ -2322,7 +2327,7 @@ next thing to read is the new `msgboard_peer_sessions` gauge from §22.
 
 ## 24. Round-16: the subscription notification carried the wrong method name
 
-`msgboard_subscribe` works end to end — verified live on `direct-a-evm-943`,
+`msgboard_subscribe` works end to end — verified live on `chain 943, replica a`,
 where a held subscription delivered real arcade and provecash messages as they
 were posted. But the notification frames named the wrong method:
 
@@ -2366,12 +2371,12 @@ earlier in this document.
 
 ```
                      peer_sessions   opened/hr   peer_unsupported   accepted_local/hr
-direct-a-evm-369           1            83            7,900               0
-direct-b-evm-369           0           186           14,411               0
-direct-a-evm-943           0             0           11,177             127
-direct-b-evm-943           0             0           12,698             139
-direct-a-evm-1             0             0           13,268               0
-direct-b-evm-1             0             0           27,112               0
+chain 369, replica a           1            83            7,900               0
+chain 369, replica b           0           186           14,411               0
+chain 943, replica a           0             0           11,177             127
+chain 943, replica b           0             0           12,698             139
+chain 1, replica a             0             0           13,268               0
+chain 1, replica b             0             0           27,112               0
 ```
 
 ### 25.1 Two different faults, neither the one that was assumed
@@ -2425,16 +2430,11 @@ Static peering fixes it outright, because on testnet there is no third party to
 depend on:
 
 ```
-direct-a-evm-943  116.202.173.179:30303
-  enode://c6b52cf99ec0bdecec6b1ca58c42c59358c7f9aabe0369aca5c73d51c5efdfb0
-         1aeeec069aa52b0a70386682a0cc6fd5c0c8c3714ce5100011c0df2b311a43b2
-
-direct-b-evm-943  157.90.179.40:30303
-  enode://8d094139bc456c134f5d397bd5320dd40faecf6d6f586a57ce2141147599ce7f
-         6f4365e10114856aa7c467ed995db84e55ced6a598d137377a2693f1b1ad5e64
+chain 943, replica a  <its address>:30303 and node ID
+chain 943, replica b  <its address>:30303 and node ID
 ```
 
-That is a deploy change in the monorepo, not a reth change. Nothing in reth
+That is a deploy change, not a reth change. Nothing in reth
 needs to move for it.
 
 ### 25.4 What the metrics will say when it works
@@ -2562,7 +2562,7 @@ upgrade should keep the window short.
 
 These two differences are deliberate. They are here so a later audit does not
 read them as parity bugs. The erigon references are to
-`~/go/src/gitlab.com/pulsechaincom/erigon-pulse` at `v3.0.0-RC8`
+the erigon-pulse source tree at `v3.0.0-RC8`
 (`48cdb29e35`), package `msgboard/`.
 
 ### 27.1 A zero difficulty rejects the whole frame, not one message
@@ -2617,7 +2617,7 @@ current when ready comes.
 
 ## 29. RPC parity, review round 2 (2026-10-01)
 
-The erigon references are to `~/go/src/gitlab.com/pulsechaincom/erigon-pulse`,
+The erigon references are to the erigon-pulse source tree,
 files `rpc/jsonrpc/msgboard_api.go`, `rpc/types.go` and `msgboard/`.
 
 ### 29.1 Fixed
@@ -2692,7 +2692,7 @@ so reth keeps it.
 
 These behaviours are reth-only and change only whom reth asks for a message.
 They add no message type and no field, so they are wire-compatible with erigon.
-The erigon references are to `~/go/src/gitlab.com/pulsechaincom/erigon-pulse`,
+The erigon references are to the erigon-pulse source tree,
 package `msgboard/`.
 
 ### 30.1 Trusted peers are asked first, and peers that did not announce are asked last
@@ -2718,3 +2718,18 @@ The second one depends on erigon's `GET_BOARD_MESSAGES` arm
 it. A hash it lacks is skipped, and an empty reply sends nothing. Reth's own
 arm behaves the same. A peer of either client therefore answers a speculative
 request correctly, and an empty answer costs it nothing.
+
+### 30.2 A claim is one message, not one ID
+
+An announced ID is 121 bytes, and only its last 32 bytes name the message. The
+rest is the announcer's word. Reth claims by hash: one message announced under
+many IDs takes one claim, one request and one place in the per-peer and global
+caps, is queued once for the pacer, and is exhausted once.
+
+The claim keeps the first ID announced until a later announcement of the message
+ranks higher. An ID that is not worth fetching (it fails the version, size, work
+or block-window checks) ranks below every one that is, and among fetchable IDs
+the one anchored to the later block ranks higher. A tie keeps the first. A first
+announcer therefore cannot keep a stale or early-anchored ID in the claim. The
+ID only decides whether an exhausted claim is still wanted and what a retry
+costs against the responder's reply budget. Every request names the hash.

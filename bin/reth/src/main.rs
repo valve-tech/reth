@@ -81,7 +81,7 @@ struct EthereumExtArgs {
     /// Replica letter stamped into firehose health.json (`a` / `b`).
     ///
     /// Optional. When unset, the ExEx infers from hostname
-    /// (`direct-b-evm-369`, `evm943b`) or `VALVE_REPLICA`.
+    /// (`direct-b-node`, `evm943b`) or `VALVE_REPLICA`.
     #[arg(long = "firehose.replica", env = "FIREHOSE_REPLICA")]
     firehose_replica: Option<String>,
 }
@@ -117,7 +117,7 @@ struct PulsechainExtArgs {
     /// Replica letter stamped into firehose health.json (`a` / `b`).
     ///
     /// Optional. When unset, the ExEx infers from hostname
-    /// (`direct-b-evm-369`, `evm943b`) or `VALVE_REPLICA`.
+    /// (`direct-b-node`, `evm943b`) or `VALVE_REPLICA`.
     #[arg(long = "firehose.replica", env = "FIREHOSE_REPLICA")]
     firehose_replica: Option<String>,
 }

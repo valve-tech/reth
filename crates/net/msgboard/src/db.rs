@@ -17,7 +17,7 @@ const TEBIBYTE: usize = GIBIBYTE * 1024;
 /// MDBX named-table holding RLP-encoded `CheckedPoWMsg` values keyed by SHA-256
 /// `PoW` hash. Mirrors `kv.BoardMessage = "BoardMessage"` in erigon-pulse so the
 /// on-disk layout is interchangeable between implementations.
-const TABLE_NAME: &str = "BoardMessage";
+pub(crate) const TABLE_NAME: &str = "BoardMessage";
 
 /// Top-level RLP elements in a stored [`CheckedPoWMsg`]: `msg`, `block_number`,
 /// `timestamp`, `hash`.
@@ -130,6 +130,10 @@ pub(crate) fn open_env_with_map_size(path: &Path, map_size: usize) -> eyre::Resu
 /// right key. Left in place, a flush that deletes the message deletes the key
 /// the message names, and the misfiled row comes back on every restart.
 pub fn db_load_all(env: &Environment) -> eyre::Result<(Vec<CheckedPoWMsg>, u64)> {
+    #[cfg(test)]
+    if FAIL_LOAD.with(std::cell::Cell::get) {
+        eyre::bail!("injected load failure");
+    }
     let tx = env.begin_ro_txn()?;
     let db = tx.open_db(Some(TABLE_NAME))?;
     let cursor = tx.cursor(db.dbi())?;
@@ -240,6 +244,13 @@ pub fn db_load_all(env: &Environment) -> eyre::Result<(Vec<CheckedPoWMsg>, u64)>
     Ok((msgs, read_failures + decode_failures))
 }
 
+// Makes `db_load_all` fail before it reads anything, as a database that opens
+// but cannot be read would.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 // Makes `rekey_misfiled_rows` fail on this thread, as a full map or a
 // read-only environment would.
 #[cfg(test)]
@@ -325,7 +336,7 @@ pub fn db_flush<M: Borrow<CheckedPoWMsg>>(
 /// nearly empty. There is no minimum row count, because a one-row database
 /// whose only row fails is total loss too, and the operator has to hear about
 /// it either way.
-const fn decode_failure_is_wholesale(rows: u64, decode_failures: u64) -> bool {
+pub(crate) const fn decode_failure_is_wholesale(rows: u64, decode_failures: u64) -> bool {
     decode_failures > 0 && decode_failures * 2 >= rows
 }
 
