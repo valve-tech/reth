@@ -10,8 +10,14 @@
 //!    and one for actual execution (executed sequentially)
 //! 2. Prewarming tasks execute transactions in parallel using shared caches
 //! 3. When actual block execution happens, it benefits from the warmed cache
+//! 4. Block execution commits prewarm results whose reads are still valid instead of executing the
+//!    transactions again
 
-use super::{bal_prewarm_pool::BalPrewarmPool, StateRootHintStream, StateRootUpdateStream};
+use super::{
+    bal_prewarm_pool::BalPrewarmPool,
+    reuse::{BalanceTracker, PoolTx, PrewarmResults, RecordingDb, SpeculativeTx},
+    StateRootHintStream, StateRootUpdateStream,
+};
 use crate::tree::{
     precompile_cache::{CachedPrecompile, PrecompileCacheMap},
     CachedStateCacheMetrics, CachedStateMetrics, CachedStateProvider, ExecutionEnv,
@@ -23,26 +29,42 @@ use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::keccak256;
 use metrics::{Counter, Gauge, Histogram};
 use rayon::prelude::*;
-use reth_evm::{execute::ExecutableTxFor, ConfigureEvm, Evm, EvmFor, RecoveredTx, SpecFor};
+use reth_evm::{
+    execute::ExecutableTxFor, ConfigureEvm, Evm, EvmFor, HaltReasonFor, RecoveredTx, SpecFor,
+};
 use reth_metrics::Metrics;
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
 use reth_provider::{
     BlockExecutionOutput, BlockNumReader, ChangeSetReader, DatabaseProviderFactory,
     DatabaseProviderROFactory, EvmStateProvider, EvmStateProviderBox, HistoryReader,
-    ProviderResult, PruneCheckpointReader, StageCheckpointReader, StateProvider,
-    StorageChangeSetReader, StorageSettingsCache,
+    PruneCheckpointReader, StageCheckpointReader, StateProvider, StorageChangeSetReader,
+    StorageSettingsCache,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_overlay::OverlayStateProviderFactory;
 use reth_tasks::{pool::WorkerPool, Runtime};
 use reth_trie_common::MultiProofTargetsV2;
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    mpsc::{self, channel, Receiver, Sender},
-    Arc,
+use revm::{context::Transaction as _, state::EvmState};
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, channel, Receiver, Sender},
+        Arc,
+    },
+    time::Duration,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, debug_span, instrument, trace, trace_span, warn, Span};
+
+/// Maximum number of consecutive rounds that execute stale prewarm results again.
+const MAX_REFRESH_ROUNDS: usize = 4;
+
+/// Number of transactions ahead of block execution that refreshing checks after block execution
+/// published actual writes.
+const REFRESH_WINDOW: usize = 64;
+
+/// How often refreshing checks whether block execution published actual writes.
+const REFRESH_POLL_INTERVAL: Duration = Duration::from_micros(50);
 
 /// Determines the prewarming mode: transaction-based, BAL-based, or skipped.
 ///
@@ -138,7 +160,7 @@ where
         actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>,
         state_root_hint_stream: Option<StateRootHintStream>,
     ) where
-        Tx: ExecutableTxFor<Evm> + Send + 'static,
+        Tx: ExecutableTxFor<Evm> + Clone + Send + Sync + 'static,
     {
         let executor = self.executor.clone();
         let ctx = self.ctx.clone();
@@ -157,6 +179,8 @@ where
 
             let mut tx_count = 0usize;
             let state_root_hint_stream = state_root_hint_stream.as_ref();
+            // Transactions to execute again when their results become stale.
+            let mut refresh_txs = Vec::new();
             pool.in_place_scope(|s| {
                 s.spawn(|_| {
                     pool.init::<PrewarmEvmState<Evm>>(|_| ctx.evm_for_ctx());
@@ -177,6 +201,20 @@ where
                     }
 
                     tx_count += 1;
+                    if ctx.prewarm_results.is_some() {
+                        refresh_txs.push((index, tx.clone()));
+                    }
+                    // Seed results before queueing, so that they are ready as soon as possible.
+                    let seeded = if let Some(results) = &ctx.prewarm_results &&
+                        let Some(seeds) = &ctx.env.pool_seeds
+                    {
+                        results.seed(index, tx.tx().tx_hash(), seeds)
+                    } else {
+                        None
+                    };
+                    if seeded.is_some() {
+                        ctx.metrics.seeded_transactions.increment(1);
+                    }
                     let parent_span = Span::current();
                     s.spawn(move |_| {
                         let _enter = trace_span!(
@@ -186,7 +224,7 @@ where
                             i = index,
                         )
                         .entered();
-                        Self::transact_worker(ctx, index, tx, state_root_hint_stream);
+                        Self::transact_worker(ctx, index, tx, seeded, state_root_hint_stream);
                     });
                 }
 
@@ -200,6 +238,10 @@ where
                 }
             });
 
+            if let Some(results) = &ctx.prewarm_results {
+                Self::refresh_results(ctx, pool, results, &refresh_txs);
+            }
+
             // All tasks are done — clear per-thread EVM state for the next block.
             pool.clear();
 
@@ -208,7 +250,72 @@ where
         });
     }
 
-    /// Executes a single prewarm transaction on the current pool thread's EVM.
+    /// Executes transactions again whose results became stale, because the predicted writes of
+    /// earlier transactions changed after they were executed.
+    ///
+    /// Each round checks the transactions that block execution has not reached yet, in block
+    /// order, on all pool threads. Rounds repeat while they find stale results, then wait for
+    /// block execution to publish actual writes that differ from the predicted ones, until
+    /// prewarming stops.
+    fn refresh_results<Tx>(
+        ctx: &PrewarmContext<N, P, Evm>,
+        pool: &WorkerPool,
+        results: &PrewarmResults<HaltReasonFor<Evm>>,
+        txs: &[(usize, Tx)],
+    ) where
+        Tx: ExecutableTxFor<Evm> + Clone + Send + Sync,
+    {
+        let mut rounds = 0;
+        // Rounds after block execution published writes only check the transactions it reaches
+        // soon, the others are checked in later rounds.
+        let mut window_len = usize::MAX;
+        while !ctx.should_stop() {
+            let generation = results.predicted().generation();
+            // Skip the transaction block execution is executing and the one it reaches next.
+            let next = ctx.executed_tx_index.load(Ordering::Relaxed) + 1;
+            let start = txs.partition_point(|(index, _)| *index <= next);
+            if start == txs.len() {
+                break
+            }
+            let window = &txs[start..txs.len().min(start.saturating_add(window_len))];
+            // Checking is cheap, so only stale transactions are handed to the pool.
+            let stale = window
+                .iter()
+                .filter(|(index, _)| results.needs_refresh(*index))
+                .collect::<Vec<_>>();
+            let refreshed = !stale.is_empty();
+            if refreshed {
+                let cursor = AtomicUsize::new(0);
+                pool.in_place_scope(|s| {
+                    for _ in 0..pool.current_num_threads().min(stale.len()) {
+                        s.spawn(|_| {
+                            while let Some((index, tx)) =
+                                stale.get(cursor.fetch_add(1, Ordering::Relaxed))
+                            {
+                                if ctx.should_stop() {
+                                    break
+                                }
+                                Self::transact_worker(ctx, *index, tx.clone(), None, None);
+                            }
+                        });
+                    }
+                });
+            }
+
+            rounds += 1;
+            if refreshed && rounds < MAX_REFRESH_ROUNDS {
+                continue
+            }
+            rounds = 0;
+            window_len = REFRESH_WINDOW;
+            while results.predicted().generation() == generation && !ctx.should_stop() {
+                std::thread::sleep(REFRESH_POLL_INTERVAL);
+            }
+        }
+    }
+
+    /// Executes a single prewarm transaction on the current pool thread's EVM, or only loads the
+    /// reads of its `seeded` pool transaction result.
     ///
     /// Lazily initialises per-thread [`PrewarmEvmState`] via
     /// [`get_or_init`](reth_tasks::pool::Worker::get_or_init) on first access.
@@ -216,17 +323,12 @@ where
         ctx: &PrewarmContext<N, P, Evm>,
         index: usize,
         tx: Tx,
+        seeded: Option<Arc<PoolTx<HaltReasonFor<Evm>>>>,
         state_root_hint_stream: Option<&StateRootHintStream>,
     ) where
         Tx: ExecutableTxFor<Evm>,
     {
         WorkerPool::with_worker_mut(|worker| {
-            let Some(evm) =
-                worker.get_or_init::<PrewarmEvmState<Evm>>(|| ctx.evm_for_ctx()).as_mut()
-            else {
-                return;
-            };
-
             if ctx.should_stop() {
                 return;
             }
@@ -236,10 +338,56 @@ where
                 return;
             }
 
+            let state = worker.get_or_init::<PrewarmEvmState<Evm>>(|| ctx.evm_for_ctx());
+            // The pool is shared across blocks, so this thread may still hold the EVM of a
+            // previous prewarm run that has not finished yet. Runs of payloads that claim the same
+            // block hash may use different block environments, so the hash cannot tell them apart.
+            if !Arc::ptr_eq(&state.run, &ctx.terminate_execution) {
+                *state = ctx.evm_for_ctx();
+            }
+            let Some(evm) = state.evm.as_mut() else { return };
+
             let start = Instant::now();
 
             let (tx_env, tx) = tx.into_parts();
-            let res = match evm.transact(tx_env) {
+            let send_hints = |state: &EvmState| {
+                if index > 0 &&
+                    let Some(state_root_hint_stream) = state_root_hint_stream
+                {
+                    let (targets, storage_targets) = MultiProofTargetsV2::from_state(state);
+                    ctx.metrics.prefetch_storage_targets.record(storage_targets as f64);
+                    state_root_hint_stream.on_access_hint(targets.into());
+                }
+            };
+
+            if let Some(seeded) = seeded {
+                // Block execution loads the reads to validate the result.
+                if let Err(err) = seeded.load_reads(evm.db_mut()) {
+                    trace!(
+                        target: "engine::tree::payload_processor::prewarm",
+                        %err,
+                        tx_hash=%tx.tx().tx_hash(),
+                        "Failed to load reads of seeded pool transaction",
+                    );
+                }
+                send_hints(seeded.state());
+                return;
+            }
+
+            // Prewarming disables nonce and balance checks, so a reusable result must also show
+            // that the caller would have passed them.
+            let speculative = SpeculativeTx {
+                caller: *tx.signer(),
+                nonce: tx_env.nonce(),
+                max_balance_spending: tx_env.max_balance_spending(),
+            };
+            if let Some(results) = &ctx.prewarm_results {
+                evm.db_mut().start_recording(Arc::clone(results.predicted()), index);
+                evm.inspector_mut().clear();
+            }
+            let res = evm.transact(tx_env);
+            let reads = evm.db_mut().take_reads();
+            let res = match res {
                 Ok(res) => res,
                 Err(err) => {
                     trace!(
@@ -250,6 +398,11 @@ where
                         "Error when executing prewarm transaction",
                     );
                     ctx.metrics.transaction_errors.increment(1);
+                    if let Some(results) = &ctx.prewarm_results &&
+                        let Some(reads) = reads
+                    {
+                        results.reject(index, reads);
+                    }
                     return;
                 }
             };
@@ -259,12 +412,13 @@ where
                 return;
             }
 
-            if index > 0 {
-                let (targets, storage_targets) = MultiProofTargetsV2::from_state(res.state);
-                ctx.metrics.prefetch_storage_targets.record(storage_targets as f64);
-                if let Some(state_root_hint_stream) = state_root_hint_stream {
-                    state_root_hint_stream.on_access_hint(targets.into());
-                }
+            send_hints(&res.state);
+
+            if let Some(results) = &ctx.prewarm_results &&
+                let Some(reads) = reads &&
+                index >= ctx.executed_tx_index.load(Ordering::Relaxed)
+            {
+                results.store(index, res, reads, evm.inspector_mut(), speculative);
             }
 
             ctx.metrics.total_runtime.record(start.elapsed());
@@ -349,20 +503,16 @@ where
         }
     }
 
-    /// Runs BAL-based prewarming and state-root streaming.
+    /// Runs BAL-based prewarming and state-root streaming inline.
     ///
     /// Spawns two halves concurrently on separate pools, then waits for both to complete:
     /// 1. Hashed state streaming on the BAL streaming pool so storage updates can reach the
     ///    state-root job before account reads finish.
     /// 2. Storage prefetch on the prewarming pool to populate the execution cache, unless BAL batch
     ///    I/O is disabled.
-    ///
-    /// Both halves stop early once the block is cancelled. The update stream is then dropped
-    /// unfinished, so the state-root task cannot compute a root from partial updates.
     #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
     fn run_bal_prewarm(
-        ctx: PrewarmContext<N, P, Evm>,
-        executor: Runtime,
+        &self,
         decoded_bal: Arc<DecodedBal>,
         actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>,
         hashed_update_stream: Option<StateRootUpdateStream>,
@@ -370,21 +520,12 @@ where
         let bal = decoded_bal.as_bal();
         if bal.is_empty() {
             if let Some(hashed_update_stream) = hashed_update_stream {
-                if ctx.is_cancelled() {
-                    drop(hashed_update_stream);
-                } else {
-                    hashed_update_stream.finish();
-                }
+                hashed_update_stream.finish();
             }
-            if !ctx.is_cancelled() {
-                let _ = actions_tx
-                    .send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
-            }
+            let _ =
+                actions_tx.send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
             return;
         }
-
-        // Clear per-thread providers on every exit, including unwinding from either prewarm half.
-        let pool_cleanup = PrewarmPoolCleanup(executor.clone());
 
         trace!(
             target: "engine::tree::payload_processor::prewarm",
@@ -392,6 +533,8 @@ where
             "Starting BAL prewarm"
         );
 
+        let ctx = self.ctx.clone();
+        let executor = self.executor.clone();
         let parent_span = Span::current();
         let stream_parent_span = parent_span;
         let prefetch_bal = Arc::clone(&decoded_bal);
@@ -411,43 +554,26 @@ where
                 let _span = branch_span.entered();
 
                 stream_bal.as_bal().par_iter().for_each(|account_changes| {
-                    if ctx.is_cancelled() {
-                        return;
-                    }
                     WorkerPool::with_worker_mut(|worker| {
                         let provider = worker.get_or_init::<Option<EvmStateProviderBox>>(|| None);
-                        if let Err(err) = ctx.send_bal_hashed_state(
+                        ctx.send_bal_hashed_state(
                             &parent_span,
                             provider,
                             account_changes,
                             &hashed_update_stream,
-                        ) {
-                            warn!(
-                                target: "engine::tree::payload_processor::prewarm",
-                                ?err,
-                                "Failed to build complete BAL hashed-state stream"
-                            );
-                            ctx.cancel();
-                        }
+                        );
                     });
                 });
 
-                if ctx.is_cancelled() {
-                    // Leave the stream unfinished: the updates are incomplete and the state-root
-                    // task must not compute a root from them.
-                    drop(hashed_update_stream);
-                } else {
-                    hashed_update_stream.finish();
-                }
+                hashed_update_stream.finish();
                 let _ = stream_tx.send(());
             });
         } else {
             let _ = stream_tx.send(());
         }
 
-        if let Some(saved_cache) = &ctx.saved_cache &&
+        if let Some(saved_cache) = ctx.saved_cache &&
             !ctx.disable_bal_batch_io &&
-            !ctx.is_cancelled() &&
             let Some(pool) = ctx.bal_prewarm_pool.as_ref()
         {
             // If
@@ -469,40 +595,23 @@ where
                 })
             });
 
-            let block = pool.begin_block(
-                build,
-                caches,
-                ctx.env.txpool_snapshot.clone(),
-                ctx.cancelled.clone(),
-            );
+            pool.begin_block(build, caches, ctx.env.txpool_snapshot.clone());
             let dispatch_start = Instant::now();
             for account in prefetch_bal.as_bal() {
-                if ctx.is_cancelled() {
-                    break;
-                }
-                block.warm_account(account.address, account.storage_slots().map(Into::into));
+                pool.warm_account(account.address, account.storage_slots().map(Into::into));
             }
             ctx.metrics.bal_slot_iteration_duration.record(dispatch_start.elapsed());
-            if !block.finish() {
-                ctx.cancel();
-            }
+            pool.end_block();
         }
 
-        if stream_rx.blocking_recv().is_err() {
-            warn!(
-                target: "engine::tree::payload_processor::prewarm",
-                "BAL hashed-state streaming task dropped without signaling completion"
-            );
-            ctx.cancel();
-        }
+        stream_rx
+            .blocking_recv()
+            .expect("BAL hashed-state streaming task dropped without signaling completion");
 
         // Drop the per-thread providers
-        drop(pool_cleanup);
+        executor.bal_streaming_pool().clear();
 
-        if !ctx.is_cancelled() {
-            let _ =
-                actions_tx.send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
-        }
+        let _ = actions_tx.send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
     }
 
     /// Executes the task.
@@ -518,7 +627,7 @@ where
     )]
     pub fn run<Tx>(self, mode: PrewarmMode<Tx>, actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>)
     where
-        Tx: ExecutableTxFor<Evm> + Send + 'static,
+        Tx: ExecutableTxFor<Evm> + Clone + Send + Sync + 'static,
     {
         // Spawn execution tasks based on mode. The state-root capabilities arrive inside the
         // mode and move into the spawned producers, so they die with the producers instead of
@@ -528,13 +637,7 @@ where
                 self.spawn_txs_prewarm(pending, actions_tx, hints);
             }
             PrewarmMode::BlockAccessList { bal, updates } => {
-                let ctx = self.ctx.clone();
-                let executor = self.executor.clone();
-                let span = Span::current();
-                self.executor.spawn_blocking_named("prewarm-bal", move || {
-                    let _enter = span.entered();
-                    Self::run_bal_prewarm(ctx, executor, bal, actions_tx, updates);
-                });
+                self.run_bal_prewarm(bal, actions_tx, updates);
             }
             PrewarmMode::Skipped => {
                 let _ = actions_tx
@@ -556,11 +659,6 @@ where
                     // `Terminate` can arrive without `TerminateTransactionExecution` when the
                     // handle is dropped on an execution error, so stop workers before waiting.
                     self.ctx.stop();
-                    // No outcome means the handle was dropped without one: the block was
-                    // abandoned and the BAL hashed-state stream is no longer needed either.
-                    if execution_outcome.is_none() {
-                        self.ctx.cancel();
-                    }
                     final_execution_outcome =
                         Some(execution_outcome.map(|outcome| (outcome, valid_block_rx)));
 
@@ -586,16 +684,8 @@ where
 
         debug!(target: "engine::tree::payload_processor::prewarm", "Completed prewarm execution");
 
-        if !finished_execution {
-            // The producer disappeared without its completion marker, for example after a panic.
-            // Do not publish a cache from a run that skipped its cleanup/completion barrier.
-            self.ctx.cancel();
-        }
-
         // save caches and finish using the shared ExecutionOutcome
-        if finished_execution &&
-            let Some(Some((execution_outcome, valid_block_rx))) = final_execution_outcome
-        {
+        if let Some(Some((execution_outcome, valid_block_rx))) = final_execution_outcome {
             self.save_cache(execution_outcome, valid_block_rx);
         }
     }
@@ -628,9 +718,6 @@ where
     pub cache_state_metrics: Option<CachedStateCacheMetrics>,
     /// An atomic bool that tells prewarm tasks to not start any more execution.
     pub terminate_execution: Arc<AtomicBool>,
-    /// An atomic bool set once the block is abandoned, which also aborts the BAL hashed-state
-    /// stream. See [`Self::cancel`].
-    pub cancelled: Arc<AtomicBool>,
     /// Shared counter tracking the next transaction index to be executed by the main execution
     /// loop. Prewarm workers skip transactions with `index < counter` since those have already
     /// been executed.
@@ -644,11 +731,20 @@ where
     pub disable_bal_parallel_state_root: bool,
     /// Whether BAL state prefetching during prewarm is disabled.
     pub disable_bal_batch_io: bool,
+    /// Results of transaction prewarming that block execution may reuse, `None` if disabled.
+    pub(crate) prewarm_results: Option<Arc<PrewarmResults<HaltReasonFor<Evm>>>>,
 }
 
 /// Per-thread EVM state initialised by [`PrewarmContext::evm_for_ctx`] and stored in
 /// [`WorkerPool`] workers via [`Worker::get_or_init`](reth_tasks::pool::Worker::get_or_init).
-type PrewarmEvmState<Evm> = Option<EvmFor<Evm, StateProviderDatabase<EvmStateProviderBox>>>;
+struct PrewarmEvmState<Evm: ConfigureEvm> {
+    /// Termination flag of the prewarm run that created the EVM, which identifies the run.
+    run: Arc<AtomicBool>,
+    /// The EVM, `None` if its state provider could not be created.
+    evm: Option<
+        EvmFor<Evm, RecordingDb<StateProviderDatabase<EvmStateProviderBox>>, BalanceTracker>,
+    >,
+}
 
 impl<N, P, Evm> PrewarmContext<N, P, Evm>
 where
@@ -664,7 +760,7 @@ where
         + 'static,
     Evm: ConfigureEvm<Primitives = N> + 'static,
 {
-    /// Creates a per-thread EVM for prewarming.
+    /// Creates a per-thread EVM for prewarming, tagged with the prewarm run it belongs to.
     #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
     fn evm_for_ctx(&self) -> PrewarmEvmState<Evm> {
         let mut state_provider = match self.provider.database_provider_ro() {
@@ -675,7 +771,7 @@ where
                     %err,
                     "Failed to build state provider in prewarm thread"
                 );
-                return None
+                return PrewarmEvmState { run: Arc::clone(&self.terminate_execution), evm: None }
             }
         };
 
@@ -702,7 +798,19 @@ where
 
         // create a new executor and disable nonce checks in the env
         let spec_id = *evm_env.spec_id();
-        let mut evm = self.evm_config.evm_with_env(state_provider, evm_env);
+        // Balances only need to be tracked to record reads for result reuse, and JIT-compiled
+        // code would skip the inspector hooks that track them.
+        let reuse = self.prewarm_results.is_some();
+        let mut evm_config = self.evm_config.clone();
+        if reuse {
+            evm_config = evm_config.with_jit_support_enabled(false);
+        }
+        let mut evm = evm_config.evm_with_env_and_inspector(
+            RecordingDb::new(state_provider),
+            evm_env,
+            BalanceTracker::default(),
+        );
+        evm.set_inspector_enabled(reuse);
 
         if !self.precompile_cache_disabled {
             // Only cache pure precompiles to avoid issues with stateful precompiles
@@ -716,7 +824,7 @@ where
             });
         }
 
-        Some(evm)
+        PrewarmEvmState { run: Arc::clone(&self.terminate_execution), evm: Some(evm) }
     }
 
     /// Returns `true` if prewarming should stop.
@@ -729,22 +837,6 @@ where
     #[inline]
     pub fn stop(&self) {
         self.terminate_execution.store(true, Ordering::Relaxed);
-    }
-
-    /// Returns `true` if the block was abandoned and remaining BAL work should be dropped.
-    #[inline]
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
-    }
-
-    /// Signals that the block was abandoned.
-    ///
-    /// Unlike [`Self::stop`], which is also called once execution completes and only ends
-    /// speculative transaction prewarming, this aborts the BAL hashed-state stream the state-root
-    /// task depends on, so it must only be set once the state root is no longer needed.
-    #[inline]
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
     }
 
     /// Hashes and streams a single BAL account's state to the state-root job's hashed-update
@@ -762,16 +854,16 @@ where
         provider: &mut Option<EvmStateProviderBox>,
         account_changes: &alloy_eip7928::AccountChanges,
         hashed_update_stream: &StateRootUpdateStream,
-    ) -> ProviderResult<()> {
+    ) {
         if self.disable_bal_parallel_state_root {
-            return Ok(())
+            return;
         }
         let address = account_changes.address;
         let mut hashed_address = None;
         let account_info = account_changes.account_info();
 
         if !account_info.changes_state_root(account_changes) {
-            return Ok(())
+            return;
         }
 
         // If there are any storage changes we can assume that the resulting account info will be
@@ -802,7 +894,17 @@ where
                 )
                 .entered();
 
-                let inner = self.provider.database_provider_ro()?.into_evm_state_provider();
+                let inner = match self.provider.database_provider_ro() {
+                    Ok(p) => p.into_evm_state_provider(),
+                    Err(err) => {
+                        warn!(
+                            target: "engine::tree::payload_processor::prewarm",
+                            ?err,
+                            "Failed to build provider for BAL account reads"
+                        );
+                        return;
+                    }
+                };
                 let boxed: EvmStateProviderBox =
                     match (self.disable_bal_batch_io, &self.saved_cache) {
                         (false, Some(saved)) => {
@@ -817,7 +919,7 @@ where
                 *provider = Some(boxed);
             }
             let account_reader = provider.as_ref().expect("provider just initialized");
-            account_reader.basic_account(&address)?
+            account_reader.basic_account(&address).ok().flatten()
         };
 
         let mut account = existing_account.unwrap_or_default();
@@ -840,16 +942,6 @@ where
         let mut hashed_state = reth_trie::HashedPostState::default();
         hashed_state.accounts.insert(hashed_address, account);
         hashed_update_stream.on_hashed_state_update(hashed_state);
-        Ok(())
-    }
-}
-
-/// Clears worker-local BAL providers before the producer publishes its completion marker.
-struct PrewarmPoolCleanup(Runtime);
-
-impl Drop for PrewarmPoolCleanup {
-    fn drop(&mut self) {
-        self.0.bal_streaming_pool().clear();
     }
 }
 
@@ -864,125 +956,109 @@ fn multiproof_targets_from_withdrawals(withdrawals: &[Withdrawal]) -> MultiProof
     }
 }
 
+/// The events the pre-warm task can handle.
+///
+/// Generic over `R` (receipt type) to allow sharing `Arc<ExecutionOutcome<R>>` with the main
+/// execution path without cloning the expensive `BundleState`.
+#[derive(Debug)]
+pub enum PrewarmTaskEvent<R> {
+    /// Signals the prewarm workers to stop executing further transactions.
+    ///
+    /// This only sets the termination flag the workers poll; the task keeps running to save the
+    /// cache. Sent once the authoritative execution no longer needs prewarming, so the workers do
+    /// not race ahead on transactions that will never be used.
+    TerminateTransactionExecution,
+    /// Tears the whole task down: stops the workers, optionally saves the warmed cache from the
+    /// final output, and exits.
+    ///
+    /// Sent when execution completed successfully (carrying the output to save) or when the task
+    /// handle is dropped (carrying no output, e.g. after an execution error). Handling this event
+    /// also stops the workers, since a teardown may arrive without a preceding
+    /// [`TerminateTransactionExecution`](Self::TerminateTransactionExecution).
+    Terminate {
+        /// The final execution outcome, or `None` when the task is torn down without one (e.g. a
+        /// dropped handle). Using `Arc` allows sharing with the main execution path without
+        /// cloning the expensive `BundleState`.
+        execution_outcome: Option<Arc<BlockExecutionOutput<R>>>,
+        /// Receiver for the block validation result.
+        ///
+        /// Cache saving is racing the state root validation. We optimistically construct the
+        /// updated cache but only save it once we know the block is valid.
+        valid_block_rx: mpsc::Receiver<()>,
+    },
+    /// Emitted by the worker-dispatch side once every dispatched transaction has finished or been
+    /// cancelled, reporting how many were executed.
+    FinishedTxExecution {
+        /// Number of transactions executed
+        executed_transactions: usize,
+    },
+}
+
+/// Metrics for transactions prewarming.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "sync.prewarm")]
+pub struct PrewarmMetrics {
+    /// The number of transactions to prewarm
+    pub(crate) transactions: Gauge,
+    /// A histogram of the number of transactions to prewarm
+    pub(crate) transactions_histogram: Histogram,
+    /// A histogram of duration per transaction prewarming
+    pub(crate) total_runtime: Histogram,
+    /// A histogram of EVM execution duration per transaction prewarming
+    pub(crate) execution_duration: Histogram,
+    /// A histogram for prefetch targets per transaction prewarming
+    pub(crate) prefetch_storage_targets: Histogram,
+    /// Time spent in `save_cache`, including dropping its removed `SavedCache` values.
+    /// Excludes any later freeing of cache contents by other `ExecutionCache` clones.
+    pub(crate) cache_saving_duration: Gauge,
+    /// Counter for transaction execution errors during prewarming
+    pub(crate) transaction_errors: Counter,
+    /// Counter for transactions seeded with results of pool transactions instead of being
+    /// executed.
+    pub(crate) seeded_transactions: Counter,
+    /// A histogram of BAL slot iteration duration during prefetching
+    pub(crate) bal_slot_iteration_duration: Histogram,
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use crate::tree::{payload_processor::StateRootSink, ExecutionCache};
-    use alloy_consensus::transaction::Recovered;
-    use alloy_eip7928::{
-        bal::Bal, AccountChanges, BalanceChange, BlockAccessIndex, CodeChange, NonceChange,
-        SlotChanges, StorageChange,
-    };
-    use alloy_primitives::{address, bytes, Address, B256, U256};
+    use alloy_consensus::{transaction::Recovered, TxLegacy};
+    use alloy_eips::eip7702::constants::EIP7702_CLEARED_DELEGATION;
+    use alloy_primitives::{Address, Signature, TxKind, B256, U256};
     use reth_chainspec::ChainSpec;
     use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
     use reth_evm::{execute::WithTxEnv, TxEnvFor};
     use reth_evm_ethereum::EthEvmConfig;
-    use reth_primitives_traits::Account;
     use reth_provider::test_utils::MockEthProvider;
     use reth_stages_api::{StageCheckpoint, StageId};
     use reth_storage_overlay::OverlayManager;
-    use reth_trie::HashedPostState;
-    use revm::state::EvmState;
+    use revm::database::EmptyDB;
 
-    /// Builds a prewarm context with the default BAL batch-I/O path enabled.
-    fn test_ctx(
-        terminate_execution: Arc<AtomicBool>,
-        cancelled: Arc<AtomicBool>,
-    ) -> PrewarmContext<EthPrimitives, MockEthProvider, EthEvmConfig> {
-        let provider = MockEthProvider::default();
-        provider.enable_database_provider();
-        provider.add_header(B256::ZERO, Default::default());
-        provider.add_stage_checkpoint(StageId::Finish, StageCheckpoint::new(0));
-
-        PrewarmContext {
+    #[test]
+    fn terminate_event_stops_transaction_execution() {
+        let terminate_execution = Arc::new(AtomicBool::new(false));
+        let ctx = PrewarmContext {
             env: ExecutionEnv::test_default(),
             evm_config: EthEvmConfig::new(Arc::new(ChainSpec::default())),
-            saved_cache: Some(SavedCache::new(B256::ZERO, ExecutionCache::new(1_000))),
+            saved_cache: None,
             provider: OverlayStateProviderFactory::new(
-                provider,
+                MockEthProvider::default(),
                 OverlayManager::default().overlay_builder(B256::ZERO),
             ),
-            bal_prewarm_pool: Some(BalPrewarmPool::new(1)),
+            bal_prewarm_pool: None,
             metrics: PrewarmMetrics::default(),
             cache_metrics: None,
             cache_state_metrics: None,
-            terminate_execution,
-            cancelled,
+            terminate_execution: Arc::clone(&terminate_execution),
             executed_tx_index: Arc::new(AtomicUsize::new(0)),
             precompile_cache_disabled: false,
             precompile_cache_map: PrecompileCacheMap::default(),
             disable_bal_parallel_state_root: false,
             disable_bal_batch_io: false,
-        }
-    }
-
-    /// Records what a BAL prewarm run streams to the state-root task.
-    #[derive(Default)]
-    struct CountingSink {
-        updates: AtomicUsize,
-        finished: AtomicBool,
-    }
-
-    impl StateRootSink for CountingSink {
-        fn on_state_update(&self, _state: EvmState) {}
-
-        fn on_hashed_state_update(&self, _state: HashedPostState) {
-            self.updates.fetch_add(1, Ordering::Relaxed);
-        }
-
-        fn on_updates_finished(&self) {
-            self.finished.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// Runs BAL prewarm over `accounts` accounts whose changes carry every leaf field, so no
-    /// parent reads are needed, and returns how many hashed-state updates were streamed and
-    /// whether the stream was finished.
-    fn run_bal_prewarm_to_sink(accounts: u64, cancelled: bool) -> (usize, bool) {
-        let mut changes: Vec<AccountChanges> = (0..accounts)
-            .map(|i| {
-                AccountChanges::new(Address::from_word(keccak256(i.to_be_bytes())))
-                    .with_balance_change(BalanceChange::new(
-                        BlockAccessIndex::new(1),
-                        U256::from(i + 1),
-                    ))
-                    .with_nonce_change(NonceChange::new(BlockAccessIndex::new(1), 1))
-                    .with_code_change(CodeChange::new(
-                        BlockAccessIndex::new(1),
-                        bytes!("6001600155"),
-                    ))
-            })
-            .collect();
-        changes.sort_by_key(|account| account.address);
-        let bal = Bal::from(changes);
-        let raw = alloy_rlp::encode(&bal).into();
-        let bal = Arc::new(DecodedBal::new(bal, raw));
-
-        let sink = Arc::new(CountingSink::default());
-        let updates = StateRootUpdateStream::new(sink.clone());
-        let ctx = test_ctx(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(cancelled)));
-        let runtime = Runtime::test();
-        let (task, actions_tx) =
-            PrewarmCacheTask::new(runtime.clone(), PayloadExecutionCache::default(), ctx);
-
-        // The producer drops the last event sender once it has streamed the BAL, which ends the
-        // event loop without an explicit terminate.
-        task.run::<WithTxEnv<TxEnvFor<EthEvmConfig>, Recovered<TransactionSigned>>>(
-            PrewarmMode::BlockAccessList { bal, updates: Some(updates) },
-            actions_tx,
-        );
-        // Named blocking tasks run serially, so this returns once the producer thread is done.
-        runtime.spawn_blocking_named("prewarm-bal", || {}).get();
-
-        (sink.updates.load(Ordering::Relaxed), sink.finished.load(Ordering::Relaxed))
-    }
-
-    #[test]
-    fn terminate_event_stops_transaction_execution() {
-        let terminate_execution = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let ctx = test_ctx(Arc::clone(&terminate_execution), Arc::clone(&cancelled));
+            prewarm_results: None,
+        };
         let (task, actions_tx) =
             PrewarmCacheTask::new(Runtime::test(), PayloadExecutionCache::default(), ctx);
         actions_tx
@@ -998,21 +1074,67 @@ mod tests {
         );
 
         assert!(terminate_execution.load(Ordering::Relaxed));
-        // A teardown without an outcome means the block was abandoned.
-        assert!(cancelled.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn cancelled_bal_prewarm_leaves_stream_unfinished() {
-        const ACCOUNTS: u64 = 64;
+    fn rebuilds_evm_for_each_prewarm_run() {
+        let caller = Address::repeat_byte(1);
+        let provider = MockEthProvider::default();
+        provider.enable_database_provider();
+        provider.add_header(B256::ZERO, Default::default());
+        provider.add_stage_checkpoint(StageId::Finish, StageCheckpoint::new(0));
+        let tx = Recovered::new_unchecked(
+            TransactionSigned::new_unhashed(
+                // Free, so that the empty caller can pay for it.
+                TxLegacy {
+                    gas_limit: 21_000,
+                    to: TxKind::Call(Address::repeat_byte(2)),
+                    ..Default::default()
+                }
+                .into(),
+                Signature::test_signature(),
+            ),
+            caller,
+        );
+        let pool = WorkerPool::new(1, "prewarm-test");
+        // Payloads that claim the same block hash may still use different block environments.
+        let prewarm = |beneficiary| {
+            let mut env = ExecutionEnv::<EthEvmConfig>::test_default();
+            env.evm_env.block_env.beneficiary = beneficiary;
+            let results = Arc::new(PrewarmResults::new(1));
+            let ctx = PrewarmContext {
+                env,
+                evm_config: EthEvmConfig::new(Arc::new(ChainSpec::default())),
+                saved_cache: None,
+                provider: OverlayStateProviderFactory::new(
+                    provider.clone(),
+                    OverlayManager::default().overlay_builder(B256::ZERO),
+                ),
+                bal_prewarm_pool: None,
+                metrics: PrewarmMetrics::default(),
+                cache_metrics: None,
+                cache_state_metrics: None,
+                terminate_execution: Arc::new(AtomicBool::new(false)),
+                executed_tx_index: Arc::new(AtomicUsize::new(0)),
+                precompile_cache_disabled: false,
+                precompile_cache_map: PrecompileCacheMap::default(),
+                disable_bal_parallel_state_root: false,
+                disable_bal_batch_io: false,
+                prewarm_results: Some(Arc::clone(&results)),
+            };
+            let tx = WithTxEnv { tx_env: ctx.evm_config.tx_env(&tx), tx: Arc::new(tx.clone()) };
+            pool.install_fn(|| {
+                PrewarmCacheTask::<EthPrimitives, MockEthProvider, EthEvmConfig>::transact_worker(
+                    &ctx, 0, tx, None, None,
+                )
+            });
+            results.take_valid(0, &mut EmptyDB::default()).unwrap().unwrap().state
+        };
 
-        let (updates, finished) = run_bal_prewarm_to_sink(ACCOUNTS, false);
-        assert_eq!(updates, ACCOUNTS as usize);
-        assert!(finished);
-
-        let (updates, finished) = run_bal_prewarm_to_sink(ACCOUNTS, true);
-        assert_eq!(updates, 0);
-        assert!(!finished, "a cancelled stream must not be finished");
+        assert!(prewarm(Address::repeat_byte(0xa)).contains_key(&Address::repeat_byte(0xa)));
+        let state = prewarm(Address::repeat_byte(0xb));
+        assert!(state.contains_key(&Address::repeat_byte(0xb)));
+        assert!(!state.contains_key(&Address::repeat_byte(0xa)));
     }
 
     fn test_prewarm_context(
@@ -1035,12 +1157,12 @@ mod tests {
             cache_metrics: None,
             cache_state_metrics: None,
             terminate_execution: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
             executed_tx_index: Arc::new(AtomicUsize::new(0)),
             precompile_cache_disabled: false,
             precompile_cache_map: PrecompileCacheMap::default(),
             disable_bal_parallel_state_root: false,
             disable_bal_batch_io: false,
+            prewarm_results: None,
         }
     }
 
@@ -1089,7 +1211,7 @@ mod tests {
         let runtime = Runtime::test();
         let execution_cache = PayloadExecutionCache::default();
         let saved = SavedCache::new(B256::repeat_byte(1), crate::tree::ExecutionCache::new(1_000));
-        let address = address!("0000000000000000000000000000000000000001");
+        let address = Address::with_last_byte(1);
         saved.cache().insert_storage(address, B256::ZERO, Some(U256::from(7)));
         execution_cache.update_with_guard(|slot| *slot = Some(saved.clone()));
         // Keep the drop worker occupied: a queued SavedCache would delay cache reuse.
@@ -1151,7 +1273,7 @@ mod tests {
 
     impl AsRef<[u8]> for CacheDropProbe {
         fn as_ref(&self) -> &[u8] {
-            &[0xef, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            &EIP7702_CLEARED_DELEGATION
         }
     }
 
@@ -1207,11 +1329,11 @@ mod tests {
         let (task, actions_tx) =
             PrewarmCacheTask::new(runtime.clone(), execution_cache.clone(), ctx);
         let mut payload = PayloadHandle {
-            prewarm_handle: CacheTaskHandle {
+            prewarm_handle: CacheTaskHandle::<_, ()> {
                 saved_cache: task.ctx.saved_cache.clone(),
                 to_prewarm_task: Some(actions_tx.clone()),
                 executed_tx_index: task.ctx.executed_tx_index.clone(),
-                cancelled: task.ctx.cancelled.clone(),
+                prewarm_results: None,
                 cache_metrics: None,
             },
             transactions: crossbeam_channel::never::<(usize, Result<(), ()>)>(),
@@ -1285,7 +1407,7 @@ mod tests {
         if insert_error {
             // Modified accounts without current info are rejected by insert_state.
             state.state.insert(
-                address!("0000000000000000000000000000000000000001"),
+                Address::with_last_byte(1),
                 BundleAccount::new(None, None, Default::default(), AccountStatus::Changed),
             );
         }
@@ -1344,129 +1466,4 @@ mod tests {
             assert_save_cache_drops_removed_caches(CacheSlot::Empty, valid, insert_error);
         }
     }
-
-    #[test]
-    fn bal_provider_error_leaves_stream_unfinished() {
-        let changes = AccountChanges::new(address!("0000000000000000000000000000000000000001"))
-            .with_storage_change(SlotChanges::new(
-                U256::from(1),
-                vec![StorageChange::new(BlockAccessIndex::new(1), U256::from(2))],
-            ));
-        let bal = Bal::from(vec![changes]);
-        let raw = alloy_rlp::encode(&bal).into();
-        let bal = Arc::new(DecodedBal::new(bal, raw));
-
-        let sink = Arc::new(CountingSink::default());
-        let updates = StateRootUpdateStream::new(sink.clone());
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let mut ctx = test_ctx(Arc::new(AtomicBool::new(false)), Arc::clone(&cancelled));
-        // This mock rejects database-provider creation, forcing the parent account read to fail.
-        ctx.provider = OverlayStateProviderFactory::new(
-            MockEthProvider::default(),
-            OverlayManager::default().overlay_builder(B256::ZERO),
-        );
-        let runtime = Runtime::test();
-        let (task, actions_tx) =
-            PrewarmCacheTask::new(runtime.clone(), PayloadExecutionCache::default(), ctx);
-
-        task.run::<WithTxEnv<TxEnvFor<EthEvmConfig>, Recovered<TransactionSigned>>>(
-            PrewarmMode::BlockAccessList { bal, updates: Some(updates) },
-            actions_tx,
-        );
-        runtime.spawn_blocking_named("prewarm-bal", || {}).get();
-
-        assert!(cancelled.load(Ordering::Relaxed));
-        assert!(!sink.finished.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn bal_read_only_account_does_not_change_state_root() {
-        let changes = AccountChanges::new(address!("0000000000000000000000000000000000000001"))
-            .with_storage_read(U256::from(1));
-
-        assert!(!changes.account_info().changes_state_root(&changes));
-    }
-
-    #[test]
-    #[allow(clippy::needless_update)]
-    fn bal_account_uses_existing_fields_only_when_missing() {
-        let changes = AccountChanges::new(address!("0000000000000000000000000000000000000001"))
-            .with_balance_change(BalanceChange::new(BlockAccessIndex::new(1), U256::from(10)));
-        let info = changes.account_info();
-
-        assert!(!info.is_complete());
-        let mut account = Account {
-            balance: U256::from(1),
-            nonce: 3,
-            bytecode_hash: Some(B256::repeat_byte(0xaa)),
-            ..Default::default()
-        };
-        account.apply_bal_info(info);
-
-        assert_eq!(account.balance, U256::from(10));
-        assert_eq!(account.nonce, 3);
-        assert_eq!(account.bytecode_hash, Some(B256::repeat_byte(0xaa)));
-    }
-}
-
-/// The events the pre-warm task can handle.
-///
-/// Generic over `R` (receipt type) to allow sharing `Arc<ExecutionOutcome<R>>` with the main
-/// execution path without cloning the expensive `BundleState`.
-#[derive(Debug)]
-pub enum PrewarmTaskEvent<R> {
-    /// Signals the prewarm workers to stop executing further transactions.
-    ///
-    /// This only sets the termination flag the workers poll; the task keeps running to save the
-    /// cache. Sent once the authoritative execution no longer needs prewarming, so the workers do
-    /// not race ahead on transactions that will never be used.
-    TerminateTransactionExecution,
-    /// Tears the whole task down: stops the workers, optionally saves the warmed cache from the
-    /// final output, and exits.
-    ///
-    /// Sent when execution completed successfully (carrying the output to save) or when the task
-    /// handle is dropped (carrying no output, e.g. after an execution error). Handling this event
-    /// also stops the workers, since a teardown may arrive without a preceding
-    /// [`TerminateTransactionExecution`](Self::TerminateTransactionExecution). Without an output
-    /// the block was abandoned, so the BAL hashed-state stream is cancelled as well.
-    Terminate {
-        /// The final execution outcome, or `None` when the task is torn down without one (e.g. a
-        /// dropped handle). Using `Arc` allows sharing with the main execution path without
-        /// cloning the expensive `BundleState`.
-        execution_outcome: Option<Arc<BlockExecutionOutput<R>>>,
-        /// Receiver for the block validation result.
-        ///
-        /// Cache saving is racing the state root validation. We optimistically construct the
-        /// updated cache but only save it once we know the block is valid.
-        valid_block_rx: mpsc::Receiver<()>,
-    },
-    /// Emitted by the worker-dispatch side once every dispatched transaction has finished or been
-    /// cancelled, reporting how many were executed.
-    FinishedTxExecution {
-        /// Number of transactions executed
-        executed_transactions: usize,
-    },
-}
-
-/// Metrics for transactions prewarming.
-#[derive(Metrics, Clone)]
-#[metrics(scope = "sync.prewarm")]
-pub struct PrewarmMetrics {
-    /// The number of transactions to prewarm
-    pub(crate) transactions: Gauge,
-    /// A histogram of the number of transactions to prewarm
-    pub(crate) transactions_histogram: Histogram,
-    /// A histogram of duration per transaction prewarming
-    pub(crate) total_runtime: Histogram,
-    /// A histogram of EVM execution duration per transaction prewarming
-    pub(crate) execution_duration: Histogram,
-    /// A histogram for prefetch targets per transaction prewarming
-    pub(crate) prefetch_storage_targets: Histogram,
-    /// Time spent in `save_cache`, including dropping its removed `SavedCache` values.
-    /// Excludes any later freeing of cache contents by other `ExecutionCache` clones.
-    pub(crate) cache_saving_duration: Gauge,
-    /// Counter for transaction execution errors during prewarming
-    pub(crate) transaction_errors: Counter,
-    /// A histogram of BAL slot iteration duration during prefetching
-    pub(crate) bal_slot_iteration_duration: Histogram,
 }

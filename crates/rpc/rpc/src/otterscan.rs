@@ -21,7 +21,7 @@ use reth_rpc_api::{EthApiServer, OtterscanServer};
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
     helpers::{EthTransactions, TraceExt},
-    FullEthApiTypes, RpcBlock, RpcHeader, RpcReceipt, RpcTransaction,
+    RpcBlock, RpcHeader, RpcReceipt, RpcTransaction,
 };
 use reth_rpc_eth_types::{utils::binary_search, EthApiError};
 use reth_rpc_server_types::result::internal_rpc_err;
@@ -35,6 +35,7 @@ use revm_inspectors::{
     },
 };
 use std::{cmp::Reverse, sync::Arc};
+use tokio::sync::OwnedSemaphorePermit;
 
 const API_LEVEL: u64 = 8;
 
@@ -60,7 +61,7 @@ impl<Eth> OtterscanApi<Eth> {
 
 impl<Eth> OtterscanApi<Eth>
 where
-    Eth: FullEthApiTypes + TraceExt,
+    Eth: TraceExt,
 {
     /// Constructs a `BlockDetails` from a block and its receipts.
     async fn block_details(
@@ -105,6 +106,13 @@ where
             InternalIssuance::default()
         };
         Ok(BlockDetails::new(block, issuance, total_fees))
+    }
+
+    /// Acquires a permit to execute a tracing call.
+    ///
+    /// The permit should be moved into the spawned trace so it is held until the trace completes.
+    async fn acquire_trace_permit(&self) -> RpcResult<OwnedSemaphorePermit> {
+        Ok(self.eth.acquire_owned_tracing().await.map_err(|_| EthApiError::InternalEthError)?)
     }
 }
 
@@ -339,8 +347,7 @@ where
             RpcHeader<Eth::NetworkTypes>,
             TxTy<Eth::Primitives>,
         > + EthTransactions
-        + TraceExt
-        + 'static,
+        + TraceExt,
 {
     /// Handler for `ots_getHeaderByNumber` and `erigon_getHeaderByNumber`
     async fn get_header_by_number(
@@ -362,11 +369,15 @@ where
 
     /// Handler for `ots_getInternalOperations`
     async fn get_internal_operations(&self, tx_hash: TxHash) -> RpcResult<Vec<InternalOperation>> {
+        let permit = self.acquire_trace_permit().await?;
         self.eth
             .spawn_trace_transaction_in_block_with_inspector(
                 tx_hash,
                 InternalOperationsInspector::default(),
-                |_tx_info, inspector, _, _| Ok(inspector.into_operations()),
+                move |_tx_info, inspector, _, _| {
+                    let _permit = permit;
+                    Ok(inspector.into_operations())
+                },
             )
             .await
             .map_err(Into::into)
@@ -375,19 +386,25 @@ where
 
     /// Handler for `ots_getTransactionError`
     async fn get_transaction_error(&self, tx_hash: TxHash) -> RpcResult<Option<Bytes>> {
+        let permit = self.acquire_trace_permit().await?;
         self.eth
-            .spawn_replay_transaction(tx_hash, |_tx_info, res, _| Ok(transaction_error(res.result)))
+            .spawn_replay_transaction(tx_hash, move |_tx_info, res, _| {
+                let _permit = permit;
+                Ok(transaction_error(res.result))
+            })
             .await
             .map_err(Into::into)
     }
 
     /// Handler for `ots_traceTransaction`
     async fn trace_transaction(&self, tx_hash: TxHash) -> RpcResult<Option<Vec<TraceEntry>>> {
+        let permit = self.acquire_trace_permit().await?;
         self.eth
             .spawn_trace_transaction_in_block(
                 tx_hash,
                 TracingInspectorConfig::default_parity(),
-                |_tx_info, inspector, _, _| {
+                move |_tx_info, inspector, _, _| {
+                    let _permit = permit;
                     Ok(otterscan_traces(inspector.into_traces().into_nodes()))
                 },
             )
@@ -855,6 +872,7 @@ where
             return Ok(None);
         }
 
+        let permit = self.acquire_trace_permit().await?;
         let num = binary_search::<_, _, ErrorObjectOwned>(
             1,
             self.eth.block_number()?.saturating_to(),
@@ -874,7 +892,8 @@ where
                 num.into(),
                 None,
                 TracingInspectorConfig::default_parity(),
-                |tx_info, mut ctx| {
+                move |tx_info, mut ctx| {
+                    let _permit = &permit;
                     Ok(ctx
                         .take_inspector()
                         .into_parity_builder()
@@ -997,9 +1016,10 @@ fn otterscan_traces(nodes: Vec<CallTraceNode>) -> Vec<TraceEntry> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use alloy_consensus::{constants::ETH_TO_WEI, Header};
-    use alloy_primitives::{hex, TxKind};
+    use alloy_primitives::{bytes, TxKind};
     use alloy_rpc_types_trace::parity::TransactionTrace;
     use reth_chainspec::MAINNET;
     use reth_evm_ethereum::EthEvmConfig;
@@ -1230,6 +1250,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trace_methods_wait_for_tracing_permit() {
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+        use std::time::Duration;
+
+        let api = OtterscanApi::new(
+            crate::eth::EthApiBuilder::new(
+                MockEthProvider::default(),
+                testing_pool(),
+                NoopNetwork::default(),
+                EthEvmConfig::new(MAINNET.clone()),
+            )
+            .proof_permits(1)
+            .build(),
+        );
+        let permit = api.eth.acquire_owned_tracing().await.unwrap();
+
+        let timeout = Duration::from_millis(100);
+        assert!(tokio::time::timeout(timeout, api.trace_transaction(B256::ZERO)).await.is_err());
+        assert!(tokio::time::timeout(timeout, api.get_transaction_error(B256::ZERO))
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(timeout, api.get_internal_operations(B256::ZERO))
+            .await
+            .is_err());
+
+        drop(permit);
+        assert_eq!(api.trace_transaction(B256::ZERO).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn execution_fees_use_full_u256_width() {
         let api = OtterscanApi::new(
             crate::eth::EthApiBuilder::new(
@@ -1314,7 +1364,7 @@ mod tests {
     #[test]
     fn selfdestruct_preserves_enclosing_call_and_beneficiary() {
         for spec in [SpecId::SHANGHAI, SpecId::CANCUN] {
-            let (result, traces) = execute(hex!("6022ff").into(), spec);
+            let (result, traces) = execute(bytes!("6022ff"), spec);
             assert!(result.is_success());
             assert_eq!(traces.len(), 2);
             assert_eq!(traces[0].r#type, "CALL");
@@ -1333,7 +1383,7 @@ mod tests {
         // Call another account, then destroy the root contract. The destruction is a sibling
         // of that call, not its child.
         let (result, traces) =
-            execute(hex!("60006000600060006000603361fffff1506022ff").into(), SpecId::CANCUN);
+            execute(bytes!("60006000600060006000603361fffff1506022ff"), SpecId::CANCUN);
         assert!(result.is_success());
         assert_eq!(traces.len(), 3);
         assert_eq!(traces[1].r#type, "CALL");
@@ -1389,7 +1439,7 @@ mod tests {
     #[test]
     fn precompile_calls_remain_in_transaction_traces() {
         let (result, traces) =
-            execute(hex!("60006000600060006000600461fffff15000").into(), SpecId::CANCUN);
+            execute(bytes!("60006000600060006000600461fffff15000"), SpecId::CANCUN);
         assert!(result.is_success());
         assert_eq!(traces.len(), 2);
         assert_eq!(traces[1].to, Address::with_last_byte(4));
@@ -1450,7 +1500,7 @@ mod tests {
     fn static_and_delegate_calls_have_no_value() {
         // STATICCALL, DELEGATECALL and CALLCODE to 0x22 do not transfer ETH.
         let (result, traces) = execute(
-            hex!("6000600060006000602261fffffa506000600060006000602261fffff45060006000600060006001602261fffff25000").into(),
+            bytes!("6000600060006000602261fffffa506000600060006000602261fffff45060006000600060006001602261fffff25000"),
             SpecId::CANCUN,
         );
         assert!(result.is_success());
@@ -1460,6 +1510,6 @@ mod tests {
         assert_eq!(traces[2].r#type, "DELEGATECALL");
         assert_eq!(traces[2].value, None);
         assert_eq!(traces[3].r#type, "CALLCODE");
-        assert_eq!(traces[3].value, Some(U256::from(1)));
+        assert_eq!(traces[3].value, Some(U256::ONE));
     }
 }

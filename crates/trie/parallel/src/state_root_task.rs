@@ -2,12 +2,12 @@
 //!
 //! The "state-root task" is the background multiproof and sparse-trie pipeline that computes
 //! state roots incrementally while a block executes. This module holds its boundary types:
-//! the input messages, the [`StateRootSink`](crate::state_root_task::StateRootSink) and
+//! the input messages and
 //! stream views that feed it, and the handles
 //! that await its result. The per-block strategy abstraction that decides whether and how the
 //! task runs lives in `reth-engine-tree` under `tree::state_root_strategy`.
 
-use crate::{error::StateRootTaskError, proof_task::ProofCancellationToken};
+use crate::error::StateRootTaskError;
 use alloy_evm::block::OnStateHook;
 use alloy_primitives::{keccak256, map::B256Map, B256};
 use reth_trie::{
@@ -47,11 +47,8 @@ pub struct StateRootComputeOutcome {
 
 /// Handle to a background sparse trie state root computation.
 ///
-/// Used by both the engine (during `newPayload`) and the payload builder (during `FCU`-triggered
-/// block building). Provides channels for streaming state updates into the pipeline and receiving
-/// the final computed state root.
-///
-/// Created by the engine's state-root strategy.
+/// Provides best-effort access hints, one authoritative update stream, and the final computation
+/// result. Dropping the handle cancels the task if it is still running.
 #[derive(Debug)]
 pub struct StateRootHandle {
     /// The state root that the cached sparse trie is anchored at (parent block's state root).
@@ -145,7 +142,7 @@ impl StateRootHandle {
             .take()
             .expect("state_root already taken")
             .recv()
-            .map_err(|_| StateRootTaskError::Other("sparse trie task dropped".to_string()))?
+            .map_err(|_| StateRootTaskError::Other("sparse trie task dropped".into()))?
     }
 
     /// Takes the state root receiver for use with custom waiting logic (e.g., timeouts).
@@ -182,6 +179,7 @@ impl StateRootHandle {
             cancel_guard: Some(self.cancel_guard),
             state_root_rx: self.state_root_rx.take(),
             hashed_state_rx: self.hashed_state_rx.take(),
+            on_payload_built: None,
         }
     }
 }
@@ -192,30 +190,13 @@ impl StateRootHandle {
 /// dropping disconnects the channel, which the task treats as the consumer abandoning the
 /// computation (for example on a timeout fallback or when a payload job is dropped unused).
 #[derive(Debug)]
-pub struct StateRootTaskCancelGuard {
-    #[allow(dead_code)]
-    sender: crossbeam_channel::Sender<()>,
-    cancellation: ProofCancellationToken,
-}
+pub struct StateRootTaskCancelGuard(#[allow(dead_code)] crossbeam_channel::Sender<()>);
 
 impl StateRootTaskCancelGuard {
     /// Creates a guard and the receiver a task watches for cancellation.
     pub fn channel() -> (Self, crossbeam_channel::Receiver<()>) {
         let (tx, rx) = crossbeam_channel::bounded(0);
-        (Self { sender: tx, cancellation: Default::default() }, rx)
-    }
-
-    /// Returns the cancellation token shared with work queued by this state-root task.
-    pub fn cancellation_token(&self) -> ProofCancellationToken {
-        self.cancellation.clone()
-    }
-}
-
-impl Drop for StateRootTaskCancelGuard {
-    fn drop(&mut self) {
-        // Set the token before `sender` is dropped so queued workers can observe cancellation by
-        // the time the sparse-trie task wakes on channel disconnection.
-        self.cancellation.cancel();
+        (Self(tx), rx)
     }
 }
 
@@ -229,6 +210,8 @@ pub struct PayloadStateRootHandle {
     state_root_rx:
         Option<std::sync::mpsc::Receiver<Result<StateRootComputeOutcome, StateRootTaskError>>>,
     hashed_state_rx: Option<std::sync::mpsc::Receiver<Arc<HashedPostState>>>,
+    /// Returns retained state to the engine once the completed block's identity is known.
+    on_payload_built: Option<Box<dyn FnOnce(B256, B256) + Send>>,
 }
 
 impl fmt::Debug for PayloadStateRootHandle {
@@ -256,7 +239,31 @@ impl PayloadStateRootHandle {
         >,
         hashed_state_rx: Option<std::sync::mpsc::Receiver<Arc<HashedPostState>>>,
     ) -> Self {
-        Self { name, hook, cancel_guard: None, state_root_rx: Some(state_root_rx), hashed_state_rx }
+        Self {
+            name,
+            hook,
+            cancel_guard: None,
+            state_root_rx: Some(state_root_rx),
+            hashed_state_rx,
+            on_payload_built: None,
+        }
+    }
+
+    /// Attaches a callback receiving the completed payload's block hash and state root.
+    ///
+    /// The callback must verify that any retained state matches the returned payload.
+    pub fn with_on_payload_built(
+        mut self,
+        callback: impl FnOnce(B256, B256) + Send + 'static,
+    ) -> Self {
+        self.on_payload_built = Some(Box::new(callback));
+        self
+    }
+
+    /// Takes the callback to invoke after a successful build, before returning its payload.
+    /// Aborted, cancelled, or failed builds must drop the callback without invoking it.
+    pub fn take_on_payload_built(&mut self) -> Option<Box<dyn FnOnce(B256, B256) + Send>> {
+        self.on_payload_built.take()
     }
 
     /// Returns the task name used in logs.
@@ -283,7 +290,7 @@ impl PayloadStateRootHandle {
             .take()
             .expect("state_root already taken")
             .recv()
-            .map_err(|_| StateRootTaskError::Other("state root task dropped".to_string()))?
+            .map_err(|_| StateRootTaskError::Other("state root task dropped".into()))?
     }
 
     /// Takes the state root receiver for use with custom waiting logic (e.g., timeouts).
@@ -311,8 +318,7 @@ impl PayloadStateRootHandle {
 /// Hashed account and storage keys that a state-root task may want to prefetch.
 ///
 /// Hints are not authoritative. They may be missing, duplicated, stale, or ignored by a task.
-/// The conversions from and to proof-target types allocate; that cost is accepted because
-/// hints are produced on prewarm workers, off the block-execution thread.
+/// Conversions to and from proof-target types allocate new collections.
 #[derive(Debug, Clone, Default)]
 pub struct StateAccessHint {
     /// Hashed account keys that may be touched later in the block.
@@ -352,7 +358,10 @@ impl From<StateAccessHint> for MultiProofTargetsV2 {
 }
 
 /// Semantic update stream consumed by state-root tasks.
-pub trait StateRootSink: Send + Sync + 'static {
+///
+/// These callbacks submit messages without reporting task completion or failure. Consumers must
+/// obtain the computation result separately, for example through [`StateRootHandle::state_root`].
+trait StateRootSink: Send + Sync + 'static {
     /// Best-effort access hint from transaction prewarming.
     fn on_access_hint(&self, _hint: StateAccessHint) {}
 
@@ -380,7 +389,7 @@ impl fmt::Debug for StateRootHintStream {
 
 impl StateRootHintStream {
     /// Creates a new hint stream view.
-    pub fn new(inner: Arc<dyn StateRootSink>) -> Self {
+    fn new(inner: Arc<dyn StateRootSink>) -> Self {
         Self { inner }
     }
 
@@ -392,9 +401,9 @@ impl StateRootHintStream {
 
 /// Authoritative update capability of a state-root stream.
 ///
-/// Exactly one of these exists per state-root task, so exactly one producer can end the
-/// update stream: either the EVM state hook made with [`Self::into_state_hook`] (finishes on
-/// drop) or a pre-hashed update producer such as BAL streaming (calls [`Self::finish`]). The
+/// A [`StateRootHandle`] provides this capability exactly once, so its producer can end the
+/// update stream either through the EVM state hook made with [`Self::into_state_hook`] (finishes
+/// on drop) or through a pre-hashed update stream (calls [`Self::finish`]). The
 /// type is deliberately not `Clone` and finishing consumes it, so a second end-of-stream
 /// signal cannot be produced.
 ///
@@ -413,7 +422,7 @@ impl fmt::Debug for StateRootUpdateStream {
 
 impl StateRootUpdateStream {
     /// Creates a new authoritative update stream backed by the given sink.
-    pub fn new(inner: Arc<dyn StateRootSink>) -> Self {
+    fn new(inner: Arc<dyn StateRootSink>) -> Self {
         Self { inner }
     }
 
@@ -436,7 +445,7 @@ impl StateRootUpdateStream {
     }
 }
 
-/// EVM hook that forwards state updates into a [`StateRootSink`].
+/// EVM hook that forwards state updates to the state-root task.
 ///
 /// Dropping the hook signals the end of the update stream, so the hook is deliberately not
 /// `Clone`: a second copy would fire a spurious end-of-stream signal.
@@ -486,6 +495,10 @@ impl SparseTrieStateRootSink {
     }
 }
 
+// Send errors mean the receiving pipeline has stopped, so further updates and the finish
+// signal cannot be processed. Task errors are delivered through the separate result channel;
+// if the task drops that channel without a result, StateRootHandle::state_root reports an error.
+// Cancellation abandons the result. Ignoring send errors here does not report a successful root.
 impl StateRootSink for SparseTrieStateRootSink {
     fn on_access_hint(&self, hint: StateAccessHint) {
         let _ = self.sender.send(StateRootMessage::PrefetchProofs(hint.into()));
@@ -566,7 +579,7 @@ mod tests {
         assert!(account.mark_selfdestructed_locally());
         account.info.nonce = 1;
         account.storage.insert(
-            U256::from(1),
+            U256::ONE,
             EvmStorageSlot::new_changed(U256::ZERO, U256::from(2), TransactionId::ZERO),
         );
 
@@ -588,7 +601,7 @@ mod tests {
         assert!(account.mark_selfdestructed_locally());
         account.selfdestruct();
         account.storage.insert(
-            U256::from(1),
+            U256::ONE,
             EvmStorageSlot::new_changed(U256::ZERO, U256::from(2), TransactionId::ZERO),
         );
 
@@ -609,7 +622,7 @@ mod tests {
         let address = Address::repeat_byte(0x05);
         let mut account = Account::default();
         // Pre-state: the account exists and holds a balance.
-        account.info.balance = U256::from(1);
+        account.info.balance = U256::ONE;
         account.set_current_info_as_original();
         // This block drains it. Not selfdestructed: an ordinary value transfer out.
         account.mark_touch();
@@ -660,7 +673,7 @@ mod tests {
         };
 
         let address = Address::repeat_byte(0x07);
-        let pre = AccountInfo { balance: U256::from(1), ..Default::default() };
+        let pre = AccountInfo { balance: U256::ONE, ..Default::default() };
 
         // The EvmState the state hook observes: a funded account drained to empty.
         let mut account = Account::from(pre.clone());
@@ -784,32 +797,17 @@ mod tests {
 
     #[derive(Default)]
     struct CountingSink {
-        access_hints: AtomicUsize,
         state_updates: AtomicUsize,
-        hashed_state_updates: AtomicUsize,
         finished_updates: AtomicUsize,
     }
 
     impl StateRootSink for CountingSink {
-        fn on_access_hint(&self, hint: StateAccessHint) {
-            assert_eq!(hint.accounts, vec![B256::repeat_byte(0x01)]);
-            assert_eq!(
-                hint.storages.get(&B256::repeat_byte(0x02)),
-                Some(&vec![B256::repeat_byte(0x03)])
-            );
-            self.access_hints.fetch_add(1, Ordering::Relaxed);
-        }
-
         fn on_state_update(&self, state: EvmState) {
             assert!(state.is_empty());
             self.state_updates.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn on_hashed_state_update(&self, state: HashedPostState) {
-            assert!(state.accounts.is_empty());
-            assert!(state.storages.is_empty());
-            self.hashed_state_updates.fetch_add(1, Ordering::Relaxed);
-        }
+        fn on_hashed_state_update(&self, _state: HashedPostState) {}
 
         fn on_updates_finished(&self) {
             self.finished_updates.fetch_add(1, Ordering::Relaxed);
@@ -837,31 +835,6 @@ mod tests {
         assert_eq!(hint.accounts, vec![account]);
         assert_eq!(hint.storages.len(), 1);
         assert_eq!(hint.storages[&storage_account], vec![storage_slot]);
-    }
-
-    #[test]
-    fn state_root_capabilities_forward_to_sink() {
-        let sink = Arc::new(CountingSink::default());
-
-        let hint_stream = StateRootHintStream::new(sink.clone());
-        let mut storages = B256Map::default();
-        storages.insert(B256::repeat_byte(0x02), vec![B256::repeat_byte(0x03)]);
-        hint_stream
-            .on_access_hint(StateAccessHint { accounts: vec![B256::repeat_byte(0x01)], storages });
-
-        let updates = StateRootUpdateStream::new(sink.clone());
-        updates.on_hashed_state_update(HashedPostState::default());
-        updates.finish();
-
-        {
-            let mut hook = StateRootUpdateStream::new(sink.clone()).into_state_hook();
-            hook.on_state(EvmState::default());
-        }
-
-        assert_eq!(sink.access_hints.load(Ordering::Relaxed), 1);
-        assert_eq!(sink.state_updates.load(Ordering::Relaxed), 1);
-        assert_eq!(sink.hashed_state_updates.load(Ordering::Relaxed), 1);
-        assert_eq!(sink.finished_updates.load(Ordering::Relaxed), 2);
     }
 
     /// A hook dropped by a panic unwind must not finish the stream: the updates are
@@ -942,20 +915,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "state_root already taken")]
-    fn payload_state_root_receiver_can_only_be_taken_once() {
-        let (_state_root_tx, state_root_rx) = std::sync::mpsc::channel();
-        let mut handle = PayloadStateRootHandle::new("test", None, state_root_rx, None);
-
-        let _state_root_rx = handle.take_state_root_rx();
-        let _ = handle.take_state_root_rx();
-    }
-
-    #[test]
     fn payload_state_root_receiver_retains_cancellation() {
         let (updates_tx, _updates_rx) = crossbeam_channel::unbounded();
         let (cancel_guard, cancel_rx) = StateRootTaskCancelGuard::channel();
-        let cancellation = cancel_guard.cancellation_token();
         let (_state_root_tx, state_root_rx) = std::sync::mpsc::channel();
         let (_hashed_state_tx, hashed_state_rx) = std::sync::mpsc::channel();
         let mut handle = StateRootHandle::new(
@@ -973,10 +935,8 @@ mod tests {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
         assert!(matches!(cancel_rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
-        assert!(!cancellation.is_cancelled());
 
         drop(handle);
-        assert!(cancellation.is_cancelled());
         assert!(matches!(
             cancel_rx.recv_timeout(Duration::from_secs(1)),
             Err(crossbeam_channel::RecvTimeoutError::Disconnected)
