@@ -65,6 +65,65 @@ Round 2 reviewed `main` at `0b46d7d398` with four read-only reviewers: the chang
 | 33 | Info | Further erigon differences to document as intentional: `getMessage` miss returns `null` (erigon errors), `addMessage` decode errors return -32602 (erigon -32000), status difficulty shown as 10000/1000000 (erigon 1/100, same ratio), subscription filter `{}` means all categories, lenient penalty for unknown-block bodies. Two parity-gaps entries are stale. | `docs/msgboard-parity-gaps.md` | `fix/msgboard-r2-rpc` | documented in parity-gaps §28-29 (!18, !19) |
 | 34 | Info | Test quality: six tests would still pass if the behaviour they test broke (claim release on a dropped send, the session gauge in the connection loop, subscription gauge decrement, two sleep-based tests, an eviction test with no upper bound); ten important behaviours have no test. | test modules | `fix/msgboard-r2-p2p` | fixed in !20 (8ffb6c12ad) |
 
+## Round 3 findings (2026-10-15)
+
+Round 3 was a read-only review of `crates/net/msgboard` and `crates/net/msgboard-types` at the audit commit. It found no Critical or High issue and no panic reachable from network input.
+
+| # | Severity | Finding | Where | Status |
+|---|---|---|---|---|
+| 35 | Low | `load_from_db` queued the hash key for deletion when it met a duplicate row, which is the row of the copy it kept. | `board.rs` `load_from_db` | fixed (PR 54) |
+| 36 | Low | An announced ID with a zero divisor or multiplier passed the work gate and was claimed and requested. | `config.rs` `is_work_acceptable` | fixed (PR 54) |
+| 37 | Low | Operator limits were not validated, and extreme values overflowed the window and ingress arithmetic. | `args.rs`, `board.rs`, `protocol.rs` | fixed (PR 54) |
+| 38 | Low | `msgboard_content` built the whole response before `--rpc.max-response-size` could refuse it. At the largest `--msgboard.size-limit` that is about 2 GB. | `rpc.rs` | fixed: a call whose estimated response is past 200 MiB is refused before the build |
+| 39 | Low | The `msg/1` frame ceiling was checked only after the multiplexer had buffered the frame. | `protocol.rs` `inbound_limits_for` | fixed: the ceiling is declared to the multiplexer |
+| 40 | Info | A failure to open or load the database was only logged. | `launch.rs` | fixed: `msgboard.persistence_failures` counts a failure to open, a load that errors, and a load that cannot decode half or more of its rows |
+| 41 | Info | A stored row anchored far above the head was kept, announced and never expired. | `board.rs` `seed_window` | fixed: `seed_window` drops messages more than one window above the head |
+| 42 | Info | Claims are keyed by the full 121-byte ID, so one work hash announced with different non-hash fields takes several claim slots. | `pending.rs` | fixed: claims are keyed by the 32-byte message hash. A claim keeps the first ID announced until a later one ranks higher: a fetchable ID outranks one that is not, and a later block outranks an earlier one. Exhaustion and the rescue fetch count once per message |
+| 43 | Info | `MsgIndex::content_page` with `limit` 0 returns an empty page with no cursor. | `index.rs` | open: the RPC layer rejects `limit` 0, so it is not reachable |
+
+## Verification of findings 1-34 (2026-10-16)
+
+Each finding in rounds 1 and 2 was re-checked against `main` at `787eba55a`: the code that closes it was read at the lines below, and the regression test was found and run. Lines are in `crates/net/msgboard/src/` unless a path is given. Test names are in the same crate unless a path is given. The `Where` column in the tables above keeps the line numbers from the review date and is not updated.
+
+Result: 29 fixed (26 with a residual risk that stays accepted as R6a), 4 accepted (13, 18, 19, 33) and 1 partly open (32: the txpool half, which is R8). Nothing was found unfixed. Two tests were added in this pass, for findings 8 and 33.
+
+| # | Status | Evidence on `main` | Regression test |
+|---|---|---|---|
+| 1 | fixed | `protocol.rs:275-284` minimum ingress limits, `:326-337` `inbound_limits_for`, `:674-741` outbound queue with the stalled flag | `a_flooding_peer_is_cut_at_the_ingress_limit`, `the_ingress_limits_hold_an_honest_peers_worst_burst`, `a_peer_that_stops_reading_gets_frames_dropped_not_queued_forever` |
+| 2 | fixed | `pending.rs:316-384` `claim_from` keeps alternates, `:386-410` `release` hands on, `:431` `sweep` retries | `a_withholding_announcer_does_not_censor_the_message`, `an_expired_claim_is_retried_from_the_next_announcer`, `a_released_claim_moves_to_the_next_announcer_at_once` |
+| 3 | fixed | `protocol.rs:414-422` burst and refill, `:767` `ServeBudget` | `distinct_requests_stop_at_the_reply_budget`, `a_repeated_request_is_served_once`, `the_reply_budget_refuses_past_the_burst_and_refills` |
+| 4 | fixed | `bin/reth/src/main.rs:205` and `:306` take `flush_guard()`, `launch.rs:285-294` flushes on drop | `the_flush_guard_flushes_when_dropped`, `dropping_the_board_without_a_final_flush_keeps_accepted_messages` |
+| 5 | fixed | `board.rs:1086-1118`: the retry set holds hashes only, and a hash whose message left the index is not kept | `a_failing_database_does_not_grow_the_flush_backlog`, `a_failed_flush_keeps_the_write_set_for_the_next_attempt` |
+| 6 | fixed | `pending.rs:753-776` `prune` ends only the reservation it queued, `:805-826` only unspent entries count | `spent_reservations_do_not_use_up_the_cap`, `an_old_expiry_does_not_cancel_a_newer_reservation` |
+| 7 | fixed | `index.rs:107-125` one `drain` of the prefix, used at `board.rs:409` and `:434`. The test proves the result equals one-at-a-time removal; the cost is structural | `remove_below_block_matches_removing_one_at_a_time` |
+| 8 | fixed | `protocol.rs:1533` hands verification to `spawn_blocking` | added: `a_delivery_is_verified_off_the_connection_task`. Replacing the `spawn_blocking` call with an inline call makes it fail (log in the PR) |
+| 9 | fixed | `args.rs:23-26` minimums, enforced by the flag parsers | `duration_flags_refuse_values_below_their_minimum` |
+| 10 | fixed | `pending.rs:66`, `:74` caps, `:309-340` fail-open past a cap, `:413` sweep at most once per tenth of the TTL | `one_peer_cannot_fill_the_claim_map`, `the_map_stops_growing_at_capacity_but_still_grants_claims`, `maybe_sweep_runs_at_most_once_per_tenth_of_the_ttl` |
+| 11 | fixed | `board.rs:129` `flush_lock`, held for the whole flush at `:362` | `a_flush_does_not_take_its_batch_while_another_is_in_flight` |
+| 12 | fixed | `board.rs:330-337` trims to `count_limit`; `db.rs:132` `db_load_all` re-files a misfiled row at `:230` | `loading_more_rows_than_the_count_limit_keeps_the_highest_precedence`, `a_misfiled_row_moves_to_its_hash_on_load` |
+| 13 | accepted | `docs/msgboard-rpc.md:20` states that `all` exposes `msgboard_addMessage`; `launch.rs:168` installs the module only on a transport that names it | `naming_msgboard_enables_it_on_that_transport_only`, `a_transport_that_does_not_name_msgboard_does_not_get_it` |
+| 14 | fixed | `rpc.rs:146` builds on a blocking thread; the whole board is served; `:83` budget added by finding 38 | `content_without_a_limit_returns_the_whole_board`, `content_builds_are_bounded_by_the_permit_count` |
+| 15 | fixed | `docs/msgboard-rpc.md:5` input format, `:11` no `--msgboard.enabled` flag, `:28-36` flag table, `:171` paging | `every_documented_flag_name_parses` for the flag names; no test for prose |
+| 16 | fixed | `protocol.rs:1361` gossip-disabled ingest returns early; `gossip_disabled_still_serves_explicit_body_requests` fixes the serving rule | `gossip_disabled_suppresses_requests_and_ingest`, `gossip_disabled_still_serves_explicit_body_requests` |
+| 17 | fixed | `pending.rs:1-12` describes the current index key | none (comment) |
+| 18 | accepted | `msgboard-types/src/pow.rs:145-146` rejects a zero divisor or multiplier; `docs/msgboard-parity-gaps.md` §27.1 | `test_validate_rejects_zero_divisor`, `one_invalid_body_rejects_the_whole_frame` (`msgboard-types`) |
+| 19 | accepted | `msgboard-types/src/pow.rs:122` `CheckedPoWMsg` keeps the timestamp; `docs/msgboard-parity-gaps.md` §27.2 | `write_and_reload_roundtrips_through_named_table` (`db.rs`) |
+| 20 | fixed | `pending.rs:316-384` and `:1111` `admit`: a returning announcer re-enters only through a session ticket | `looping_sybils_do_not_flush_an_honest_announcer`, `a_repeat_announcement_in_one_session_does_not_re_enter` |
+| 21 | fixed | `rpc.rs:37` accepts `"messages"` and `"newMessages"` | `subscribe_accepts_the_erigon_and_the_legacy_kind_names` |
+| 22 | fixed | `rpc_api.rs:314` bound deserialiser takes numbers, decimal and hex strings | `content_block_bounds_accept_erigon_block_number_forms` |
+| 23 | fixed | `pending.rs:905-980` `RequestPacer` spaces requests to the responder's reply budget; a partial answer is not a strike | `an_honest_full_sync_is_never_penalised`, `a_bulk_sync_past_the_reply_budget_costs_an_honest_responder_nothing`, `a_partial_answer_never_escalates` |
+| 24 | fixed | `protocol.rs:745` `is_stalled_and_full`, checked at `:1405` before any lookup or encode | `a_stalled_peer_with_a_full_queue_gets_no_reply_work`, `a_dropped_reply_is_refunded_to_the_budget` |
+| 25 | fixed | `launch.rs:376` `seed_head_window` seeds the whole window, called at `launch.rs:213-221` | `startup_seeds_every_hash_in_the_window` |
+| 26 | fixed, residual R6a accepted | `rpc.rs:83` 200 MiB estimate refused before the build, two build slots held until handoff | `content_past_the_budget_is_refused_and_names_the_page_method`, `content_permit_is_held_until_the_response_is_handed_off` |
+| 27 | fixed | `launch.rs:308` `drive_canonical_head` registers every block of a commit | `a_multi_block_commit_registers_every_block` |
+| 28 | fixed | `block_filter.rs:52` `retain` drops hashes outside the window | `a_reorg_to_a_lower_head_forgets_the_orphans`, `a_reorg_to_a_lower_tip_still_moves_the_head` |
+| 29 | fixed | `rpc.rs:20` and `:76`: separate permit pool for pages | `content_page_is_not_starved_by_full_board_builds` |
+| 30 | fixed | `rpc.rs:215` cap of 8, `:235` verifies on the blocking pool | `add_message_verifies_off_the_runtime_worker`, `add_message_verifies_are_bounded_by_the_permit_count` |
+| 31 | fixed | `pending.rs:1010-1056` strikes are kept by the board, not by the connection | `reconnecting_does_not_reset_withholding_escalation` |
+| 32 | msgboard half fixed; txpool half open (R8) | `index.rs:292` `content_page` scans from the cursor; `board.rs:1003`. `crates/rpc/rpc/src/txpool_page.rs:171-195` still reads the whole pool | `content_page_scan_follows_limit_not_board_size`, `content_page_matches_the_reference_on_random_boards` (`index.rs`) |
+| 33 | accepted | `docs/msgboard-parity-gaps.md` §29.2 lists each difference | `get_message_returns_null_for_an_unknown_hash`, `every_decode_failure_reports_the_same_code`, `add_remote_msgs_skips_unknown_blocks`; added: `an_empty_subscription_filter_delivers_every_category` |
+| 34 | fixed | fixed in !20; the tests named here exist and assert the behaviour (a gauge returns to zero on every exit path, a dropped send releases its claim) | `a_request_that_never_reaches_its_peer_releases_its_claim`, `the_gauge_returns_to_zero_on_every_exit_path` (`tests/session_gauge.rs`, `tests/subscription_gauge.rs`), `count_limit_causes_eviction` |
+
 ## Residual risks
 
 These risks stay after the fixes. We accept them on purpose, and the auditor should see them stated.
@@ -106,3 +165,6 @@ The reviewers verified these. The auditor can use this list to see what we cover
 | 2026-10-01 | Round 2 review: findings 20-34 recorded, R7 and R8 added. R1, R1b, R5 and R6 are understated until findings 20, 23 and 26 are fixed. |
 | 2026-10-01 | Round 2 fixes merged: !18 (block window), !19 (RPC), !20 (p2p). Findings 20-31, 33 and 34 closed; 26 partly (R6a); 32 open (R8). R1 rewritten for the per-subnet bound. |
 | 2026-10-01 | !22 hash-ordered index (finding 32, msgboard half). !23 R1 mitigations: session rejoin, trusted first, rescue fetch from non-announcers, exhaustion metrics. R1 and R8 rewritten. |
+| 2026-10-15 | Round 3 review: findings 35-43 recorded. 35-37 fixed in PR 54; 38-41 fixed in the follow-up; 42 and 43 open. |
+| 2026-10-16 | Findings 1-34 re-verified against `main` at `787eba55a`: 29 fixed, 4 accepted, 1 partly open (32, txpool half, R8). Regression tests added for findings 8 and 33. |
+| 2026-10-16 | Finding 42 fixed: claims keyed by message hash. |

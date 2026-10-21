@@ -139,7 +139,7 @@ pub const fn chain_id_at_block_testnet_v4(block: u64) -> u64 {
 
 /// `PulseChain` mainnet bootnodes.
 ///
-/// Source: <https://gitlab.com/pulsechaincom/private-erigon-pulse/-/blob/main/params/bootnodes.go>
+/// Source: the bootnode list in erigon-pulse `params/bootnodes.go`.
 pub static PULSECHAIN_BOOTNODES: [&str; 10] = [
     "enode://bdb96e7ff6607414a4be8cdc8458861e9c22a25a0c254c7bb9c9c8423912e998b59e7ba012801538480eb78cec4d6766ab0b379d0b60356de84a7cdaec988c0b@5.9.124.244:30303",     // bootnode-001-hetzner-fsn
     "enode://d69f8d28804ab34f7d5e20ac8bd4940412602787e2c37fc3600adc60dcd5d0a52e1fe1baccbefb6e278e1ee59fcb099c45db242edeb5e0a4547ff971218a0592@148.251.54.222:30303",  // bootnode-002-hetzner-fsn
@@ -155,7 +155,7 @@ pub static PULSECHAIN_BOOTNODES: [&str; 10] = [
 
 /// `PulseChain` Testnet V4 bootnodes.
 ///
-/// Source: <https://gitlab.com/pulsechaincom/private-erigon-pulse/-/blob/main/params/bootnodes.go>
+/// Source: the bootnode list in erigon-pulse `params/bootnodes.go`.
 pub static PULSECHAIN_TESTNET_V4_BOOTNODES: [&str; 8] = [
     "enode://3edb6b2b76ef50af30d3b02e098f00546f1a460ff1c82adad2639a57f6742c69516d24d760c0dd4555334adb01e6f3327f1a61056b3d89db4de10060248e8dea@65.21.204.190:30303",   // bootnode-001-hetzner-hel
     "enode://2b9af9cc9d09e2d2ef8cb3203f859e69b0175c1d7c41e14acf5162b239a773a966eea98a71999af9424ddb5b27a44759318869f8a4ba954483889aafdd6ea921@157.90.129.118:30303",  // bootnode-002-hetzner-fsn

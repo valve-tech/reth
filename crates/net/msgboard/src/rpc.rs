@@ -79,6 +79,9 @@ pub struct MsgboardApi {
     /// Bounds concurrent `msgboard_addMessage` verifications; see
     /// [`ADD_MESSAGE_CONCURRENT_VERIFIES`].
     add_permits: Arc<Semaphore>,
+    /// Largest estimated `msgboard_content` response; see
+    /// [`CONTENT_MAX_RESPONSE_BYTES`].
+    content_budget: u64,
     #[cfg(test)]
     probe: Arc<tests::BuildProbe>,
 }
@@ -91,9 +94,18 @@ impl MsgboardApi {
             content_permits: Arc::new(Semaphore::new(CONTENT_CONCURRENT_BUILDS)),
             page_permits: Arc::new(Semaphore::new(CONTENT_PAGE_CONCURRENT_BUILDS)),
             add_permits: Arc::new(Semaphore::new(ADD_MESSAGE_CONCURRENT_VERIFIES)),
+            content_budget: CONTENT_MAX_RESPONSE_BYTES,
             #[cfg(test)]
             probe: Default::default(),
         }
+    }
+
+    /// Replace the largest estimated `msgboard_content` response, in bytes.
+    ///
+    /// The default is [`CONTENT_MAX_RESPONSE_BYTES`].
+    pub const fn with_content_budget(mut self, bytes: u64) -> Self {
+        self.content_budget = bytes;
+        self
     }
 
     /// Waits for one of `permits`, then runs `f` on the blocking pool and
@@ -116,7 +128,7 @@ impl MsgboardApi {
         &self,
         permits: &Arc<Semaphore>,
         method: &'static str,
-        f: impl FnOnce(&MsgBoard) -> T + Send + 'static,
+        f: impl FnOnce(&MsgBoard) -> Result<T, ErrorObjectOwned> + Send + 'static,
     ) -> ResponsePayload<'static, Box<RawValue>> {
         let permit = match Arc::clone(permits).acquire_owned().await {
             Ok(permit) => permit,
@@ -134,7 +146,8 @@ impl MsgboardApi {
         let built = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             let _guard = probe.enter();
-            (permit, serde_json::value::to_raw_value(&f(&board)))
+            let built = f(&board).map(|value| serde_json::value::to_raw_value(&value));
+            (permit, built)
         })
         .await;
         let (permit, json) = match built {
@@ -146,8 +159,11 @@ impl MsgboardApi {
             }
         };
         let json = match json {
-            Ok(json) => json,
-            Err(err) => {
+            Ok(Ok(json)) => json,
+            // The call was refused before anything was built. The permit goes
+            // back with the dropped `permit` binding.
+            Err(refused) => return ResponsePayload::error(refused),
+            Ok(Err(err)) => {
                 return ResponsePayload::error(internal_error(format!(
                     "{method} serialisation failed: {err}"
                 )))
@@ -164,6 +180,11 @@ impl MsgboardApi {
         payload
     }
 }
+
+/// Largest `msgboard_content` response the node agrees to build, in estimated
+/// JSON bytes. The default is the `--rpc.max-response-size` default of 200 MiB
+/// that this build sets.
+pub const CONTENT_MAX_RESPONSE_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Most `msgboard_content` responses the node holds at once.
 ///
@@ -242,9 +263,19 @@ impl MsgboardApiServer for MsgboardApi {
         let offset = filter.offset.unwrap_or(0);
         let limit = filter.limit.unwrap_or(usize::MAX);
         let ContentFilter { category, from_block, to_block, .. } = filter;
+        let budget = self.content_budget;
         self.build(&self.content_permits, "msgboard_content", move |board| {
             let msgs = matching(board, category, from_block, to_block);
-            group_by_category(msgs.iter().skip(offset).take(limit))
+            let selected = || msgs.iter().skip(offset).take(limit);
+            let estimate = estimated_content_json_bytes(selected());
+            if estimate > budget {
+                return Err(invalid_params(format!(
+                    "msgboard_content: this call would build a response of about {estimate} \
+                     bytes, past the {budget}-byte limit. Narrow it with `limit`, `category`, \
+                     `fromBlock` or `toBlock`, or read the board with msgboard_contentPage"
+                )));
+            }
+            Ok(group_by_category(selected()))
         })
         .await
     }
@@ -267,7 +298,7 @@ impl MsgboardApiServer for MsgboardApi {
             // cursor.
             let IndexPage { msgs, next, .. } =
                 board.content_page(category.as_ref(), from_block, to_block, after, limit);
-            ContentPage { content: group_by_category(msgs.iter()), next }
+            Ok(ContentPage { content: group_by_category(msgs.iter()), next })
         })
         .await
     }
@@ -405,6 +436,24 @@ fn matching(
         Some(cat) => board.category_msgs_filtered(&cat, from_block, to_block),
         None => board.all_msgs_filtered(from_block, to_block),
     }
+}
+
+/// Fixed JSON cost of one message beyond its `data`: the field names, the
+/// hashes, the numbers and the separators. A full message is about 400 bytes
+/// of it, so 500 over-counts and never under-counts.
+const CONTENT_JSON_OVERHEAD_PER_MSG: u64 = 500;
+
+/// Upper bound on the JSON size of the response for `msgs`, from their lengths
+/// alone. `data` travels as hex, two characters a byte.
+///
+/// It is computed before anything is copied or serialised, which is the point:
+/// at the largest `--msgboard.size-limit` a full board is about 2 GB of JSON.
+fn estimated_content_json_bytes<'a>(msgs: impl Iterator<Item = &'a Arc<CheckedPoWMsg>>) -> u64 {
+    msgs.fold(0u64, |total, m| {
+        total
+            .saturating_add(CONTENT_JSON_OVERHEAD_PER_MSG)
+            .saturating_add((m.msg.data.len() as u64).saturating_mul(2))
+    })
 }
 
 /// Groups messages into erigon's category map. `BTreeMap` sorts the category
@@ -1052,6 +1101,31 @@ mod tests {
         assert_eq!(got.category, category(0xBB));
     }
 
+    /// An empty filter object is "every category", the same as no filter
+    /// (finding 33, parity-gaps §29.2). Erigon reads `{}` as the zero
+    /// category and delivers almost nothing, so a client that depends on
+    /// either reading would break if this one changed.
+    #[tokio::test]
+    async fn an_empty_subscription_filter_delivers_every_category() {
+        let board = ready_board(10);
+        let m = module(Arc::clone(&board));
+
+        let mut sub = m
+            .subscribe_unbounded("msgboard_subscribe", vec![json!("messages"), json!({})])
+            .await
+            .unwrap();
+
+        let first = board.add_local_msg(mined(&[1], category(0xAA), 10)).unwrap();
+        let second = board.add_local_msg(mined(&[2], category(0xBB), 10)).unwrap();
+
+        let (got, _id) =
+            sub.next::<MsgboardMsg>().await.expect("subscription yielded nothing").unwrap();
+        assert_eq!(got.hash, first.hash);
+        let (got, _id) =
+            sub.next::<MsgboardMsg>().await.expect("subscription yielded nothing").unwrap();
+        assert_eq!(got.hash, second.hash);
+    }
+
     // ── content paging ───────────────────────────────────────────────────────
 
     /// A no-argument call is the shape erigon clients use, and erigon answers
@@ -1323,6 +1397,81 @@ mod tests {
     async fn content_rejects_a_zero_limit() {
         let m = module(filled_board(3, 8));
         assert_eq!(call_err_code(&m, "msgboard_content", vec![json!({"limit": 0})]).await, -32602);
+    }
+
+    // ── content response budget ──────────────────────────────────────────────
+
+    /// The estimate behind the budget: two hex characters per `data` byte plus
+    /// the fixed fields, counted at 500 bytes a message.
+    fn content_estimate(count: u64, data_len: u64) -> u64 {
+        count * (2 * data_len + 500)
+    }
+
+    /// A call that would build a response past the budget is refused before
+    /// the build. The only other outcome is a multi-gigabyte response that
+    /// `--rpc.max-response-size` rejects after it has been built and held.
+    #[tokio::test]
+    async fn content_past_the_budget_is_refused_and_names_the_page_method() {
+        let api = MsgboardApi::new(filled_board(10, 1_000)).with_content_budget(20_000);
+        let m = api.into_rpc();
+
+        match m.call::<_, Value>("msgboard_content", rpc_params_none()).await {
+            Err(MethodsError::JsonRpc(e)) => {
+                assert_eq!(e.code(), -32602);
+                let text = e.message();
+                assert!(text.contains("msgboard_contentPage"), "{text}");
+                assert!(text.contains("limit"), "{text}");
+            }
+            other => panic!("expected -32602, got {other:?}"),
+        }
+    }
+
+    /// Narrowing the call, or paging, gets the same messages through.
+    #[tokio::test]
+    async fn content_inside_the_budget_is_unchanged() {
+        let api = MsgboardApi::new(filled_board(10, 1_000)).with_content_budget(20_000);
+        let m = api.into_rpc();
+
+        let v: Value = m.call("msgboard_content", vec![json!({"limit": 5})]).await.unwrap();
+        assert_eq!(total_msgs(&v), 5, "5 messages estimate to 12_500, inside 20_000");
+
+        let v: Value = m.call("msgboard_contentPage", vec![json!({"limit": 10})]).await.unwrap();
+        assert_eq!(total_msgs(&v["content"]), 10, "paging has its own cap and no byte budget");
+    }
+
+    /// The budget is inclusive: a response that estimates to exactly the
+    /// budget is built, one byte more is not.
+    #[tokio::test]
+    async fn content_budget_is_inclusive() {
+        let exact = content_estimate(10, 1_000);
+        let board = filled_board(10, 1_000);
+
+        let m = MsgboardApi::new(Arc::clone(&board)).with_content_budget(exact).into_rpc();
+        let v: Value = m.call("msgboard_content", rpc_params_none()).await.unwrap();
+        assert_eq!(total_msgs(&v), 10);
+
+        let m = MsgboardApi::new(board).with_content_budget(exact - 1).into_rpc();
+        assert_eq!(call_err_code(&m, "msgboard_content", vec![]).await, -32602);
+    }
+
+    /// The budget counts the messages the call returns, not the board. A
+    /// category with few messages on a large board still answers whole.
+    #[tokio::test]
+    async fn content_budget_counts_only_the_matching_messages() {
+        let m = MsgboardApi::new(filled_board(10, 1_000)).with_content_budget(2_600).into_rpc();
+        let none: Value =
+            m.call("msgboard_content", vec![json!({"category": category(0xBB)})]).await.unwrap();
+        assert_eq!(total_msgs(&none), 0);
+        let one: Value = m.call("msgboard_content", vec![json!({"limit": 1})]).await.unwrap();
+        assert_eq!(total_msgs(&one), 1);
+    }
+
+    /// The default budget must admit the largest board the defaults allow, or
+    /// the budget would break the call it is meant to protect.
+    #[test]
+    fn the_default_budget_admits_a_full_default_board() {
+        let full = content_estimate(10_000, 8 * 1024);
+        assert!(full <= CONTENT_MAX_RESPONSE_BYTES, "{full} > {CONTENT_MAX_RESPONSE_BYTES}");
     }
 
     // ── subscribe: the server's own cap ──────────────────────────────────────

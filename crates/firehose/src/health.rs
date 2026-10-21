@@ -82,7 +82,7 @@ impl HealthStatus {
 
 /// Parse replica letter from a valve host name.
 ///
-/// Accepts `direct-b-evm-369`, `direct-a-evm-1.internal`, `evm943b`, `evm1b`.
+/// Accepts `direct-b-node`, `direct-a-node.example`, `evm943b`, `evm1b`.
 pub fn replica_from_host(host: &str) -> Option<String> {
     let host = host.trim().to_ascii_lowercase();
     let name = host.split('.').next().unwrap_or(&host);
@@ -121,7 +121,7 @@ fn current_hostname() -> Option<String> {
 
 /// Testable replica resolution: env lookup + optional hostname, no process globals.
 ///
-/// Order: `VALVE_REPLICA`, `FIREHOSE_REPLICA`, hostname (`direct-{a|b}-evm-*` /
+/// Order: `VALVE_REPLICA`, `FIREHOSE_REPLICA`, hostname (`direct-{a|b}-*` /
 /// `evm*{a|b}`), then `"a"`. Empty/whitespace values fall through to the next source.
 pub fn resolve_replica_from(
     mut env_get: impl FnMut(&str) -> Option<String>,
@@ -145,7 +145,7 @@ pub fn resolve_replica_from(
 
 /// Replica stamp for health.json.
 ///
-/// Order: `VALVE_REPLICA`, `FIREHOSE_REPLICA`, hostname (`direct-{a|b}-evm-*` /
+/// Order: `VALVE_REPLICA`, `FIREHOSE_REPLICA`, hostname (`direct-{a|b}-*` /
 /// `evm*{a|b}`), then `"a"`.
 pub fn resolve_replica() -> String {
     resolve_replica_from(|k| std::env::var(k).ok(), current_hostname().as_deref())

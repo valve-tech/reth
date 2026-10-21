@@ -1289,12 +1289,16 @@ JIT:
 
 Msgboard:
       --msgboard.work-multiplier <MSGBOARD_WORK_MULTIPLIER>
-          Minimum accepted `work_multiplier` value
+          Minimum accepted `work_multiplier` value.
+
+          Must be at least 1: a zero multiplier turns the check off.
 
           [default: 10000]
 
       --msgboard.work-divisor <MSGBOARD_WORK_DIVISOR>
-          Maximum accepted `work_divisor` value
+          Maximum accepted `work_divisor` value.
+
+          Must be at least 1.
 
           [default: 1000000]
 
@@ -1306,7 +1310,9 @@ Msgboard:
           [default: 8192]
 
       --msgboard.count-limit <MSGBOARD_COUNT_LIMIT>
-          Maximum number of messages retained in the board
+          Maximum number of messages retained in the board.
+
+          At most 1,000,000.
 
           [default: 10000]
 
@@ -1316,7 +1322,9 @@ Msgboard:
           [default: 120]
 
       --msgboard.stale-block-buffer <MSGBOARD_STALE_BLOCK_BUFFER>
-          Stale block buffer for peer filtering (avoid requesting nearly-expired messages)
+          Stale block buffer for peer filtering (avoid requesting nearly-expired messages).
+
+          At most 1080, the widest live window.
 
           [default: 3]
 
@@ -1361,7 +1369,7 @@ Msgboard:
       --firehose.replica <FIREHOSE_REPLICA>
           Replica letter stamped into firehose health.json (`a` / `b`).
 
-          Optional. When unset, the ExEx infers from hostname (`direct-b-evm-369`, `evm943b`) or `VALVE_REPLICA`.
+          Optional. When unset, the ExEx infers from hostname (`direct-b-node`, `evm943b`) or `VALVE_REPLICA`.
 
           [env: FIREHOSE_REPLICA=]
 
