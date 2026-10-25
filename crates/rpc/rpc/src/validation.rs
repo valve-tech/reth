@@ -865,7 +865,8 @@ mod tests {
         BidTrace, BuilderBlockValidationRequestV2, SignedBidSubmissionV2,
     };
     use alloy_rpc_types_engine::{
-        ExecutionData, ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2,
+        ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV1,
+        ExecutionPayloadV2,
     };
     use evm2::evm::AccountInfo;
     use reth_chainspec::MAINNET;
@@ -1437,5 +1438,77 @@ mod tests {
         assert_eq!(request.request.execution_payload.payload_inner.timestamp, 1_700_000_000);
         assert_eq!(request.request.execution_payload.withdrawals.len(), 1);
         assert_eq!(request.request.execution_payload.withdrawals[0].amount, 3);
+    }
+
+    /// Converts `PulseChain` testnet block 25,731,855 (one transaction, 16 withdrawals), taken
+    /// from a live node, into the V2 payload a builder would submit for it.
+    fn pulsechain_testnet_payload() -> ExecutionPayloadV2 {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            block: alloy_rpc_types_eth::Block,
+            raw_txs: Vec<alloy_primitives::Bytes>,
+        }
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../testdata/pulsechain-testnet-block-25731855.json"
+        ))
+        .unwrap();
+
+        let transactions = fixture
+            .raw_txs
+            .iter()
+            .map(|raw| {
+                <reth_ethereum_primitives::TransactionSigned as alloy_eips::Decodable2718>::decode_2718(
+                    &mut raw.as_ref(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let block = Block {
+            header: fixture.block.header.inner,
+            body: BlockBody {
+                transactions,
+                ommers: Default::default(),
+                withdrawals: fixture.block.withdrawals,
+            },
+        };
+        ExecutionPayloadV2::from_block_unchecked(fixture.block.header.hash, &block)
+    }
+
+    fn ensure_pulsechain_testnet_payload(
+        payload: ExecutionPayloadV2,
+    ) -> Result<SealedBlock<Block>, alloy_rpc_types_engine::PayloadError> {
+        ensure_well_formed_payload(
+            reth_pulsechain_forks::chainspec::PULSECHAIN_TESTNET_V4.clone(),
+            ExecutionData {
+                payload: ExecutionPayload::V2(payload),
+                sidecar: ExecutionPayloadSidecar::none(),
+            },
+        )
+    }
+
+    /// `PulseChain`'s own rules accept a V2 payload of a real block, and recompute its hash.
+    #[test]
+    fn test_v2_accepts_a_real_pulsechain_testnet_block() {
+        let payload = pulsechain_testnet_payload();
+        let expected = payload.payload_inner.block_hash;
+
+        let block = ensure_pulsechain_testnet_payload(payload).unwrap();
+
+        assert_eq!(block.hash(), expected);
+        assert_eq!(block.body().withdrawals.as_ref().map(|w| w.len()), Some(16));
+    }
+
+    /// The same block with one withdrawal changed no longer matches its hash.
+    #[test]
+    fn test_v2_rejects_a_tampered_pulsechain_testnet_block() {
+        let mut payload = pulsechain_testnet_payload();
+        payload.withdrawals[0].amount += 1;
+
+        let err = ensure_pulsechain_testnet_payload(payload).unwrap_err();
+
+        assert!(
+            matches!(err, alloy_rpc_types_engine::PayloadError::BlockHash { .. }),
+            "unexpected error: {err}"
+        );
     }
 }
