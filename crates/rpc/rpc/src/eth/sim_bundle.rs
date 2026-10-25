@@ -13,7 +13,7 @@ use jsonrpsee::core::RpcResult;
 use reth_errors::RethError;
 use reth_evm::{ConfigureEvm, Evm, EvmEnv};
 use reth_primitives_traits::Recovered;
-use reth_rpc_api::MevSimApiServer;
+use reth_rpc_api::{MevSimApiServer, SimBundleRequest};
 use reth_rpc_eth_api::{
     helpers::{block::LoadBlock, Call, EthTransactions},
     FromEthApiError, FromEvmError,
@@ -519,15 +519,17 @@ where
 {
     async fn sim_bundle(
         &self,
-        request: MevSendBundle,
-        overrides: SimBundleOverrides,
+        SimBundleRequest(request): SimBundleRequest,
+        overrides: Option<SimBundleOverrides>,
     ) -> RpcResult<SimBundleResponse> {
         trace!("mev_simBundle called, request: {:?}, overrides: {:?}", request, overrides);
 
+        let overrides = overrides.unwrap_or_default();
         let override_timeout = overrides.timeout;
 
+        // The Flashbots builder reads the timeout in milliseconds.
         let timeout = override_timeout
-            .map(Duration::from_secs)
+            .map(Duration::from_millis)
             .map(|d| d.min(MAX_SIM_TIMEOUT))
             .unwrap_or(DEFAULT_SIM_TIMEOUT);
 
@@ -698,7 +700,8 @@ mod tests {
                 overridden_coinbase,
             ),
         ] {
-            let response = api.sim_bundle(bundle(number), overrides.clone()).await.unwrap();
+            let response =
+                api.sim_bundle(bundle(number).into(), Some(overrides.clone())).await.unwrap();
             assert!(response.success);
             assert_eq!(response.state_block, 0);
             let tip = (2_000_000_000u64 - base_fee).min(1_000_000_000);
@@ -728,10 +731,14 @@ mod tests {
             assert_eq!(log.log_index, Some(0));
 
             // Nonzero inclusion bounds reach the simulation check instead of failing parsing.
-            let err = api.sim_bundle(bundle(number + 1), overrides.clone()).await.unwrap_err();
+            let err = api
+                .sim_bundle(bundle(number + 1).into(), Some(overrides.clone()))
+                .await
+                .unwrap_err();
             assert!(err.message().contains("invalid inclusion"), "{err}");
             if number > 1 {
-                let err = api.sim_bundle(bundle(number - 1), overrides).await.unwrap_err();
+                let err =
+                    api.sim_bundle(bundle(number - 1).into(), Some(overrides)).await.unwrap_err();
                 assert!(err.message().contains("invalid inclusion"), "{err}");
             }
         }
@@ -978,18 +985,18 @@ mod tests {
 
         let capped = api(21_000);
         assert_eq!(
-            capped.sim_bundle(bundle.clone(), overrides).await.unwrap_err(),
+            capped.sim_bundle(bundle.clone().into(), Some(overrides)).await.unwrap_err(),
             ErrorObjectOwned::from(EthApiError::InvalidTransaction(
                 RpcInvalidTransactionError::GasTooHigh
             ))
         );
         assert_eq!(
-            capped.sim_bundle(bundle.clone(), SimBundleOverrides::default()).await.unwrap_err(),
+            capped.sim_bundle(bundle.clone().into(), None).await.unwrap_err(),
             ErrorObjectOwned::from(EthApiError::InvalidParams(
                 EthBundleError::BundleGasLimitExceeded(21_000).to_string()
             ))
         );
-        let response = api(0).sim_bundle(bundle, SimBundleOverrides::default()).await.unwrap();
+        let response = api(0).sim_bundle(bundle.into(), None).await.unwrap();
         assert_eq!(response.gas_used, 42_000);
     }
 }

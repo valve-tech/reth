@@ -33,6 +33,7 @@ mod txpool_page;
 mod validation;
 mod web3;
 
+pub use mev::SimBundleRequest;
 pub use reth::RethJitAction;
 pub use testing::{
     TestingBuildBlockRequestV1, TestingBuildBlockResponseV1, TESTING_BUILD_BLOCK_V1,
