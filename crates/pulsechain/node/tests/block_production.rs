@@ -8,128 +8,38 @@
 //! 2. `engine_getPayloadV2`.
 //! 3. `engine_newPayloadV2` with the built payload, then a forkchoice update onto it.
 //!
-//! Each test launches a real `PulsechainNode` on the real 369 or 943 hardfork
-//! schedule. The genesis sits above the `PrimordialPulse` block and after
-//! PulseChain's Shanghai, so every PulseChain override runs in its post-fork
-//! branch, as it does at the live head. The built block is then checked
-//! against `PulsechainConsensus` directly and re-imported through
-//! `newPayloadV2`, which re-executes it and checks the state root.
-//!
-//! The network component is the plain Ethereum one, so the test never dials
-//! the real PulseChain bootnodes. The network takes no part in building or
-//! validating a block.
+//! Each test also starts a second node, a follower with the same genesis, and
+//! imports the payload there. The follower has never seen the block, so it
+//! executes it in full and checks the state root and receipts, as every
+//! PulseChain peer would. The built block is also checked against
+//! `PulsechainConsensus` directly.
 
-use std::{sync::Arc, time::Duration};
+mod common;
+
+use std::time::Duration;
 
 use alloy_consensus::{proofs::calculate_withdrawals_root, BlockHeader};
-use alloy_eips::{eip1559::calculate_block_gas_limit, eip4895::Withdrawal};
-use alloy_genesis::{Genesis, GenesisAccount};
-use alloy_primitives::{address, b256, Address, Bytes, TxKind, B256, U256};
+use alloy_eips::eip1559::calculate_block_gas_limit;
+use alloy_primitives::{Address, Bytes, B256, B64, U256};
 use alloy_rpc_types_engine::{
     ExecutionPayload, ExecutionPayloadFieldV2, ExecutionPayloadInputV2, ForkchoiceState,
     PayloadAttributes, PayloadStatusEnum,
 };
-use alloy_rpc_types_eth::TransactionRequest;
+use common::*;
 use jsonrpsee_core::{client::ClientT, rpc_params};
-use reth_chainspec::{make_genesis_header, Chain, ChainSpec, EthChainSpec};
+use reth_chainspec::{Chain, ChainSpec, EthChainSpec};
 use reth_consensus::{Consensus, HeaderValidator};
-use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
 use reth_ethereum_primitives::{Block, TransactionSigned};
-use reth_node_builder::{NodeBuilder, NodeHandle};
+use reth_node_builder::NodeHandle;
 use reth_node_core::{
-    args::PayloadBuilderArgs, cli::config::PayloadBuilderConfig, node_config::NodeConfig,
-    version::default_extra_data_bytes,
+    args::PayloadBuilderArgs, cli::config::PayloadBuilderConfig, version::default_extra_data_bytes,
 };
-use reth_node_ethereum::{EthEngineTypes, EthereumAddOns, EthereumNetworkBuilder};
+use reth_node_ethereum::EthEngineTypes;
 use reth_primitives_traits::{Block as _, SealedHeader};
-use reth_provider::{BlockNumReader, StateProviderFactory};
+use reth_provider::{BlockNumReader, BlockReaderIdExt, StateProviderFactory};
 use reth_pulsechain_forks::chainspec::{PULSECHAIN, PULSECHAIN_TESTNET_V4};
-use reth_pulsechain_node::{
-    consensus::PulsechainConsensus, spec::PulsechainChainSpec, PulsechainNode,
-};
+use reth_pulsechain_node::consensus::PulsechainConsensus;
 use reth_rpc_api::EngineApiClient;
-use reth_tasks::Runtime;
-
-/// One PLS in wei.
-const PLS: u128 = 1_000_000_000_000_000_000;
-
-/// One gwei in wei. Consensus-layer withdrawal amounts are in gwei.
-const GWEI: u128 = 1_000_000_000;
-
-/// The live 369 base fee on 2026-10-26 (block 27,897,284), in wei.
-const PULSECHAIN_BASE_FEE: u64 = 352_156_972_705_304;
-
-/// The block every built block extends. It is above both `PrimordialPulse`
-/// blocks (17,233,000 and 16,492,700), so the executor takes its post-fork path.
-const PARENT_NUMBER: u64 = 27_900_000;
-
-/// A parent timestamp after both PulseChain Shanghai activations.
-const PARENT_TIMESTAMP: u64 = 1_761_000_000;
-
-/// PulseChain's slot length, from the live beacon spec.
-const SECONDS_PER_SLOT: u64 = 10;
-
-/// The fee recipient the validator client would set.
-const FEE_RECIPIENT: Address = address!("0x000000000000000000000000000000000000fee5");
-
-/// Two withdrawal addresses. The first gets two withdrawals in one block.
-const WITHDRAWAL_A: Address = address!("0x00000000000000000000000000000000000a0a0a");
-const WITHDRAWAL_B: Address = address!("0x00000000000000000000000000000000000b0b0b");
-
-/// Extra data the test proposer stamps into its blocks.
-const EXTRA_DATA: &[u8] = b"valve/block-production-test";
-
-/// The recipient of the test transfer.
-const TRANSFER_TO: Address = address!("0x0000000000000000000000000000000000c0ffee");
-
-/// Builds a PulseChain chain spec whose genesis is a post-fork, post-Shanghai
-/// block, on the real hardfork schedule of `base` (369 or 943).
-///
-/// `make_genesis_header` decides the base fee from London's activation at
-/// block 0. On the real PulseChain schedule London starts at 12,965,000, so
-/// the header it returns has no base fee. A block at 27,900,000 must carry one,
-/// so the base fee is set on the header by hand.
-fn pulse_spec(base: &ChainSpec, gas_limit: u64, funded: Address) -> Arc<PulsechainChainSpec> {
-    let genesis = Genesis {
-        number: Some(PARENT_NUMBER),
-        parent_hash: Some(b256!(
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-        )),
-        timestamp: PARENT_TIMESTAMP,
-        gas_limit,
-        base_fee_per_gas: Some(PULSECHAIN_BASE_FEE as u128),
-        difficulty: U256::ZERO,
-        alloc: [(funded, GenesisAccount::default().with_balance(U256::from(1_000_000_000 * PLS)))]
-            .into(),
-        config: base.genesis.config.clone(),
-        ..Default::default()
-    };
-
-    let mut header = make_genesis_header(&genesis, &base.hardforks);
-    header.base_fee_per_gas = Some(PULSECHAIN_BASE_FEE);
-
-    let spec =
-        ChainSpec { genesis, genesis_header: SealedHeader::seal_slow(header), ..base.clone() };
-    Arc::new(PulsechainChainSpec::new(Arc::new(spec)))
-}
-
-/// Withdrawals as the beacon node sends them, in gwei.
-///
-/// The first is a full 32,000,000 PLS validator exit, `MAX_EFFECTIVE_BALANCE`
-/// on PulseChain. A second withdrawal to the same address checks that two
-/// credits to one address both land.
-fn withdrawals() -> Vec<Withdrawal> {
-    vec![
-        Withdrawal {
-            index: 1_000,
-            validator_index: 7,
-            address: WITHDRAWAL_A,
-            amount: 32_000_000 * 1_000_000_000,
-        },
-        Withdrawal { index: 1_001, validator_index: 8, address: WITHDRAWAL_A, amount: 12_345_678 },
-        Withdrawal { index: 1_002, validator_index: 9, address: WITHDRAWAL_B, amount: 1 },
-    ]
-}
 
 /// What one proposal run returns for the per-chain assertions.
 struct Proposal {
@@ -149,64 +59,28 @@ async fn propose_one_block(
     reth_tracing::init_test_tracing();
 
     let chain_id = base.chain().id();
-    let signer = Wallet::new(1).with_chain_id(chain_id).wallet_gen().remove(0);
-    let sender = signer.address();
-    let chain_spec = pulse_spec(base, parent_gas_limit, sender);
+    let sender_address = sender(chain_id).address();
+    let chain_spec = pulse_spec(base, parent_gas_limit, sender_address);
     let consensus = PulsechainConsensus::new(chain_spec.clone());
-
-    let mut config = NodeConfig::new(chain_spec.clone()).with_unused_ports();
-    config.network.discovery.disable_discovery = true;
-    config.rpc = config.rpc.with_http();
-    // reth's default cap is 1 PLS, which rejects every ordinary PulseChain
-    // transaction submitted over RPC. The fleet runs 1,000,000.
-    config.rpc.rpc_tx_fee_cap = 1_000_000 * PLS;
-    config.builder.extra_data = Bytes::from_static(EXTRA_DATA);
-    config.builder.gas_limit = builder_gas_limit;
-
-    let NodeHandle { node, node_exit_future: _exit } = NodeBuilder::new(config)
-        .testing_node(Runtime::test())
-        .with_types::<PulsechainNode>()
-        .with_components(PulsechainNode::components().network(EthereumNetworkBuilder::default()))
-        .with_add_ons(EthereumAddOns::default())
-        .launch()
-        .await?;
-
     let genesis_hash = chain_spec.genesis_hash();
-    let engine = node.auth_server_handle().http_client();
-    let rpc = node.rpc_server_handle().http_client().expect("http rpc is enabled");
 
-    // A transfer signed for this chain id. The tip is what lands with the fee
-    // recipient; the base fee is burned.
-    let tip: u128 = 2 * GWEI;
-    let transfer = TransactionRequest {
-        from: Some(sender),
-        to: Some(TxKind::Call(TRANSFER_TO)),
-        value: Some(U256::from(PLS)),
-        nonce: Some(0),
-        gas: Some(21_000),
-        max_fee_per_gas: Some(2 * PULSECHAIN_BASE_FEE as u128),
-        max_priority_fee_per_gas: Some(tip),
-        chain_id: Some(chain_id),
-        ..Default::default()
-    };
-    let raw = TransactionTestContext::sign_tx_bytes(signer, transfer).await;
+    let NodeHandle { node: proposer, node_exit_future: _proposer_exit } =
+        launch_node!(node_config(chain_spec.clone(), builder_gas_limit));
+    let NodeHandle { node: follower, node_exit_future: _follower_exit } =
+        launch_node!(node_config(chain_spec.clone(), builder_gas_limit));
+
+    let engine = proposer.auth_server_handle().http_client();
+    let follower_engine = follower.auth_server_handle().http_client();
+    let rpc = proposer.rpc_server_handle().http_client().expect("http rpc is enabled");
+    let follower_rpc = follower.rpc_server_handle().http_client().expect("http rpc is enabled");
+
+    let raw = signed_transfer(chain_id).await;
     let tx_hash: B256 = rpc.request("eth_sendRawTransaction", rpc_params![raw]).await?;
 
-    let head = ForkchoiceState {
-        head_block_hash: genesis_hash,
-        safe_block_hash: genesis_hash,
-        finalized_block_hash: genesis_hash,
-    };
-    let attributes = PayloadAttributes {
-        timestamp: PARENT_TIMESTAMP + SECONDS_PER_SLOT,
-        prev_randao: b256!("0x2222222222222222222222222222222222222222222222222222222222222222"),
-        suggested_fee_recipient: FEE_RECIPIENT,
-        withdrawals: Some(withdrawals()),
-        parent_beacon_block_root: None,
-        ..Default::default()
-    };
+    let head = forkchoice_at(genesis_hash);
+    let attributes = attributes();
 
-    // --- the Engine API rejects the shapes a Shanghai-only chain must refuse ---
+    // --- the Engine API refuses the shapes a Shanghai-only chain must refuse ---
 
     // A V2 forkchoice update on a Shanghai chain must carry withdrawals.
     let no_withdrawals = PayloadAttributes { withdrawals: None, ..attributes.clone() };
@@ -262,12 +136,11 @@ async fn propose_one_block(
         "getPayloadV3 must be rejected: cancun_time is None"
     );
 
-    // Lighthouse asks for the payload one prepare-lookahead later. One second
-    // is enough for the first build, which starts at once on the FCU.
+    // Lighthouse asks for the payload about a third of a slot after the FCU.
+    // One second is enough for the first build, which starts at once.
     tokio::time::sleep(Duration::from_secs(1)).await;
     let envelope = EngineApiClient::<EthEngineTypes>::get_payload_v2(&engine, payload_id).await?;
-    let elapsed = started.elapsed();
-    eprintln!("chain {chain_id}: FCUv2 -> getPayloadV2 took {elapsed:?}");
+    eprintln!("chain {chain_id}: FCUv2 -> getPayloadV2 took {:?}", started.elapsed());
 
     let ExecutionPayloadFieldV2::V2(payload) = envelope.execution_payload.clone() else {
         panic!("a post-Shanghai payload must be the V2 variant, with withdrawals");
@@ -278,10 +151,7 @@ async fn propose_one_block(
     assert_eq!(inner.block_number, PARENT_NUMBER + 1);
     assert_eq!(inner.timestamp, PARENT_TIMESTAMP + SECONDS_PER_SLOT);
     assert_eq!(inner.fee_recipient, FEE_RECIPIENT, "fee recipient comes from the attributes");
-    assert_eq!(
-        inner.prev_randao,
-        b256!("0x2222222222222222222222222222222222222222222222222222222222222222")
-    );
+    assert_eq!(inner.prev_randao, PREV_RANDAO);
     assert_eq!(inner.extra_data.as_ref(), EXTRA_DATA, "extraData comes from --builder.extradata");
     assert_eq!(payload.withdrawals, withdrawals(), "withdrawals are included in order");
     assert_eq!(inner.transactions.len(), 1, "the pending transfer is included");
@@ -295,14 +165,15 @@ async fn propose_one_block(
     assert_eq!(inner.gas_limit, expected_gas_limit);
     assert_eq!(inner.gas_used, 21_000);
 
-    // The base fee of a full parent-gas-limit-targeted block follows EIP-1559.
-    let parent_header = chain_spec.genesis_header();
-    let expected_base_fee =
-        chain_spec.next_block_base_fee(parent_header, inner.timestamp).expect("london is active");
+    // EIP-1559 base fee from the parent. The follower import below checks the
+    // same rule independently.
+    let expected_base_fee = chain_spec
+        .next_block_base_fee(chain_spec.genesis_header(), inner.timestamp)
+        .expect("london is active");
     assert_eq!(inner.base_fee_per_gas, U256::from(expected_base_fee));
 
     // The block value is the tip on the transfer.
-    let effective_tip = tip.min(2 * PULSECHAIN_BASE_FEE as u128 - expected_base_fee as u128);
+    let effective_tip = TIP.min(2 * PULSECHAIN_BASE_FEE as u128 - expected_base_fee as u128);
     assert_eq!(envelope.block_value, U256::from(effective_tip * 21_000));
 
     // --- the block, as a PulseChain header ---
@@ -316,7 +187,7 @@ async fn propose_one_block(
     assert_eq!(header.excess_blob_gas, None, "no Cancun field");
     assert_eq!(header.requests_hash, None, "no Prague field");
     assert_eq!(header.difficulty, U256::ZERO);
-    assert_eq!(header.nonce, alloy_primitives::B64::ZERO);
+    assert_eq!(header.nonce, B64::ZERO);
     assert_eq!(header.ommers_hash, alloy_consensus::EMPTY_OMMER_ROOT_HASH);
     assert_eq!(header.number(), PARENT_NUMBER + 1);
 
@@ -329,43 +200,51 @@ async fn propose_one_block(
     HeaderValidator::validate_header_against_parent(&consensus, sealed.sealed_header(), &parent)?;
     Consensus::<Block>::validate_block_pre_execution(&consensus, &sealed)?;
 
-    // --- import our own block, as the beacon node does after signing it ---
+    // --- import on both nodes, as the beacon nodes do after the proposal ---
 
-    let status = EngineApiClient::<EthEngineTypes>::new_payload_v2(
-        &engine,
-        ExecutionPayloadInputV2 {
-            execution_payload: payload.payload_inner.clone(),
-            withdrawals: Some(payload.withdrawals.clone()),
-        },
-    )
-    .await?;
-    assert_eq!(
-        status.status,
-        PayloadStatusEnum::Valid,
-        "newPayloadV2 re-executes the block and checks its state root"
-    );
-
+    let input = ExecutionPayloadInputV2 {
+        execution_payload: payload.payload_inner.clone(),
+        withdrawals: Some(payload.withdrawals.clone()),
+    };
     let new_head = ForkchoiceState {
         head_block_hash: inner.block_hash,
         safe_block_hash: genesis_hash,
         finalized_block_hash: genesis_hash,
     };
+
+    // The follower executes the block from scratch: PulseChain executor,
+    // PulsechainConsensus, receipts root and state root.
+    let status =
+        EngineApiClient::<EthEngineTypes>::new_payload_v2(&follower_engine, input.clone()).await?;
+    assert_eq!(status.status, PayloadStatusEnum::Valid, "a follower accepts our block");
+    let updated =
+        EngineApiClient::<EthEngineTypes>::fork_choice_updated_v2(&follower_engine, new_head, None)
+            .await?;
+    assert_eq!(updated.payload_status.status, PayloadStatusEnum::Valid);
+
+    // The proposer re-executes its own block here too. `EthBuiltPayload`
+    // carries no executed block, so reth never takes the `InsertExecutedBlock`
+    // shortcut for it (see block_production_firehose.rs).
+    let status = EngineApiClient::<EthEngineTypes>::new_payload_v2(&engine, input).await?;
+    assert_eq!(status.status, PayloadStatusEnum::Valid);
     let updated =
         EngineApiClient::<EthEngineTypes>::fork_choice_updated_v2(&engine, new_head, None).await?;
     assert_eq!(updated.payload_status.status, PayloadStatusEnum::Valid);
 
-    // Wait for the canonical head to move. The forkchoice update returns
+    // Wait for both canonical heads to move. The forkchoice update returns
     // before the in-memory canonical state is published.
-    let mut tries = 0;
-    while node.provider.best_block_number()? != PARENT_NUMBER + 1 {
-        tries += 1;
-        assert!(tries < 50, "the built block never became canonical");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    for node_provider in [&proposer.provider, &follower.provider] {
+        let mut tries = 0;
+        while node_provider.best_block_number()? != PARENT_NUMBER + 1 {
+            tries += 1;
+            assert!(tries < 50, "the built block never became canonical");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
-    // --- the state the block produced ---
+    // --- the state the block produced, as the follower computed it ---
 
-    let state = node.provider.latest()?;
+    let state = follower.provider.latest()?;
     let balance = |address: Address| -> eyre::Result<U256> {
         Ok(state.account_balance(&address)?.unwrap_or_default())
     };
@@ -379,10 +258,16 @@ async fn propose_one_block(
     assert_eq!(balance(WITHDRAWAL_B)?, U256::from(GWEI));
     assert_eq!(balance(TRANSFER_TO)?, U256::from(PLS));
     assert_eq!(balance(FEE_RECIPIENT)?, envelope.block_value, "the fee recipient gets the tips");
-    assert_eq!(state.account_nonce(&sender)?, Some(1));
+    assert_eq!(state.account_nonce(&sender_address)?, Some(1));
+
+    // Both nodes agree on the state root.
+    assert_eq!(
+        proposer.provider.latest_header()?.expect("head").state_root(),
+        follower.provider.latest_header()?.expect("head").state_root(),
+    );
 
     let receipt: serde_json::Value =
-        rpc.request("eth_getTransactionReceipt", rpc_params![tx_hash]).await?;
+        follower_rpc.request("eth_getTransactionReceipt", rpc_params![tx_hash]).await?;
     assert_eq!(receipt["status"], "0x1");
 
     Ok(Proposal { gas_limit: inner.gas_limit, extra_data: inner.extra_data.clone() })

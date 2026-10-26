@@ -10529,6 +10529,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
+ "alloy-signer-local",
  "base64 0.22.1",
  "evm2",
  "eyre",
