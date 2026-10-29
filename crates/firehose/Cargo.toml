@@ -24,7 +24,6 @@ reth-node-api.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
-reth-revm.workspace = true
 reth-tracing.workspace = true
 
 # PulseChain-specific (intentional cross-crate dep): the firehose wrapper layer
@@ -39,7 +38,6 @@ reth-pulsechain-forks.workspace = true
 alloy-consensus.workspace = true
 alloy-eip7928.workspace = true
 alloy-eips.workspace = true
-alloy-evm.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
@@ -54,5 +52,6 @@ serde_json.workspace = true
 [dev-dependencies]
 base64 = "0.22"
 prost = "0.14"
-revm.workspace = true
+evm2.workspace = true
+evm2-inspectors.workspace = true
 

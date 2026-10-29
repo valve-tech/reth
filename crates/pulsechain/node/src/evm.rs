@@ -1,56 +1,44 @@
-//! `PulseChain` EVM configuration and block executor.
+//! `PulseChain` EVM configuration on evm2.
 //!
-//! Provides:
-//! - [`PulsechainEvmConfig`]: Wraps [`EthEvmConfig`], overriding the CHAINID opcode so that blocks
-//!   *before* `PrimordialPulse` return `chain_id = 1` (Ethereum mainnet) and blocks *at or after*
-//!   the fork return the `PulseChain` chain ID (369 mainnet / 943 testnet v4).
-//! - [`PulsechainBlockExecutorFactory`]: Wraps [`EthBlockExecutorFactory`], calling
-//!   [`apply_primordial_pulse`] exactly once at the fork block after all transactions execute but
-//!   before state commitment.
-//! - [`PulsechainExecutorBuilder`]: Integrates the above into the reth node builder.
+//! [`PulsechainEvmConfig`] wraps [`EthEvmConfig`] and changes three things:
+//!
+//! - **Chain ID**: the CHAINID opcode returns `1` for blocks before `PrimordialPulse` (Ethereum
+//!   history replay), then `369`/`943`.
+//! - **Spec for Ethereum post-Merge history**: blocks in `[ETH_MAINNET_MERGE_BLOCK,
+//!   PrimordialPulse)` run with Ethereum's post-Merge rules (MERGE, then SHANGHAI from Ethereum's
+//!   Shanghai timestamp), although `PulseChain`'s own Paris and Shanghai come later.
+//! - **Block executor**: [`PulsechainBlockExecutor`] pays no proof-of-work reward in that
+//!   Ethereum post-Merge range and applies the `PrimordialPulse` state transition at the fork
+//!   block.
 
 use std::{borrow::Cow, convert::Infallible, fmt::Debug, sync::Arc};
 
-use alloy_consensus::{
-    transaction::TransactionEnvelope, Header, Transaction as AlloyTransaction, TxReceipt,
-};
-use alloy_eips::{eip7685::Requests, Decodable2718, Encodable2718};
-use alloy_evm::{
-    block::{
-        BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockExecutorFactory,
-        BlockValidationError, ExecutableTx, GasOutput, StateDB,
-    },
-    eth::{
-        receipt_builder::ReceiptBuilder, spec::EthExecutorSpec, EthBlockExecutionCtx,
-        EthBlockExecutor, EthBlockExecutorFactory, EthEvmFactory, EthTxResult,
-    },
-    precompiles::PrecompilesMap,
-    Evm, EvmEnv, EvmFactory, FromRecoveredTx, FromTxWithEncoded,
-};
-use alloy_primitives::{Bytes, Log, B256, U256};
+use alloy_consensus::Header;
+use alloy_eips::{eip7685::Requests, Decodable2718};
+use alloy_primitives::{map::AddressMap, Address, Bytes, B256, U256};
 use alloy_rpc_types_engine::ExecutionData;
-use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks};
+use evm2::{
+    bytecode::Bytecode,
+    evm::{AccountInfo, DynDatabase, PendingState},
+    SpecId,
+};
+use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks, MAINNET};
 use reth_ethereum_primitives::{Block, EthPrimitives, TransactionSigned};
 use reth_evm::{
-    ConfigureEngineEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor, NextBlockEnvAttributes,
-    TransactionEnvMut,
+    precompile_cache::PrecompileCacheMap, BlockExecutionError, BlockExecutionOutput,
+    BlockExecutor, BlockExecutorFactory, ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv,
+    EvmEnvFor, EvmFor, ExecutableTxIterator, ExecutionCtxFor, ExecutorTx, GasOutput,
+    NextBlockEnvAttributes, ReceiptBuilder, SpecFor,
 };
 use reth_evm_ethereum::{
-    revm_spec_by_timestamp_and_block_number, EthBlockAssembler, EthEvmConfig, RethReceiptBuilder,
+    EthBlockAssembler, EthBlockExecutionCtx, EthBlockExecutor, EthBlockExecutorFactory,
+    EthEvmConfig, EthEvmEnv, EvmFactory, ExecutableRecoveredTx, RethEvmFactory,
+    RethReceiptBuilder,
 };
+use reth_execution_types::{BlockExecutionResult, BundleState, StateUpdate};
 use reth_node_builder::{components::ExecutorBuilder, BuilderContext, FullNodeTypes, NodeTypes};
-use reth_primitives_traits::{
-    constants::MAX_TX_GAS_LIMIT_OSAKA, SealedBlock, SealedHeader, SignedTransaction,
-};
+use reth_primitives_traits::{SealedBlock, SealedHeader, SignedTransaction};
 use reth_storage_errors::any::AnyError;
-use revm::{
-    context::{BlockEnv, CfgEnv},
-    // Block trait provides `.number()`, `.timestamp()`, etc. on `BlockEnv`.
-    context_interface::block::{BlobExcessGasAndPrice, Block as RevmBlock},
-    database::DatabaseCommitExt,
-    primitives::hardfork::SpecId,
-    state::{Account, AccountInfo, Bytecode, EvmStorageSlot, TransactionId},
-};
 
 use crate::fork::{apply_primordial_pulse, PrimordialPulseStateWriter};
 use reth_pulsechain_forks::{
@@ -64,12 +52,9 @@ use reth_pulsechain_forks::{
     },
 };
 
-// ── Chain-ID helpers ─────────────────────────────────────────────────────────
+// ── Chain helpers ─────────────────────────────────────────────────────────────
 
-/// Returns the effective CHAINID at `block_number` for the given `PulseChain` chain.
-///
-/// Before `PrimordialPulse`: returns `1` (Ethereum mainnet).
-/// At or after `PrimordialPulse`: returns `base_chain_id` (369 or 943).
+/// Returns the CHAINID value for `block_number` on the chain `base_chain_id`.
 const fn chain_id_for_block(base_chain_id: u64, block_number: u64) -> u64 {
     match base_chain_id {
         PULSECHAIN_MAINNET_CHAIN_ID => chain_id_at_block_mainnet(block_number),
@@ -78,87 +63,132 @@ const fn chain_id_for_block(base_chain_id: u64, block_number: u64) -> u64 {
     }
 }
 
-/// Returns the `PrimordialPulse` fork block for the given `PulseChain` chain ID.
+/// Returns the `PrimordialPulse` block of `chain_id`, or `u64::MAX` on another chain.
 const fn primordial_pulse_block_for_chain(chain_id: u64) -> u64 {
     match chain_id {
         PULSECHAIN_MAINNET_CHAIN_ID => PRIMORDIAL_PULSE_MAINNET_BLOCK,
         PULSECHAIN_TESTNET_V4_CHAIN_ID => PRIMORDIAL_PULSE_TESTNET_V4_BLOCK,
-        // Non-PulseChain chain: use u64::MAX so the hook never fires.
         _ => u64::MAX,
     }
 }
 
-// ── PrimordialPulseStateWriter blanket impl for any StateDB ──────────────────
+/// Returns whether `block_number` replays Ethereum mainnet after its Merge.
+const fn is_eth_post_merge_replay(block_number: u64, primordial_pulse_block: u64) -> bool {
+    block_number >= ETH_MAINNET_MERGE_BLOCK && block_number < primordial_pulse_block
+}
 
-/// Implements [`PrimordialPulseStateWriter`] for any type implementing [`StateDB`].
+/// Returns the Ethereum spec for a block in the Ethereum post-Merge replay range, or `None`
+/// outside it.
 ///
-/// This provides the revm-level state mutations needed by [`apply_primordial_pulse`]:
-/// `increment_balance`, `set_code`, `set_nonce`, `set_storage`, and `selfdestruct`.
+/// `PulseChain`'s own Paris (one block after `PrimordialPulse`) and Shanghai come later than
+/// Ethereum's. Without this, replay blocks after Ethereum's Merge would run pre-Merge rules, and
+/// blocks after Ethereum's Shanghai would treat PUSH0 as invalid. This mirrors erigon-pulse:
+/// `if c.PrimordialPulseAhead(num) { return 1681338455 <= time }`.
+const fn eth_replay_spec(
+    block_number: u64,
+    timestamp: u64,
+    primordial_pulse_block: u64,
+) -> Option<SpecId> {
+    if !is_eth_post_merge_replay(block_number, primordial_pulse_block) {
+        return None
+    }
+    Some(if timestamp >= ETH_MAINNET_SHANGHAI_TIMESTAMP { SpecId::SHANGHAI } else { SpecId::MERGE })
+}
+
+// ── PrimordialPulse state writer ──────────────────────────────────────────────
+
+/// Collects the `PrimordialPulse` writes as one [`PendingState`].
 ///
-/// # Cache preloading
-///
-/// Every method calls `self.basic(address)` before `commit()` to preload the account
-/// into revm's cache. Without this, `State<DB>::commit` panics with:
-/// `"All accounts should be present inside cache"`.
-impl<T: StateDB> PrimordialPulseStateWriter for T {
-    fn increment_balance(&mut self, address: alloy_primitives::Address, amount: U256) {
-        // DatabaseCommitExt::increment_balances calls basic() internally, so no
-        // explicit preload is needed here.
-        let _ = self.increment_balances([(address, amount.saturating_to::<u128>())]);
+/// Every account is read once from the executor's overlay, so a write sees the result of the
+/// writes before it. A selfdestructed account becomes absent; the block state then records it
+/// as destroyed, which wipes its storage.
+struct PrimordialPulseChanges<'e, 'a, T: evm2::EvmTypes> {
+    evm: &'e mut evm2::Evm<'a, T>,
+    /// Original and current account, in first-write order.
+    accounts: AddressMap<(Option<AccountInfo>, Option<AccountInfo>)>,
+    /// Original and current storage values per written slot.
+    storage: Vec<(Address, U256, U256, U256)>,
+    order: Vec<Address>,
+    destroyed: Vec<Address>,
+}
+
+impl<'e, 'a, T: evm2::EvmTypes> PrimordialPulseChanges<'e, 'a, T> {
+    fn new(evm: &'e mut evm2::Evm<'a, T>) -> Self {
+        Self {
+            evm,
+            accounts: AddressMap::default(),
+            storage: Vec::new(),
+            order: Vec::new(),
+            destroyed: Vec::new(),
+        }
     }
 
-    fn selfdestruct(&mut self, address: alloy_primitives::Address) {
-        // Preload account into cache.
-        let existing = self.basic(address).ok().flatten().unwrap_or_default();
-        let mut account = Account::from(existing);
-        account.mark_selfdestruct();
-        account.mark_touch();
-        self.commit(std::iter::once((address, account)).collect());
-    }
-
-    fn set_code(&mut self, address: alloy_primitives::Address, code: &[u8]) {
-        // Preload account into cache. After selfdestruct(), basic() returns None;
-        // unwrap_or_default() gives an empty AccountInfo, which is correct for a
-        // newly-deployed contract.
-        let existing = self.basic(address).ok().flatten().unwrap_or_default();
-        let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
-        let code_hash = bytecode.hash_slow();
-        let info = AccountInfo { code: Some(bytecode), code_hash, ..existing };
-        let mut account = Account::from(info);
-        // mark_created() transitions a Destroyed cache entry → DestroyedNew, which
-        // is required when code is deployed at an address that was just selfdestructed.
-        account.mark_created();
-        account.mark_touch();
-        self.commit(std::iter::once((address, account)).collect());
-    }
-
-    fn set_nonce(&mut self, address: alloy_primitives::Address, nonce: u64) {
-        let existing = self.basic(address).ok().flatten().unwrap_or_default();
-        let info = AccountInfo { nonce, ..existing };
-        let mut account = Account::from(info);
-        account.mark_touch();
-        self.commit(std::iter::once((address, account)).collect());
-    }
-
-    fn set_storage(&mut self, address: alloy_primitives::Address, slot: B256, value: B256) {
-        // Preload account into cache.
-        let existing = self.basic(address).ok().flatten().unwrap_or_default();
-        let mut account = Account::from(existing);
-        account.mark_touch();
-        // EvmStorageSlot::new_changed(original, present, tx_id): original=ZERO means this
-        // is a fresh write. is_changed() returns true when original != present, which
-        // passes the filter inside State<DB>::commit.
-        account.storage.insert(
-            U256::from_be_bytes(slot.0),
-            EvmStorageSlot::new_changed(
-                U256::ZERO,
-                U256::from_be_bytes(value.0),
-                TransactionId::ZERO,
-            ),
+    /// Returns the current value of `address`, reading it from the overlay on first use.
+    fn current(&mut self, address: Address) -> &mut Option<AccountInfo> {
+        assert!(
+            !self.destroyed.contains(&address),
+            "PrimordialPulse writes to {address} after destroying it; PendingState cannot \
+             express a wiped and recreated account"
         );
-        // Successive set_storage commits accumulate: CacheAccount::change() extends
-        // the existing cache storage with the new slot via extend().
-        self.commit(std::iter::once((address, account)).collect());
+        if !self.accounts.contains_key(&address) {
+            let original = self
+                .evm
+                .read_account_info(&address)
+                .expect("PrimordialPulse: database read of an account failed");
+            self.accounts.insert(address, (original.clone(), original));
+            self.order.push(address);
+        }
+        &mut self.accounts.get_mut(&address).expect("inserted above").1
+    }
+
+    fn current_or_empty(&mut self, address: Address) -> &mut AccountInfo {
+        self.current(address).get_or_insert_with(AccountInfo::default)
+    }
+
+    fn into_pending_state(self) -> PendingState {
+        let mut pending = PendingState::default();
+        for address in &self.order {
+            let (original, current) = self.accounts[address].clone();
+            pending.insert_account(*address, original, current);
+        }
+        for (address, key, original, current) in self.storage {
+            pending.insert_storage(address, key, original, current);
+        }
+        pending
+    }
+}
+
+impl<T: evm2::EvmTypes> PrimordialPulseStateWriter for PrimordialPulseChanges<'_, '_, T> {
+    fn increment_balance(&mut self, address: Address, amount: U256) {
+        let account = self.current_or_empty(address);
+        account.balance = account.balance.saturating_add(amount);
+    }
+
+    fn selfdestruct(&mut self, address: Address) {
+        *self.current(address) = None;
+        self.destroyed.push(address);
+    }
+
+    fn set_code(&mut self, address: Address, code: &[u8]) {
+        let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
+        let account = self.current_or_empty(address);
+        account.code_hash = bytecode.hash_slow();
+        account.code = Some(bytecode);
+    }
+
+    fn set_nonce(&mut self, address: Address, nonce: u64) {
+        self.current_or_empty(address).nonce = nonce;
+    }
+
+    fn set_storage(&mut self, address: Address, slot: B256, value: B256) {
+        self.current_or_empty(address);
+        let key = U256::from_be_bytes(slot.0);
+        let original = self
+            .evm
+            .overlay_db_mut()
+            .get_storage(&address, &key)
+            .expect("PrimordialPulse: database read of a storage slot failed");
+        self.storage.push((address, key, original, U256::from_be_bytes(value.0)));
     }
 }
 
@@ -166,17 +196,30 @@ impl<T: StateDB> PrimordialPulseStateWriter for T {
 
 /// Block executor for `PulseChain`.
 ///
-/// Delegates all execution to [`EthBlockExecutor`] and adds a single post-execution
-/// hook in [`finish`][BlockExecutor::finish]: if the block number matches the
-/// `PrimordialPulse` fork block, [`apply_primordial_pulse`] is called on the state DB.
-pub struct PulsechainBlockExecutor<'a, E, Spec, R: ReceiptBuilder> {
-    inner: EthBlockExecutor<'a, E, &'a Spec, &'a R>,
+/// Delegates execution to [`EthBlockExecutor`]. At the `PrimordialPulse` block it commits the
+/// fork's state transition after the last transaction and before the inner executor finishes.
+///
+/// The inner executor then applies the block reward and withdrawals. In v2.8 the transition ran
+/// after them. The order does not change the state: the reward and withdrawals only add to
+/// balances, and the transition adds to balances, replaces the Ethereum deposit contract and
+/// deploys the `PulseChain` one. A test checks that the fork blocks' beneficiaries are not
+/// accounts the transition destroys or rewrites.
+pub struct PulsechainBlockExecutor<'a, T, R>
+where
+    T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync>,
+    R: ReceiptBuilder,
+{
+    inner: EthBlockExecutor<'a, T, R>,
     block_number: u64,
     primordial_pulse_block: u64,
     chain_id: u64,
 }
 
-impl<'a, E, Spec, R: ReceiptBuilder> std::fmt::Debug for PulsechainBlockExecutor<'a, E, Spec, R> {
+impl<T, R> Debug for PulsechainBlockExecutor<'_, T, R>
+where
+    T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync>,
+    R: ReceiptBuilder,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PulsechainBlockExecutor")
             .field("block_number", &self.block_number)
@@ -186,145 +229,122 @@ impl<'a, E, Spec, R: ReceiptBuilder> std::fmt::Debug for PulsechainBlockExecutor
     }
 }
 
-impl<'a, E, Spec, R> BlockExecutor for PulsechainBlockExecutor<'a, E, Spec, R>
+impl<'a, T, R> PulsechainBlockExecutor<'a, T, R>
 where
+    T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync>,
     R: ReceiptBuilder,
-    EthBlockExecutor<'a, E, &'a Spec, &'a R>:
-        BlockExecutor<Receipt = R::Receipt, Evm = E, Transaction = R::Transaction>,
-    E: Evm<DB: StateDB, Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>>,
 {
-    type Transaction = R::Transaction;
-    type Receipt = R::Receipt;
-    type Evm = E;
-    type Result = <EthBlockExecutor<'a, E, &'a Spec, &'a R> as BlockExecutor>::Result;
-
-    fn apply_pre_execution_changes(&mut self) -> std::result::Result<(), BlockExecutionError> {
-        self.inner.apply_pre_execution_changes()
-    }
-
-    fn execute_transaction_without_commit(
-        &mut self,
-        tx: impl ExecutableTx<Self>,
-    ) -> std::result::Result<Self::Result, BlockExecutionError> {
-        // ExecutableTx<PulsechainBlockExecutor> ≡ ExecutableTxParts<E::Tx, R::Transaction>
-        //                                       ≡ ExecutableTx<EthBlockExecutor<'a, E, &'a Spec,
-        // &'a R>> because both executors declare the same Evm and Transaction associated
-        // types.
-        self.inner.execute_transaction_without_commit(tx)
-    }
-
-    fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
-        self.inner.commit_transaction(output)
-    }
-
-    fn finish(
-        self,
-    ) -> std::result::Result<(Self::Evm, BlockExecutionResult<Self::Receipt>), BlockExecutionError>
-    {
-        // For post-ETH-Merge pre-PrimordialPulse blocks, bypass the inner
-        // executor's finish(). The PulseChain chain spec has Paris activating at
-        // block 17,233,001, so the inner EthBlockExecutor would incorrectly add
-        // 2 ETH PoW block rewards for Ethereum post-Merge blocks (15,537,394+).
-        //
-        // The previous add-then-subtract approach caused state divergence: it
-        // created/touched coinbase accounts that shouldn't exist on Ethereum,
-        // corrupting the state trie over ~140K blocks and causing gas mismatches
-        // when transactions interacted with those phantom accounts.
-        //
-        // Instead, we handle finish() directly with correct post-Merge semantics:
-        // no block rewards, and withdrawal processing gated on ETH's actual
-        // Shanghai timestamp (not PulseChain's later activation).
-        if self.block_number >= ETH_MAINNET_MERGE_BLOCK &&
-            self.block_number < self.primordial_pulse_block
-        {
-            let mut inner = self.inner;
-
-            // No Prague requests — all blocks in this range are pre-Cancun.
-            let requests = Requests::default();
-
-            // No block rewards (post-Merge). No DAO fork (block 1,920,000).
-
-            // Process withdrawals for blocks after ETH Shanghai activation.
-            // PulseChain's chain spec has Shanghai at a later timestamp, but
-            // we must match Ethereum's actual behavior for pre-fork replay.
-            let timestamp: u64 = inner.evm.block().timestamp().saturating_to();
-            if timestamp >= ETH_MAINNET_SHANGHAI_TIMESTAMP {
-                if let Some(ref withdrawals) = inner.ctx.withdrawals {
-                    // Merge amounts per address — multiple validators can share a
-                    // withdrawal address. revm's increment_balances reads the
-                    // original balance for each entry independently (before commit),
-                    // so duplicate addresses would lose all but the last increment.
-                    let mut merged: std::collections::HashMap<alloy_primitives::Address, u128> =
-                        std::collections::HashMap::new();
-                    for w in withdrawals.iter().filter(|w| w.amount > 0) {
-                        *merged.entry(w.address).or_default() += w.amount_wei().to::<u128>();
-                    }
-                    if !merged.is_empty() {
-                        inner
-                            .evm
-                            .db_mut()
-                            .increment_balances(merged)
-                            .map_err(|_| BlockValidationError::IncrementBalanceFailed)?;
-                    }
-                }
-            }
-
-            // PulseChain post-Merge pre-PrimordialPulse blocks predate Amsterdam
-            // (EIP-8037), so cumulative_tx_gas_used (with refunds) is the correct
-            // block gas total — matching upstream's pre-Amsterdam branch.
-            let gas_used = inner.cumulative_tx_gas_used;
-
-            Ok((
-                inner.evm,
-                BlockExecutionResult {
-                    receipts: inner.receipts,
-                    requests,
-                    gas_used,
-                    blob_gas_used: inner.blob_gas_used,
-                },
-            ))
-        } else {
-            let (mut evm, result) = self.inner.finish()?;
-
-            // PrimordialPulse fires exactly once at the fork block (== not >=,
-            // so the transition never re-applies). The transition mutates
-            // state via `evm.db_mut()` (revm `State<DB>`) without going through
-            // opcode dispatch, so the firehose inspector never sees those
-            // writes — same invisibility problem as EIP-4895 withdrawals and
-            // the pre-merge block reward.
-            //
-            // We do NOT emit firehose events here. Emission lives in
-            // `FirehoseWrappedExecutor::finish` (capture pre-state before
-            // `inner.finish()`, emit deltas after) in
-            // `crates/firehose/src/executor.rs` — same pattern as
-            // `emit_block_reward_balance_changes`. That keeps the inner
-            // executor tracer-agnostic and avoids the `std::sync::Mutex`
-            // non-reentrancy deadlock that wedged the testnet v4 firehose
-            // pipeline at PrimordialPulse block 16,492,700 on 2026-05-19
-            // (executor sat in `Mutex::lock` for >32h with no error log, no
-            // panic, no DB writes in flight — the outer wrapper held the
-            // tracer guard, the inner `tracer()` call deadlocked on the same
-            // thread). When this executor runs WITHOUT the firehose wrapper
-            // (non-firehose builds, tests), state still commits correctly and
-            // the chain syncs; emission is simply absent, which is fine.
-            if self.block_number == self.primordial_pulse_block {
-                apply_primordial_pulse(evm.db_mut(), self.chain_id);
-            }
-
-            Ok((evm, result))
+    /// Commits the `PrimordialPulse` transition when this is the fork block.
+    ///
+    /// The transition fires exactly once, at `==` the fork block. Firehose does not see these
+    /// writes through the inspector; `FirehoseWrappedExecutor` emits them from a state diff.
+    fn apply_fork_transition(&mut self) {
+        if self.block_number != self.primordial_pulse_block {
+            return
         }
+        let mut changes = PrimordialPulseChanges::new(&mut self.inner.evm);
+        apply_primordial_pulse(&mut changes, self.chain_id);
+        let pending = changes.into_pending_state();
+        self.inner.commit_pending_state(&pending);
+    }
+}
+
+impl<'a, T, R> BlockExecutor for PulsechainBlockExecutor<'a, T, R>
+where
+    T: evm2::EvmTypes<Tx: alloy_eips::eip2718::Typed2718, TxResultExt: Send + Sync>,
+    R: ReceiptBuilder,
+    EthBlockExecutor<'a, T, R>: BlockExecutor<Evm = evm2::Evm<'a, T>>,
+{
+    type Transaction = <EthBlockExecutor<'a, T, R> as BlockExecutor>::Transaction;
+    type Receipt = <EthBlockExecutor<'a, T, R> as BlockExecutor>::Receipt;
+    type Evm = evm2::Evm<'a, T>;
+    type TransactionResultWithState =
+        <EthBlockExecutor<'a, T, R> as BlockExecutor>::TransactionResultWithState;
+    type BlockAccessList = <EthBlockExecutor<'a, T, R> as BlockExecutor>::BlockAccessList;
+
+    fn evm(&self) -> &Self::Evm {
+        self.inner.evm()
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
         self.inner.evm_mut()
     }
 
-    fn evm(&self) -> &Self::Evm {
-        self.inner.evm()
+    fn set_state_hook(&mut self, hook: impl FnMut(StateUpdate) + Send + 'static) -> bool {
+        self.inner.set_state_hook(hook)
+    }
+
+    fn convert_block_access_list(
+        block_access_list: &alloy_eip7928::BlockAccessList,
+    ) -> Result<Self::BlockAccessList, BlockExecutionError> {
+        <EthBlockExecutor<'a, T, R> as BlockExecutor>::convert_block_access_list(block_access_list)
+    }
+
+    fn set_block_access_list(&mut self, block_access_list: Arc<Self::BlockAccessList>) {
+        self.inner.set_block_access_list(block_access_list)
+    }
+
+    fn set_block_access_index(&mut self, index: alloy_eip7928::BlockAccessIndex) {
+        self.inner.set_block_access_index(index)
+    }
+
+    fn enable_block_access_list_builder(&mut self) {
+        self.inner.enable_block_access_list_builder()
+    }
+
+    fn take_block_access_list(&mut self) -> Option<alloy_eip7928::BlockAccessList> {
+        self.inner.take_block_access_list()
+    }
+
+    fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
+        self.inner.apply_pre_execution_changes()
+    }
+
+    fn into_state(self) -> BundleState {
+        self.inner.into_state()
+    }
+
+    fn validate_transaction_gas_limit(
+        &mut self,
+        gas_limit: u64,
+    ) -> Result<(), BlockExecutionError> {
+        self.inner.validate_transaction_gas_limit(gas_limit)
+    }
+
+    fn execute_transaction_without_commit(
+        &mut self,
+        transaction: impl ExecutorTx<Self>,
+    ) -> Result<Self::TransactionResultWithState, BlockExecutionError> {
+        self.inner.execute_transaction_without_commit(transaction)
+    }
+
+    fn commit_transaction(
+        &mut self,
+        output: Self::TransactionResultWithState,
+    ) -> Result<GasOutput, BlockExecutionError> {
+        self.inner.commit_transaction(output)
     }
 
     fn receipts(&self) -> &[Self::Receipt] {
         self.inner.receipts()
+    }
+
+    fn finish_with_block_access_list(
+        mut self,
+    ) -> Result<
+        (BlockExecutionOutput<Self::Receipt>, Option<alloy_eip7928::BlockAccessList>),
+        BlockExecutionError,
+    > {
+        self.apply_fork_transition();
+        self.inner.finish_with_block_access_list()
+    }
+
+    fn finish_with_prepared_block_access_list(
+        mut self,
+    ) -> Result<(BlockExecutionOutput<Self::Receipt>, Option<evm2::evm::Bal>), BlockExecutionError>
+    {
+        self.apply_fork_transition();
+        self.inner.finish_with_prepared_block_access_list()
     }
 }
 
@@ -332,58 +352,53 @@ where
 
 /// Block executor factory for `PulseChain`.
 ///
-/// Wraps [`EthBlockExecutorFactory`] and constructs [`PulsechainBlockExecutor`] instances
-/// that inject the `PrimordialPulse` hook into [`BlockExecutor::finish`].
+/// Wraps [`EthBlockExecutorFactory`]. For a block that replays Ethereum after its Merge, the
+/// inner executor gets Ethereum mainnet's chain spec: there `PulseChain`'s spec still has
+/// proof-of-work rewards (its Paris is one block after `PrimordialPulse`), but Ethereum paid
+/// none. Withdrawals follow the block's EVM spec, which [`eth_replay_spec`] already sets.
 #[derive(Debug, Clone)]
-pub struct PulsechainBlockExecutorFactory<R, Spec, EvmF> {
-    inner: EthBlockExecutorFactory<R, Spec, EvmF>,
+pub struct PulsechainBlockExecutorFactory<C = ChainSpec, F: EvmFactory = RethEvmFactory> {
+    inner: EthBlockExecutorFactory<RethReceiptBuilder, C, F>,
     primordial_pulse_block: u64,
     chain_id: u64,
 }
 
-impl<R, Spec, EvmF> BlockExecutorFactory for PulsechainBlockExecutorFactory<R, Spec, EvmF>
+impl<C, F> BlockExecutorFactory for PulsechainBlockExecutorFactory<C, F>
 where
-    R: ReceiptBuilder<Transaction: AlloyTransaction + Encodable2718, Receipt: TxReceipt<Log = Log>>,
-    <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
-    Spec: EthExecutorSpec,
-    EvmF: EvmFactory<
-        Spec: Into<SpecId> + Clone,
-        Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
-        Precompiles = PrecompilesMap,
-    >,
-    Self: 'static,
+    C: EthChainSpec<Header = Header> + EthereumHardforks,
+    F: EvmFactory,
+    <F::Types as evm2::EvmTypesHost>::Tx: alloy_eips::eip2718::Typed2718,
 {
-    type EvmFactory = EvmF;
-    type ExecutionCtx<'a> = EthBlockExecutionCtx<'a>;
-    type Transaction = R::Transaction;
-    type Receipt = R::Receipt;
-    type TxExecutionResult =
-        EthTxResult<EvmF::HaltReason, <R::Transaction as TransactionEnvelope>::TxType>;
-    type Executor<'a, DB: StateDB, I: revm::Inspector<EvmF::Context<DB>>> =
-        PulsechainBlockExecutor<'a, EvmF::Evm<DB, I>, Spec, R>;
-
-    fn evm_factory(&self) -> &Self::EvmFactory {
-        self.inner.evm_factory()
-    }
-
-    fn create_executor<'a, DB, I>(
-        &'a self,
-        evm: EvmF::Evm<DB, I>,
-        ctx: Self::ExecutionCtx<'a>,
-    ) -> Self::Executor<'a, DB, I>
+    type EvmFactory = F;
+    type EvmTypes = F::Types;
+    type Transaction = TransactionSigned;
+    type Receipt = reth_ethereum_primitives::Receipt;
+    type Evm<'a> = evm2::Evm<'a, F::Types>;
+    type EvmEnv = EthEvmEnv<F::Types>;
+    type ExecutionCtx<'a>
+        = EthBlockExecutionCtx<'a>
     where
-        DB: StateDB,
-        I: revm::Inspector<EvmF::Context<DB>>,
+        Self: 'a;
+    type Executor<'a>
+        = PulsechainBlockExecutor<'a, F::Types, &'a RethReceiptBuilder>
+    where
+        Self: 'a;
+
+    fn create_executor<'a>(
+        &'a self,
+        evm: Self::Evm<'a>,
+        ctx: Self::ExecutionCtx<'a>,
+    ) -> Self::Executor<'a>
+    where
+        Self: 'a,
     {
-        // Read block number from the EVM's block environment before consuming it.
-        let block_number = evm.block().number().saturating_to::<u64>();
-
-        // Build the inner EthBlockExecutor directly using EthBlockExecutorFactory's
-        // public accessors. This avoids calling inner.create_executor() which returns
-        // RPIT (unnameable type) that we cannot wrap.
-        let inner =
-            EthBlockExecutor::new(evm, ctx, self.inner.spec(), self.inner.receipt_builder());
-
+        let block_number = evm.block_env().number.saturating_to::<u64>();
+        let receipt_builder = self.inner.receipt_builder();
+        let inner = if is_eth_post_merge_replay(block_number, self.primordial_pulse_block) {
+            EthBlockExecutor::new(evm, ctx, MAINNET.as_ref(), receipt_builder)
+        } else {
+            EthBlockExecutor::new(evm, ctx, self.inner.chain_spec().as_ref(), receipt_builder)
+        };
         PulsechainBlockExecutor {
             inner,
             block_number,
@@ -391,72 +406,97 @@ where
             chain_id: self.chain_id,
         }
     }
+
+    fn evm_factory(&self) -> &Self::EvmFactory {
+        self.inner.evm_factory()
+    }
+
+    fn evm_with_env<'a, DB>(&self, db: DB, evm_env: Self::EvmEnv) -> Self::Evm<'a>
+    where
+        DB: DynDatabase + 'a,
+    {
+        <EthBlockExecutorFactory<RethReceiptBuilder, C, F> as BlockExecutorFactory>::evm_with_env(
+            &self.inner,
+            db,
+            evm_env,
+        )
+    }
 }
 
 // ── PulsechainEvmConfig ───────────────────────────────────────────────────────
 
-/// EVM configuration for `PulseChain`.
-///
-/// Wraps [`EthEvmConfig`] and overrides:
-/// - **CHAINID opcode**: Returns `1` for blocks before `PrimordialPulse` (replaying Ethereum
-///   mainnet history), then `369`/`943` for `PulseChain` blocks.
-/// - **Block executor factory**: Uses [`PulsechainBlockExecutorFactory`] which fires the
-///   `PrimordialPulse` state transition at the fork block.
+/// `PulseChain` EVM configuration. See the module docs.
 #[derive(Debug, Clone)]
-pub struct PulsechainEvmConfig<C = ChainSpec, EvmF = EthEvmFactory> {
-    /// Inner Ethereum config — reused for block assembler and context methods.
-    inner: EthEvmConfig<C, EvmF>,
-    /// PulseChain-aware executor factory (wraps the inner factory with fork hook).
-    pulse_factory: PulsechainBlockExecutorFactory<RethReceiptBuilder, Arc<C>, EvmF>,
+pub struct PulsechainEvmConfig<C = ChainSpec, F: EvmFactory = RethEvmFactory> {
+    /// Inner Ethereum config, used for the block assembler, contexts and environments.
+    inner: EthEvmConfig<C, F>,
+    /// `PulseChain` executor factory.
+    pulse_factory: PulsechainBlockExecutorFactory<C, F>,
 }
 
 impl<C> PulsechainEvmConfig<C>
 where
-    C: EthChainSpec + EthereumHardforks + EthExecutorSpec + 'static,
+    C: EthChainSpec + EthereumHardforks + 'static,
 {
-    /// Creates a new `PulseChain` EVM configuration from the given chain spec.
+    /// Creates a `PulseChain` EVM configuration with the default EVM factory.
     pub fn new(chain_spec: Arc<C>) -> Self {
-        let inner = EthEvmConfig::new(chain_spec.clone());
-        let base_chain_id = chain_spec.chain().id();
-        let primordial_pulse_block = primordial_pulse_block_for_chain(base_chain_id);
-        let pulse_factory = PulsechainBlockExecutorFactory {
-            inner: inner.executor_factory.clone(),
-            primordial_pulse_block,
-            chain_id: base_chain_id,
-        };
-        Self { inner, pulse_factory }
+        Self::from_eth(EthEvmConfig::new(chain_spec))
     }
 }
 
-impl<C, EvmF> reth_firehose::FirehoseLiveHooks for PulsechainEvmConfig<C, EvmF>
+impl<C, F> PulsechainEvmConfig<C, F>
 where
-    Self: reth_evm::ConfigureEvm,
+    C: EthChainSpec + 'static,
+    F: EvmFactory,
+{
+    /// Wraps an Ethereum EVM configuration, keeping its EVM factory and sender recovery cache.
+    pub fn from_eth(inner: EthEvmConfig<C, F>) -> Self {
+        let chain_id = inner.chain_spec().chain().id();
+        let pulse_factory = PulsechainBlockExecutorFactory {
+            inner: inner.executor_factory.clone(),
+            primordial_pulse_block: primordial_pulse_block_for_chain(chain_id),
+            chain_id,
+        };
+        Self { inner, pulse_factory }
+    }
+
+    /// Applies the `PulseChain` chain ID and the Ethereum replay spec to an environment.
+    fn adjust_env(&self, mut env: EthEvmEnv<F::Types>, number: u64, timestamp: u64) -> EthEvmEnv<F::Types> {
+        let chain_id = chain_id_for_block(self.pulse_factory.chain_id, number);
+        if let Some(spec) =
+            eth_replay_spec(number, timestamp, self.pulse_factory.primordial_pulse_block)
+        {
+            let factory = self.inner.executor_factory.evm_factory();
+            let mut version = factory.version(spec, chain_id);
+            version.max_blobs_per_tx = env.version.max_blobs_per_tx;
+            env = EthEvmEnv::new_with_version(factory.spec_id(spec), env.block, version);
+        }
+        env.version.chain_id = chain_id;
+        env
+    }
+}
+
+impl<C, F> reth_firehose::FirehoseLiveHooks for PulsechainEvmConfig<C, F>
+where
+    F: EvmFactory,
+    Self: ConfigureEvm,
 {
     type PreTxAdjust = reth_firehose::NoPreTxAdjust;
     type PostTxExtras = reth_firehose::NoPostTxExtras;
 }
 
-impl<C, EvmF> reth_evm::ConfigureEvm for PulsechainEvmConfig<C, EvmF>
+impl<C, F> ConfigureEvm for PulsechainEvmConfig<C, F>
 where
-    C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static,
-    EvmF: EvmFactory<
-            Tx: TransactionEnvMut
-                    + FromRecoveredTx<TransactionSigned>
-                    + FromTxWithEncoded<TransactionSigned>,
-            Spec = SpecId,
-            BlockEnv = BlockEnv,
-            Precompiles = PrecompilesMap,
-        > + Clone
-        + Debug
-        + Send
-        + Sync
-        + Unpin
-        + 'static,
+    C: EthChainSpec<Header = Header> + EthereumHardforks + Hardforks + 'static,
+    F: EvmFactory,
+    <F::Types as evm2::EvmTypesHost>::Tx: alloy_eips::eip2718::Typed2718
+        + reth_evm::FromTxWithEncoded<TransactionSigned>
+        + reth_evm::TransactionEnvMut,
 {
     type Primitives = EthPrimitives;
     type Error = Infallible;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
-    type BlockExecutorFactory = PulsechainBlockExecutorFactory<RethReceiptBuilder, Arc<C>, EvmF>;
+    type BlockExecutorFactory = PulsechainBlockExecutorFactory<C, F>;
     type BlockAssembler = EthBlockAssembler<C>;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
@@ -467,170 +507,90 @@ where
         self.inner.block_assembler()
     }
 
-    fn evm_env(&self, header: &Header) -> std::result::Result<EvmEnv<SpecId>, Self::Error> {
-        let mut env = self.inner.evm_env(header)?;
-        let base_chain_id = self.inner.chain_spec().chain().id();
-        env.cfg_env.chain_id = chain_id_for_block(base_chain_id, header.number);
+    fn with_jit_support_enabled(self, enabled: bool) -> Self {
+        Self::from_eth(self.inner.with_jit_support_enabled(enabled))
+    }
 
-        // PulseChain replays Ethereum history verbatim. Blocks >= ETH_MAINNET_MERGE_BLOCK
-        // (15,537,394) are post-Merge Ethereum blocks that need post-Merge EVM rules, even
-        // though PulseChain's own Paris activation is at block 17,233,001.
-        //
-        // Within this range, we must also distinguish Shanghai-era blocks: Ethereum's Shanghai
-        // activated at timestamp 1,681,338,455 (~block 17,034,870), enabling PUSH0 (EIP-3855),
-        // warm COINBASE (EIP-3651), and initcode metering (EIP-3860). PulseChain's own
-        // Shanghai timestamp is later (1,683,786,515), so without this override blocks in the
-        // gap would use MERGE rules and PUSH0 would be treated as an invalid opcode.
-        //
-        // This mirrors the Erigon-Pulse override:
-        //   if c.PrimordialPulseAhead(num) { return 1681338455 <= time }
-        let primordial_block = primordial_pulse_block_for_chain(base_chain_id);
-        if header.number >= ETH_MAINNET_MERGE_BLOCK && header.number < primordial_block {
-            let spec = if header.timestamp >= ETH_MAINNET_SHANGHAI_TIMESTAMP {
-                SpecId::SHANGHAI
-            } else {
-                SpecId::MERGE
-            };
-            env.cfg_env.set_spec_and_mainnet_gas_params(spec);
-            env.block_env.difficulty = U256::ZERO;
-            env.block_env.prevrandao = Some(header.mix_hash);
-        }
+    fn evm_with_precompile_cache<'a, DB>(
+        &self,
+        db: DB,
+        evm_env: EvmEnvFor<Self>,
+        cache_map: PrecompileCacheMap<SpecFor<Self>>,
+        metrics_enabled: bool,
+    ) -> EvmFor<'a, Self>
+    where
+        DB: Database + 'a,
+    {
+        self.inner.evm_with_precompile_cache(db, evm_env, cache_map, metrics_enabled)
+    }
 
-        Ok(env)
+    fn jit_backend(&self) -> Option<&dyn reth_evm::JitBackend> {
+        self.inner.jit_backend()
+    }
+
+    fn evm_env(&self, header: &Header) -> Result<EvmEnvFor<Self>, Self::Error> {
+        let env = self.inner.evm_env(header)?;
+        Ok(self.adjust_env(env, header.number, header.timestamp))
     }
 
     fn next_evm_env(
         &self,
         parent: &Header,
         attributes: &NextBlockEnvAttributes,
-    ) -> std::result::Result<EvmEnv<SpecId>, Self::Error> {
-        let mut env = self.inner.next_evm_env(parent, attributes)?;
-        let next_block_number = parent.number.saturating_add(1);
-        let base_chain_id = self.inner.chain_spec().chain().id();
-        env.cfg_env.chain_id = chain_id_for_block(base_chain_id, next_block_number);
-
-        // Apply Ethereum post-Merge/Shanghai rules for history replay blocks.
-        let primordial_block = primordial_pulse_block_for_chain(base_chain_id);
-        if next_block_number >= ETH_MAINNET_MERGE_BLOCK && next_block_number < primordial_block {
-            let spec = if attributes.timestamp >= ETH_MAINNET_SHANGHAI_TIMESTAMP {
-                SpecId::SHANGHAI
-            } else {
-                SpecId::MERGE
-            };
-            env.cfg_env.set_spec_and_mainnet_gas_params(spec);
-            env.block_env.difficulty = U256::ZERO;
-            env.block_env.prevrandao = Some(attributes.prev_randao);
-        }
-
-        Ok(env)
+    ) -> Result<EvmEnvFor<Self>, Self::Error> {
+        let env = self.inner.next_evm_env(parent, attributes)?;
+        Ok(self.adjust_env(env, parent.number.saturating_add(1), attributes.timestamp))
     }
 
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<Block>,
-    ) -> std::result::Result<EthBlockExecutionCtx<'a>, Self::Error> {
-        // Delegate directly to inner — EthBlockExecutionCtx construction is chain-agnostic.
+    ) -> Result<EthBlockExecutionCtx<'a>, Self::Error>
+    where
+        Self: 'a,
+    {
         self.inner.context_for_block(block)
     }
 
     fn context_for_next_block(
         &self,
-        parent: &SealedHeader<Header>,
-        attributes: NextBlockEnvAttributes,
-    ) -> std::result::Result<EthBlockExecutionCtx<'_>, Self::Error> {
+        parent: &SealedHeader,
+        attributes: Self::NextBlockEnvCtx,
+    ) -> Result<EthBlockExecutionCtx<'_>, Self::Error> {
         self.inner.context_for_next_block(parent, attributes)
+    }
+
+    fn reuses_prewarm_results(&self) -> bool {
+        self.inner.reuses_prewarm_results()
+    }
+
+    fn prewarm_tx_result<'a>(
+        &self,
+        tx: &TransactionSigned,
+        result: reth_evm::TxResultWithStateFor<Self>,
+    ) -> Option<reth_evm::TxExecutionResultFor<'a, Self>>
+    where
+        Self: 'a,
+    {
+        self.inner.prewarm_tx_result(tx, result)
     }
 }
 
-#[cfg(feature = "std")]
-impl<C, EvmF> ConfigureEngineEvm<ExecutionData> for PulsechainEvmConfig<C, EvmF>
+impl<C, F> ConfigureEngineEvm<ExecutionData> for PulsechainEvmConfig<C, F>
 where
-    C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static,
-    EvmF: EvmFactory<
-            Tx: TransactionEnvMut
-                    + FromRecoveredTx<TransactionSigned>
-                    + FromTxWithEncoded<TransactionSigned>,
-            Spec = SpecId,
-            BlockEnv = BlockEnv,
-            Precompiles = PrecompilesMap,
-        > + Clone
-        + Debug
-        + Send
-        + Sync
-        + Unpin
-        + 'static,
+    C: EthChainSpec<Header = Header> + EthereumHardforks + Hardforks + 'static,
+    F: EvmFactory,
+    F::Types: evm2::EvmTypes<Tx = evm2::ethereum::TxEnvelope>,
 {
-    fn evm_env_for_payload(
-        &self,
-        payload: &ExecutionData,
-    ) -> std::result::Result<EvmEnvFor<Self>, Self::Error> {
-        // Implemented directly (not delegated to inner) because Rust cannot normalize
-        // EvmEnvFor<EthEvmConfig<C, EvmF>> to EvmEnvFor<PulsechainEvmConfig<C, EvmF>>
-        // without additional where-clause machinery.
-        let timestamp = payload.payload.timestamp();
-        let block_number = payload.payload.block_number();
-        let chain_spec = self.inner.chain_spec();
-
-        let blob_params = chain_spec.blob_params_at_timestamp(timestamp);
-        let base_chain_id = chain_spec.chain().id();
-        let primordial_block = primordial_pulse_block_for_chain(base_chain_id);
-
-        // Use Ethereum post-Merge/Shanghai rules for history replay blocks.
-        let spec = if block_number >= ETH_MAINNET_MERGE_BLOCK && block_number < primordial_block {
-            if timestamp >= ETH_MAINNET_SHANGHAI_TIMESTAMP {
-                SpecId::SHANGHAI
-            } else {
-                SpecId::MERGE
-            }
-        } else {
-            revm_spec_by_timestamp_and_block_number(chain_spec, timestamp, block_number)
-        };
-
-        // Set PulseChain chain ID: 1 before PrimordialPulse, 369/943 after.
-        let mut cfg_env = CfgEnv::new()
-            .with_chain_id(chain_id_for_block(base_chain_id, block_number))
-            .with_spec_and_mainnet_gas_params(spec);
-
-        if let Some(blob_params) = &blob_params {
-            cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
-        }
-        if chain_spec.is_osaka_active_at_timestamp(timestamp) {
-            cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
-        }
-
-        let blob_excess_gas_and_price =
-            payload.payload.excess_blob_gas().zip(blob_params).map(|(excess_blob_gas, params)| {
-                let blob_gasprice = params.calc_blob_fee(excess_blob_gas);
-                BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
-            });
-
-        let block_env = BlockEnv {
-            number: U256::from(block_number),
-            beneficiary: payload.payload.fee_recipient(),
-            timestamp: U256::from(timestamp),
-            difficulty: if spec >= SpecId::MERGE {
-                U256::ZERO
-            } else {
-                payload.payload.as_v1().prev_randao.into()
-            },
-            prevrandao: (spec >= SpecId::MERGE).then(|| payload.payload.as_v1().prev_randao),
-            gas_limit: payload.payload.gas_limit(),
-            basefee: payload.payload.saturated_base_fee_per_gas(),
-            blob_excess_gas_and_price,
-            slot_num: 0,
-        };
-
-        Ok(EvmEnv { cfg_env, block_env })
+    fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
+        let env = self.inner.evm_env_for_payload(payload)?;
+        Ok(self.adjust_env(env, payload.payload.block_number(), payload.payload.timestamp()))
     }
 
     fn context_for_payload<'a>(
         &self,
         payload: &'a ExecutionData,
-    ) -> std::result::Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        // Implemented directly (not delegated to inner) because Rust cannot normalize
-        // ExecutionCtxFor<EthEvmConfig<C, EvmF>> to ExecutionCtxFor<PulsechainEvmConfig<C, EvmF>>
-        // without proof that both factories share the same ExecutionCtx<'a> =
-        // EthBlockExecutionCtx<'a>.
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
         Ok(EthBlockExecutionCtx {
             tx_count_hint: Some(payload.payload.transactions().len()),
             parent_hash: payload.parent_hash(),
@@ -638,22 +598,27 @@ where
             ommers: &[],
             withdrawals: payload.payload.withdrawals().map(|w| Cow::Borrowed(w.as_slice())),
             extra_data: payload.payload.as_v1().extra_data.clone(),
-            slot_number: None,
+            slot_number: payload.payload.as_v4().map(|v4| v4.slot_number),
         })
     }
 
     fn tx_iterator_for_payload(
         &self,
         payload: &ExecutionData,
-    ) -> std::result::Result<impl ExecutableTxIterator<Self>, Self::Error> {
-        // Decode each raw transaction in the payload and recover the signer.
-        // This mirrors EthEvmConfig::tx_iterator_for_payload exactly so that
-        // Rust can see the concrete return type and verify ExecutableTxFor<Self>.
+    ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
+        // Same as `EthEvmConfig::tx_iterator_for_payload`; restated so the compiler can see that
+        // the iterator satisfies `ExecutableTxIterator<Self>`.
         let txs = payload.payload.transactions().clone();
-        let convert = |tx: Bytes| {
+        let sender_recovery_cache = self.inner.sender_recovery_cache.clone();
+        let convert = move |tx: Bytes| {
             let tx = TransactionSigned::decode_2718_exact(tx.as_ref()).map_err(AnyError::new)?;
-            let signer = tx.try_recover().map_err(AnyError::new)?;
-            Ok::<_, AnyError>(tx.with_signer(signer))
+            let signer = if let Some(cache) = &sender_recovery_cache {
+                cache.recover(&tx)
+            } else {
+                tx.try_recover()
+            }
+            .map_err(AnyError::new)?;
+            Ok::<_, AnyError>(ExecutableRecoveredTx::new(tx.with_signer(signer)))
         };
         Ok((txs, convert))
     }
@@ -663,7 +628,8 @@ where
 
 /// Node builder component that provides the `PulseChain` EVM configuration.
 ///
-/// Returns a [`PulsechainEvmConfig`] with CHAINID override and `PrimordialPulse` hook wired in.
+/// Builds the Ethereum config the same way as `EthereumExecutorBuilder` (JIT settings and the
+/// shared sender recovery cache), then wraps it in [`PulsechainEvmConfig`].
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct PulsechainExecutorBuilder;
@@ -671,26 +637,28 @@ pub struct PulsechainExecutorBuilder;
 impl<Types, Node> ExecutorBuilder<Node> for PulsechainExecutorBuilder
 where
     Types: NodeTypes<
-        ChainSpec: EthExecutorSpec
-                       + EthChainSpec<Header = Header>
-                       + EthereumHardforks
-                       + Hardforks
-                       + 'static,
+        ChainSpec: EthChainSpec<Header = Header> + EthereumHardforks + Hardforks + 'static,
         Primitives = EthPrimitives,
     >,
     Node: FullNodeTypes<Types = Types>,
 {
-    type EVM = PulsechainEvmConfig<Types::ChainSpec>;
+    type EVM = PulsechainEvmConfig<Types::ChainSpec, RethEvmFactory>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        Ok(PulsechainEvmConfig::new(ctx.chain_spec()))
+        let jit = &ctx.config().jit;
+        let dump_dir = jit.debug.then(|| ctx.config().datadir().data_dir().join("jit"));
+        let (mut evm_config, _jit_metrics) =
+            reth_node_ethereum::node::build_evm_config(ctx.chain_spec(), jit, dump_dir)?;
+        if let Some(cache) = ctx.sender_recovery_cache() {
+            evm_config = evm_config.with_sender_recovery_cache(cache.clone());
+        }
+        Ok(PulsechainEvmConfig::from_eth(evm_config))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_evm::ConfigureEvm;
     use reth_pulsechain_forks::{
         chainspec::PULSECHAIN,
         hardfork::{
@@ -743,9 +711,9 @@ mod tests {
 
         // Should NOT be MERGE — should be GRAY_GLACIER or LONDON range
         assert!(
-            env.cfg_env.spec < SpecId::MERGE,
+            env.spec < SpecId::MERGE,
             "block before ETH Merge should use pre-MERGE spec, got {:?}",
-            env.cfg_env.spec
+            env.spec
         );
     }
 
@@ -757,7 +725,7 @@ mod tests {
         let header = header_at(ETH_MAINNET_MERGE_BLOCK, 0, randao);
         let env = config.evm_env(&header).unwrap();
 
-        assert_eq!(env.cfg_env.spec, SpecId::MERGE, "ETH Merge block must use MERGE spec");
+        assert_eq!(env.spec, SpecId::MERGE, "ETH Merge block must use MERGE spec");
     }
 
     #[test]
@@ -768,7 +736,7 @@ mod tests {
         let header = header_at(16_000_000, 0, randao);
         let env = config.evm_env(&header).unwrap();
 
-        assert_eq!(env.cfg_env.spec, SpecId::MERGE, "post-Merge replay block must use MERGE spec");
+        assert_eq!(env.spec, SpecId::MERGE, "post-Merge replay block must use MERGE spec");
     }
 
     // ── Shanghai SpecId tests ────────────────────────────────────────
@@ -783,7 +751,7 @@ mod tests {
         let env = config.evm_env(&header).unwrap();
 
         assert_eq!(
-            env.cfg_env.spec,
+            env.spec,
             SpecId::MERGE,
             "post-Merge pre-Shanghai block must use MERGE spec"
         );
@@ -799,7 +767,7 @@ mod tests {
         let env = config.evm_env(&header).unwrap();
 
         assert_eq!(
-            env.cfg_env.spec,
+            env.spec,
             SpecId::SHANGHAI,
             "post-Shanghai block before PrimordialPulse must use SHANGHAI spec"
         );
@@ -813,8 +781,8 @@ mod tests {
             header_at_with_timestamp(17_100_000, 0, randao, ETH_MAINNET_SHANGHAI_TIMESTAMP + 1000);
         let env = config.evm_env(&header).unwrap();
 
-        assert_eq!(env.block_env.difficulty, U256::ZERO);
-        assert_eq!(env.block_env.prevrandao, Some(randao));
+        assert_eq!(env.block.difficulty, U256::ZERO);
+        assert_eq!(env.block.prevrandao, U256::from_be_bytes(randao.0));
     }
 
     #[test]
@@ -827,7 +795,7 @@ mod tests {
         let env = config.evm_env(&header).unwrap();
 
         assert_eq!(
-            env.cfg_env.spec,
+            env.spec,
             SpecId::SHANGHAI,
             "block at exact Shanghai timestamp must use SHANGHAI spec"
         );
@@ -842,7 +810,7 @@ mod tests {
         let env = config.evm_env(&header).unwrap();
 
         assert_eq!(
-            env.cfg_env.spec,
+            env.spec,
             SpecId::MERGE,
             "block 1 second before Shanghai must use MERGE spec"
         );
@@ -855,9 +823,9 @@ mod tests {
         let env = config.evm_env(&header).unwrap();
 
         assert!(
-            env.cfg_env.spec < SpecId::MERGE,
+            env.spec < SpecId::MERGE,
             "block right before ETH Merge should not use MERGE spec, got {:?}",
-            env.cfg_env.spec
+            env.spec
         );
     }
 
@@ -870,11 +838,13 @@ mod tests {
         let env = config.evm_env(&header).unwrap();
 
         assert_ne!(
-            env.block_env.difficulty,
+            env.block.difficulty,
             U256::ZERO,
             "pre-Merge block should preserve difficulty"
         );
-        assert_eq!(env.block_env.prevrandao, None, "pre-Merge block should not have prevrandao");
+        // evm2 always fills `prevrandao` from `mix_hash`; the pre-Merge spec makes DIFFICULTY
+        // return `difficulty`, so there is no separate "no prevrandao" state to check.
+        assert!(env.spec < SpecId::MERGE);
     }
 
     #[test]
@@ -885,13 +855,12 @@ mod tests {
         let env = config.evm_env(&header).unwrap();
 
         assert_eq!(
-            env.block_env.difficulty,
+            env.block.difficulty,
             U256::ZERO,
             "post-Merge block must have zero difficulty"
         );
         assert_eq!(
-            env.block_env.prevrandao,
-            Some(randao),
+            env.block.prevrandao, U256::from_be_bytes(randao.0),
             "post-Merge block must set prevrandao from header.mix_hash"
         );
     }
@@ -904,8 +873,8 @@ mod tests {
         let header = header_at(17_000_000, 0, randao);
         let env = config.evm_env(&header).unwrap();
 
-        assert_eq!(env.block_env.prevrandao, Some(randao));
-        assert_eq!(env.block_env.difficulty, U256::ZERO);
+        assert_eq!(env.block.prevrandao, U256::from_be_bytes(randao.0));
+        assert_eq!(env.block.difficulty, U256::ZERO);
     }
 
     // ── Chain ID tests ─────────────────────────────────────────────────
@@ -916,7 +885,7 @@ mod tests {
         let header = header_at(ETH_MAINNET_MERGE_BLOCK, 0, B256::repeat_byte(0xaa));
         let env = config.evm_env(&header).unwrap();
 
-        assert_eq!(env.cfg_env.chain_id, 1, "chain ID must be 1 during Ethereum history replay");
+        assert_eq!(env.version.chain_id, 1, "chain ID must be 1 during Ethereum history replay");
     }
 
     #[test]
@@ -925,7 +894,7 @@ mod tests {
         let header = header_at(PRIMORDIAL_PULSE_MAINNET_BLOCK, 100, B256::ZERO);
         let env = config.evm_env(&header).unwrap();
 
-        assert_eq!(env.cfg_env.chain_id, 369, "chain ID must be 369 at PrimordialPulse");
+        assert_eq!(env.version.chain_id, 369, "chain ID must be 369 at PrimordialPulse");
     }
 
     // ── Boundary: PrimordialPulse block itself ─────────────────────────
@@ -942,9 +911,9 @@ mod tests {
         // PrimordialPulse itself is NOT in range, so spec comes from chain spec's
         // hardfork schedule (GrayGlacier, since Paris is at 17,233,001).
         assert!(
-            env.cfg_env.spec < SpecId::MERGE,
+            env.spec < SpecId::MERGE,
             "PrimordialPulse block should not use MERGE spec (Paris is at +1), got {:?}",
-            env.cfg_env.spec
+            env.spec
         );
     }
 
@@ -958,7 +927,7 @@ mod tests {
         // This block is past the override range AND past PulseChain's Paris activation,
         // so it should get MERGE from the chain spec (not from our override).
         assert_eq!(
-            env.cfg_env.spec,
+            env.spec,
             SpecId::MERGE,
             "first PulseChain PoS block must use MERGE spec"
         );

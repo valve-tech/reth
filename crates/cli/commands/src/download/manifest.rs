@@ -2,6 +2,8 @@ use blake3::Hasher;
 use eyre::Result;
 use rayon::prelude::*;
 use reqwest::Client;
+use reth_db::static_file::iter_static_files;
+use reth_static_file_types::StaticFileSegment;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -101,7 +103,11 @@ pub struct SingleArchive {
 pub struct ChunkedArchive {
     /// Number of blocks per archive file. Matches reth's `blocks_per_file` config.
     pub blocks_per_file: u64,
-    /// Total number of blocks covered by this component.
+    /// Total number of blocks covered by this component, including block zero.
+    ///
+    /// Coverage is contiguous from block zero. The final chunk may be partial; its actual
+    /// last block is `total_blocks - 1`, irrespective of its filename's range end.
+    /// Older manifests may store the declared snapshot block instead of the count.
     pub total_blocks: u64,
     /// Compressed size of each chunk in bytes, ordered from first to last.
     /// Computed during manifest generation. Older manifests may omit this.
@@ -322,7 +328,7 @@ impl SnapshotManifest {
     }
 
     /// Returns archive URLs for a component, limited to chunks covering at least `distance`
-    /// blocks from the tip. Returns all URLs if distance is `None` (All mode).
+    /// blocks ending at [`Self::block`]. Returns all URLs if distance is `None` (All mode).
     pub fn archive_urls_for_distance(
         &self,
         ty: SnapshotComponentType,
@@ -339,7 +345,7 @@ impl SnapshotManifest {
             ComponentManifest::Chunked(chunked) => {
                 let key = ty.key();
                 let ranges = chunked.ranges();
-                let start_chunk = chunked.start_index_for_distance(distance);
+                let start_chunk = self.start_chunk_for_distance(chunked, distance);
 
                 (start_chunk..ranges.len())
                     .map(|i| {
@@ -353,7 +359,8 @@ impl SnapshotManifest {
         }
     }
 
-    /// Returns concrete snapshot archives for a component, optionally limited to distance.
+    /// Returns concrete snapshot archives for a component, optionally limited to a distance
+    /// ending at [`Self::block`].
     pub fn snapshot_archives_for_distance(
         &self,
         ty: SnapshotComponentType,
@@ -376,7 +383,7 @@ impl SnapshotManifest {
             ComponentManifest::Chunked(chunked) => {
                 let key = ty.key();
                 let ranges = chunked.ranges();
-                let start_chunk = chunked.start_index_for_distance(distance);
+                let start_chunk = self.start_chunk_for_distance(chunked, distance);
 
                 (start_chunk..ranges.len())
                     .map(|i| {
@@ -398,7 +405,7 @@ impl SnapshotManifest {
         }
     }
 
-    /// Returns the exact download size for a component given a distance selection.
+    /// Returns the exact download size for a component given a distance ending at [`Self::block`].
     ///
     /// For single archives, returns the full size. For chunked archives, sums the
     /// sizes of the selected tail chunks from [`ChunkedArchive::chunk_sizes`].
@@ -412,7 +419,7 @@ impl SnapshotManifest {
                 if chunked.chunk_sizes.is_empty() {
                     return 0;
                 }
-                let start_chunk = chunked.start_index_for_distance(distance);
+                let start_chunk = self.start_chunk_for_distance(chunked, distance);
                 (start_chunk..chunked.ranges().len())
                     .filter_map(|i| chunked.chunk_sizes.get(i).copied())
                     .sum()
@@ -420,7 +427,8 @@ impl SnapshotManifest {
         }
     }
 
-    /// Returns the exact extracted plain-output size for a component given a distance selection.
+    /// Returns the exact extracted plain-output size for a component given a distance ending at
+    /// [`Self::block`].
     pub fn output_size_for_distance(
         &self,
         ty: SnapshotComponentType,
@@ -434,20 +442,47 @@ impl SnapshotManifest {
             ComponentManifest::Single(single) => single.output_size(),
             ComponentManifest::Chunked(chunked) => {
                 let num_chunks = chunked.ranges().len();
-                let start_chunk = chunked.start_index_for_distance(distance);
+                let start_chunk = self.start_chunk_for_distance(chunked, distance);
 
                 (start_chunk..num_chunks).map(|index| chunked.chunk_output_size(index)).sum()
             }
         }
     }
 
-    /// Returns the number of chunks that would be downloaded for a given distance.
+    /// Returns the number of chunks that would be downloaded for a distance ending at
+    /// [`Self::block`].
     pub fn chunks_for_distance(&self, ty: SnapshotComponentType, distance: Option<u64>) -> u64 {
         let Some(ComponentManifest::Chunked(chunked)) = self.component(ty) else {
             return if self.component(ty).is_some() { 1 } else { 0 };
         };
-        let start_chunk = chunked.start_index_for_distance(distance);
-        (chunked.ranges().len() - start_chunk) as u64
+        (chunked.ranges().len() - self.start_chunk_for_distance(chunked, distance)) as u64
+    }
+
+    /// Returns the index of the first chunk needed for a distance measured from the declared
+    /// snapshot block [`Self::block`]. `None` (All mode) selects every chunk; `Some(0)` none.
+    ///
+    /// This is the single source of truth for tail selection, so every distance-aware method
+    /// agrees on uniform and mixed-span (`chunk_ranges`) manifests.
+    ///
+    /// - The anchor is `self.block`, not the end of the final archive. The final archive may
+    ///   extend past the snapshot block; counting back from its end would shift the requested
+    ///   window forward and could skip a required chunk.
+    /// - The anchor is not the chunks' nominal filename spans either. reth names the tip file by
+    ///   its full fixed bucket while it is still filling, so a walk over nominal spans
+    ///   under-covers.
+    /// - The first needed block is `block - (distance - 1)`. Every chunk whose range reaches it
+    ///   (`end >= first_block`) is included. `ComponentSelection::Since` already adds `+1` when
+    ///   planning converts it to a distance, so this does not re-add it.
+    /// - Legacy manifests stored the inclusive snapshot height in `total_blocks`. At equality the
+    ///   boundary chunk is kept if it exists; past `total_blocks` nothing is selected.
+    fn start_chunk_for_distance(&self, chunked: &ChunkedArchive, distance: Option<u64>) -> usize {
+        let ranges = chunked.ranges();
+        let Some(distance) = distance else { return 0 };
+        let first_block = self.block.saturating_sub(distance.saturating_sub(1));
+        if distance == 0 || first_block > chunked.total_blocks {
+            return ranges.len();
+        }
+        ranges.iter().position(|&(_, end)| end >= first_block).unwrap_or(ranges.len())
     }
 }
 
@@ -488,40 +523,6 @@ impl ChunkedArchive {
             let n = self.total_blocks.div_ceil(self.blocks_per_file);
             (0..n).map(|i| (i * self.blocks_per_file, (i + 1) * self.blocks_per_file - 1)).collect()
         }
-    }
-
-    /// Returns the index of the first chunk to include so the selected tail covers at least
-    /// `distance` blocks of ACTUAL data. `None` (All mode) selects every chunk (index 0);
-    /// `Some(0)` selects none.
-    ///
-    /// Selection is anchored to `total_blocks` (the snapshot height), NOT to the chunks'
-    /// nominal filename spans: reth names the tip static file by its full fixed bucket
-    /// (`find_fixed_range`) regardless of how many blocks it actually contains, so walking
-    /// nominal spans from the tail under-covers whenever the tip bucket is still filling —
-    /// the normal production state. Instead, compute the cutoff block
-    /// `total_blocks - min(distance, total_blocks)` and include every chunk whose range
-    /// reaches it (`end >= cutoff`).
-    ///
-    /// On a uniform manifest whose `total_blocks` is a multiple of `blocks_per_file` this is
-    /// provably identical to the historical `num_chunks - distance.div_ceil(blocks_per_file)`
-    /// selection. At exact chunk boundaries the cutoff rule is deliberately conservative (it
-    /// may include one chunk more than the minimal cover) — it never under-covers. Note
-    /// `ComponentSelection::Since` already adds `+1` when converted to a distance (planning),
-    /// so the cutoff must not re-add it.
-    ///
-    /// This is the single source of truth for tail selection so every distance-aware method
-    /// agrees, on both uniform and mixed-span manifests.
-    fn start_index_for_distance(&self, distance: Option<u64>) -> usize {
-        let ranges = self.ranges();
-        let Some(dist) = distance else {
-            return 0;
-        };
-        if dist == 0 {
-            return ranges.len();
-        }
-        let clamped = dist.min(self.total_blocks);
-        let cutoff = self.total_blocks.saturating_sub(clamped);
-        ranges.iter().position(|&(_, end)| end >= cutoff).unwrap_or(ranges.len())
     }
 
     /// Returns the number of chunks.
@@ -643,6 +644,9 @@ pub async fn fetch_manifest(manifest_url: &str) -> Result<SnapshotManifest> {
 }
 
 /// Package chunk archives from a source datadir and generate a manifest.
+///
+/// `block` selects chunks whose nominal ranges start at or before the snapshot height. Each
+/// selected file is archived in full; component block counts come from its actual stored ranges.
 pub fn generate_manifest(
     source_datadir: &Path,
     output_dir: &Path,
@@ -655,6 +659,14 @@ pub fn generate_manifest(
     std::fs::create_dir_all(output_dir)?;
 
     let mut components = BTreeMap::new();
+    let mut static_files_dir = source_datadir.join("static_files");
+    if !static_files_dir.exists() {
+        static_files_dir = source_datadir.to_path_buf();
+    }
+
+    // Segment headers give each file's real last block. Fixture datadirs and partial copies may
+    // hold files without readable headers; their ranges still come from the file names below.
+    let static_files = iter_static_files(&static_files_dir).ok();
 
     // Package chunked static-file components.
     for ty in &[
@@ -666,19 +678,37 @@ pub fn generate_manifest(
         SnapshotComponentType::StorageChangesets,
     ] {
         let key = ty.key();
-        let Some(segment_name) = static_segment_name(*ty) else {
-            continue;
-        };
+        let segment = static_segment(*ty).expect("chunked components have a static file segment");
 
         // Enumerate the ACTUAL on-disk static-file ranges for this segment instead of assuming
         // a single uniform stride. This is what makes mixed-block-span datadirs (e.g. a chain-1
         // archive with 50k-span seed files below the default-500k tip files) packageable: each
-        // real (start, end) becomes one chunk, named by its real range.
-        let ranges = super::manifest_cmd::segment_ranges(source_datadir, segment_name)?;
-        if ranges.is_empty() {
+        // real (start, end) becomes one chunk, named by its real range. Only files whose nominal
+        // range starts at or before `block` are selected; each one is archived in full.
+        let mut ranges = super::manifest_cmd::segment_ranges(source_datadir, segment.as_str())?;
+        ranges.retain(|&(start, _)| start <= block);
+        let Some(&(last_start, last_end)) = ranges.last() else {
             continue;
-        }
+        };
         validate_segment_ranges(key, &ranges, block)?;
+
+        // Coverage starts at block zero and includes the whole final file, even past `block`.
+        // Take the final file's real last block from its header. When the header cannot be
+        // read, fall back to `block`, which `validate_segment_ranges` proves is covered.
+        let last_block = static_files
+            .as_ref()
+            .and_then(|files| files.get(segment))
+            .and_then(|files| {
+                files.iter().rfind(|(_, header)| {
+                    let expected = header.expected_block_range();
+                    expected.start() == last_start && expected.end() == last_end
+                })
+            })
+            .map(|(range, _)| range.end())
+            .unwrap_or(block);
+        let total_blocks = last_block
+            .checked_add(1)
+            .ok_or_else(|| eyre::eyre!("Block count overflows for {key}"))?;
 
         let mut planned_chunks = Vec::with_capacity(ranges.len());
         for (idx, (start, end)) in ranges.iter().copied().enumerate() {
@@ -718,7 +748,7 @@ pub fn generate_manifest(
         info!(target: "reth::cli",
             component = ty.display_name(),
             chunks = chunk_sizes.len(),
-            total_blocks = block,
+            total_blocks,
             size = %super::DownloadProgress::format_size(total_size),
             "Found chunked component"
         );
@@ -726,7 +756,7 @@ pub fn generate_manifest(
             key.to_string(),
             ComponentManifest::Chunked(ChunkedArchive {
                 blocks_per_file,
-                total_blocks: block,
+                total_blocks,
                 chunk_sizes,
                 chunk_decompressed_sizes: chunk_output_files
                     .iter()
@@ -857,14 +887,14 @@ fn source_files_for_chunk(
     start: u64,
     end: u64,
 ) -> Result<Vec<PathBuf>> {
-    let Some(segment_name) = static_segment_name(component) else {
+    let Some(segment) = static_segment(component) else {
         return Ok(Vec::new());
     };
 
     let static_files_dir = source_datadir.join("static_files");
     let static_files_dir =
         if static_files_dir.exists() { static_files_dir } else { source_datadir.to_path_buf() };
-    let prefix = format!("static_file_{segment_name}_{start}_{end}");
+    let prefix = format!("static_file_{}_{start}_{end}", segment.as_str());
 
     let mut files = Vec::new();
     for entry in std::fs::read_dir(&static_files_dir)? {
@@ -888,14 +918,14 @@ fn source_files_for_chunk(
     Ok(files)
 }
 
-fn static_segment_name(component: SnapshotComponentType) -> Option<&'static str> {
+fn static_segment(component: SnapshotComponentType) -> Option<StaticFileSegment> {
     match component {
-        SnapshotComponentType::Headers => Some("headers"),
-        SnapshotComponentType::Transactions => Some("transactions"),
-        SnapshotComponentType::TransactionSenders => Some("transaction-senders"),
-        SnapshotComponentType::Receipts => Some("receipts"),
-        SnapshotComponentType::AccountChangesets => Some("account-change-sets"),
-        SnapshotComponentType::StorageChangesets => Some("storage-change-sets"),
+        SnapshotComponentType::Headers => Some(StaticFileSegment::Headers),
+        SnapshotComponentType::Transactions => Some(StaticFileSegment::Transactions),
+        SnapshotComponentType::TransactionSenders => Some(StaticFileSegment::TransactionSenders),
+        SnapshotComponentType::Receipts => Some(StaticFileSegment::Receipts),
+        SnapshotComponentType::AccountChangesets => Some(StaticFileSegment::AccountChangeSets),
+        SnapshotComponentType::StorageChangesets => Some(StaticFileSegment::StorageChangeSets),
         SnapshotComponentType::State | SnapshotComponentType::RocksdbIndices => None,
     }
 }
@@ -1073,6 +1103,10 @@ impl<R: Read> Read for HashingReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
+    use reth_node_api::NodeTypes;
+    use reth_provider::{test_utils::MockNodeTypes, StaticFileProviderBuilder, StaticFileWriter};
     use tempfile::tempdir;
 
     fn test_manifest() -> SnapshotManifest {
@@ -1121,6 +1155,36 @@ mod tests {
             components,
             extensions: Default::default(),
         }
+    }
+
+    fn snapshot_source() -> tempfile::TempDir {
+        let source = tempdir().unwrap();
+        reth_fs_util::create_dir_all(source.path().join("db")).unwrap();
+        reth_fs_util::write(source.path().join("db/mdbx.dat"), b"state-data").unwrap();
+        source
+    }
+
+    fn write_test_static_files(source: &Path, segment: StaticFileSegment, tip: u64) {
+        let static_files = source.join("static_files");
+        reth_fs_util::create_dir_all(&static_files).unwrap();
+
+        let provider = StaticFileProviderBuilder::read_write(&static_files)
+            .with_blocks_per_file(10)
+            .build::<<MockNodeTypes as NodeTypes>::Primitives>()
+            .unwrap();
+
+        let mut writer = provider.get_writer(0, segment).unwrap();
+        for number in 0..=tip {
+            if segment == StaticFileSegment::Headers {
+                writer
+                    .append_header(&Header { number, ..Default::default() }, &B256::ZERO)
+                    .unwrap();
+            } else {
+                writer.increment_block(number).unwrap();
+            }
+        }
+
+        writer.commit().unwrap();
     }
 
     #[test]
@@ -1757,6 +1821,9 @@ mod tests {
     /// and under-covers whenever the tip bucket is only partially filled.
     #[test]
     fn tail_selection_anchors_to_total_blocks_not_nominal_spans() {
+        // Merge note (v2.9.0): selection is exact, as upstream #28058 defines it. A distance
+        // `d` needs blocks `block - (d - 1)..=block`, so each boundary distance below is one
+        // larger than the fork's original cutoff rule used. The covered blocks are unchanged.
         let m = mixed_manifest_partial_tip();
         let tx = SnapshotComponentType::Transactions;
 
@@ -1764,8 +1831,8 @@ mod tests {
         // nominal 500k span as already covering 150k and selected only 1 chunk.
         assert_eq!(m.chunks_for_distance(tx, Some(150_000)), 3);
         // Past the tip chunk's ~50k of actual data → the previous chunk is needed too.
-        // cutoff = 150_000 - 50_001 = 99_999 → first chunk with end >= 99_999 is index 1.
-        assert_eq!(m.chunks_for_distance(tx, Some(50_001)), 2);
+        // first block = 150_000 - 50_001 = 99_999 → first chunk with end >= 99_999 is index 1.
+        assert_eq!(m.chunks_for_distance(tx, Some(50_002)), 2);
         // Boundary: dist=50_000 → cutoff = 100_000 = tip chunk start → tip chunk alone.
         assert_eq!(m.chunks_for_distance(tx, Some(50_000)), 1);
         // dist=0 → nothing (matches baseline behavior).
@@ -1777,11 +1844,11 @@ mod tests {
 
         // Every distance-aware method agrees (chunk_sizes = [10, 20, 30]).
         assert_eq!(m.size_for_distance(tx, Some(150_000)), 60);
-        assert_eq!(m.size_for_distance(tx, Some(50_001)), 50);
+        assert_eq!(m.size_for_distance(tx, Some(50_002)), 50);
         assert_eq!(m.size_for_distance(tx, Some(50_000)), 30);
         // chunk_decompressed_sizes = [100, 200, 300].
         assert_eq!(m.output_size_for_distance(tx, Some(150_000)), 600);
-        assert_eq!(m.output_size_for_distance(tx, Some(50_001)), 500);
+        assert_eq!(m.output_size_for_distance(tx, Some(50_002)), 500);
     }
 
     #[test]
@@ -1902,6 +1969,9 @@ mod tests {
 
     #[test]
     fn snapshot_archives_over_mixed_ranges_distance_tail() {
+        // Merge note (v2.9.0): selection is exact, as upstream #28058 defines it. A distance
+        // `d` needs blocks `block - (d - 1)..=block`, so each boundary distance below is one
+        // larger than the fork's original cutoff rule used. The covered blocks are unchanged.
         let m = mixed_manifest();
         // Strictly inside the tip chunk's data (cutoff = 100_000 = tip start) → tip alone.
         let one =
@@ -1912,7 +1982,7 @@ mod tests {
         // Boundary: dist=500_000 → cutoff = 99_999 == the previous chunk's end. The cutoff
         // rule is conservative at exact boundaries and includes that chunk too.
         let two =
-            m.snapshot_archives_for_distance(SnapshotComponentType::Transactions, Some(500_000));
+            m.snapshot_archives_for_distance(SnapshotComponentType::Transactions, Some(500_001));
         assert_eq!(two.len(), 2);
         assert_eq!(two[0].file_name, "transactions-50000-99999.tar.zst");
         assert_eq!(two[1].file_name, "transactions-100000-599999.tar.zst");
@@ -1920,6 +1990,9 @@ mod tests {
 
     #[test]
     fn range_aware_tail_selection_over_mixed_ranges() {
+        // Merge note (v2.9.0): selection is exact, as upstream #28058 defines it. A distance
+        // `d` needs blocks `block - (d - 1)..=block`, so each boundary distance below is one
+        // larger than the fork's original cutoff rule used. The covered blocks are unchanged.
         let m = mixed_manifest();
         let tx = SnapshotComponentType::Transactions;
 
@@ -1929,22 +2002,22 @@ mod tests {
         assert_eq!(m.chunks_for_distance(tx, None), 3);
         assert_eq!(m.chunks_for_distance(tx, Some(499_999)), 1);
         // Boundary: cutoff = 99_999 == middle chunk's end → included.
-        assert_eq!(m.chunks_for_distance(tx, Some(500_000)), 2);
+        assert_eq!(m.chunks_for_distance(tx, Some(500_001)), 2);
         // Boundary: cutoff = 49_999 == first chunk's end → all included.
-        assert_eq!(m.chunks_for_distance(tx, Some(550_000)), 3);
+        assert_eq!(m.chunks_for_distance(tx, Some(550_001)), 3);
         assert_eq!(m.chunks_for_distance(tx, Some(10_000_000)), 3);
 
         // size_for_distance (chunk_sizes = [10, 20, 30])
         assert_eq!(m.size_for_distance(tx, None), 60);
         assert_eq!(m.size_for_distance(tx, Some(499_999)), 30);
-        assert_eq!(m.size_for_distance(tx, Some(500_000)), 50);
-        assert_eq!(m.size_for_distance(tx, Some(550_000)), 60);
+        assert_eq!(m.size_for_distance(tx, Some(500_001)), 50);
+        assert_eq!(m.size_for_distance(tx, Some(550_001)), 60);
 
         // output_size_for_distance (chunk_decompressed_sizes = [100, 200, 300])
         assert_eq!(m.output_size_for_distance(tx, None), 600);
         assert_eq!(m.output_size_for_distance(tx, Some(499_999)), 300);
-        assert_eq!(m.output_size_for_distance(tx, Some(500_000)), 500);
-        assert_eq!(m.output_size_for_distance(tx, Some(550_000)), 600);
+        assert_eq!(m.output_size_for_distance(tx, Some(500_001)), 500);
+        assert_eq!(m.output_size_for_distance(tx, Some(550_001)), 600);
     }
 
     #[test]
@@ -2186,5 +2259,87 @@ mod tests {
             "mismatched chunk_files must not partially apply"
         );
         assert_eq!(urls[1], "https://example.com/mainnet/headers-500000-999999.tar.zst");
+    }
+
+    #[test]
+    fn generate_manifest_uses_actual_component_block_ranges() {
+        let source = snapshot_source();
+        let output = tempdir().unwrap();
+        write_test_static_files(source.path(), StaticFileSegment::Headers, 24);
+        write_test_static_files(source.path(), StaticFileSegment::Transactions, 21);
+
+        // The declared height is beyond both components' actual tips, within the same chunk.
+        let manifest = generate_manifest(source.path(), output.path(), None, 29, 1, 10).unwrap();
+        assert_eq!(manifest.block, 29);
+        for (component, expected_blocks) in
+            [(SnapshotComponentType::Headers, 25), (SnapshotComponentType::Transactions, 22)]
+        {
+            let ComponentManifest::Chunked(chunked) = manifest.component(component).unwrap() else {
+                panic!("component should be chunked");
+            };
+
+            assert_eq!(chunked.total_blocks, expected_blocks);
+            assert_eq!(chunked.num_chunks(), 3);
+            assert_eq!(chunked.chunk_sizes.len(), 3);
+            assert_eq!(chunked.chunk_output_files.len(), 3);
+            assert_eq!(chunked.tail_chunks_for_distance(6), 2);
+            for (index, size) in chunked.chunk_sizes.iter().enumerate() {
+                let path =
+                    output.path().join(chunked.chunk_relative_path(component.key(), index));
+                assert_eq!(reth_fs_util::metadata(path).unwrap().len(), *size);
+            }
+        }
+    }
+
+    #[test]
+    fn generate_manifest_includes_genesis_and_chunk_boundary_blocks() {
+        for tip in [0, 9, 10, 19, 20] {
+            let source = snapshot_source();
+            let output = tempdir().unwrap();
+            write_test_static_files(source.path(), StaticFileSegment::Headers, tip);
+
+            let manifest =
+                generate_manifest(source.path(), output.path(), None, tip, 1, 10).unwrap();
+            let ComponentManifest::Chunked(chunked) =
+                manifest.component(SnapshotComponentType::Headers).unwrap()
+            else {
+                panic!("headers should be chunked");
+            };
+
+            assert_eq!(chunked.total_blocks, tip + 1);
+            assert_eq!(chunked.num_chunks(), tip / 10 + 1);
+            assert_eq!(chunked.chunk_sizes.len() as u64, chunked.num_chunks());
+        }
+    }
+
+    #[test]
+    fn generate_manifest_counts_whole_selected_chunks() {
+        let source = snapshot_source();
+        write_test_static_files(source.path(), StaticFileSegment::Headers, 24);
+
+        // Selecting a chunk copies its whole file, including blocks beyond the declared height.
+        for (block, expected_blocks) in [(9, 10), (10, 20), (20, 25)] {
+            let output = tempdir().unwrap();
+            let manifest =
+                generate_manifest(source.path(), output.path(), None, block, 1, 10).unwrap();
+
+            let ComponentManifest::Chunked(chunked) =
+                manifest.component(SnapshotComponentType::Headers).unwrap()
+            else {
+                panic!("headers should be chunked");
+            };
+
+            assert_eq!(chunked.total_blocks, expected_blocks);
+            assert_eq!(chunked.chunk_sizes.len() as u64, chunked.num_chunks());
+        }
+
+        // Upstream also expected `(39, 25)` here: a height in a bucket (30-39) that has no file
+        // at all. The fork's coverage check rejects that, because the state archive would then
+        // disagree with the static files on every downloaded node. See
+        // `generate_manifest_rejects_coverage_short_of_block`.
+        let output = tempdir().unwrap();
+        let err = generate_manifest(source.path(), output.path(), None, 39, 1, 10)
+            .expect_err("a height past the last static file must not package");
+        assert!(err.to_string().contains("snapshot height"), "unexpected error: {err}");
     }
 }

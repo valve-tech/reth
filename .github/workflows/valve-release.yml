@@ -113,7 +113,7 @@ jobs:
           # stays off at runtime regardless, so this IS the fleet binary.
           cargo build --release --bin reth --target "$TARGET" \
             --no-default-features \
-            --features "jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
+            --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
 
       - name: Check glibc
         if: contains(matrix.target, 'linux')

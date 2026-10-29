@@ -21,7 +21,6 @@ reth-ethereum-primitives.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 reth-primitives-traits.workspace = true
-reth-revm.workspace = true
 
 # alloy
 alloy-consensus.workspace = true
@@ -31,7 +30,7 @@ alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 
 # revm
-revm.workspace = true
+evm2.workspace = true
 
 # encoding & errors
 base64 = "0.22"
