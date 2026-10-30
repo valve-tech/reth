@@ -24,3 +24,9 @@ slow-timeout = { period = "2m", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = "package(reth-node-ethereum) and binary(e2e)"
 slow-timeout = { period = "1m", terminate-after = 5 }
+
+# A 32-case proptest that builds a full engine harness per case: ~10 s alone on a fast machine,
+# and over the 60 s default when it shares the fork's 8-core CI runner with the rest of the suite.
+[[profile.default.overrides]]
+filter = "package(reth-engine-tree) and test(engine_messages_keep_sender_parent_on_another_thread)"
+slow-timeout = { period = "1m", terminate-after = 5 }
