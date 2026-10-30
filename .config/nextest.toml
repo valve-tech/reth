@@ -31,8 +31,8 @@ slow-timeout = { period = "1m", terminate-after = 5 }
 filter = "package(reth-engine-tree) and test(engine_messages_keep_sender_parent_on_another_thread)"
 slow-timeout = { period = "1m", terminate-after = 5 }
 
-# Both take 4-7 s locally but passed the 60 s default on the CI runner on all three tries. The
-# longer limit shows whether they are slow there or hung: a hang still fails.
+# Slow on the fork's CI runner, not hung. Measured in pipeline 4568: 51 s, 79 s and 58 s (about
+# 5-7 s locally for the first two), against a 60 s default.
 [[profile.default.overrides]]
-filter = "(package(reth-engine-tree) and test(bounds_pool_results)) or (package(reth-rpc) and test(call_allowance_respects_rpc_gas_cap))"
+filter = "(package(reth-engine-tree) and test(bounds_pool_results)) or (package(reth-rpc) and test(call_allowance_respects_rpc_gas_cap)) or (package(reth-provider) and test(test_prunable_receipts_logic))"
 slow-timeout = { period = "1m", terminate-after = 5 }
