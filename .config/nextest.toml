@@ -30,3 +30,9 @@ slow-timeout = { period = "1m", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = "package(reth-engine-tree) and test(engine_messages_keep_sender_parent_on_another_thread)"
 slow-timeout = { period = "1m", terminate-after = 5 }
+
+# Both take 4-7 s locally but passed the 60 s default on the CI runner on all three tries. The
+# longer limit shows whether they are slow there or hung: a hang still fails.
+[[profile.default.overrides]]
+filter = "(package(reth-engine-tree) and test(bounds_pool_results)) or (package(reth-rpc) and test(call_allowance_respects_rpc_gas_cap))"
+slow-timeout = { period = "1m", terminate-after = 5 }
