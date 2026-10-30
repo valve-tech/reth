@@ -9347,7 +9347,7 @@ dependencies = [
 
 [[package]]
 name = "reth-firehose"
-version = "2.8.0"
+version = "2.8.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
@@ -9382,7 +9382,7 @@ dependencies = [
 
 [[package]]
 name = "reth-firehose-tests"
-version = "2.8.0"
+version = "2.8.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
@@ -9522,7 +9522,7 @@ dependencies = [
 
 [[package]]
 name = "reth-msgboard"
-version = "2.8.0"
+version = "2.8.1"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -9561,7 +9561,7 @@ dependencies = [
 
 [[package]]
 name = "reth-msgboard-types"
-version = "2.8.0"
+version = "2.8.1"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -10303,7 +10303,7 @@ dependencies = [
 
 [[package]]
 name = "reth-pulsechain-forks"
-version = "2.8.0"
+version = "2.8.1"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -10314,7 +10314,7 @@ dependencies = [
 
 [[package]]
 name = "reth-pulsechain-node"
-version = "2.8.0"
+version = "2.8.1"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
