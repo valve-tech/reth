@@ -7,9 +7,8 @@
 //! - **Spec for Ethereum post-Merge history**: blocks in `[ETH_MAINNET_MERGE_BLOCK,
 //!   PrimordialPulse)` run with Ethereum's post-Merge rules (MERGE, then SHANGHAI from Ethereum's
 //!   Shanghai timestamp), although `PulseChain`'s own Paris and Shanghai come later.
-//! - **Block executor**: [`PulsechainBlockExecutor`] pays no proof-of-work reward in that
-//!   Ethereum post-Merge range and applies the `PrimordialPulse` state transition at the fork
-//!   block.
+//! - **Block executor**: [`PulsechainBlockExecutor`] pays no proof-of-work reward in that Ethereum
+//!   post-Merge range and applies the `PrimordialPulse` state transition at the fork block.
 
 use std::{borrow::Cow, convert::Infallible, fmt::Debug, sync::Arc};
 
@@ -25,21 +24,20 @@ use evm2::{
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks, MAINNET};
 use reth_ethereum_primitives::{Block, EthPrimitives, TransactionSigned};
 use reth_evm::{
-    precompile_cache::PrecompileCacheMap, BlockExecutionError, BlockExecutionOutput,
-    BlockExecutor, BlockExecutorFactory, ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv,
-    EvmEnvFor, EvmFor, ExecutableTxIterator, ExecutionCtxFor, ExecutorTx, GasOutput,
-    NextBlockEnvAttributes, ReceiptBuilder, SpecFor,
+    precompile_cache::PrecompileCacheMap, BlockExecutionError, BlockExecutionOutput, BlockExecutor,
+    BlockExecutorFactory, ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmEnvFor, EvmFor,
+    ExecutableTxIterator, ExecutionCtxFor, ExecutorTx, GasOutput, NextBlockEnvAttributes,
+    ReceiptBuilder, SpecFor,
 };
 use reth_evm_ethereum::{
     EthBlockAssembler, EthBlockExecutionCtx, EthBlockExecutor, EthBlockExecutorFactory,
-    EthEvmConfig, EthEvmEnv, EvmFactory, ExecutableRecoveredTx, RethEvmFactory,
-    RethReceiptBuilder,
+    EthEvmConfig, EthEvmEnv, EvmFactory, ExecutableRecoveredTx, RethEvmFactory, RethReceiptBuilder,
 };
 use reth_execution_types::StateUpdate;
-use reth_trie_common::bundle_state::BundleState;
 use reth_node_builder::{components::ExecutorBuilder, BuilderContext, FullNodeTypes, NodeTypes};
 use reth_primitives_traits::{SealedBlock, SealedHeader, SignedTransaction};
 use reth_storage_errors::any::AnyError;
+use reth_trie_common::bundle_state::BundleState;
 
 use crate::fork::{apply_primordial_pulse, PrimordialPulseStateWriter};
 use reth_pulsechain_forks::{
@@ -459,7 +457,12 @@ where
     }
 
     /// Applies the `PulseChain` chain ID and the Ethereum replay spec to an environment.
-    fn adjust_env(&self, mut env: EthEvmEnv<F::Types>, number: u64, timestamp: u64) -> EthEvmEnv<F::Types> {
+    fn adjust_env(
+        &self,
+        mut env: EthEvmEnv<F::Types>,
+        number: u64,
+        timestamp: u64,
+    ) -> EthEvmEnv<F::Types> {
         let chain_id = chain_id_for_block(self.pulse_factory.chain_id, number);
         if let Some(spec) =
             eth_replay_spec(number, timestamp, self.pulse_factory.primordial_pulse_block)
@@ -748,11 +751,7 @@ mod tests {
         let header = header_at_with_timestamp(16_000_000, 0, randao, 1_674_000_000);
         let env = config.evm_env(&header).unwrap();
 
-        assert_eq!(
-            env.spec,
-            SpecId::MERGE,
-            "post-Merge pre-Shanghai block must use MERGE spec"
-        );
+        assert_eq!(env.spec, SpecId::MERGE, "post-Merge pre-Shanghai block must use MERGE spec");
     }
 
     #[test]
@@ -807,11 +806,7 @@ mod tests {
             header_at_with_timestamp(17_034_869, 0, randao, ETH_MAINNET_SHANGHAI_TIMESTAMP - 1);
         let env = config.evm_env(&header).unwrap();
 
-        assert_eq!(
-            env.spec,
-            SpecId::MERGE,
-            "block 1 second before Shanghai must use MERGE spec"
-        );
+        assert_eq!(env.spec, SpecId::MERGE, "block 1 second before Shanghai must use MERGE spec");
     }
 
     #[test]
@@ -835,11 +830,7 @@ mod tests {
         let header = header_at(15_050_001, 12_345_678, B256::ZERO);
         let env = config.evm_env(&header).unwrap();
 
-        assert_ne!(
-            env.block.difficulty,
-            U256::ZERO,
-            "pre-Merge block should preserve difficulty"
-        );
+        assert_ne!(env.block.difficulty, U256::ZERO, "pre-Merge block should preserve difficulty");
         // evm2 always fills `prevrandao` from `mix_hash`; the pre-Merge spec makes DIFFICULTY
         // return `difficulty`, so there is no separate "no prevrandao" state to check.
         assert!(env.spec < SpecId::MERGE);
@@ -852,13 +843,10 @@ mod tests {
         let header = header_at(ETH_MAINNET_MERGE_BLOCK, 0, randao);
         let env = config.evm_env(&header).unwrap();
 
+        assert_eq!(env.block.difficulty, U256::ZERO, "post-Merge block must have zero difficulty");
         assert_eq!(
-            env.block.difficulty,
-            U256::ZERO,
-            "post-Merge block must have zero difficulty"
-        );
-        assert_eq!(
-            env.block.prevrandao, U256::from_be_bytes(randao.0),
+            env.block.prevrandao,
+            U256::from_be_bytes(randao.0),
             "post-Merge block must set prevrandao from header.mix_hash"
         );
     }
@@ -924,10 +912,136 @@ mod tests {
 
         // This block is past the override range AND past PulseChain's Paris activation,
         // so it should get MERGE from the chain spec (not from our override).
-        assert_eq!(
-            env.spec,
-            SpecId::MERGE,
-            "first PulseChain PoS block must use MERGE spec"
+        assert_eq!(env.spec, SpecId::MERGE, "first PulseChain PoS block must use MERGE spec");
+    }
+
+    // ── Block execution through PulsechainBlockExecutor ────────────────────────
+
+    use crate::fork::{
+        decode_sacrifice_credits, DEPOSIT_CONTRACT_BYTECODE, DEPOSIT_CONTRACT_INITIAL_STORAGE,
+        ETH_DEPOSIT_CONTRACT, PULSE_DEPOSIT_CONTRACT, SACRIFICE_CREDITS_TESTNET_V4,
+        TESTNET_V4_TREASURY, TESTNET_V4_TREASURY_BALANCE,
+    };
+    use alloy_primitives::keccak256;
+    use evm2::evm::InMemoryDB;
+    use reth_evm::execute::{BasicBlockExecutor, Executor};
+    use reth_primitives_traits::Block as _;
+    use reth_pulsechain_forks::{
+        chainspec::PULSECHAIN_TESTNET_V4,
+        hardfork::{PRIMORDIAL_PULSE_TESTNET_V4_BLOCK, PRIMORDIAL_PULSE_TESTNET_V4_TIMESTAMP},
+    };
+
+    const BENEFICIARY: alloy_primitives::Address = alloy_primitives::Address::repeat_byte(0xbe);
+
+    /// Executes an empty block `number` on testnet v4 on top of `db` and returns the final state.
+    fn execute_empty_block(db: InMemoryDB, number: u64, timestamp: u64) -> BundleState {
+        let header = Header {
+            number,
+            timestamp,
+            beneficiary: BENEFICIARY,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(7),
+            difficulty: U256::from(1),
+            ..Default::default()
+        };
+        let block = Block { header, body: Default::default() }
+            .try_into_recovered()
+            .expect("an empty block recovers");
+        let mut executor =
+            BasicBlockExecutor::new(PulsechainEvmConfig::new(PULSECHAIN_TESTNET_V4.clone()), db);
+        executor.execute_one(&block).expect("the block executes");
+        executor.into_state()
+    }
+
+    fn balance(state: &BundleState, address: alloy_primitives::Address) -> Option<U256> {
+        state.account(&address).and_then(|account| account.info.as_ref()).map(|info| info.balance)
+    }
+
+    /// The fork block applies the whole transition: the treasury and every sacrifice credit, the
+    /// destroyed Ethereum deposit contract (storage wiped), and the deployed `PulseChain` one. The
+    /// block's proof-of-work reward is still paid, because Paris activates one block later.
+    #[test]
+    fn primordial_pulse_block_applies_the_transition_and_the_block_reward() {
+        let mut db = InMemoryDB::default();
+        let eth_code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00]));
+        let mut eth_deposit =
+            AccountInfo::new(U256::from(1_000), 1, eth_code.hash_slow(), Some(eth_code));
+        db.insert_contract(&mut eth_deposit);
+        db.insert_account_info(&ETH_DEPOSIT_CONTRACT, eth_deposit);
+        db.insert_account_storage(&ETH_DEPOSIT_CONTRACT, &U256::from(7), &U256::from(42));
+
+        let state = execute_empty_block(
+            db,
+            PRIMORDIAL_PULSE_TESTNET_V4_BLOCK,
+            PRIMORDIAL_PULSE_TESTNET_V4_TIMESTAMP,
         );
+
+        let credits = decode_sacrifice_credits(SACRIFICE_CREDITS_TESTNET_V4);
+        assert!(!credits.is_empty());
+        let mut expected: std::collections::HashMap<_, U256> = Default::default();
+        expected.insert(TESTNET_V4_TREASURY, TESTNET_V4_TREASURY_BALANCE);
+        for (address, amount) in &credits {
+            *expected.entry(*address).or_default() += *amount;
+        }
+        for (address, amount) in &expected {
+            if *address == BENEFICIARY {
+                continue
+            }
+            assert_eq!(balance(&state, *address), Some(*amount), "credit to {address}");
+        }
+
+        let eth_deposit =
+            state.account(&ETH_DEPOSIT_CONTRACT).expect("ETH deposit is in the state");
+        assert!(eth_deposit.info.is_none(), "the ETH deposit contract is destroyed");
+        assert!(eth_deposit.was_destroyed(), "its storage is wiped");
+
+        let pulse = state
+            .account(&PULSE_DEPOSIT_CONTRACT)
+            .and_then(|account| account.info.as_ref())
+            .expect("the PulseChain deposit contract is deployed");
+        assert_eq!(pulse.code_hash, keccak256(DEPOSIT_CONTRACT_BYTECODE));
+        let pulse_storage = &state.account(&PULSE_DEPOSIT_CONTRACT).unwrap().storage;
+        for (slot, value) in DEPOSIT_CONTRACT_INITIAL_STORAGE {
+            let slot = pulse_storage
+                .get(&U256::from_be_bytes(slot.0))
+                .unwrap_or_else(|| panic!("deposit contract slot {slot} is written"));
+            assert_eq!(slot.present_value, U256::from_be_bytes(value.0));
+        }
+
+        // 2 ETH proof-of-work reward (Constantinople onward), plus any credit to the
+        // beneficiary.
+        let reward = U256::from(2_000_000_000_000_000_000u128);
+        let credit = expected.get(&BENEFICIARY).copied().unwrap_or_default();
+        assert_eq!(balance(&state, BENEFICIARY), Some(reward + credit));
+    }
+
+    /// No transition account is one the fork block's beneficiary reward would also touch in a
+    /// way the order of the two could change: the transition destroys or rewrites only the two
+    /// deposit contracts, and only adds to every other balance.
+    #[test]
+    fn primordial_pulse_rewrites_only_the_deposit_contracts() {
+        for (address, _) in decode_sacrifice_credits(SACRIFICE_CREDITS_TESTNET_V4) {
+            assert_ne!(address, ETH_DEPOSIT_CONTRACT);
+            assert_ne!(address, PULSE_DEPOSIT_CONTRACT);
+        }
+        assert_ne!(ETH_DEPOSIT_CONTRACT, PULSE_DEPOSIT_CONTRACT);
+    }
+
+    /// A block that replays Ethereum after its Merge pays no proof-of-work reward, although
+    /// `PulseChain`'s own spec has Paris only after `PrimordialPulse`.
+    #[test]
+    fn eth_post_merge_replay_block_pays_no_block_reward() {
+        let state =
+            execute_empty_block(InMemoryDB::default(), ETH_MAINNET_MERGE_BLOCK + 1, 1_663_300_000);
+        assert_eq!(balance(&state, BENEFICIARY), None, "the beneficiary must not be credited");
+    }
+
+    /// Negative control for the test above: the block just before Ethereum's Merge still pays
+    /// the proof-of-work reward.
+    #[test]
+    fn eth_pre_merge_block_pays_the_block_reward() {
+        let state =
+            execute_empty_block(InMemoryDB::default(), ETH_MAINNET_MERGE_BLOCK - 1, 1_663_200_000);
+        assert_eq!(balance(&state, BENEFICIARY), Some(U256::from(2_000_000_000_000_000_000u128)));
     }
 }

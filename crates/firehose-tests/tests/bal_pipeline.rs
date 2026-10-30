@@ -14,6 +14,7 @@ use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::{address, hex, keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
+use evm2::evm::InMemoryDB;
 use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, TransactionSigned};
 use reth_evm::execute::{BasicBlockExecutor, Executor};
@@ -23,7 +24,6 @@ use reth_firehose::{
 };
 use reth_firehose_tests::prestate::{parse_fire_block_for, seed_cache_db, Prestate};
 use reth_primitives_traits::{Block as _, RecoveredBlock};
-use evm2::evm::InMemoryDB;
 
 const RECIPIENT: Address = address!("0x000000000000000000000000000000000000beef");
 
@@ -102,12 +102,11 @@ fn pipeline_rebuilds_bal_of_a_block_with_transactions() {
         "reth-firehose-tests",
         env!("CARGO_PKG_VERSION"),
     );
-    let mut guard =
-        FirehoseBlockTracer::start_local::<EthPrimitives>(
-            Box::new(tracer),
-            block.sealed_block(),
-            None,
-        );
+    let mut guard = FirehoseBlockTracer::start_local::<EthPrimitives>(
+        Box::new(tracer),
+        block.sealed_block(),
+        None,
+    );
     run_wrapped_block(
         &EthEvmConfig::new(chain_spec),
         state(&prestate),

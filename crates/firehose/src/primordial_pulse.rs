@@ -39,9 +39,9 @@
 
 use alloy_primitives::{Address, B256, U256};
 use evm2::evm::DynDatabase;
-use reth_trie_common::bundle_state::BundleState;
 use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
 use reth_pulsechain_forks::primordial_pulse as spec;
+use reth_trie_common::bundle_state::BundleState;
 
 /// Returns the PrimordialPulse fork-block number for the given chain ID, or `None`
 /// if the chain doesn't have a PrimordialPulse transition.
@@ -471,6 +471,7 @@ mod tests {
     use std::collections::HashMap;
 
     use alloy_primitives::keccak256;
+    use evm2::{bytecode::Bytecode, evm::AccountInfo};
     use firehose_tracer::{
         config::{ChainConfig, Config},
         pb::sf::ethereum::r#type::v2::{
@@ -480,7 +481,6 @@ mod tests {
         Tracer,
     };
     use prost::Message;
-    use evm2::{bytecode::Bytecode, evm::AccountInfo};
 
     /// Scripted post-finish state, turned into the [`BundleState`] the emitter reads.
     #[derive(Default)]
@@ -549,10 +549,7 @@ mod tests {
 
     fn seed_post_deposit_state(db: &mut MockDb) {
         // ETH deposit wiped.
-        db.accounts.insert(
-            spec::ETH_DEPOSIT_CONTRACT,
-            account(U256::ZERO, 0, B256::ZERO, None),
-        );
+        db.accounts.insert(spec::ETH_DEPOSIT_CONTRACT, account(U256::ZERO, 0, B256::ZERO, None));
 
         let pulse_code = Bytecode::new_raw(spec::DEPOSIT_CONTRACT_BYTECODE.to_vec().into());
         let pulse_hash = keccak256(spec::DEPOSIT_CONTRACT_BYTECODE);
@@ -677,10 +674,8 @@ mod tests {
         };
 
         let mut db = MockDb::default();
-        db.accounts.insert(
-            treasury,
-            account(spec::TESTNET_V4_TREASURY_BALANCE, 0, B256::ZERO, None),
-        );
+        db.accounts
+            .insert(treasury, account(spec::TESTNET_V4_TREASURY_BALANCE, 0, B256::ZERO, None));
         db.accounts.insert(credit_addr, account(credit_amt, 0, B256::ZERO, None));
         seed_post_deposit_state(&mut db);
 

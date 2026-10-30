@@ -11,7 +11,6 @@ use reth_provider::{
     BlockIdReader, BlockNumReader, BlockReader, EvmStateProviderBox, StateProviderFactory,
 };
 
-
 pub async fn run_exex<Node>(mut ctx: ExExContext<Node>) -> eyre::Result<()>
 where
     Node: FullNodeComponents,

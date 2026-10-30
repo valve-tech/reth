@@ -69,10 +69,7 @@ impl<Node> ExecutorBuilder<Node> for PulsechainFirehoseExecutorBuilder
 where
     Node: FullNodeTypes<
         Types: NodeTypes<
-            ChainSpec: EthChainSpec<Header = Header>
-                           + EthereumHardforks
-                           + Hardforks
-                           + 'static,
+            ChainSpec: EthChainSpec<Header = Header> + EthereumHardforks + Hardforks + 'static,
             Primitives = EthPrimitives,
         >,
     >,

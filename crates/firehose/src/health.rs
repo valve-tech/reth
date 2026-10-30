@@ -8,8 +8,8 @@ use std::{
     time::Duration,
 };
 
-use serde::Serialize;
 use reth_tracing::tracing::{info, warn};
+use serde::Serialize;
 
 pub const HEALTH_LISTEN_ADDR: &str = "127.0.0.1:8754";
 
@@ -96,8 +96,8 @@ pub fn replica_from_host(host: &str) -> Option<String> {
 
     if let Some(rest) = name.strip_prefix("evm") {
         let letter = rest.chars().last()?;
-        if (letter == 'a' || letter == 'b')
-            && rest.chars().rev().nth(1).is_some_and(|c| c.is_ascii_digit())
+        if (letter == 'a' || letter == 'b') &&
+            rest.chars().rev().nth(1).is_some_and(|c| c.is_ascii_digit())
         {
             return Some(letter.to_string());
         }
@@ -180,7 +180,11 @@ pub struct HealthPublisher {
 }
 
 impl HealthPublisher {
-    pub fn start(datadir: impl AsRef<Path>, chain_id: u64, replica: impl Into<String>) -> eyre::Result<Self> {
+    pub fn start(
+        datadir: impl AsRef<Path>,
+        chain_id: u64,
+        replica: impl Into<String>,
+    ) -> eyre::Result<Self> {
         Self::start_inner(datadir, chain_id, replica, true)
     }
 
@@ -219,15 +223,14 @@ impl HealthPublisher {
             spawn_loopback_server(path.clone());
         }
 
-        Ok(Self {
-            path,
-            chain_id,
-            replica,
-            last: status,
-        })
+        Ok(Self { path, chain_id, replica, last: status })
     }
 
-    pub fn record_finished_height(&mut self, height: u64, block_time_unix: u64) -> eyre::Result<()> {
+    pub fn record_finished_height(
+        &mut self,
+        height: u64,
+        block_time_unix: u64,
+    ) -> eyre::Result<()> {
         let status = HealthStatus::alive_at_block(
             self.chain_id,
             self.replica.clone(),
@@ -338,12 +341,9 @@ fn handle_health_http(mut stream: impl Read + Write, path: &Path) -> std::io::Re
 
     match fs::read(path) {
         Ok(body) => write_http_response(&mut stream, 200, "application/json", &body)?,
-        Err(_) => write_http_response(
-            &mut stream,
-            503,
-            "application/json",
-            br#"{"exex_alive":false}"#,
-        )?,
+        Err(_) => {
+            write_http_response(&mut stream, 503, "application/json", br#"{"exex_alive":false}"#)?
+        }
     }
     Ok(())
 }

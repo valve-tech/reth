@@ -12,6 +12,7 @@ use alloy_consensus::{
 };
 use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::{keccak256, B256};
+use evm2::evm::InMemoryDB;
 use reth_chainspec::ChainSpec;
 use reth_consensus::noop::NoopConsensus;
 use reth_db_common::init::init_genesis;
@@ -27,7 +28,6 @@ use reth_provider::{
 use reth_stages::stages::ExecutionStage;
 use reth_stages_api::{ExecInput, Stage};
 use reth_static_file_types::StaticFileSegment;
-use evm2::evm::InMemoryDB;
 
 #[test]
 fn execution_stage_stores_the_rebuilt_block_access_list() {

@@ -291,7 +291,6 @@ where
         self.ommer_beneficiaries = ommer_beneficiaries;
         self
     }
-
 }
 
 impl<Inner, G, Extras, Adjust> FirehoseWrappedExecutor<Inner, G, Extras, Adjust>
@@ -395,7 +394,12 @@ fn emit_block_reward_balance_changes<G: DerefMut<Target = firehose_tracer::Trace
     let mut tracer = inspector.tracer_mut();
     // `on_balance_change` drops no-op changes itself.
     let coinbase_post = final_balance(state, pre.coinbase, pre.coinbase_pre);
-    tracer.on_balance_change(pre.coinbase, pre.coinbase_pre, coinbase_post, Reason::RewardMineBlock);
+    tracer.on_balance_change(
+        pre.coinbase,
+        pre.coinbase_pre,
+        coinbase_post,
+        Reason::RewardMineBlock,
+    );
     for &(address, pre_balance) in &pre.ommer_pre {
         let post_balance = final_balance(state, address, pre_balance);
         tracer.on_balance_change(address, pre_balance, post_balance, Reason::RewardMineUncle);

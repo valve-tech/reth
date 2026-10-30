@@ -20,10 +20,8 @@ fn read_health_json(path: &Path) -> serde_json::Value {
 }
 
 fn env_map(pairs: &[(&str, Option<&str>)]) -> impl FnMut(&str) -> Option<String> {
-    let map: HashMap<String, Option<String>> = pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), v.map(|s| s.to_string())))
-        .collect();
+    let map: HashMap<String, Option<String>> =
+        pairs.iter().map(|(k, v)| ((*k).to_string(), v.map(|s| s.to_string()))).collect();
     move |key: &str| map.get(key).cloned().flatten()
 }
 
