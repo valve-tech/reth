@@ -22,13 +22,13 @@
 # Declared before the first FROM so it is usable in the runtime stage's FROM.
 ARG FIREHOSE_ETHEREUM="latest"
 
-FROM lukemathwalker/cargo-chef:latest-rust-1.95-trixie AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.96-trixie AS chef
 WORKDIR /app
 
 LABEL org.opencontainers.image.source=https://github.com/streamingfast/reth
 LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
-# Install system dependencies. LLVM is required by `revmc-llvm` (via `llvm-sys`).
+# Install system dependencies. LLVM is required by `evm2-jit` (via `llvm-sys`).
 COPY .github/scripts/install_llvm_ubuntu.sh /tmp/install_llvm.sh
 RUN /tmp/install_llvm.sh && rm /tmp/install_llvm.sh && \
     apt-get install -y --no-install-recommends libclang-dev m4 pkg-config

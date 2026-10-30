@@ -17,8 +17,12 @@ use alloy_consensus::{
 };
 use alloy_eips::{eip2718::Decodable2718, eip4895::Withdrawals};
 use alloy_genesis::{Genesis, GenesisAccount};
-use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use base64::{engine::general_purpose, Engine as _};
+use evm2::{
+    bytecode::Bytecode,
+    evm::{AccountInfo, InMemoryDB},
+};
 use eyre::{Context, ContextCompat};
 use firehose_tracer::pb::sf::ethereum::r#type::v2::Block as FirehoseBlock;
 use prost::Message;
@@ -27,16 +31,10 @@ use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, TransactionSigne
 use reth_evm::execute::Executor as _;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_firehose::{
-    init_tracer_with_buffer, is_tracer_initialized, run_wrapped_block,
-    take_traced_block_access_list, FirehoseBlockExecutor, FirehoseBlockTracer, NoPostTxExtras,
-    NoPreTxAdjust,
+    init_tracer_with_buffer, is_tracer_initialized, record_block_access_list, run_wrapped_block,
+    FirehoseBlockExecutor, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust,
 };
 use reth_primitives_traits::{Block as _, RecoveredBlock};
-use reth_revm::State;
-use revm::{
-    database::{CacheDB, EmptyDB},
-    state::{AccountInfo, Bytecode},
-};
 use serde::Deserialize;
 
 /// Captured outcome of a prestate run.
@@ -105,7 +103,7 @@ pub struct LoadedPrestate {
     /// The block to execute, carrying the fixture's single transaction.
     pub block: RecoveredBlock<Block>,
     /// State database seeded with the genesis allocation.
-    pub db: CacheDB<EmptyDB>,
+    pub db: InMemoryDB,
 }
 
 /// Run the prestate-driven Firehose harness against `case_folder` and return the captured Block.
@@ -115,15 +113,15 @@ pub struct LoadedPrestate {
 /// `FIRE BLOCK` line emitted for the executed block; assert against a `.binpb` golden via
 /// [`assert_block_equals_golden`].
 pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
-    let LoadedPrestate { prestate, chain_spec, block: recovered, db } = load_prestate(case_folder)?;
-    let mut state = State::builder().with_database(db).with_bundle_update().build();
+    let LoadedPrestate { prestate, chain_spec, block: recovered, mut db } =
+        load_prestate(case_folder)?;
 
-    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let evm_config = EthEvmConfig::new(chain_spec);
 
     // Bundles `new_with_writer` + `on_blockchain_init`: the Tracer guards mid-block events behind
     // a one-shot init so any captured output is preceded by a `FIRE INIT` line declaring the
     // chain. Fork timings are derived from the prestate's genesis config.
-    let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+    let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
         firehose_tracer::config::Config::default(),
         firehose_tracer::config::ChainConfig {
             chain_id: prestate.genesis.config.chain_id,
@@ -144,23 +142,20 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
     });
 
     let mut block_tracer = FirehoseBlockTracer::start_local::<EthPrimitives>(
-        &mut tracer,
+        Box::new(tracer),
         recovered.sealed_block(),
         finalized,
     );
 
-    let exec_result = run_wrapped_block::<_, _, _, _, _>(
+    let exec_result = run_wrapped_block(
         &evm_config,
-        &mut state,
+        &mut db,
         &recovered,
         &mut block_tracer,
         NoPreTxAdjust,
         NoPostTxExtras,
     )
-    .and_then(|result| {
-        take_traced_block_access_list(&mut state, &recovered, &mut block_tracer)?;
-        Ok(result)
-    });
+    .and_then(|(_, bal)| record_block_access_list(&recovered, bal.as_ref(), &mut block_tracer));
 
     match exec_result {
         Ok(_) => block_tracer.mark_verified(),
@@ -170,8 +165,6 @@ pub fn run_prestate(case_folder: &Path) -> eyre::Result<RunOutcome> {
             return Err(eyre::eyre!("block execution failed: {msg}"));
         }
     }
-
-    drop(tracer);
 
     let raw = buffer.get_bytes();
     let block = parse_fire_block_for(&raw, block_number)?;
@@ -206,7 +199,7 @@ pub fn load_prestate(case_folder: &Path) -> eyre::Result<LoadedPrestate> {
     let recovered: RecoveredBlock<Block> =
         block.try_into_recovered().map_err(|_| eyre::eyre!("recovering tx senders"))?;
 
-    let mut db = CacheDB::new(EmptyDB::default());
+    let mut db = InMemoryDB::default();
     seed_cache_db(&mut db, &prestate.genesis)?;
     Ok(LoadedPrestate { prestate, chain_spec, block: recovered, db })
 }
@@ -255,9 +248,8 @@ pub fn run_prestate_via_block_executor(case_folder: &Path) -> eyre::Result<RunOu
         block.try_into_recovered().map_err(|_| eyre::eyre!("recovering tx senders"))?;
     let block_number = recovered.header().number;
 
-    let mut db = CacheDB::new(EmptyDB::default());
+    let mut db = InMemoryDB::default();
     seed_cache_db(&mut db, &prestate.genesis)?;
-    let state = State::builder().with_database(db).with_bundle_update().build();
 
     let evm_config = EthEvmConfig::new(chain_spec.clone());
 
@@ -271,7 +263,7 @@ pub fn run_prestate_via_block_executor(case_folder: &Path) -> eyre::Result<RunOu
         config.prague_time,
     );
 
-    let mut executor = FirehoseBlockExecutor::new(evm_config, state);
+    let mut executor = FirehoseBlockExecutor::new(evm_config, db);
     executor
         .execute_and_trace_one(&recovered)
         .map_err(|e| eyre::eyre!("execute_and_trace_one failed: {e}"))?;
@@ -367,34 +359,32 @@ fn build_header(
     }
 }
 
-/// Seed a [`CacheDB`] from a genesis `alloc` map, inserting account info and storage slots.
-pub fn seed_cache_db(db: &mut CacheDB<EmptyDB>, genesis: &Genesis) -> eyre::Result<()> {
+/// Seed an [`InMemoryDB`] from a genesis `alloc` map, inserting account info and storage slots.
+pub fn seed_cache_db(db: &mut InMemoryDB, genesis: &Genesis) -> eyre::Result<()> {
     for (addr, account) in &genesis.alloc {
-        let info = build_account_info(account);
-        db.insert_account_info(*addr, info);
+        db.insert_account_info(addr, build_account_info(account));
 
         if let Some(storage) = &account.storage {
             for (slot, value) in storage {
-                let slot_u = U256::from_be_bytes(slot.0);
-                let value_u = U256::from_be_bytes(value.0);
-                db.insert_account_storage(*addr, slot_u, value_u)
-                    .with_context(|| format!("seeding storage for {addr:?}"))?;
+                db.insert_account_storage(
+                    addr,
+                    &U256::from_be_bytes(slot.0),
+                    &U256::from_be_bytes(value.0),
+                );
             }
         }
     }
     Ok(())
 }
 
-/// Convert a [`GenesisAccount`] into a revm [`AccountInfo`].
+/// Convert a [`GenesisAccount`] into an evm2 [`AccountInfo`].
 pub fn build_account_info(account: &GenesisAccount) -> AccountInfo {
-    let code = account.code.as_ref().map(|c| Bytecode::new_raw(Bytes::copy_from_slice(c)));
-    let code_hash = code.as_ref().map(|c| keccak256(c.original_byte_slice()));
-    AccountInfo {
-        balance: account.balance,
-        nonce: account.nonce.unwrap_or_default(),
-        code_hash: code_hash.unwrap_or(revm::primitives::KECCAK_EMPTY),
-        code,
-        account_id: None,
+    let info = AccountInfo::default()
+        .with_balance(account.balance)
+        .with_nonce(account.nonce.unwrap_or_default());
+    match &account.code {
+        Some(code) => info.with_code(Bytecode::new_raw(Bytes::copy_from_slice(code))),
+        None => info,
     }
 }
 

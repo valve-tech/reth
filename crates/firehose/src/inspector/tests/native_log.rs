@@ -3,9 +3,10 @@
 
 use super::support::*;
 use crate::inspector::*;
-use reth_revm::revm::primitives::hardfork::SpecId;
+use evm2::SpecId;
+use firehose_tracer::pb;
 
-/// `SYSTEM_ADDRESS`, the emitter revm stamps on every [EIP-7708] log.
+/// `SYSTEM_ADDRESS`, the emitter evm2 stamps on every [EIP-7708] log.
 ///
 /// [EIP-7708]: https://eips.ethereum.org/EIPS/eip-7708
 const NATIVE_LOG_ADDRESS: Address = Address::new([
@@ -17,7 +18,8 @@ const CONTRACT_A: Address = Address::repeat_byte(0xa1);
 const CONTRACT_B: Address = Address::repeat_byte(0xb1);
 
 /// The `identity` precompile, used as a stand-in for any real mainnet precompile — as
-/// opposed to [`PRECOMPILE`] (a made-up address) used for hand-driven hook tests.
+/// opposed to [`PRECOMPILE`], a made-up address the precompile tests install a custom
+/// precompile at.
 const IDENTITY_PRECOMPILE: Address =
     Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
 
@@ -67,7 +69,7 @@ fn native_transfer_log_attaches_to_root_call() {
     assert_native_transfer(&call.logs[0], SENDER, RECIPIENT, 1_000);
 }
 
-/// The log belongs to the callee, not the caller: revm appends it after taking the callee's
+/// The log belongs to the callee, not the caller: evm2 appends it after taking the callee's
 /// checkpoint, so that is the frame it reverts with. Here the root call moves no value and
 /// must stay empty while the inner call carries the transfer.
 #[test]
@@ -88,10 +90,10 @@ fn native_transfer_log_attaches_to_callee_not_caller() {
     assert_native_transfer(&trx.calls[1].logs[0], CONTRACT_A, RECIPIENT, 1_000);
 }
 
-/// Regression: `log_full` sets the watermark to the full journal length, so a `LOG` opcode
-/// executed after an undrained journal log strands that log forever. Without the drain on
-/// the frame's first `step`, the incoming EIP-7708 log is swallowed here and the call tree
-/// ends up one log short of the receipt.
+/// A native transfer log and an opcode log in the same frame both land on it, in emission
+/// order: the transfer log, appended before the frame's first opcode, takes block index 0 and
+/// the `LOG0` after it index 1. Missing either leaves the call tree one log short of the
+/// receipt.
 #[test]
 fn native_transfer_log_survives_an_opcode_log_in_the_same_frame() {
     let a = code_account(&op_log0(), 0);
@@ -113,17 +115,15 @@ fn native_transfer_log_survives_an_opcode_log_in_the_same_frame() {
 }
 
 /// The native transfer log must take an ordinal AFTER the balance changes for the very
-/// transfer it describes. This is the property that keeps [`FirehoseInspector::log`]
-/// deliberately empty: revm calls that hook before the frame's first `step`, which is where
-/// the balance changes are emitted, so forwarding the log there would announce the transfer
-/// ahead of the money moving. A consumer replaying the call by ordinal would see the event
-/// before its effect.
+/// transfer it describes. evm2 calls the inspector's `log` hook before the frame's first
+/// opcode, ahead of the hook that would otherwise report the transfer, so the hook flushes the
+/// journal first: forwarding the log straight away would announce the transfer ahead of the
+/// money moving. A consumer replaying the call by ordinal would see the event before its
+/// effect.
 #[test]
 fn native_transfer_log_is_ordered_after_its_balance_changes() {
-    use pb::sf::ethereum::r#type::v2::balance_change::Reason;
-
     // A contract target, so the frame executes opcodes and the transfer balance changes are
-    // emitted from the first `step` rather than from `call_end`.
+    // not left for the frame's exit to report.
     let a = code_account(&op_log0(), 0);
     let block = drive_tx(
         SpecId::AMSTERDAM,
@@ -156,9 +156,9 @@ fn native_transfer_log_is_ordered_after_its_balance_changes() {
     }
 }
 
-/// Regression: draining only at `call_end` parks an outer frame's log on whichever inner
-/// frame exits first. The tracer drops the logs of reverted calls, so a log that actually
-/// survived would vanish from the call tree while staying in the receipt.
+/// An outer frame's log must not be parked on whichever inner frame exits first. The tracer drops
+/// the logs of reverted calls, so a log that actually survived would vanish from the call tree
+/// while staying in the receipt.
 ///
 /// Here the root call receives value (log survives) and then calls a reverting contract
 /// with value (log reverts with it). The two must end up on different frames.
@@ -220,10 +220,51 @@ fn native_transfer_log_on_selfdestruct_attaches_to_the_destructing_call() {
     assert_native_transfer(&call.logs[0], CONTRACT_A, RECIPIENT, 750);
 }
 
-/// CREATE with value and non-empty initcode: the endowment log is appended to the journal
-/// with no opcode behind it (same as any value transfer), but the frame that follows still
-/// executes at least one opcode (the initcode's `STOP`), so this exercises the drain on the
-/// CREATE frame's first `step` rather than the zero-opcode path `create_end` covers.
+/// Geth's SELFDESTRUCT emits its EIP-7708 transfer log before moving the balance, the reverse of
+/// a call's value transfer.
+#[test]
+fn native_transfer_log_on_selfdestruct_precedes_its_balance_changes() {
+    let mut code = Vec::new();
+    code.extend(push(RECIPIENT.as_slice()));
+    code.push(0xff); // SELFDESTRUCT
+    let a = code_account(&code, 750);
+
+    let block = drive_tx(
+        SpecId::AMSTERDAM,
+        &[(SENDER, balance_account(1_000_000)), (CONTRACT_A, a), (RECIPIENT, balance_account(0))],
+        CONTRACT_A,
+        0,
+    );
+
+    let trx = block.transaction_traces.first().expect("one transaction");
+    let call = trx.calls.first().expect("the root call");
+    let native_log = &call.logs[0];
+    assert_native_transfer(native_log, CONTRACT_A, RECIPIENT, 750);
+
+    let suicide_ordinals: Vec<u64> = call
+        .balance_changes
+        .iter()
+        .filter(|change| {
+            change.reason == Reason::SuicideWithdraw as i32 ||
+                change.reason == Reason::SuicideRefund as i32
+        })
+        .map(|change| change.ordinal)
+        .collect();
+    assert_eq!(suicide_ordinals.len(), 2, "contract withdraw and beneficiary refund");
+    for ordinal in suicide_ordinals {
+        assert!(
+            native_log.ordinal < ordinal,
+            "native transfer log at ordinal {} must precede the balance change at ordinal \
+             {ordinal}",
+            native_log.ordinal,
+        );
+    }
+}
+
+/// CREATE with value and non-empty initcode: the endowment log is emitted with no opcode
+/// behind it (same as any value transfer), and the frame that follows executes at least one
+/// opcode (the initcode's `STOP`), so this covers a CREATE frame that runs code rather than
+/// the zero-opcode one the empty-initcode case below covers.
 #[test]
 fn native_transfer_log_on_create_attaches_to_the_create_call() {
     let value = 1_000u64;
@@ -277,137 +318,33 @@ fn native_transfer_log_on_create2_attaches_to_the_create_call() {
     assert_native_transfer(&create_call.logs[0], CONTRACT_A, created, value);
 }
 
-/// Drives a root CREATE by hand-invoking the inspector's `create`/`create_end` hooks
-/// directly, with the EIP-7708 endowment log placed on the journal between them and no
-/// opcode ever executed — unlike a genuine `CREATE` with empty initcode, where revm pads
-/// the init code into a one-instruction `[STOP]` bytecode object that a real interpreter
-/// run still single-steps (see `Bytecode::new_legacy`), draining the log via the frame's
-/// first `step` and masking the very regression this is meant to pin. Mirrors
-/// `drive_precompile_call`'s hand-driven pattern. Returns the raw FIRE output buffer.
-fn drive_create_with_no_interpreter_step() -> (Vec<u8>, Address, Address) {
-    use reth_revm::revm::{
-        context::Context,
-        context_interface::CreateScheme,
-        database::{CacheDB, EmptyDB},
-        interpreter::{CreateInputs, CreateOutcome, Gas, InstructionResult, InterpreterResult},
-        state::AccountInfo,
-        MainContext,
-    };
-
-    let value = U256::from(1_000u64);
-    let created = CONTRACT_A.create(0);
-
-    let mut db = CacheDB::new(EmptyDB::default());
-    db.insert_account_info(
-        CONTRACT_A,
-        AccountInfo { balance: U256::from(10_000u64), ..Default::default() },
-    );
-    let mut ctx = Context::mainnet().with_db(db);
-
-    let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
-        firehose_tracer::config::Config::default(),
-        firehose_tracer::config::ChainConfig {
-            chain_id: 8453,
-            shanghai_time: Some(0),
-            cancun_time: Some(0),
-            prague_time: None,
-            verkle_time: None,
-        },
-        "reth-firehose-test",
-        "0",
-    );
-
-    {
-        let mut insp = FirehoseInspector::new(&mut tracer);
-        insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
-            block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
-            finalized: None,
-            flash_block: None,
-        });
-        insp.tracer_mut().on_tx_start(
-            firehose_tracer::types::TxEvent {
-                from: CONTRACT_A,
-                to: None,
-                value,
-                ..legacy_tx_event()
-            },
-            None,
-        );
-
-        let mut inputs =
-            CreateInputs::new(CONTRACT_A, CreateScheme::Create, value, Bytes::new(), 100_000, 0);
-
-        // Enter the CREATE frame through the production hook.
-        let _ = insp.create(&mut ctx, &mut inputs);
-
-        // The endowment log for the value transfer, straight on the journal with no
-        // opcode in between — exactly what revm's frame_init does for a real CREATE.
-        ctx.journal_mut().log(AlloyLog {
-            address: NATIVE_LOG_ADDRESS,
-            data: alloy_primitives::LogData::new_unchecked(
-                vec![
-                    native_transfer_topic(),
-                    B256::left_padding_from(CONTRACT_A.as_slice()),
-                    B256::left_padding_from(created.as_slice()),
-                ],
-                Bytes::copy_from_slice(&value.to_be_bytes::<32>()),
-            ),
-        });
-
-        // Exit through the production hook — this is where `create_end`'s drain must run.
-        let mut outcome = CreateOutcome {
-            result: InterpreterResult {
-                result: InstructionResult::Return,
-                output: Bytes::new(),
-                gas: Gas::new(100_000),
-            },
-            address: Some(created),
-            charged_create_state_gas: false,
-        };
-        insp.create_end(&mut ctx, &inputs, &mut outcome);
-
-        let mut receipt = firehose_tracer::types::ReceiptData::new(0, 21_000, 1, 21_000);
-        receipt.add_log(firehose_tracer::types::LogData::new(
-            NATIVE_LOG_ADDRESS,
-            vec![
-                native_transfer_topic(),
-                B256::left_padding_from(CONTRACT_A.as_slice()),
-                B256::left_padding_from(created.as_slice()),
-            ],
-            Bytes::copy_from_slice(&value.to_be_bytes::<32>()),
-            0,
-        ));
-        // Panics ("mismatch between call logs and receipt logs") if the CREATE call
-        // carries fewer logs than the receipt — i.e. if create_end's drain regressed.
-        insp.tracer_mut().on_tx_end(Some(&receipt), None);
-    }
-
-    tracer.on_block_end(None);
-    drop(tracer);
-
-    (buffer.get_bytes(), CONTRACT_A, created)
-}
-
-/// Pins the drain in `create_end` for a CREATE frame that never reaches `step`. A genuine
-/// empty-initcode CREATE does step (revm pads it to `[STOP]`), so this is hand-driven — see
-/// `drive_create_with_no_interpreter_step`. Without that drain the endowment log is
-/// stranded: this is the root call, so no outer frame picks it up.
+/// A root CREATE with value and empty init code: the endowment log is the only log of the
+/// transaction and there is no outer frame to pick it up, so it must land on the CREATE call
+/// itself, whether or not the frame runs an opcode.
 #[test]
 fn native_transfer_log_on_empty_initcode_create_attaches_to_the_create_call() {
-    let (raw, creator, created) = drive_create_with_no_interpreter_step();
-    let block = decode_fire_block(&raw);
+    let block = drive_txs(
+        SpecId::AMSTERDAM,
+        &[(SENDER, balance_account(1_000_000))],
+        &[DriveTx::create(Bytes::new()).with_value(1_000)],
+    );
 
     let trx = block.transaction_traces.first().expect("one transaction");
     let call = trx.calls.first().expect("the root CREATE call");
+    assert_eq!(
+        call.call_type,
+        pb::sf::ethereum::r#type::v2::CallType::Create as i32,
+        "root call is the CREATE"
+    );
 
     assert_eq!(call.logs.len(), 1);
-    assert_native_transfer(&call.logs[0], creator, created, 1_000);
+    assert_native_transfer(&call.logs[0], SENDER, SENDER.create(0), 1_000);
 }
 
 /// A CALL with value to a real precompile (`identity`, address `0x…04`) is still a no-code
 /// target from the EVM's perspective — no opcode ever runs in that frame — so this pins that
-/// the precompile-call path (`was_precompile_called`) gets the same log attachment as any
-/// other no-code callee, not the root that dispatched it.
+/// the precompile call gets the same log attachment as any other no-code callee, not the root
+/// that dispatched it.
 #[test]
 fn native_transfer_log_to_precompile_attaches_to_the_precompile_call() {
     let a = code_account(&op_call_with_value(IDENTITY_PRECOMPILE, 1_000), 10_000);
@@ -461,7 +398,7 @@ fn native_transfer_log_second_tx_continues_block_index() {
     );
 }
 
-/// A zero-value call must not produce a log: revm short-circuits on a zero balance, and a
+/// A zero-value call must not produce a log: evm2 short-circuits on a zero value, and a
 /// spurious entry here would desync every log index in the block.
 #[test]
 fn zero_value_transfer_emits_no_native_log() {
@@ -477,7 +414,7 @@ fn zero_value_transfer_emits_no_native_log() {
 }
 
 /// The fork gate: the exact transfer that produces a native log at Amsterdam must produce
-/// none at Prague. Pins that the drain reports what revm journals rather than synthesising
+/// none at Prague. Pins that the inspector reports the logs evm2 emits rather than synthesising
 /// logs of its own, so pre-Amsterdam chains keep byte-identical Firehose output.
 #[test]
 fn value_transfer_emits_no_native_log_before_amsterdam() {

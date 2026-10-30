@@ -4,7 +4,7 @@
 
 use super::support::*;
 use crate::inspector::*;
-use reth_revm::revm::primitives::hardfork::SpecId;
+use evm2::SpecId;
 
 const CONTRACT: Address = Address::repeat_byte(0xa1);
 

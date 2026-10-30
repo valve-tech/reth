@@ -7,6 +7,45 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.9.0-fh3.1
+
+### Changed
+
+- Update to upstream reth [v2.9.0](https://github.com/paradigmxyz/reth/releases/tag/v2.9.0).
+  Upstream replaced revm and alloy-evm with [evm2](https://github.com/alloy-rs/evm2), so the
+  Firehose tracer now runs as an evm2 inspector. evm2 comes from the `streamingfast/evm2` fork tag
+  `reth-v2.9.0-sf`, which runs block system calls (EIP-2935, EIP-4788, EIP-7002, EIP-7251,
+  EIP-8282) through the inspector. The `streamingfast/evm` alloy-evm fork is no longer used.
+- Update `firehose-tracer` to 5.7.0. The Ethereum block output does not change: reth has no
+  account abstraction (type `0x79`) transactions, so it never fills the new fields.
+
+## reth-v2.8.1-fh3.1
+
+### Changed
+
+- Update to upstream reth [v2.8.1](https://github.com/paradigmxyz/reth/releases/tag/v2.8.1).
+  It removes the Hoodi Amsterdam activation at timestamp `1793036568` scheduled in
+  `reth-v2.8.0-fh3.1`, which has been cancelled.
+
+## reth-v2.8.0-fh3.1
+
+### Changed
+
+- Update to upstream reth [v2.8.0](https://github.com/paradigmxyz/reth/releases/tag/v2.8.0).
+  revm and alloy-evm are unchanged, so alloy-evm still comes from the `streamingfast/evm` fork tag
+  `v0.39.0-sf`.
+
+- Hoodi activates Amsterdam at timestamp `1793036568` (2026-10-26 17:42:48 UTC). Hoodi nodes must
+  run this release or later before then.
+
+- The new `--engine.prewarm-reuse` flag has no effect while Firehose traces. Reusing a prewarm
+  result commits the transaction without executing it, so Firehose would miss it; the traced path
+  executes every transaction.
+
+- The new `--snap.v2` flag syncs a fresh node by downloading state at a recent block instead of
+  executing the chain. Firehose emits no block below that point, and the first traced block is the
+  one after it. Don't use it on a node that must produce Firehose blocks from genesis.
+
 ## reth-v2.7.0-fh3.1-2
 
 ### Fixed

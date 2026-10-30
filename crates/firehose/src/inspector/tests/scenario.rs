@@ -4,7 +4,8 @@
 
 use super::support::*;
 use crate::inspector::*;
-use reth_revm::revm::primitives::hardfork::SpecId;
+use evm2::SpecId;
+use firehose_tracer::pb;
 
 /// Beneficiary of every `selfdestruct-to-other` below, distinct from [`RECIPIENT`] so a
 /// suicide refund cannot be confused with a plain transfer.
@@ -37,7 +38,7 @@ pub(super) struct Scenario {
     pub(super) initcode: Vec<u8>,
     pub(super) endowment: u64,
     pub(super) ops: Vec<Vec<u8>>,
-    pub(super) extra_accounts: Vec<(Address, revm::state::AccountInfo)>,
+    pub(super) extra_accounts: Vec<(Address, AccountInfo)>,
     pub(super) gas_limit: u64,
     pub(super) transactions: usize,
 }
@@ -304,8 +305,6 @@ pub(super) fn balance_change_log_of(
     trx: &pb::sf::ethereum::r#type::v2::TransactionTrace,
     labels: &[(Address, &str)],
 ) -> Vec<String> {
-    use pb::sf::ethereum::r#type::v2::balance_change::Reason;
-
     let mut entries: Vec<_> = trx
         .calls
         .iter()

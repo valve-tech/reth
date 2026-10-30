@@ -684,7 +684,7 @@ walkdir = "2.3.3"
 ipnet = "2.11"
 
 ## Firehose Additions
-firehose-tracer = "=5.5.0"
+firehose-tracer = "=5.7.0"
 reth-firehose = { path = "crates/firehose" }
 reth-firehose-tests = { path = "crates/firehose-tests" }
 
@@ -705,6 +705,13 @@ reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth-core", rev = "
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
 reth-rpc-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
 reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+
+## Firehose additions
+# SF fork of evm2 that can run system calls (EIP-4788, EIP-2935, etc.) through the Inspector.
+[patch."https://github.com/alloy-rs/evm2"]
+evm2 = { git = "https://github.com/streamingfast/evm2", tag = "reth-v2.9.0-sf" }
+evm2-inspectors = { git = "https://github.com/streamingfast/evm2", tag = "reth-v2.9.0-sf" }
+evm2-jit = { git = "https://github.com/streamingfast/evm2", tag = "reth-v2.9.0-sf" }
 
 ## Firehose additions
 # This is needed otherwise we get flooding of debug logs around a problem that seems to happen in Reth directly.

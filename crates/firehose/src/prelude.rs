@@ -1,7 +1,7 @@
 // Common imports used across both ethereum and optimism implementations
 
 // Reth core types
-pub use reth_evm::evm::Evm;
+pub use reth_evm::Evm;
 pub use reth_node_api::{ConfigureEvm, FullNodeComponents};
 pub use reth_provider::StateProviderBox;
 pub use reth_tracing::tracing::{debug, error, info, trace, warn};

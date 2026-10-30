@@ -1,9 +1,32 @@
 //! Shared fixtures for the [`crate::inspector`] tests: well-known addresses, account and
-//! opcode builders, the revm drivers every EVM-level test runs through, and the FIRE output
+//! opcode builders, the block driver every EVM-level test runs through, and the FIRE output
 //! decoder.
 
-use crate::inspector::*;
-use reth_revm::revm::primitives::hardfork::SpecId;
+use crate::{
+    inspector::*, run_wrapped_block, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust,
+    PreTxAdjust,
+};
+use alloy_consensus::{
+    constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH},
+    proofs::calculate_transaction_root,
+    Header, SignableTransaction, TxEip4844, TxEip7702, TxLegacy,
+};
+use alloy_eips::{eip4895::Withdrawals, eip7702::SignedAuthorization};
+use alloy_primitives::{Signature, TxKind};
+use base64::Engine as _;
+use evm2::{
+    bytecode::Bytecode,
+    evm::{AccountInfo, InMemoryDB},
+    SpecId,
+};
+use firehose_tracer::pb;
+use prost::Message as _;
+use reth_chainspec::{ChainSpec, ChainSpecBuilder};
+use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, TransactionSigned};
+use reth_evm::{ConfigureEvm, EvmFor};
+use reth_evm_ethereum::{EthEvmConfig, EvmFactory, RethEvmFactory};
+use reth_primitives_traits::RecoveredBlock;
+use std::{collections::HashMap, sync::Arc};
 
 /// Address of the B-20 activation registry precompile, used here as a stand-in for any
 /// native precompile that writes storage / emits logs directly on the journal.
@@ -14,21 +37,20 @@ pub(super) const SENDER: Address = Address::repeat_byte(0xaa);
 /// Recipient of a plain value transfer, holding no code.
 pub(super) const RECIPIENT: Address = Address::repeat_byte(0xcc);
 
-pub(super) fn code_account(code: &[u8], balance: u64) -> revm::state::AccountInfo {
-    use reth_revm::bytecode::Bytecode;
+/// Chain id of the driven block, and of the transactions and authorizations in it.
+pub(super) const CHAIN_ID: u64 = 1;
 
-    let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
-    revm::state::AccountInfo {
-        balance: U256::from(balance),
-        nonce: 0,
-        code_hash: alloy_primitives::keccak256(bytecode.original_byte_slice()),
-        code: Some(bytecode),
-        account_id: None,
-    }
+/// Gas limit of the driven block, above the sum of what any scenario sends.
+const BLOCK_GAS_LIMIT: u64 = 100_000_000;
+
+pub(super) fn code_account(code: &[u8], balance: u64) -> AccountInfo {
+    AccountInfo::default()
+        .with_balance(U256::from(balance))
+        .with_code(Bytecode::new_raw(Bytes::copy_from_slice(code)))
 }
 
-pub(super) fn balance_account(balance: u64) -> revm::state::AccountInfo {
-    revm::state::AccountInfo { balance: U256::from(balance), ..Default::default() }
+pub(super) fn balance_account(balance: u64) -> AccountInfo {
+    AccountInfo::default().with_balance(U256::from(balance))
 }
 
 /// `PUSHn <bytes>`. `PUSH0` is `0x5f`, so `PUSHn` is `0x5f + n`.
@@ -101,184 +123,200 @@ pub(super) fn op_create2(value: u64, offset: u8, size: u8, salt: u8) -> Vec<u8> 
     code
 }
 
-/// Runs `txs` as separate transactions in one block through revm at `spec`, with the
-/// production inspector attached, then replays each resulting receipt through `on_tx_end`.
+/// Runs `txs` as separate transactions of one block at `spec`, through the production
+/// Firehose block executor, and returns the decoded FIRE block.
 ///
-/// `spec` is a parameter rather than a constant so a test can pin behaviour on both sides of
-/// a fork boundary — EIP-7708 only emits below `SpecId::AMSTERDAM`, and the absence of a log
-/// before it is as much a property worth testing as its presence after.
-///
-/// Going through a genuine `inspect_tx_commit` rather than hand-driven hooks is the point:
-/// EIP-7708 logs are appended by revm's journal outside any opcode, and where revm appends
-/// them is the thing under test, so a fixture that fabricated them would only re-assert this
-/// file's own assumptions. `on_tx_end`
-/// runs `assign_ordinal_and_index_to_receipt_logs`, which panics when the logs collected off
-/// the call tree do not match the receipt one-for-one, in count and in `block_index` order.
-///
-/// A single inspector is built once and shared across every tx, exactly as the production
-/// executor holds one inspector for the whole block: `process_post_tx_balance_changes` is
-/// called after each tx to advance its block-wide log counter, so a second tx's logs
-/// continue numbering after the first's rather than restarting at `block_index` 0.
+/// See [`BlockDriver`] for what this exercises; this is [`BlockDriver::run`] with the default
+/// coinbase, EVM factory and hooks.
 pub(super) fn drive_txs(
     spec: SpecId,
-    accounts: &[(Address, revm::state::AccountInfo)],
+    accounts: &[(Address, AccountInfo)],
     txs: &[DriveTx],
 ) -> pb::sf::ethereum::r#type::v2::Block {
-    use reth_revm::revm::{
-        context::{Context, TxEnv},
-        database::{CacheDB, EmptyDB},
-        primitives::TxKind,
-        InspectCommitEvm, MainBuilder, MainContext,
-    };
-
-    let mut db = CacheDB::new(EmptyDB::default());
-    for (address, info) in accounts {
-        db.insert_account_info(*address, info.clone());
-    }
-
-    let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
-        firehose_tracer::config::Config::default(),
-        firehose_tracer::config::ChainConfig {
-            chain_id: 1,
-            shanghai_time: Some(0),
-            cancun_time: Some(0),
-            prague_time: Some(0),
-            verkle_time: None,
-        },
-        "reth-firehose-test",
-        "0",
-    );
-
-    tracer.on_block_start(firehose_tracer::types::BlockEvent {
-        block: firehose_tracer::types::BlockData { number: 2, ..Default::default() },
-        finalized: None,
-        flash_block: None,
-    });
-
-    // Scoped so the EVM (which owns the inspector, which borrows the tracer) is dropped
-    // before the tracer is used again for `on_block_end`.
-    {
-        let insp = FirehoseInspector::new(&mut tracer);
-        let mut evm = Context::mainnet()
-            .with_db(db)
-            // Matches how the node builds its config (`EthEvmConfig::evm_env`): assigning
-            // `spec` alone leaves the Amsterdam gas params and the EIP-8037/EIP-2780
-            // switches off, so the EVM under test would not be the one that runs in
-            // production.
-            .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(spec))
-            .build_mainnet_with_inspector(insp);
-
-        // Block-wide log count seen so far, mirroring `log_block_index`: a receipt log's
-        // `block_index` is the block-wide position the call tree reports, not the index
-        // within this tx's own `ExecutionResult::logs()`.
-        let mut block_log_offset = 0u32;
-
-        for (tx_index, drive_tx) in txs.iter().enumerate() {
-            let DriveTx { to, ref input, value, gas_limit } = *drive_tx;
-            let tx = TxEnv {
-                caller: SENDER,
-                gas_limit,
-                gas_price: 0,
-                kind: to.map_or(TxKind::Create, TxKind::Call),
-                value: U256::from(value),
-                data: input.clone(),
-                nonce: tx_index as u64,
-                ..Default::default()
-            };
-
-            evm.inspector.tracer_mut().on_tx_start(
-                firehose_tracer::types::TxEvent {
-                    to,
-                    input: input.clone(),
-                    value: U256::from(value),
-                    gas: gas_limit,
-                    gas_price: U256::ZERO,
-                    nonce: tx_index as u64,
-                    ..legacy_tx_event()
-                },
-                None,
-            );
-
-            evm.inspector.start_transaction();
-            let result = evm.inspect_tx_commit(tx).expect("transaction executes");
-
-            // Mirrors the production executor: a transaction revm included without opening its
-            // root frame gets that root traced before the post-tx accounting.
-            if !evm.inspector.root_frame_entered() {
-                let kind = to.map_or(TxKind::Create, TxKind::Call);
-                let value = U256::from(value);
-                let root_gas_limit = FramelessTx::root_gas_limit(
-                    &evm.ctx.cfg,
-                    kind,
-                    SENDER,
-                    value,
-                    input,
-                    gas_limit,
-                    0,
-                    0,
-                    0,
-                );
-                let frameless = FramelessTx {
-                    kind,
-                    value,
-                    input: input.clone(),
-                    nonce: tx_index as u64,
-                    root_gas_limit,
-                };
-                // Gas is free here (`gas_price: 0`), so the gas buy costs nothing.
-                evm.inspector
-                    .trace_frameless_root_call(SENDER, U256::ZERO, frameless, |_| U256::ZERO);
-            }
-
-            let gas_used = result.tx_gas_used();
-            let committed_log_count = result.logs().len() as u32;
-            let mut receipt = firehose_tracer::types::ReceiptData::new(
-                tx_index as u32,
-                gas_used,
-                u64::from(result.is_success()),
-                gas_used,
-            );
-            for (log_index, log) in result.logs().iter().enumerate() {
-                receipt.add_log(firehose_tracer::types::LogData::new(
-                    log.address,
-                    log.topics().to_vec(),
-                    log.data.data.clone(),
-                    block_log_offset + log_index as u32,
-                ));
-            }
-            // Mirrors the production executor, which runs post-tx accounting before
-            // closing the transaction: the gas-refund and coinbase-reward events, and the
-            // nonce/code cleanup of self-destructed accounts, all belong to the
-            // transaction the tracer is still inside. It also advances the block-wide log
-            // counter (`self.log_block_index += committed_log_count`).
-            evm.inspector.process_post_tx_balance_changes(
-                SENDER,
-                Address::ZERO,
-                gas_limit,
-                gas_used,
-                0,
-                0,
-                committed_log_count,
-                |_| U256::ZERO,
-            );
-
-            evm.inspector.tracer_mut().on_tx_end(Some(&receipt), None);
-            block_log_offset += committed_log_count;
-        }
-
-        evm.inspector.tracer_mut().on_block_end(None);
-    }
-
-    decode_fire_block(&buffer.get_bytes())
+    BlockDriver::new(spec, accounts).run(txs)
 }
 
-/// One transaction for [`drive_txs`]. Runs with [`DriveTx::AMPLE_GAS`] unless a scenario
-/// starves it on purpose with [`DriveTx::with_gas`].
+/// Runs one real transaction calling `to` with `value` at `spec`. See [`drive_txs`].
+pub(super) fn drive_tx(
+    spec: SpecId,
+    accounts: &[(Address, AccountInfo)],
+    to: Address,
+    value: u64,
+) -> pb::sf::ethereum::r#type::v2::Block {
+    drive_txs(spec, accounts, &[DriveTx::call(to, value)])
+}
+
+/// Executes one block of transactions with the production inspector attached and returns the
+/// decoded FIRE block.
+///
+/// The block goes through [`run_wrapped_block`] on an [`EthEvmConfig`], the path staged sync
+/// traces blocks with: the EVM is built from the chain spec exactly as the node builds it, the
+/// [`crate::FirehoseWrappedExecutor`] drives the transaction lifecycle (`on_tx_start`,
+/// post-transaction gas accounting, `on_tx_end` with the real receipt), and the block's system
+/// calls run around the transactions. Going through genuine execution rather than hand-driven
+/// hooks is the point: where evm2 journals a change, appends a log or settles gas is the thing
+/// under test, so a fixture that fabricated those would only re-assert this file's own
+/// assumptions. `on_tx_end` runs `assign_ordinal_and_index_to_receipt_logs`, which panics when
+/// the logs collected off the call tree do not match the receipt one-for-one.
+///
+/// `spec` selects the hardforks active in the block, so a test can pin behaviour on both sides
+/// of a fork boundary.
+pub(super) struct BlockDriver<'a, F = RethEvmFactory, A = NoPreTxAdjust> {
+    spec: SpecId,
+    accounts: &'a [(Address, AccountInfo)],
+    coinbase: Address,
+    evm_factory: F,
+    adjust: A,
+}
+
+impl<'a> BlockDriver<'a> {
+    pub(super) fn new(spec: SpecId, accounts: &'a [(Address, AccountInfo)]) -> Self {
+        Self {
+            spec,
+            accounts,
+            coinbase: Address::ZERO,
+            evm_factory: RethEvmFactory::default(),
+            adjust: NoPreTxAdjust,
+        }
+    }
+}
+
+impl<'a, F, A> BlockDriver<'a, F, A> {
+    /// Sets the block beneficiary, credited the priority fee of every transaction.
+    pub(super) const fn with_coinbase(mut self, coinbase: Address) -> Self {
+        self.coinbase = coinbase;
+        self
+    }
+
+    /// Builds the block's EVM with `evm_factory` instead of the node's default one.
+    pub(super) fn with_evm_factory<F2>(self, evm_factory: F2) -> BlockDriver<'a, F2, A> {
+        let Self { spec, accounts, coinbase, adjust, .. } = self;
+        BlockDriver { spec, accounts, coinbase, evm_factory, adjust }
+    }
+
+    /// Installs a chain-specific [`PreTxAdjust`] hook on the executor.
+    pub(super) fn with_pre_tx_adjust<A2>(self, adjust: A2) -> BlockDriver<'a, F, A2> {
+        let Self { spec, accounts, coinbase, evm_factory, .. } = self;
+        BlockDriver { spec, accounts, coinbase, evm_factory, adjust }
+    }
+
+    pub(super) fn run(self, txs: &[DriveTx]) -> pb::sf::ethereum::r#type::v2::Block
+    where
+        F: EvmFactory,
+        EthEvmConfig<ChainSpec, F>: ConfigureEvm<Primitives = EthPrimitives>,
+        for<'e> A: PreTxAdjust<EvmFor<'e, EthEvmConfig<ChainSpec, F>>>,
+    {
+        let evm_config =
+            EthEvmConfig::new_with_evm_factory(chain_spec(self.spec), self.evm_factory);
+
+        let mut db = InMemoryDB::default();
+        let mut nonces = HashMap::new();
+        for (address, info) in self.accounts {
+            db.insert_account_info(address, info.clone());
+            nonces.insert(*address, info.nonce);
+        }
+
+        let (transactions, senders): (Vec<_>, Vec<_>) = txs
+            .iter()
+            .map(|tx| {
+                let nonce = nonces.entry(tx.sender).or_default();
+                let signed = tx.sign(*nonce);
+                *nonce += 1;
+                (signed, tx.sender)
+            })
+            .unzip();
+
+        let header = Header {
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            transactions_root: calculate_transaction_root(&transactions),
+            receipts_root: EMPTY_ROOT_HASH,
+            withdrawals_root: Some(EMPTY_ROOT_HASH),
+            number: 2,
+            timestamp: 24,
+            gas_limit: BLOCK_GAS_LIMIT,
+            beneficiary: self.coinbase,
+            base_fee_per_gas: Some(0),
+            parent_beacon_block_root: Some(B256::ZERO),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            slot_number: self.spec.enables(SpecId::AMSTERDAM).then_some(0),
+            ..Default::default()
+        };
+        let block = Block {
+            header,
+            body: BlockBody {
+                transactions,
+                ommers: Vec::new(),
+                withdrawals: Some(Withdrawals::default()),
+            },
+        };
+        let block = RecoveredBlock::new_unhashed(block, senders);
+
+        let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+            firehose_tracer::config::Config::default(),
+            firehose_tracer::config::ChainConfig {
+                chain_id: CHAIN_ID,
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: Some(0),
+                verkle_time: None,
+            },
+            "reth-firehose-test",
+            "0",
+        );
+        let mut block_tracer = FirehoseBlockTracer::start_local::<EthPrimitives>(
+            Box::new(tracer),
+            block.sealed_block(),
+            None,
+        );
+
+        run_wrapped_block(
+            &evm_config,
+            &mut db,
+            &block,
+            &mut block_tracer,
+            self.adjust,
+            NoPostTxExtras,
+        )
+        .expect("block executes");
+        block_tracer.mark_verified();
+
+        decode_fire_block(&buffer.get_bytes())
+    }
+}
+
+/// Chain spec with every hardfork up to `spec` active at genesis, and none after it.
+fn chain_spec(spec: SpecId) -> Arc<ChainSpec> {
+    let builder = ChainSpecBuilder::mainnet();
+    let builder = match spec {
+        SpecId::PRAGUE => builder.prague_activated(),
+        SpecId::OSAKA => builder.osaka_activated(),
+        SpecId::AMSTERDAM => builder.amsterdam_activated(),
+        other => panic!("no chain spec for {other:?}"),
+    };
+    Arc::new(builder.build())
+}
+
+/// One transaction for [`drive_txs`]: a legacy transaction from [`SENDER`] paying no gas,
+/// with [`DriveTx::AMPLE_GAS`], unless a scenario changes it.
+///
+/// Transactions of the same sender take consecutive nonces, starting from the sender's account
+/// nonce.
 pub(super) struct DriveTx {
+    sender: Address,
     to: Option<Address>,
     input: Bytes,
     value: u64,
     gas_limit: u64,
+    gas_price: u128,
+    envelope: Envelope,
+}
+
+/// Transaction type of a [`DriveTx`].
+enum Envelope {
+    Legacy,
+    Blob { versioned_hashes: Vec<B256>, max_fee_per_blob_gas: u128 },
+    SetCode { authorizations: Vec<SignedAuthorization> },
 }
 
 impl DriveTx {
@@ -286,12 +324,20 @@ impl DriveTx {
 
     /// A call to `to` carrying `value`.
     pub(super) fn call(to: Address, value: u64) -> Self {
-        Self { to: Some(to), input: Bytes::new(), value, gas_limit: Self::AMPLE_GAS }
+        Self {
+            sender: SENDER,
+            to: Some(to),
+            input: Bytes::new(),
+            value,
+            gas_limit: Self::AMPLE_GAS,
+            gas_price: 0,
+            envelope: Envelope::Legacy,
+        }
     }
 
     /// A contract creation running `initcode`.
     pub(super) fn create(initcode: impl Into<Bytes>) -> Self {
-        Self { to: None, input: initcode.into(), value: 0, gas_limit: Self::AMPLE_GAS }
+        Self { to: None, input: initcode.into(), ..Self::call(Address::ZERO, 0) }
     }
 
     /// Sets the calldata (ignored by a creation, whose calldata is its init code).
@@ -300,24 +346,101 @@ impl DriveTx {
         self
     }
 
+    /// Sets the value the transaction transfers.
+    pub(super) const fn with_value(mut self, value: u64) -> Self {
+        self.value = value;
+        self
+    }
+
     /// Sets the gas limit, so a scenario can starve a frame instead of always running to
     /// completion.
-    pub(super) fn with_gas(mut self, gas_limit: u64) -> Self {
+    pub(super) const fn with_gas(mut self, gas_limit: u64) -> Self {
         self.gas_limit = gas_limit;
         self
     }
-}
 
-/// Runs one real transaction through revm at `spec`, with the production inspector
-/// attached, then replays the resulting receipt through `on_tx_end`. See [`drive_txs`] for
-/// what this exercises and why.
-pub(super) fn drive_tx(
-    spec: SpecId,
-    accounts: &[(Address, revm::state::AccountInfo)],
-    to: Address,
-    value: u64,
-) -> pb::sf::ethereum::r#type::v2::Block {
-    drive_txs(spec, accounts, &[DriveTx::call(to, value)])
+    /// Sets the gas price. The block's base fee is zero, so all of it is priority fee.
+    pub(super) const fn with_gas_price(mut self, gas_price: u128) -> Self {
+        self.gas_price = gas_price;
+        self
+    }
+
+    /// Sends the transaction from `sender` instead of [`SENDER`].
+    pub(super) const fn with_sender(mut self, sender: Address) -> Self {
+        self.sender = sender;
+        self
+    }
+
+    /// Makes the transaction an EIP-4844 blob transaction carrying `blobs` blobs, paying
+    /// `max_fee_per_blob_gas` per blob gas.
+    pub(super) fn with_blobs(mut self, blobs: u8, max_fee_per_blob_gas: u128) -> Self {
+        let versioned_hashes = (0..blobs)
+            .map(|index| {
+                let mut hash = B256::repeat_byte(index);
+                hash[0] = alloy_eips::eip4844::VERSIONED_HASH_VERSION_KZG;
+                hash
+            })
+            .collect();
+        self.envelope = Envelope::Blob { versioned_hashes, max_fee_per_blob_gas };
+        self
+    }
+
+    /// Makes the transaction an EIP-7702 set-code transaction carrying `authorizations`.
+    pub(super) fn with_authorizations(mut self, authorizations: Vec<SignedAuthorization>) -> Self {
+        self.envelope = Envelope::SetCode { authorizations };
+        self
+    }
+
+    /// Builds the signed transaction at `nonce`. The signature is a placeholder: the driver
+    /// hands the executor the sender directly.
+    fn sign(&self, nonce: u64) -> TransactionSigned {
+        let signature = Signature::test_signature();
+        let value = U256::from(self.value);
+        let input = self.input.clone();
+        let to = || self.to.expect("only a legacy transaction can create a contract");
+        match &self.envelope {
+            Envelope::Legacy => TxLegacy {
+                chain_id: Some(CHAIN_ID),
+                nonce,
+                gas_price: self.gas_price,
+                gas_limit: self.gas_limit,
+                to: self.to.map_or(TxKind::Create, TxKind::Call),
+                value,
+                input,
+            }
+            .into_signed(signature)
+            .into(),
+            Envelope::Blob { versioned_hashes, max_fee_per_blob_gas } => TxEip4844 {
+                chain_id: CHAIN_ID,
+                nonce,
+                gas_limit: self.gas_limit,
+                max_fee_per_gas: self.gas_price,
+                max_priority_fee_per_gas: self.gas_price,
+                to: to(),
+                value,
+                access_list: Default::default(),
+                blob_versioned_hashes: versioned_hashes.clone(),
+                max_fee_per_blob_gas: *max_fee_per_blob_gas,
+                input,
+            }
+            .into_signed(signature)
+            .into(),
+            Envelope::SetCode { authorizations } => TxEip7702 {
+                chain_id: CHAIN_ID,
+                nonce,
+                gas_limit: self.gas_limit,
+                max_fee_per_gas: self.gas_price,
+                max_priority_fee_per_gas: self.gas_price,
+                to: to(),
+                value,
+                access_list: Default::default(),
+                authorization_list: authorizations.clone(),
+                input,
+            }
+            .into_signed(signature)
+            .into(),
+        }
+    }
 }
 
 pub(super) fn legacy_tx_event() -> firehose_tracer::types::TxEvent {
@@ -341,15 +464,13 @@ pub(super) fn legacy_tx_event() -> firehose_tracer::types::TxEvent {
         blob_gas_fee_cap: None,
         blob_hashes: Vec::new(),
         set_code_authorizations: Vec::new(),
+        account_abstraction_trx_input: None,
     }
 }
 
 /// firehose-tracer exposes no FIRE BLOCK parser (only `InMemoryBuffer::get_bytes`), so
 /// pull the base64 protobuf payload off the single FIRE BLOCK line and decode it here.
 pub(super) fn decode_fire_block(raw: &[u8]) -> pb::sf::ethereum::r#type::v2::Block {
-    use base64::Engine as _;
-    use prost::Message as _;
-
     let text = std::str::from_utf8(raw).expect("FIRE output is UTF-8");
     let line = text.lines().find(|l| l.starts_with("FIRE BLOCK ")).expect("a FIRE BLOCK line");
     let payload = line.split(' ').next_back().expect("payload token");

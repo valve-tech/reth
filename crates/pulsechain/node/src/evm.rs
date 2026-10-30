@@ -35,7 +35,8 @@ use reth_evm_ethereum::{
     EthEvmConfig, EthEvmEnv, EvmFactory, ExecutableRecoveredTx, RethEvmFactory,
     RethReceiptBuilder,
 };
-use reth_execution_types::{BlockExecutionResult, BundleState, StateUpdate};
+use reth_execution_types::StateUpdate;
+use reth_trie_common::bundle_state::BundleState;
 use reth_node_builder::{components::ExecutorBuilder, BuilderContext, FullNodeTypes, NodeTypes};
 use reth_primitives_traits::{SealedBlock, SealedHeader, SignedTransaction};
 use reth_storage_errors::any::AnyError;
@@ -183,10 +184,7 @@ impl<T: evm2::EvmTypes> PrimordialPulseStateWriter for PrimordialPulseChanges<'_
     fn set_storage(&mut self, address: Address, slot: B256, value: B256) {
         self.current_or_empty(address);
         let key = U256::from_be_bytes(slot.0);
-        let original = self
-            .evm
-            .overlay_db_mut()
-            .get_storage(&address, &key)
+        let original = DynDatabase::get_storage(self.evm.overlay_db_mut(), &address, &key)
             .expect("PrimordialPulse: database read of a storage slot failed");
         self.storage.push((address, key, original, U256::from_be_bytes(value.0)));
     }
@@ -392,7 +390,7 @@ where
     where
         Self: 'a,
     {
-        let block_number = evm.block_env().number.saturating_to::<u64>();
+        let block_number = evm.block().number.saturating_to::<u64>();
         let receipt_builder = self.inner.receipt_builder();
         let inner = if is_eth_post_merge_replay(block_number, self.primordial_pulse_block) {
             EthBlockExecutor::new(evm, ctx, MAINNET.as_ref(), receipt_builder)

@@ -49,9 +49,9 @@ pub mod runner;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
-    reject_jit_capable_inner, run_wrapped_block, take_traced_block_access_list, ChainHooks,
-    FirehoseBlockExecutor, FirehoseEvmConfig, FirehoseLiveHooks, FirehoseWrappedExecutor,
-    LiveTracedEvm, NoChainHooks, NoPostTxExtras, NoPreTxAdjust, PostTxExtras, PreTxAdjust,
+    record_block_access_list, run_wrapped_block, BlockFees, ChainHooks, FirehoseBlockExecutor,
+    FirehoseEvmConfig, FirehoseLiveHooks, FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras,
+    NoPreTxAdjust, PostTxExtras, PreTxAdjust,
 };
 pub use finality::finalized_ref_for_block;
 pub use firehose_tracer::types::FinalizedBlockRef;
@@ -60,7 +60,7 @@ pub use health::{
     HealthStatus, HEALTH_HTTP_PATH, HEALTH_LISTEN_ADDR, HEALTH_REL_PATH,
 };
 pub use init::{emit_genesis_block_on_empty_chain, init_blockchain};
-pub use inspector::{FramelessTx, PostTxGasAccounting};
+pub use inspector::{FirehoseInspector, FramelessTx, PostTxGasAccounting};
 pub use runner::run_exex;
 
 use std::{

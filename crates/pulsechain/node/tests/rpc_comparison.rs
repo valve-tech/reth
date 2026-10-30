@@ -139,7 +139,7 @@ fn test_evm_cfg_chain_id_before_primordial_pulse_is_1() {
     let header = Header { number: PRIMORDIAL_PULSE_MAINNET_BLOCK - 1, ..Default::default() };
     let env = config.evm_env(&header).unwrap();
     assert_eq!(
-        env.cfg_env.chain_id, 1,
+        env.version.chain_id, 1,
         "EVM cfg.chain_id must be 1 before PrimordialPulse (Ethereum history replay)"
     );
 }
@@ -150,7 +150,7 @@ fn test_evm_cfg_chain_id_at_primordial_pulse_switches_to_369() {
     let config = PulsechainEvmConfig::new(PULSECHAIN.clone());
     let header = Header { number: PRIMORDIAL_PULSE_MAINNET_BLOCK, ..Default::default() };
     let env = config.evm_env(&header).unwrap();
-    assert_eq!(env.cfg_env.chain_id, 369, "EVM cfg.chain_id must be 369 at PrimordialPulse block");
+    assert_eq!(env.version.chain_id, 369, "EVM cfg.chain_id must be 369 at PrimordialPulse block");
 }
 
 /// After PrimordialPulse, PulseChain EVM must continue to report chain_id = 369.
@@ -160,7 +160,7 @@ fn test_evm_cfg_chain_id_after_primordial_pulse_is_369() {
     let header =
         Header { number: PRIMORDIAL_PULSE_MAINNET_BLOCK + 1_000_000, ..Default::default() };
     let env = config.evm_env(&header).unwrap();
-    assert_eq!(env.cfg_env.chain_id, 369);
+    assert_eq!(env.version.chain_id, 369);
 }
 
 /// At the PrimordialPulse block, PulseChain's EVM chain_id differs from
@@ -177,12 +177,12 @@ fn test_evm_cfg_chain_id_pulsechain_differs_from_ethereum_at_fork_block() {
     let pulse_env = pulse_config.evm_env(&fork_header).unwrap();
 
     // PulseChain at PrimordialPulse: 369
-    assert_eq!(pulse_env.cfg_env.chain_id, 369);
+    assert_eq!(pulse_env.version.chain_id, 369);
 
     // Ethereum at the same block number: always 1
     let eth_chain_id_at_same_block: u64 = 1;
     assert_ne!(
-        pulse_env.cfg_env.chain_id, eth_chain_id_at_same_block,
+        pulse_env.version.chain_id, eth_chain_id_at_same_block,
         "CHAINID opcode must differ between PulseChain and Ethereum at block {}",
         PRIMORDIAL_PULSE_MAINNET_BLOCK,
     );
@@ -199,8 +199,8 @@ fn test_evm_cfg_chain_id_testnetv4_transition() {
     let pre_env = config.evm_env(&pre_fork).unwrap();
     let fork_env = config.evm_env(&at_fork).unwrap();
 
-    assert_eq!(pre_env.cfg_env.chain_id, 1, "testnet v4 EVM chain_id must be 1 before fork");
-    assert_eq!(fork_env.cfg_env.chain_id, 943, "testnet v4 EVM chain_id must be 943 at fork");
+    assert_eq!(pre_env.version.chain_id, 1, "testnet v4 EVM chain_id must be 1 before fork");
+    assert_eq!(fork_env.version.chain_id, 943, "testnet v4 EVM chain_id must be 943 at fork");
 }
 
 /// The chain_id helper functions agree with PulsechainEvmConfig::evm_env.
@@ -215,7 +215,7 @@ fn test_chain_id_helpers_agree_with_evm_config() {
         let header = Header { number: block, ..Default::default() };
         let env = config.evm_env(&header).unwrap();
         assert_eq!(
-            env.cfg_env.chain_id,
+            env.version.chain_id,
             chain_id_at_block_mainnet(block),
             "evm_env chain_id must agree with chain_id_at_block_mainnet at block {block}"
         );
@@ -225,7 +225,7 @@ fn test_chain_id_helpers_agree_with_evm_config() {
         let header = Header { number: block, ..Default::default() };
         let env = config.evm_env(&header).unwrap();
         assert_eq!(
-            env.cfg_env.chain_id,
+            env.version.chain_id,
             chain_id_at_block_mainnet(block),
             "evm_env chain_id must agree with chain_id_at_block_mainnet at block {block}"
         );

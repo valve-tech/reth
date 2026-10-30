@@ -21,7 +21,7 @@ use alloy_consensus::BlockHeader;
 use alloy_primitives::Sealable;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, SealedBlock};
-use std::{fmt::Debug, ops::DerefMut, sync::MutexGuard};
+use std::{cell::RefMut, fmt::Debug, ops::DerefMut, sync::MutexGuard};
 
 use crate::{inspector::FirehoseInspector, mapper};
 
@@ -32,16 +32,18 @@ pub type GlobalTracerGuard = MutexGuard<'static, firehose_tracer::Tracer>;
 ///
 /// `G` is the tracer-handle type. By default it's [`GlobalTracerGuard`] — i.e. a `MutexGuard`
 /// pointing at the process-wide tracer installed via [`crate::init_tracer`]. Tests and other
-/// callers that need a self-contained tracer can use `FirehoseBlockTracer<&'a mut
-/// firehose_tracer::Tracer>` via [`FirehoseBlockTracer::start_local`] to bypass the global
-/// entirely.
+/// callers that need a self-contained tracer pass their own handle (a `Box<Tracer>`, for one) to
+/// [`FirehoseBlockTracer::start_local`] to bypass the global entirely.
+///
+/// The handle is owned by the block's [`FirehoseInspector`] state and released once the guard and
+/// every inspector clone installed on an EVM are dropped.
 ///
 /// See the module-level documentation for the full lifecycle contract.
 pub struct FirehoseBlockTracer<G = GlobalTracerGuard>
 where
     G: DerefMut<Target = firehose_tracer::Tracer>,
 {
-    guard: G,
+    inspector: FirehoseInspector<G>,
     status: Status,
 }
 
@@ -79,25 +81,21 @@ impl FirehoseBlockTracer<GlobalTracerGuard> {
         <N::Block as BlockTrait>::Body: BlockBody,
         <<N::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: BlockHeader + Sealable,
     {
-        let mut guard = crate::tracer();
-        guard.on_block_start(firehose_tracer::types::BlockEvent {
-            block: mapper::to_block_data(block),
-            finalized,
-            flash_block: None,
-        });
-        Self { guard, status: Status::Started }
+        Self::start_local::<N>(crate::tracer(), block, finalized)
     }
 }
 
-impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
-    /// Borrow-based variant of [`Self::start`] that drives the block lifecycle through a
+impl<G> FirehoseBlockTracer<G>
+where
+    G: DerefMut<Target = firehose_tracer::Tracer>,
+{
+    /// Variant of [`Self::start`] that drives the block lifecycle through a
     /// caller-supplied tracer instance instead of the process-wide global.
     ///
     /// This is intended for tests and one-off integration harnesses that need a self-contained
     /// tracer (e.g. one whose output writer is an in-memory buffer they can later inspect).
-    /// Callers must keep the tracer alive for the lifetime of the returned guard.
     pub fn start_local<N>(
-        tracer: &'a mut firehose_tracer::Tracer,
+        mut tracer: G,
         block: &SealedBlock<N::Block>,
         finalized: Option<firehose_tracer::types::FinalizedBlockRef>,
     ) -> Self
@@ -113,19 +111,18 @@ impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
             finalized,
             flash_block: None,
         });
-        Self { guard: tracer, status: Status::Started }
+        Self { inspector: FirehoseInspector::new(tracer), status: Status::Started }
     }
 
-    /// Borrow-based variant of the flashblock constructor that drives the block lifecycle
+    /// Variant of the flashblock constructor that drives the block lifecycle
     /// through a caller-supplied tracer instead of the process-wide global.
     ///
     /// Emits `on_block_start` with a [`firehose_tracer::types::FlashBlockData`] annotation so
     /// the downstream Firehose consumer knows this is a partial (pre-canonical) block emission.
     ///
-    /// Use this when the flashblock processor owns its own dedicated tracer instance. Callers
-    /// must keep the tracer alive for the lifetime of the returned guard.
+    /// Use this when the flashblock processor owns its own dedicated tracer instance.
     pub fn start_flashblock_local<N>(
-        tracer: &'a mut firehose_tracer::Tracer,
+        mut tracer: G,
         block: &SealedBlock<N::Block>,
         finalized: Option<firehose_tracer::types::FinalizedBlockRef>,
         flash_block_idx: u64,
@@ -146,27 +143,23 @@ impl<'a> FirehoseBlockTracer<&'a mut firehose_tracer::Tracer> {
                 is_final,
             }),
         });
-        Self { guard: tracer, status: Status::Started }
-    }
-}
-
-impl<G> FirehoseBlockTracer<G>
-where
-    G: DerefMut<Target = firehose_tracer::Tracer>,
-{
-    /// Returns a mutable reference to the held tracer, for in-block event emission.
-    pub fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer {
-        &mut self.guard
+        Self { inspector: FirehoseInspector::new(tracer), status: Status::Started }
     }
 
-    /// Builds a [`FirehoseInspector`] that borrows the tracer held by this guard.
+    /// Returns the held tracer, for in-block event emission.
     ///
-    /// The returned inspector is valid for as long as `self` is not otherwise borrowed.
-    /// Typically this inspector is moved into an EVM via `evm_with_env_and_inspector`, then
-    /// dropped automatically when the executor is consumed by `finish()` — at which point the
-    /// tracer becomes accessible again via [`Self::tracer_mut`] / [`Self::mark_verified`].
-    pub fn inspector(&mut self) -> FirehoseInspector<'_> {
-        FirehoseInspector::new(&mut self.guard)
+    /// Panics when called while an inspector hook of this block is running.
+    pub fn tracer_mut(&mut self) -> RefMut<'_, firehose_tracer::Tracer> {
+        self.inspector.tracer_mut()
+    }
+
+    /// Returns the [`FirehoseInspector`] tracing this block into the held tracer.
+    ///
+    /// The inspector shares its state with this guard. It is installed on the block's EVM by
+    /// [`crate::FirehoseWrappedExecutor`] and must be dropped with that EVM before the block ends,
+    /// so the tracer handle is released.
+    pub fn inspector(&self) -> FirehoseInspector<G> {
+        self.inspector.clone()
     }
 
     /// Consumes the guard and emits `on_block_end(None)`, flushing the block to stdout.
@@ -175,7 +168,7 @@ where
     /// consensus checks) have succeeded. Calling it earlier risks flushing a block that later
     /// turns out to be invalid.
     pub fn mark_verified(mut self) {
-        self.guard.on_block_end(None);
+        self.inspector.tracer_mut().on_block_end(None);
         self.status = Status::Consumed;
     }
 
@@ -190,13 +183,13 @@ where
     /// [`Self::mark_verified`] for normal blocks and reserve this for guards created by
     /// [`Self::start_flashblock_local`].
     pub fn mark_flashblock(mut self) {
-        self.guard.on_block_end(None);
+        self.inspector.tracer_mut().on_block_end(None);
         self.status = Status::Consumed;
     }
 
     /// Consumes the guard and emits `on_block_end(Some(err))`, discarding the block.
     pub fn mark_failed(mut self, err: &dyn std::error::Error) {
-        self.guard.on_block_end(Some(err));
+        self.inspector.tracer_mut().on_block_end(Some(err));
         self.status = Status::Consumed;
     }
 }
@@ -212,7 +205,7 @@ where
             let err = std::io::Error::other(
                 "FirehoseBlockTracer dropped without mark_verified/mark_failed",
             );
-            self.guard.on_block_end(Some(&err));
+            self.inspector.tracer_mut().on_block_end(Some(&err));
         }
     }
 }

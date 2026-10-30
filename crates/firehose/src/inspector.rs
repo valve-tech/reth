@@ -1,23 +1,24 @@
-use alloy_primitives::{Address, Bytes, Log as AlloyLog, B256, U256};
+use alloy_primitives::{Address, Bytes, Log as AlloyLog, B256, KECCAK256_EMPTY, U256};
+use evm2::{
+    evm::{AccountInfo, DynDatabase as _, JournalEntry, SYSTEM_MAX_SSTORES_PER_CALL},
+    interpreter::{InstrStop, Interpreter, Message, MessageKind, MessageResult, Word},
+    version::GasId,
+    Evm, EvmTypes, Inspector,
+};
 use firehose_tracer::{
-    pb,
+    pb::sf::ethereum::r#type::v2::balance_change::Reason,
     types::{Opcode, StringError},
 };
-use reth_revm::revm::{
-    context::JournalEntry,
-    context_interface::{cfg::gas_params::Eip2780TxInfo, Cfg, ContextTr, JournalTr},
-    inspector::{Inspector, JournalExt},
-    interpreter::{
-        interpreter::EthInterpreter,
-        interpreter_types::{Jumps, LoopControl},
-        CallInputs, CallOutcome, CreateInputs, CreateOutcome, Gas, Interpreter,
-    },
-    primitives::{TxKind, KECCAK_EMPTY},
-};
 use std::{
+    cell::{RefCell, RefMut},
     collections::{HashMap, HashSet},
     fmt::Debug,
+    ops::DerefMut,
+    rc::Rc,
+    sync::LazyLock,
 };
+
+use crate::block_tracer::GlobalTracerGuard;
 
 /// The largest preimage, in bytes, recorded in `Call.keccak_preimages`. The map exists so a
 /// consumer can walk a storage slot back to the expression that produced it, and Solidity's slot
@@ -29,18 +30,15 @@ use std::{
 /// worse than no entry at all.
 const MAX_KECCAK_PREIMAGE_SIZE: usize = 256;
 
-struct StepContext {
-    start_journal_idx: usize,
-    pc: u64,
-    gas: u64,
-    depth: i32,
-    opcode: u8,
-    /// For KECCAK256: preimage captured in `step` (where stack still holds offset/size),
-    /// emitted from `step_end` only when the opcode did not halt. Mirrors Geth's firehose
-    /// tracer, which hooks the opcode body after the gas charge and so emits no preimage
-    /// when KECCAK256 fails (e.g. OOG on memory expansion).
-    keccak_preimage: Option<(B256, Vec<u8>)>,
-}
+/// The EIP-8037 state-gas reservoir of a system call, sized for
+/// [`SYSTEM_MAX_SSTORES_PER_CALL`] new slots at Amsterdam's state gas price.
+///
+/// Geth reports a system call's gas as its regular limit plus this reservoir in every fork. evm2
+/// keeps the reservoir out of the message's regular gas, and only grants it from Amsterdam on.
+static SYSTEM_CALL_STATE_GAS_RESERVOIR: LazyLock<u64> = LazyLock::new(|| {
+    let params = &evm2::Version::new(evm2::SpecId::AMSTERDAM).gas_params;
+    params.get(GasId::SstoreSetState) * SYSTEM_MAX_SSTORES_PER_CALL
+});
 
 /// Gas-fee parameters for the post-transaction `GasRefund` and `RewardTransactionFee` balance
 /// changes of one transaction.
@@ -79,167 +77,65 @@ impl PostTxGasAccounting {
 }
 
 /// The transaction fields [`FirehoseInspector::trace_frameless_root_call`] needs to trace the
-/// root call revm never opened.
+/// root call evm2 never opened.
 #[derive(Debug, Clone)]
 pub struct FramelessTx {
     /// Whether the transaction is a call (and to whom) or a contract creation.
-    pub kind: TxKind,
+    pub kind: alloy_primitives::TxKind,
     /// Value the transaction would have transferred.
     pub value: U256,
     /// Calldata, or the init code of a creation.
     pub input: Bytes,
     /// Nonce the transaction was sent with.
     pub nonce: u64,
-    /// Regular gas the root frame would have been handed, see [`Self::root_gas_limit`].
+    /// Regular gas the root frame would have been handed: the transaction gas limit less its
+    /// intrinsic cost, capped at the transaction gas limit cap (the part above it goes to the
+    /// EIP-8037 state gas reservoir instead).
     pub root_gas_limit: u64,
 }
 
-impl FramelessTx {
-    /// Regular gas the root frame of a transaction is handed: what is left of `gas_limit` once
-    /// the intrinsic cost is paid, as revm's `Handler::tx_gas` computes it (the part above
-    /// `tx_gas_limit_cap` goes to the EIP-8037 state gas reservoir instead).
-    #[allow(clippy::too_many_arguments)]
-    pub fn root_gas_limit(
-        cfg: &impl Cfg,
-        kind: TxKind,
-        caller: Address,
-        value: U256,
-        input: &[u8],
-        gas_limit: u64,
-        access_list_accounts: u64,
-        access_list_storages: u64,
-        authorization_count: u64,
-    ) -> u64 {
-        let eip2780 = cfg
-            .is_amsterdam_eip2780_enabled()
-            .then(|| Eip2780TxInfo { value, is_self_transfer: kind.to() == Some(&caller) });
-        let initial = cfg.gas_params().initial_tx_gas(
-            input,
-            kind.is_create(),
-            access_list_accounts,
-            access_list_storages,
-            authorization_count,
-            eip2780,
-        );
-        initial.initial_gas_and_reservoir(gas_limit, cfg.tx_gas_limit_cap()).0
+/// Captures execution traces for the Firehose format.
+///
+/// It is installed on the evm2 EVM as its [`Inspector`] and builds the call tree, state changes
+/// and logs of each transaction and system call. The block tracer and the block executor wrapper
+/// keep clones to drive the block and transaction lifecycle (`on_tx_start`, post-transaction
+/// balance changes, `on_tx_end`, `on_block_end`): all clones share one state, because evm2 cannot
+/// hand back an installed inspector by type.
+///
+/// The inspector owns the tracer handle `G`, so it is `'static` whenever `G` is, as the global
+/// tracer's [`GlobalTracerGuard`] is. The handle is released when the last clone is dropped.
+pub struct FirehoseInspector<G = GlobalTracerGuard>
+where
+    G: DerefMut<Target = firehose_tracer::Tracer>,
+{
+    state: Rc<RefCell<InspectorState<G>>>,
+}
+
+impl<G: DerefMut<Target = firehose_tracer::Tracer>> Clone for FirehoseInspector<G> {
+    fn clone(&self) -> Self {
+        Self { state: Rc::clone(&self.state) }
     }
 }
 
-/// FirehoseInspector captures execution traces for the Firehose format
-/// It hooks into EVM execution via the Inspector trait to build a complete call tree
-pub struct FirehoseInspector<'a> {
-    tracer: &'a mut firehose_tracer::Tracer,
-
-    /// The last opcode executed in `step`, used to detect SSTORE for storage change tracking in
-    /// `step_end`.
-    last_step: Option<StepContext>,
-
-    /// Index into the journal up to which balance/nonce/code changes have already been processed.
-    /// Advances at each call/create entry and exit to avoid processing the same entries twice.
-    journal_processed_up_to: usize,
-
-    /// When true, the next `step` call should process journal changes to pick up
-    /// the value transfer BalanceTransfer entry pushed by frame_init AFTER the
-    /// call/create hook returned. This ensures value transfers for ALL calls
-    /// (successful or failed, root or nested) are captured before any revert.
-    pending_value_transfer_check: bool,
-
-    /// Set in the `call` hook when revm is about to attempt a self-transfer
-    /// (CallScheme::Call with caller == target_address and value > 0). revm
-    /// short-circuits these in `transfer_loaded` without pushing a BalanceTransfer
-    /// journal entry, so we synthesize the two balance change events ourselves
-    /// when the frame actually starts executing (step) or exits successfully
-    /// without any opcode run (call_end on a no-code target).
-    pending_self_transfer: Option<(Address, U256)>,
-
-    /// Value transfer `(from, to, value)` for the current non-self `call`, captured at
-    /// call-enter. `process_journal_changes` clears it once revm's BalanceTransfer journal
-    /// entry has been emitted (stepping callee, or a successful no-step callee). If it
-    /// survives to `call_end`, the call reverted and revm truncated the entry before our
-    /// journal walk could read it. For a no-step callee (a precompile) the transfer would
-    /// otherwise be lost, so `call_end` re-emits it synthetically to match Geth, which
-    /// records the transfer that happened before the revert.
-    pending_value_transfer: Option<(Address, Address, U256)>,
-
-    /// Addresses that executed SELFDESTRUCT and were truly destroyed (AccountDestroyed
-    /// journal entry) during the current transaction.
-    ///
-    /// Entries are added when the opcode runs and are NOT removed when the frame around it
-    /// reverts, so this is a set of candidates: `capture_selfdestruct_cleanup` keeps only the
-    /// ones whose journal entry survived in the committed journal.
-    selfdestruct_addresses: HashSet<Address>,
-
-    /// Captured nonce/code state for self-destructed accounts, to be emitted after post-tx
-    /// balance changes (gas refund, reward). This matches Geth 1.17.x's Finalise timing
-    /// where nonce resets and code clears happen after gas accounting.
-    pending_selfdestruct_cleanups: Vec<SelfdestructCleanupEntry>,
-
-    /// Flat snapshot of all committed journal entries for the current transaction, captured
-    /// at root call/create exit (after execution, before revm's post-execution runs).
-    /// Used in `process_post_tx_balance_changes` to derive correct sender/coinbase balances
-    /// even when the root call reverted and `balance_tracker` is stale.
-    tx_journal_snapshot: Vec<JournalEntry>,
-
-    /// Sender's account balance at the start of root execution (i.e. after all pre-execution
-    /// deductions: gas buy on mainnet, gas buy + L1 cost + operator fee on OP Stack).
-    /// Captured at depth 0 from `account.info.balance` and consumed by
-    /// `process_post_tx_balance_changes` as the starting point for gas-refund accounting.
-    ///
-    /// Without this capture we would derive the post-pre-exec balance by subtracting
-    /// `gas_buy_cost` from the journal's first `BalanceChange { old_balance }` entry — that
-    /// formula is correct only on chains where gas buy is the only pre-exec deduction. OP
-    /// folds L1 cost (and Isthmus-onward operator fee) into the same single `set_balance`
-    /// call inside `validate_against_state_and_deduct_caller`, so the journal entry's
-    /// implicit new balance is `old - gas_buy_cost - additional_op_cost`. Capturing the live
-    /// account balance instead of recomputing makes the sender's gas-refund `old_balance`
-    /// correct on every chain.
-    tx_post_pre_exec_sender_balance: Option<U256>,
-
-    /// Override for the depth-0 root-call sender balance change emitted by
-    /// `enter_frame_pre_hook`. When `None`, the inspector emits the change with reason
-    /// `GasBuy` (mainnet semantics: `validate_against_state_and_deduct_caller` charges the
-    /// caller for `gas_limit * gas_price`). When `Some(reason)`, the inspector emits with
-    /// the supplied reason instead and clears the override (single-shot, per-tx).
-    ///
-    /// The OP Stack uses this to flag deposit transactions: their depth-0 balance change
-    /// is the `mint` credit applied by `OpHandler::validate_against_state_and_deduct_caller`
-    /// (`balance + mint − effective_balance_spending`), not a gas buy. The chain-specific
-    /// `PreTxAdjust` impl detects deposit envelopes (`tx_type == OptimismDeposit`) and calls
-    /// [`Self::set_root_balance_reason`] with `IncreaseMint` before the depth-0 hook fires.
-    /// Any chain that needs a different reason here (e.g. `Burn` for a fee-burn variant) can
-    /// follow the same pattern from its own `PreTxAdjust`.
-    root_balance_reason_override: Option<pb::sf::ethereum::r#type::v2::balance_change::Reason>,
-
-    // increments at the end of each transaction, to get proper block index for logs
-    log_block_index: u32,
-
-    // last seen number of logs in a given transaction
-    trx_logs_count: u32,
-
-    // per-tx journal index up to which StorageChanged entries have been emitted (by the
-    // SSTORE opcode in step_end, or by the precompile gather in call_end). Prevents the
-    // call_end precompile-storage gather from re-emitting opcode SSTOREs.
-    storage_processed_up_to: usize,
-
-    /// Whether the current transaction opened its root frame. Cleared by
-    /// [`Self::start_transaction`], set by the depth-0 frame hook and consumed by
-    /// [`Self::trace_frameless_root_call`], which traces the root call itself when revm included
-    /// the transaction without ever opening one. Cleared at transaction start rather than trusted
-    /// from the previous one because system calls open depth-0 frames too.
-    root_frame_entered: bool,
-}
-
-impl<'a> Debug for FirehoseInspector<'a> {
+impl<G: DerefMut<Target = firehose_tracer::Tracer>> Debug for FirehoseInspector<G> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.borrow();
         f.debug_struct("FirehoseInspector")
-            .field("last_step", &self.last_step.as_ref().map(|s| s.opcode))
-            .field("journal_processed_up_to", &self.journal_processed_up_to)
-            .field("pending_value_transfer_check", &self.pending_value_transfer_check)
-            .field("pending_value_transfer", &self.pending_value_transfer)
-            .field("selfdestruct_addresses", &self.selfdestruct_addresses)
-            .field("tx_journal_snapshot_len", &self.tx_journal_snapshot.len())
+            .field("journal_processed_up_to", &state.journal_processed_up_to)
+            .field("pending_value_transfer", &state.pending_value_transfer)
+            .field("selfdestruct_candidates", &state.selfdestruct_candidates)
             .finish()
     }
+}
+
+struct StepContext {
+    gas: u64,
+    opcode: u8,
+    /// For KECCAK256: preimage captured in `step` (where the stack still holds offset/size),
+    /// emitted from `step_end` only when the opcode did not halt. Mirrors Geth's firehose
+    /// tracer, which hooks the opcode body after the gas charge and so emits no preimage
+    /// when KECCAK256 fails (e.g. OOG on memory expansion).
+    keccak_preimage: Option<(B256, Vec<u8>)>,
 }
 
 /// Pre-destruction state for a self-destructed account, captured at root call exit.
@@ -250,1189 +146,175 @@ struct SelfdestructCleanupEntry {
     code: Bytes,
 }
 
-impl<'a> FirehoseInspector<'a> {
-    /// Create a new FirehoseInspector with a mutable reference to the tracer.
-    pub fn new(tracer: &'a mut firehose_tracer::Tracer) -> Self {
+/// How balance changes found in the journal are attributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// Value transfers of a call or create.
+    Transfer,
+    /// The account creation of a CREATE frame: Geth emits the creator and created-contract nonce
+    /// changes before the endowment transfer.
+    Create,
+    /// The balance moves of a SELFDESTRUCT.
+    Selfdestruct,
+}
+
+struct InspectorState<G> {
+    tracer: G,
+
+    /// The opcode running between `step` and `step_end`.
+    last_step: Option<StepContext>,
+
+    /// Index into the transaction journal up to which entries have been emitted.
+    ///
+    /// evm2 truncates the journal when a frame fails, so this is clamped down to the journal
+    /// length at every scan.
+    journal_processed_up_to: usize,
+
+    /// Attribution of the entries the next scan finds.
+    window: Window,
+
+    /// Set by `call` for a self-transfer (CALL with caller == target and value > 0). evm2's
+    /// `transfer` journals no balance change for it, but Geth reports the debit-then-credit pair,
+    /// so it is synthesized when the frame starts or completes without running code.
+    pending_self_transfer: Option<(Address, U256)>,
+
+    /// Value transfer `(from, to, value)` of the current non-self call, captured at call enter
+    /// and cleared once the scan emitted it. If it survives to `call_end`, the call failed and
+    /// evm2 rolled the transfer back before any hook saw it (a precompile that failed); Geth
+    /// records the transfer that happened before the revert, so `call_end` re-emits it.
+    pending_value_transfer: Option<(Address, Address, U256)>,
+
+    /// Contracts that executed SELFDESTRUCT this transaction. A candidate whose frame reverted
+    /// is still in the set; [`InspectorState::capture_selfdestruct_cleanup`] keeps only the
+    /// accounts still marked destroyed at root exit.
+    selfdestruct_candidates: HashSet<Address>,
+
+    /// Nonce/code state of self-destructed accounts, emitted after the post-transaction balance
+    /// changes to match Geth's `Finalise` ordering.
+    pending_selfdestruct_cleanups: Vec<SelfdestructCleanupEntry>,
+
+    /// Balances at the end of the root frame (after its rollback, before gas refund and
+    /// beneficiary reward) of every account the transaction touched. Read by the post-transaction
+    /// balance changes and by chain-specific extras.
+    post_exec_balances: HashMap<Address, U256>,
+
+    /// Creation nonce bump of the sender of a CREATE transaction. evm2 bumps it with the other
+    /// pre-execution changes, Geth inside the root call, so it is held until `on_call_enter`.
+    deferred_creator_nonce: Option<(Address, u64)>,
+
+    /// Override for the reason of the depth-0 sender balance change, see
+    /// [`FirehoseInspector::set_root_balance_reason`].
+    root_balance_reason_override: Option<Reason>,
+
+    /// Logs emitted by earlier transactions of the block, to derive each log's block index.
+    log_block_index: u32,
+
+    /// Whether the current transaction opened its root frame. Cleared by
+    /// [`FirehoseInspector::start_transaction`], set by the depth-0 frame hook and consumed by
+    /// [`FirehoseInspector::trace_frameless_root_call`].
+    root_frame_entered: bool,
+}
+
+impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
+    /// Creates an inspector emitting into `tracer`.
+    pub fn new(tracer: G) -> Self {
         Self {
-            tracer,
-            last_step: None,
-            journal_processed_up_to: 0,
-            pending_value_transfer_check: false,
-            pending_self_transfer: None,
-            pending_value_transfer: None,
-            selfdestruct_addresses: HashSet::new(),
-            pending_selfdestruct_cleanups: Vec::new(),
-            tx_journal_snapshot: Vec::new(),
-            tx_post_pre_exec_sender_balance: None,
-            root_balance_reason_override: None,
-            log_block_index: 0,
-            trx_logs_count: 0,
-            storage_processed_up_to: 0,
-            root_frame_entered: false,
+            state: Rc::new(RefCell::new(InspectorState {
+                tracer,
+                last_step: None,
+                journal_processed_up_to: 0,
+                window: Window::Transfer,
+                pending_self_transfer: None,
+                pending_value_transfer: None,
+                selfdestruct_candidates: HashSet::new(),
+                pending_selfdestruct_cleanups: Vec::new(),
+                post_exec_balances: HashMap::new(),
+                deferred_creator_nonce: None,
+                root_balance_reason_override: None,
+                log_block_index: 0,
+                root_frame_entered: false,
+            })),
         }
     }
 
-    /// Returns a mutable reference to the tracer, allowing the runner to call tracer lifecycle
-    /// methods (on_tx_start, on_tx_end, etc.) while the inspector owns the tracer borrow.
-    pub fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer {
-        self.tracer
+    /// Returns the tracer, for the lifecycle events the executor emits itself (`on_tx_start`,
+    /// `on_tx_end`, system call boundaries).
+    ///
+    /// Panics when called from inside an inspector hook.
+    pub fn tracer_mut(&self) -> RefMut<'_, firehose_tracer::Tracer> {
+        RefMut::map(self.state.borrow_mut(), |state| &mut *state.tracer)
     }
 
-    /// Override the reason for the depth-0 root-call sender balance change emitted by the next
-    /// transaction. Single-shot: the override is consumed when the depth-0 hook fires. Intended
-    /// for chain-specific `PreTxAdjust` impls (see `root_balance_reason_override` field doc).
-    pub fn set_root_balance_reason(
-        &mut self,
-        reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
-    ) {
-        self.root_balance_reason_override = Some(reason);
+    /// Override the reason for the depth-0 root-call sender balance change of the next
+    /// transaction. Single-shot: the override is consumed when the depth-0 hook fires.
+    ///
+    /// Defaults to `GasBuy`. The OP Stack flags deposit transactions as `IncreaseMint`: their
+    /// depth-0 change is the minted credit, not a gas buy.
+    pub fn set_root_balance_reason(&self, reason: Reason) {
+        self.state.borrow_mut().root_balance_reason_override = Some(reason);
     }
 
-    /// Capture KECCAK256 preimage from the interpreter state.
-    ///
-    /// Called from `step` before the opcode executes. The stack still holds
-    /// the inputs: stack[0] = offset, stack[1] = size.
-    ///
-    /// Since `step` fires before memory resize, the memory region may not yet
-    /// be allocated. Like Geth's `scope.Memory.GetPtr`, we zero-pad any bytes
-    /// beyond current memory length to produce a complete preimage.
-    ///
-    /// Returns the (hash, preimage) pair to be emitted later from `step_end` if the
-    /// opcode actually executes successfully.
-    fn step_keccak256(interp: &mut Interpreter<EthInterpreter>) -> Option<(B256, Vec<u8>)> {
-        let (Ok(offset), Ok(size)) = (interp.stack.peek(0), interp.stack.peek(1)) else {
-            return None;
-        };
-
-        let len = size.saturating_to::<usize>();
-        if len > MAX_KECCAK_PREIMAGE_SIZE {
-            return None;
-        }
-
-        if len == 0 {
-            return Some((alloy_primitives::utils::KECCAK256_EMPTY, Vec::new()));
-        }
-
-        let offset = offset.saturating_to::<usize>();
-        let mem_len = interp.memory.len();
-
-        if offset.checked_add(len).is_some_and(|end| end <= mem_len) {
-            // Happy path: entire region is within current memory, no allocation
-            let preimage = interp.memory.slice_len(offset, len);
-            let hash = alloy_primitives::keccak256(&*preimage);
-            Some((hash, preimage.to_vec()))
-        } else {
-            // Memory not yet resized (step fires before resize_memory!).
-            // Zero-pad like Geth's Memory.GetPtr to produce a complete preimage.
-            //
-            // Growing memory to cover `size` costs quadratic gas (3*w + w^2/512,
-            // w = words). Anything the remaining gas can't pay for OOG-reverts
-            // before the opcode runs, so step_end never emits this preimage; skip
-            // it here as well rather than hashing a region that never existed.
-            //
-            // From 3*w + w^2/512 <= gas, a generous bound is w <= floor(sqrt(512*gas))
-            // (dropping the +3*w term only makes the cap larger, never rejecting a
-            // keccak that would actually execute).
-            let gas = interp.gas.remaining() as u128;
-            let max_words = (512u128.saturating_mul(gas)).isqrt();
-            let max_len = max_words.saturating_mul(32).min(usize::MAX as u128) as usize;
-            if len > max_len {
-                return None;
-            }
-            let mut buf = vec![0u8; len];
-            if offset < mem_len {
-                let copy_len = (mem_len - offset).min(len);
-                buf[..copy_len].copy_from_slice(&interp.memory.slice_len(offset, copy_len));
-            }
-            let hash = alloy_primitives::keccak256(&buf);
-            Some((hash, buf))
-        }
+    /// Resets the per-transaction state that must not carry over from whatever ran before in the
+    /// block, a system call included. Call right before a transaction executes.
+    pub fn start_transaction(&self) {
+        let mut state = self.state.borrow_mut();
+        state.root_frame_entered = false;
+        state.post_exec_balances.clear();
     }
 
-    /// Process new balance/nonce/code journal entries since the last scan and emit the
-    /// corresponding tracer events. Called at strategic points:
-    ///  - BEFORE on_call_enter in `call`/`create` hooks (so parent entries stay on parent)
-    ///  - BEFORE on_call_exit in `call_end`/`create_end` hooks (so child entries stay on child)
-    fn process_journal_changes<CTX>(&mut self, context: &mut CTX)
-    where
-        CTX: ContextTr,
-        CTX::Journal: JournalExt,
-    {
-        use reth_revm::revm::context::JournalEntry;
-
-        let journal_len = context.journal().journal().len();
-
-        // Handle journal rollback: when a call reverts, revm truncates journal entries
-        // from that call's execution. If our pointer is past the new end, snap it to the
-        // current length so we don't re-process parent entries that were already emitted.
-        if self.journal_processed_up_to > journal_len {
-            self.journal_processed_up_to = journal_len;
-        }
-
-        if self.journal_processed_up_to == journal_len {
-            return;
-        }
-
-        // Collect the entries we need to process (clone to avoid borrow conflicts when reading
-        // state)
-        let entries: Vec<_> = context.journal().journal()
-            [self.journal_processed_up_to..journal_len]
-            .iter()
-            .cloned()
-            .collect();
-        self.journal_processed_up_to = journal_len;
-
-        let reason = pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer;
-
-        for entry in entries {
-            match entry {
-                JournalEntry::BalanceChange { address, old_balance } => {
-                    let new_balance = context
-                        .journal()
-                        .evm_state()
-                        .get(&address)
-                        .map(|a| a.info.balance)
-                        .unwrap_or(U256::ZERO);
-                    if old_balance != new_balance {
-                        self.tracer.on_balance_change(address, old_balance, new_balance, reason);
-                    }
-                }
-                JournalEntry::BalanceTransfer { from, to, balance } => {
-                    if !balance.is_zero() {
-                        let evm_state = context.journal().evm_state();
-                        let new_from =
-                            evm_state.get(&from).map(|a| a.info.balance).unwrap_or(U256::ZERO);
-                        let old_from = new_from.saturating_add(balance);
-                        let new_to =
-                            evm_state.get(&to).map(|a| a.info.balance).unwrap_or(U256::ZERO);
-                        let old_to = new_to.saturating_sub(balance);
-
-                        self.tracer.on_balance_change(from, old_from, new_from, reason);
-                        self.tracer.on_balance_change(to, old_to, new_to, reason);
-                    }
-                    // Mark the current call's own value transfer as emitted so call_end
-                    // does not synthesize a duplicate (see `pending_value_transfer`).
-                    if let Some((pf, pt, pv)) = self.pending_value_transfer {
-                        if pf == from && pt == to && pv == balance {
-                            self.pending_value_transfer = None;
-                        }
-                    }
-                }
-                JournalEntry::NonceChange { address, previous_nonce } => {
-                    let new_nonce = context
-                        .journal()
-                        .evm_state()
-                        .get(&address)
-                        .map(|a| a.info.nonce)
-                        .unwrap_or(0);
-                    self.tracer.on_nonce_change(address, previous_nonce, new_nonce);
-                }
-                JournalEntry::NonceBump { address } => {
-                    // NonceBump is pushed by EIP-7702 delegate() and by CREATE frame
-                    // setup (bump_nonce for the caller). EIP-7702 entries are already
-                    // handled by process_eip7702_auth_list and skipped via
-                    // journal_processed_up_to advancement.
-                    let new_nonce = context
-                        .journal()
-                        .evm_state()
-                        .get(&address)
-                        .map(|a| a.info.nonce)
-                        .unwrap_or(0);
-                    let old_nonce = new_nonce.saturating_sub(1);
-                    self.tracer.on_nonce_change(address, old_nonce, new_nonce);
-                }
-                JournalEntry::CodeChange { address, had_code_hash, had_code } => {
-                    let account = context.journal().evm_state().get(&address);
-                    if let Some(account) = account {
-                        let new_hash = account.info.code_hash;
-                        let new_code = account
-                            .info
-                            .code
-                            .as_ref()
-                            .map(|b| b.original_bytes())
-                            .unwrap_or_default();
-                        // revm 42 records the real previous code on the entry and restores it
-                        // on revert. Before that this arm assumed the previous code was always
-                        // empty; that is false for an EIP-7702 account whose delegation is
-                        // reassigned, where the old code is the prior delegation indicator.
-                        let old_code =
-                            had_code.as_ref().map(|b| b.original_bytes()).unwrap_or_default();
-                        self.tracer.on_code_change(
-                            address,
-                            had_code_hash,
-                            new_hash,
-                            old_code.as_ref(),
-                            new_code.as_ref(),
-                        );
-                    }
-                }
-                JournalEntry::AccountCreated { address, .. } => {
-                    // EIP-161a: `create_account_checkpoint` directly sets the newly created
-                    // contract's nonce to 1 WITHOUT pushing a NonceChange/NonceBump entry.
-                    // We derive the 0→1 bump from the AccountCreated marker instead.
-                    //
-                    // Emitting from the journal (rather than at `create_end`) is what matches
-                    // Geth's ordinal ordering: the created-contract nonce bump is interleaved
-                    // with frame_init events (caller nonce bump + balance transfer) BEFORE the
-                    // constructor runs, not emitted after the whole CREATE (which would place
-                    // it after any code deployment and nested calls).
-                    //
-                    // Failure modes automatically no-op here: CallTooDeep / OutOfFunds abort
-                    // before create_account_checkpoint pushes the entry; CreateCollision also
-                    // aborts before the push; OverflowPayment pushes the entry but then reverts
-                    // the checkpoint, truncating it back out of the journal.
-                    self.tracer.on_nonce_change(address, 0, 1);
-                }
-                _ => {}
-            }
-        }
+    /// Whether the current transaction opened its root frame, see
+    /// [`Self::trace_frameless_root_call`].
+    pub fn root_frame_entered(&self) -> bool {
+        self.state.borrow().root_frame_entered
     }
 
-    /// Emit logs appended to the journal without a LOG opcode.
+    /// Balance of `address` at the end of the current transaction's root frame, before gas refund
+    /// and beneficiary reward, or `None` when the transaction did not touch it.
     ///
-    /// Two producers append to the journal outside the `log_full` hook:
-    ///
-    /// * Custom precompiles (B-20 tokens, the activation/policy registries, ...) push event logs
-    ///   straight onto the journal via `EvmInternals::log`.
-    /// * [EIP-7708] native ETH transfer logs, which revm appends from `Journal::transfer_loaded`,
-    ///   `create_account_checkpoint` and `selfdestruct` once Amsterdam is active.
-    ///
-    /// revm does report both: `inspect_frame_init` snapshots the journal log count around
-    /// `frame_init` and forwards anything new through `Inspector::log`. We implement that hook
-    /// as an explicit no-op and drain here instead, because it fires before the frame's first
-    /// `step` — ahead of the balance changes that `step` emits from the journal. Taking the log
-    /// there would invert Geth's effects-then-event ordinal order for exactly the transfer the
-    /// log describes. Draining from `step` keeps the pair in order at the cost of this
-    /// watermark. [`Self::log`] carries the full rationale.
-    ///
-    /// Without a drain the call frame carries fewer logs than the receipt and
-    /// `assign_ordinal_and_index_to_receipt_logs` panics on the count mismatch.
-    ///
-    /// Must be called at every point where the journal can grow without an
-    /// opcode firing, because `log_full` sets the watermark to the full journal
-    /// length: a single LOG opcode after an undrained journal log strands it
-    /// permanently. The drain points are a frame's first `step` (the EIP-7708
-    /// log for its own incoming value transfer) and `call_end`/`create_end` (a
-    /// precompile's logs, plus frames that never execute an opcode — an EOA
-    /// target, or a precompile).
-    ///
-    /// Draining at frame entry is also what makes the attribution right:
-    /// revm appends the transfer log *after* taking the callee's checkpoint, so
-    /// the log is scoped to the callee and reverts with it. Draining only at
-    /// `call_end` would park an outer frame's log on whichever inner frame
-    /// happened to exit first, and the tracer drops logs of reverted calls —
-    /// a surviving log attributed to a reverted callee reappears as a count
-    /// mismatch.
-    ///
-    /// [EIP-7708]: https://eips.ethereum.org/EIPS/eip-7708
-    fn drain_journal_logs<CTX>(&mut self, context: &mut CTX)
-    where
-        CTX: ContextTr,
-        CTX::Journal: JournalExt,
-    {
-        let total = context.journal().logs().len() as u32;
-
-        // revm truncates journal logs when a call reverts. If an earlier opcode LOG
-        // advanced `trx_logs_count` (via `log_full`) and was then rolled back, the
-        // watermark is now stale-high relative to the shrunken journal. Clamp it down
-        // so a subsequent journal log that reuses the freed index is not skipped as
-        // "already emitted". Mirrors the clamp in `gather_precompile_storage_changes`.
-        // Runs on every `call_end`, including the reverting frames, so the watermark is
-        // corrected before the next call appends at the reused index.
-        if self.trx_logs_count > total {
-            self.trx_logs_count = total;
-        }
-        if total == self.trx_logs_count {
-            return;
-        }
-
-        // Clone the unemitted tail: `on_log` borrows `self.tracer` mutably while
-        // the slice borrows `context`, mirroring `process_journal_changes`.
-        let new_logs: Vec<AlloyLog> =
-            context.journal().logs()[self.trx_logs_count as usize..total as usize].to_vec();
-        for (offset, log) in new_logs.iter().enumerate() {
-            // Same block_index formula as `log_full`: a log at per-tx journal
-            // index `i` gets `i + log_block_index`. Here `i = trx_logs_count + offset`.
-            let block_index = self.trx_logs_count + offset as u32 + self.log_block_index;
-            self.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
-        }
-        self.trx_logs_count = total;
+    /// Chain-specific post-transaction extras use it as the `old_balance` of their credits, so an
+    /// account drained during execution (an OP Stack fee vault withdrawal) reports the drained
+    /// balance rather than the stale pre-transaction one.
+    pub fn post_exec_balance(&self, address: Address) -> Option<U256> {
+        self.state.borrow().post_exec_balances.get(&address).copied()
     }
 
-    /// Emit storage writes a native precompile made directly on the journal.
-    ///
-    /// Storage changes are normally captured in `step_end` gated on the SSTORE
-    /// opcode. Native precompiles write via `EvmInternals::sstore` without an
-    /// opcode, so `step_end` never fires and the `StorageChanged` journal entry
-    /// is silently dropped (`process_journal_changes` skips it via its `_` arm).
-    /// Unlike logs there is no call/receipt validator, so the loss is silent —
-    /// a B-20 token transfer's balance-slot writes would vanish from firehose.
-    ///
-    /// Called from `call_end` before the frame is popped, so the changes attach
-    /// to the precompile call that made them. `storage_processed_up_to` (advanced
-    /// by `step_end` for opcode SSTOREs) bounds the scan so opcode writes are
-    /// never re-emitted. Reverted precompile calls have their journal entries
-    /// truncated by revm, so the clamp drops them — matching final state.
-    fn gather_precompile_storage_changes<CTX>(&mut self, context: &mut CTX)
-    where
-        CTX: ContextTr,
-        CTX::Journal: JournalExt,
-    {
-        use reth_revm::revm::context::JournalEntry;
-
-        let journal_len = context.journal().journal().len();
-        if self.storage_processed_up_to > journal_len {
-            self.storage_processed_up_to = journal_len;
-        }
-        if self.storage_processed_up_to == journal_len {
-            return;
-        }
-
-        let entries: Vec<_> = context.journal().journal()
-            [self.storage_processed_up_to..journal_len]
-            .iter()
-            .cloned()
-            .collect();
-        self.storage_processed_up_to = journal_len;
-
-        for entry in entries {
-            if let JournalEntry::StorageChanged { address, key, had_value } = entry {
-                let new_value = context
-                    .journal()
-                    .evm_state()
-                    .get(&address)
-                    .and_then(|a| a.storage.get(&key))
-                    .map(|s| s.present_value())
-                    .unwrap_or_default();
-                self.tracer.on_storage_change(
-                    address,
-                    B256::from(key.to_be_bytes::<32>()),
-                    B256::from(had_value.to_be_bytes::<32>()),
-                    B256::from(new_value.to_be_bytes::<32>()),
-                );
-            }
-        }
-    }
-
-    /// Emit the two synthetic Transfer balance change events for a self-transfer
-    /// (caller == recipient, value > 0). revm's `transfer_loaded` short-circuits
-    /// these without pushing a BalanceTransfer journal entry — but Geth still
-    /// reports the debit-then-credit pair (net-zero), so we mirror that here.
-    fn emit_self_transfer_balance_changes<CTX>(
-        &mut self,
-        context: &mut CTX,
-        address: Address,
-        value: U256,
-    ) where
-        CTX: ContextTr,
-        CTX::Journal: JournalExt,
-    {
-        let reason = pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer;
-        let current = context
-            .journal()
-            .evm_state()
-            .get(&address)
-            .map(|a| a.info.balance)
-            .unwrap_or(U256::ZERO);
-        let intermediate = current.saturating_sub(value);
-
-        self.tracer.on_balance_change(address, current, intermediate, reason);
-        self.tracer.on_balance_change(address, intermediate, current, reason);
-    }
-
-    /// Emit the sender-debit + recipient-credit balance changes for a value transfer that
-    /// revm reverted (a no-step callee such as a precompile that ran out of gas). The
-    /// checkpoint rollback already restored both balances, so `evm_state` shows the
-    /// pre-transfer values: the debit runs `bal → bal - value`, the credit `bal → bal +
-    /// value`, matching what Geth reported at transfer time before the revert.
-    fn emit_reverted_value_transfer<CTX>(
-        &mut self,
-        context: &mut CTX,
-        from: Address,
-        to: Address,
-        value: U256,
-    ) where
-        CTX: ContextTr,
-        CTX::Journal: JournalExt,
-    {
-        let reason = pb::sf::ethereum::r#type::v2::balance_change::Reason::Transfer;
-        let evm_state = context.journal().evm_state();
-        let from_bal = evm_state.get(&from).map(|a| a.info.balance).unwrap_or(U256::ZERO);
-        let to_bal = evm_state.get(&to).map(|a| a.info.balance).unwrap_or(U256::ZERO);
-        self.tracer.on_balance_change(from, from_bal, from_bal.saturating_sub(value), reason);
-        self.tracer.on_balance_change(to, to_bal, to_bal.saturating_add(value), reason);
-    }
-
-    /// Shared pre-`on_call_enter` bookkeeping for the `call` and `create` hooks.
-    ///
-    /// At depth 0, the journal already contains entries from `deduct_caller`
-    /// (BalanceChange for gas cost, NonceBump for CALL transactions) and `load_accounts`
-    /// (AccountWarmed for coinbase/access-list). We skip `process_journal_changes` to
-    /// avoid emitting `deduct_caller`'s BalanceChange with the wrong reason (Transfer
-    /// instead of GasBuy); instead we advance past all pre-execution journal entries
-    /// and emit gas buy + nonce explicitly with the correct reasons.
-    ///
-    /// At depth > 0 we process journal entries BEFORE pushing the child call so that
-    /// entries from the parent's execution (including the parent call's own value
-    /// transfer BalanceTransfer) are attributed to the parent, not the child. In Geth,
-    /// OnEnter fires first (pushing the call), then Transfer runs and OnBalanceChange
-    /// fires (on the newly-pushed call). revm's journal captures the same entries but
-    /// they're only visible at the NEXT inspector hook. By processing here (before
-    /// pushing), the parent's BalanceTransfer from a previous call setup lands on the
-    /// parent. The current call's own value transfer will be created by revm AFTER the
-    /// hook returns and processed at the next call/call_end, correctly landing on THIS
-    /// call.
-    ///
-    /// Note on nonce semantics at depth 0:
-    /// - CALL transactions: `deduct_caller` bumped the nonce; emitted here.
-    /// - CREATE transactions: `deduct_caller` did NOT bump the nonce — that happens later in
-    ///   `create_account_checkpoint`, which pushes a NonceChange journal entry that
-    ///   `process_journal_changes` picks up.
-    fn enter_frame_pre_hook<CTX>(&mut self, context: &mut CTX, caller: Address)
-    where
-        CTX: ContextTr,
-        CTX::Journal: JournalExt,
-    {
-        let depth = context.journal().depth() as i32;
-
-        if depth > 0 {
-            self.process_journal_changes(context);
-            return;
-        }
-
-        self.journal_processed_up_to = context.journal().journal().len();
-        self.root_frame_entered = true;
-
-        // Clear the previous tx's journal snapshot at the start of this tx. It is re-seeded
-        // at this tx's root call/create exit (see `call_end` / `create_end`) and read by
-        // `process_post_tx_balance_changes` and the chain-specific post-tx extras hook that
-        // follow. Clearing here (rather than at the end of the previous tx's post-processing)
-        // keeps the snapshot alive across the extras hook while guaranteeing that, should a
-        // future refactor ever drop the root-exit re-seed, `resolve_post_tx_balance` falls
-        // back to the pre-tx DB balance instead of reading a STALE previous-tx snapshot.
-        // Do NOT remove during refactors. See `resolve_post_tx_balance_*` tests.
-        self.tx_journal_snapshot.clear();
-
-        let Some(account) = context.journal().evm_state().get(&caller) else { return };
-
-        // REGRESSION GUARD: snapshot the live post-pre-exec sender balance so
-        // `process_post_tx_balance_changes` can use it as the gas-refund `old_balance`
-        // instead of recomputing via `first BalanceChange.old_balance − gas_buy_cost`.
-        // The recompute formula is correct on mainnet (gas buy is the only pre-exec
-        // deduction) but **wrong on OP Stack**, where
-        // `validate_against_state_and_deduct_caller` folds gas_buy + L1_cost
-        // (+ Isthmus operator fee) into a single `set_balance` whose journal entry
-        // only records `old_balance = pre_tx`. Without this snapshot, OP transactions
-        // emit a gas-refund `old_balance` that is higher than the gas-buy `new_balance`
-        // by `(L1 + operator_fee)` — exactly the bug this line is here to prevent.
-        // Do NOT remove during refactors. See `resolve_post_tx_balance_*` tests.
-        self.tx_post_pre_exec_sender_balance = Some(account.info.balance);
-
-        // Reason for the depth-0 sender balance change. Defaults to `GasBuy` (mainnet
-        // semantics: `validate_against_state_and_deduct_caller` charges the caller for
-        // `gas_limit * gas_price`). Chain-specific `PreTxAdjust` impls can override this via
-        // [`Self::set_root_balance_reason`] before the depth-0 hook fires — e.g. OP Stack uses
-        // `IncreaseMint` for deposit txs whose depth-0 change is `balance + mint − spending`,
-        // not a gas buy. The override is single-shot (consumed via `.take()`) so the next tx
-        // starts clean.
-        let reason = self
-            .root_balance_reason_override
-            .take()
-            .unwrap_or(pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy);
-
-        self.tracer.on_balance_change(
-            caller,
-            account.original_info().balance,
-            account.info.balance,
-            reason,
-        );
-
-        // See `deduct_caller_nonce_emission` for why we emit `(old, old+1)`
-        // instead of `(original_info.nonce, info.nonce)`. Short version: when the
-        // tx is EIP-7702 AND the sender is also an authority in the auth list,
-        // `info.nonce` already reflects the EIP-7702 bump on top of deduct_caller's,
-        // and `process_eip7702_auth_list` (called below) emits those bumps
-        // separately. Letting the live nonce through here would double-count.
-        if let Some((old, new)) =
-            deduct_caller_nonce_emission(account.original_info().nonce, account.info.nonce)
-        {
-            self.tracer.on_nonce_change(caller, old, new);
-        }
-
-        // Replay the EIP-7702 auth list BEFORE on_call_enter so emissions land in the
-        // tracer's deferred_call_state and are prepended to the root call. This matches
-        // Geth's ordering: auth-list nonce/code changes carry ordinals less than the
-        // root call's beginOrdinal.
-        self.process_eip7702_auth_list(context);
-    }
-
-    /// Process SELFDESTRUCT balance changes from journal entries pushed during the opcode.
-    ///
-    /// SELFDESTRUCT causes revm to push journal entries (AccountDestroyed or BalanceTransfer)
-    /// with balance mutations. We emit these as suicide-specific balance change reasons
-    /// (SuicideWithdraw/SuicideRefund) and advance journal_processed_up_to so that
-    /// process_journal_changes doesn't re-emit them with the wrong reason.
-    ///
-    /// For the post-Cancun case where contract == target and the contract was NOT created
-    /// locally, revm pushes no journal entry and doesn't change state. We still emit the
-    /// withdraw/refund balance changes to match Geth's behavior (net-zero change).
-    fn process_selfdestruct_balance_changes<CTX>(&mut self, context: &mut CTX, start_idx: usize)
-    where
-        CTX: ContextTr,
-        CTX::Journal: JournalExt,
-    {
-        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
-        use reth_revm::revm::context::JournalEntry;
-
-        let journal = context.journal().journal();
-        let new_entries = &journal[start_idx..];
-
-        // Look for the selfdestruct-related journal entry
-        let mut found = false;
-        for entry in new_entries {
-            match entry {
-                JournalEntry::AccountDestroyed { address, target, had_balance, .. } => {
-                    // Only emit balance changes when there's actually balance to move.
-                    // When had_balance == 0, there's nothing to withdraw or refund.
-                    if !had_balance.is_zero() {
-                        // Contract's balance was zeroed
-                        self.tracer.on_balance_change(
-                            *address,
-                            *had_balance,
-                            U256::ZERO,
-                            Reason::SuicideWithdraw,
-                        );
-
-                        if address != target {
-                            // Target received the balance (already mutated by revm)
-                            let target_balance = context
-                                .journal()
-                                .evm_state()
-                                .get(target)
-                                .map(|a| a.info.balance)
-                                .unwrap_or(U256::ZERO);
-                            let old_target = target_balance.saturating_sub(*had_balance);
-                            self.tracer.on_balance_change(
-                                *target,
-                                old_target,
-                                target_balance,
-                                Reason::SuicideRefund,
-                            );
-                        }
-                        // Self-beneficiary locally created (address == target): only the
-                        // initial WITHDRAW is emitted. Geth 1.17.x does not emit the
-                        // REFUND+WITHDRAW round-trip that older versions produced.
-                    }
-
-                    self.selfdestruct_addresses.insert(*address);
-                    found = true;
-                    break;
-                }
-                JournalEntry::BalanceTransfer { from, to, balance } => {
-                    // Post-Cancun, non-locally-created, address != target:
-                    // revm pushes BalanceTransfer instead of AccountDestroyed.
-                    // Only emit when there's actual balance to transfer.
-                    if !balance.is_zero() {
-                        let from_balance = context
-                            .journal()
-                            .evm_state()
-                            .get(from)
-                            .map(|a| a.info.balance)
-                            .unwrap_or(U256::ZERO);
-                        self.tracer.on_balance_change(
-                            *from,
-                            from_balance.saturating_add(*balance),
-                            from_balance,
-                            Reason::SuicideWithdraw,
-                        );
-
-                        let to_balance = context
-                            .journal()
-                            .evm_state()
-                            .get(to)
-                            .map(|a| a.info.balance)
-                            .unwrap_or(U256::ZERO);
-                        self.tracer.on_balance_change(
-                            *to,
-                            to_balance.saturating_sub(*balance),
-                            to_balance,
-                            Reason::SuicideRefund,
-                        );
-                    }
-
-                    found = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        if !found {
-            // Post-Cancun, not locally created, address == target: no journal entry pushed,
-            // no state change. Geth 1.17.x does not emit any balance changes for this case
-            // because the net effect is zero (withdraw + refund to self cancel out).
-            return;
-        }
-
-        // Advance past the selfdestruct journal entries so process_journal_changes
-        // doesn't re-emit them with wrong reasons.
-        self.journal_processed_up_to = context.journal().journal().len();
-    }
-
-    /// Process EIP-7702 auth list delegations that occur during pre-execution.
-    ///
-    /// `apply_eip7702_auth_list` runs before the first call frame and applies each valid
-    /// authorization in order, potentially modifying the same authority account multiple
-    /// times (e.g. auth2 sets wallet2→setterCC, then auth4 overwrites wallet2→setterBB).
-    ///
-    /// A state-comparison approach (original_info vs current info) only sees the NET change
-    /// and loses intermediate states. We replay the auth list locally, tracking per-authority
-    /// state initialized from `original_info`, to emit one code change and one nonce change
-    /// per applied auth in chronological order.
-    ///
-    /// Must be called at root-call entry (depth=0) BEFORE `on_call_enter`, so the
-    /// emitted nonce/code changes land in the tracer's `deferred_call_state` and get
-    /// prepended to the root call (matching Geth's ordering: auth-list ordinals fall
-    /// below the root call's `beginOrdinal`).
-    ///
-    /// `journal_processed_up_to` is already advanced past these EIP-7702 journal entries
-    /// by the caller's earlier `journal_processed_up_to = journal().len()` snapshot
-    /// (the snapshot is taken after `apply_eip7702_auth_list` has already written its
-    /// journal entries), so `process_journal_changes` will skip the entries.
-    fn process_eip7702_auth_list<CTX>(&mut self, context: &mut CTX)
-    where
-        CTX: ContextTr,
-        CTX::Journal: JournalExt,
-    {
-        use reth_revm::revm::{
-            context_interface::{transaction::AuthorizationTr, Cfg, Transaction},
-            Database as _,
-        };
-
-        if context.tx().authorization_list_len() == 0 {
-            return;
-        }
-
-        let chain_id = context.cfg().chain_id();
-
-        // Collect auth list to avoid simultaneous borrows on `context.tx()` and
-        // `context.journal()` inside the loop.
-        let auths: Vec<(Option<Address>, U256, u64, Address)> = context
-            .tx()
-            .authorization_list()
-            .map(|a| (a.authority(), a.chain_id(), a.nonce(), a.address()))
-            .collect();
-
-        // Per-authority running state: (nonce, code_hash, code_bytes).
-        // Initialized lazily from original_info on first auth for that address.
-        let mut auth_tracker: HashMap<Address, (u64, B256, Vec<u8>)> = HashMap::new();
-
-        // The sender's nonce is bumped by deduct_caller BEFORE apply_auth_list runs.
-        // original_info.nonce still holds the pre-tx nonce, so for the sender we must
-        // add 1 to match the nonce that apply_auth_list will see.
-        let tx_sender = context.tx().caller();
-
-        for (maybe_authority, auth_chain_id, auth_nonce, target_address) in auths {
-            // 1. Chain ID must be zero (wildcard) or match the current chain.
-            if !auth_chain_id.is_zero() && auth_chain_id != U256::from(chain_id) {
-                continue;
-            }
-
-            // 2. Nonce must be < u64::MAX.
-            if auth_nonce == u64::MAX {
-                continue;
-            }
-
-            // 3. Authority must be recoverable via ecrecover.
-            let authority = match maybe_authority {
-                Some(a) => a,
-                None => continue,
-            };
-
-            // Initialize tracker for this authority from original_info on first encounter.
-            if !auth_tracker.contains_key(&authority) {
-                // First, read nonce and code_hash from evm_state (immutable borrow on journal).
-                let (mut nonce, code_hash, code_loaded) =
-                    if let Some(acc) = context.journal().evm_state().get(&authority) {
-                        let code =
-                            acc.original_info().code.as_ref().map(|b| b.original_bytes().to_vec());
-                        (acc.original_info().nonce, acc.original_info().code_hash, code)
-                    } else {
-                        (0, KECCAK_EMPTY, Some(Vec::new()))
-                    };
-
-                // Sender's nonce was already incremented by deduct_caller.
-                if authority == tx_sender {
-                    nonce += 1;
-                }
-
-                // If code wasn't loaded in original_info (common when load_account skips
-                // code loading), fetch it from the database via code_by_hash.
-                let code_bytes = match code_loaded {
-                    Some(bytes) => bytes,
-                    None if code_hash == KECCAK_EMPTY => Vec::new(),
-                    None => context
-                        .db_mut()
-                        .code_by_hash(code_hash)
-                        .ok()
-                        .map(|b| b.original_bytes().to_vec())
-                        .unwrap_or_default(),
-                };
-
-                auth_tracker.insert(authority, (nonce, code_hash, code_bytes));
-            }
-            let (tracked_nonce, tracked_code_hash, tracked_code) =
-                auth_tracker.get_mut(&authority).unwrap();
-
-            // 4. Code must be empty or an EIP-7702 delegation designator.
-            let code_eligible = *tracked_code_hash == KECCAK_EMPTY ||
-                (tracked_code.len() == 23 && tracked_code.starts_with(&[0xef, 0x01, 0x00]));
-            if !code_eligible {
-                continue;
-            }
-
-            // 5. Nonce in the auth must match the authority's current nonce.
-            if auth_nonce != *tracked_nonce {
-                continue;
-            }
-
-            // Valid auth: compute the new code that delegate() will set.
-            let (new_hash, new_code) = if target_address.is_zero() {
-                (KECCAK_EMPTY, Vec::new())
-            } else {
-                let mut raw = [0u8; 23];
-                raw[0] = 0xef;
-                raw[1] = 0x01;
-                raw[2] = 0x00;
-                raw[3..].copy_from_slice(target_address.as_slice());
-                let hash = alloy_primitives::keccak256(raw);
-                (hash, raw.to_vec())
-            };
-
-            let old_hash = *tracked_code_hash;
-            let old_code = tracked_code.clone();
-            let old_nonce = *tracked_nonce;
-
-            // Geth's `applyAuthorization` calls `SetNonce` then `SetCode` (state_transition.go),
-            // firing OnNonceChange before OnCodeChange. Match that ordering so per-auth ordinals
-            // come out as (nonce, code) pairs.
-            self.tracer.on_nonce_change(authority, old_nonce, old_nonce + 1);
-            // Emit code change only when the hash actually differs.
-            if old_hash != new_hash {
-                self.tracer.on_code_change(authority, old_hash, new_hash, &old_code, &new_code);
-            }
-
-            // Advance per-authority tracker.
-            *tracked_nonce = old_nonce + 1;
-            *tracked_code_hash = new_hash;
-            *tracked_code = new_code;
-
-            // Note: journal_processed_up_to is advanced after this function returns,
-            // so process_journal_changes will skip the CodeChange/NonceBump entries
-            // that revm emitted for this auth.
-        }
-    }
-
-    /// Capture nonce/code state for self-destructed accounts at root call exit.
-    ///
-    /// In Geth 1.17.x, `statedb.Finalise()` emits `OnNonceChange` (nonce→0) and
-    /// `OnCodeChange` (code→empty) for each destroyed account AFTER post-tx balance
-    /// changes (gas refund, coinbase reward). In revm, no journal entries are pushed
-    /// for these cleanup operations. We capture the pre-destruction state here (at root
-    /// call exit, while EVM context is still available) and emit later in
-    /// `process_post_tx_balance_changes` to match Geth's ordinal ordering.
-    ///
-    /// Reverted destructions are filtered out here rather than at the opcode, because whether
-    /// the surrounding frame commits is not known until it exits.
-    fn capture_selfdestruct_cleanup<CTX>(&mut self, context: &mut CTX)
-    where
-        CTX: ContextTr,
-        CTX::Journal: JournalExt,
-    {
-        use reth_revm::revm::context::JournalEntry;
-
-        // Only the destructions still present in the committed journal actually happened.
-        // `selfdestruct_addresses` is filled when the opcode runs; when the frame around it
-        // reverts, revm truncates the `AccountDestroyed` entry and never tells the inspector,
-        // so the set keeps addresses whose account survived with its nonce and code intact.
-        // Emitting the cleanup for those reported `nonce → 0` and an empty code for a live
-        // account. Geth's journal reverts its self-destruct set, so it emits nothing there.
-        let destroyed: HashSet<Address> = context
-            .journal()
-            .journal()
-            .iter()
-            .filter_map(|entry| match entry {
-                JournalEntry::AccountDestroyed { address, .. } => Some(*address),
-                _ => None,
-            })
-            .collect();
-
-        // Iterate in ascending address order so downstream nonce/code-change events are
-        // emitted deterministically, matching Geth's `statedb.Finalise()` which sorts
-        // self-destructed addresses before invoking hooks. Without this, creating and
-        // selfdestructing N contracts in one tx would emit cleanup hooks in HashSet
-        // iteration order and diverge from Geth firehose traces.
-        let mut sorted: Vec<Address> = self
-            .selfdestruct_addresses
-            .iter()
-            .copied()
-            .filter(|address| destroyed.contains(address))
-            .collect();
-        sorted.sort_unstable();
-
-        for address in sorted {
-            if let Some(account) = context.journal().evm_state().get(&address) {
-                self.pending_selfdestruct_cleanups.push(SelfdestructCleanupEntry {
-                    address,
-                    nonce: account.info.nonce,
-                    code_hash: account.info.code_hash,
-                    code: account
-                        .info
-                        .code
-                        .as_ref()
-                        .map(|b| b.original_bytes())
-                        .unwrap_or_default(),
-                });
-            }
-        }
-    }
-
-    /// Derive an address's balance at the end of EVM execution by replaying the committed
-    /// journal entries for the transaction.
-    ///
-    /// The snapshot is captured at root call/create exit — after execution but before revm's
-    /// post-execution (reimburse_caller / reward_beneficiary). Replaying it produces the
-    /// correct balance to use as `old_balance` for the gas-refund and coinbase-reward events.
-    ///
-    /// `initial_balance` seeds the running balance, suppressing the journal-walk fallback for
-    /// the first `BalanceChange` entry. Pass `Some(post_pre_exec_balance)` when the caller has
-    /// already captured the live account balance (e.g. for the sender, snapshotted at root
-    /// call entry into `tx_post_pre_exec_sender_balance`); pass `None` to derive it from the
-    /// journal.
-    ///
-    /// When `initial_balance` is `None`, the algorithm falls back to:
-    /// `first BalanceChange { old_balance }` − `gas_buy_cost`. That formula is correct on
-    /// chains where gas buy is the only pre-exec deduction; on OP Stack it under-counts by the
-    /// L1/operator fee folded into the same balance change, which is why the sender path
-    /// always passes `initial_balance = Some(..)`.
-    ///
-    /// For coinbase (which has no gas-buy BalanceChange), pass `gas_buy_cost = U256::ZERO`
-    /// and `initial_balance = None` — the journal walk recovers from `BalanceTransfer`
-    /// entries or `get_pre_tx_balance` if the coinbase had no journal activity.
-    fn resolve_post_tx_balance(
-        address: Address,
-        initial_balance: Option<U256>,
-        gas_buy_cost: U256,
-        tx_journal: &[JournalEntry],
-        get_pre_tx_balance: &mut impl FnMut(Address) -> U256,
-    ) -> U256 {
-        let mut balance: Option<U256> = initial_balance;
-
-        for entry in tx_journal {
-            match entry {
-                // Gas buy (deduct_caller) is always the first BalanceChange for the sender.
-                // Recover the post-gas-buy balance: old_balance − gas_buy_cost.
-                // Only applied when balance is still None (i.e. caller did not pre-seed via
-                // `initial_balance` and this is the first entry for this address); subsequent
-                // BalanceChange entries (custom precompiles, future EIPs, …) have unknown
-                // deltas and are skipped to avoid corrupting the running balance.
-                JournalEntry::BalanceChange { address: a, old_balance }
-                    if *a == address && balance.is_none() =>
-                {
-                    balance = Some(old_balance.saturating_sub(gas_buy_cost));
-                }
-                JournalEntry::BalanceTransfer { from, to, balance: amount } => {
-                    if *from == address {
-                        let b = balance.get_or_insert_with(|| get_pre_tx_balance(address));
-                        *b = b.saturating_sub(*amount);
-                    }
-                    if *to == address {
-                        let b = balance.get_or_insert_with(|| get_pre_tx_balance(address));
-                        *b = b.saturating_add(*amount);
-                    }
-                }
-                // SELFDESTRUCT beneficiary: revm credits `target` in place and records the
-                // move only inside `AccountDestroyed` — no `BalanceTransfer` entry is pushed
-                // on the truly-destroyed path (EIP-6780: contract created in the same tx, or
-                // pre-Cancun). Without this arm a coinbase/sender that received a suicide
-                // refund resolves to its stale pre-refund balance, so the following
-                // RewardTransactionFee/GasRefund event reports an `old_balance` that
-                // contradicts the SuicideRefund event emitted moments earlier.
-                JournalEntry::AccountDestroyed {
-                    address: destroyed, target, had_balance, ..
-                } if *target == address && *destroyed != address => {
-                    let b = balance.get_or_insert_with(|| get_pre_tx_balance(address));
-                    *b = b.saturating_add(*had_balance);
-                }
-                // SELFDESTRUCT: the contract's balance left the account, either to `target` or
-                // (self-beneficiary, pre-Amsterdam) to the burn.
-                //
-                // `had_balance` is what actually left. [EIP-8246] makes a self-beneficiary
-                // SELFDESTRUCT record zero there and keep the balance on the account, which is
-                // then stripped of code, storage and nonce at finalization. Zeroing the running
-                // balance on that entry would make the GasRefund / RewardTransactionFee event
-                // that follows report `old_balance = 0` for an account that still holds its
-                // ether — reachable when a tx CREATE2s the coinbase address and self-destructs
-                // it, or on an OP Stack fee vault resolved through `post_tx_balance`.
-                //
-                // Pre-Amsterdam a zero `had_balance` on the self-beneficiary path means the
-                // account held nothing to burn, so leaving the running balance untouched is
-                // correct on both sides of the fork.
-                //
-                // [EIP-8246]: https://eips.ethereum.org/EIPS/eip-8246
-                JournalEntry::AccountDestroyed { address: a, target, had_balance, .. }
-                    if *a == address && (target != a || !had_balance.is_zero()) =>
-                {
-                    balance = Some(U256::ZERO);
-                }
-                _ => {}
-            }
-        }
-        if balance.is_none() {
-            firehose_tracer::firehose_debug!("balance is none for address: {:?}", address);
-        }
-
-        balance.unwrap_or_else(|| get_pre_tx_balance(address))
-    }
-
-    /// Resolves the post-execution balance of `address` from this transaction's journal
-    /// snapshot, falling back to `get_pre_tx_balance` when the account had no
-    /// balance-affecting journal entry this tx.
-    ///
-    /// This is the same derivation the coinbase reward uses (`initial_balance = None`,
-    /// `gas_buy_cost = 0`): it reflects intra-tx value transfers and self-destructs, so an
-    /// account drained mid-execution (e.g. an OP Stack FeeVault withdrawal) resolves to its
-    /// drained balance rather than the stale pre-tx balance. Chain-specific post-tx extras
-    /// use it as the `old_balance` for their credits.
-    ///
-    /// Must be called after `execute_transaction_without_commit` returns and before the
-    /// snapshot is re-seeded by the next transaction.
-    pub fn post_tx_balance(
-        &self,
-        address: Address,
-        get_pre_tx_balance: &mut impl FnMut(Address) -> U256,
-    ) -> U256 {
-        Self::resolve_post_tx_balance(
-            address,
-            None,
-            U256::ZERO,
-            &self.tx_journal_snapshot,
-            get_pre_tx_balance,
-        )
-    }
-
-    /// Emit post-execution balance changes: gas refund to sender and miner fee to coinbase.
-    ///
-    /// In Geth, these are emitted by `OnBalanceChange` hooks inside `reimburse_caller` and
-    /// `reward_beneficiary`. In revm, no inspector hooks fire during post_execution, so we
-    /// explicitly compute and emit them using the Ethereum gas accounting rules.
-    ///
-    /// Must be called after `execute_transaction_without_commit` returns. Uses the committed
-    /// journal snapshot (captured at root call/create exit) to derive correct balances even
-    /// when the root call reverted and `balance_tracker` would be stale.
-    ///
-    /// Resets `balance_tracker` and `journal_processed_up_to` so the inspector is ready for
-    /// the next transaction. `tx_journal_snapshot` is deliberately left in place here (the
-    /// post-tx extras hook, which runs after this method, still needs it) and is instead
-    /// cleared at the start of the next tx in `enter_frame_pre_hook` (depth 0).
-    pub fn process_post_tx_balance_changes<F>(
-        &mut self,
-        sender: Address,
-        coinbase: Address,
-        gas_limit: u64,
-        gas_used: u64,
-        effective_gas_price: u128,
-        base_fee: u64,
-        committed_log_count: u32,
-        get_pre_tx_balance: F,
-    ) where
-        F: FnMut(Address) -> U256,
-    {
-        self.process_post_tx_gas_accounting(
-            sender,
-            coinbase,
-            gas_limit,
-            gas_used,
-            PostTxGasAccounting::ethereum(effective_gas_price, base_fee),
-            committed_log_count,
-            get_pre_tx_balance,
-        );
-    }
-
-    /// Same as [`Self::process_post_tx_balance_changes`] with chain-supplied gas-fee
-    /// parameters instead of Ethereum's.
-    ///
-    /// The refund is `(gas_limit - gas_used) * accounting.refund_gas_price` and the reward is
-    /// `gas_used * accounting.reward_gas_price + accounting.extra_reward`; each change is only
-    /// emitted when its amount is non-zero.
-    #[allow(clippy::too_many_arguments)]
-    pub fn process_post_tx_gas_accounting<F>(
-        &mut self,
-        sender: Address,
-        coinbase: Address,
-        gas_limit: u64,
-        gas_used: u64,
-        accounting: PostTxGasAccounting,
-        committed_log_count: u32,
-        mut get_pre_tx_balance: F,
-    ) where
-        F: FnMut(Address) -> U256,
-    {
-        use pb::sf::ethereum::r#type::v2::balance_change::Reason;
-
-        let gas_buy_cost = U256::from(gas_limit) * U256::from(accounting.refund_gas_price);
-        let remaining_gas = gas_limit.saturating_sub(gas_used);
-        let refund_amount = U256::from(remaining_gas) * U256::from(accounting.refund_gas_price);
-
-        // Derive sender's balance after execution (before gas refund). Seed with the
-        // post-pre-exec balance captured at root call entry — this is the only reliable
-        // source on chains (OP Stack) that fold multiple pre-exec deductions (gas buy + L1
-        // cost + operator fee) into a single journal `BalanceChange` whose implicit new
-        // balance can't be recovered from `old_balance − gas_buy_cost` alone.
-        // `tx_post_pre_exec_sender_balance` is `None` when the depth-0 root entry hook
-        // didn't capture (e.g. tracer activated mid-tx, or sender account missing from the
-        // EVM state map); in that case `resolve_post_tx_balance` falls back to the
-        // journal-walk derivation, which is correct for chains without the OP-style fold.
-        let sender_balance = Self::resolve_post_tx_balance(
-            sender,
-            self.tx_post_pre_exec_sender_balance.take(),
-            gas_buy_cost,
-            &self.tx_journal_snapshot,
-            &mut get_pre_tx_balance,
-        );
-
-        // Gas refund to sender: reimburse unused gas at the refund gas price.
-        // gas_used from ExecutionResult already accounts for the capped refund counter,
-        // so remaining_gas = gas_limit - gas_used includes both unspent gas and EVM refunds.
-        if remaining_gas > 0 {
-            let new_balance = sender_balance + refund_amount;
-            self.tracer.on_balance_change(sender, sender_balance, new_balance, Reason::GasRefund);
-        }
-
-        // Coinbase reward. With Ethereum accounting this is the priority fee portion of consumed
-        // gas: post-EIP-1559 the base fee is burned, pre-EIP-1559 (base_fee == 0) the entire gas
-        // price goes to coinbase.
-        let reward_amount = (U256::from(gas_used) * U256::from(accounting.reward_gas_price))
-            .saturating_add(accounting.extra_reward);
-        if !reward_amount.is_zero() {
-            // When sender == coinbase, the gas refund event was emitted first; use the
-            // sender's updated balance as the coinbase's old_balance. Otherwise derive
-            // independently from the journal snapshot (coinbase has no gas-buy BalanceChange,
-            // so gas_buy_cost is zero).
-            let coinbase_balance = if sender == coinbase {
-                sender_balance + refund_amount
-            } else {
-                Self::resolve_post_tx_balance(
-                    coinbase,
-                    None,
-                    U256::ZERO,
-                    &self.tx_journal_snapshot,
-                    &mut get_pre_tx_balance,
-                )
-            };
-
-            let new_balance = coinbase_balance + reward_amount;
-            self.tracer.on_balance_change(
-                coinbase,
-                coinbase_balance,
-                new_balance,
-                Reason::RewardTransactionFee,
-            );
-        }
-
-        // Emit nonce reset and code clearing for self-destructed accounts.
-        // This matches Geth 1.17.x's Finalise() ordering: nonce/code cleanup happens
-        // AFTER gas refund and coinbase reward, so ordinals are sequenced correctly.
-        for entry in self.pending_selfdestruct_cleanups.drain(..) {
-            if entry.nonce > 0 {
-                self.tracer.on_nonce_change(entry.address, entry.nonce, 0);
-            }
-            if entry.code_hash != KECCAK_EMPTY {
-                self.tracer.on_code_change(
-                    entry.address,
-                    entry.code_hash,
-                    KECCAK_EMPTY,
-                    entry.code.as_ref(),
-                    &[],
-                );
-            }
-        }
-
-        self.selfdestruct_addresses.clear();
-        self.journal_processed_up_to = 0;
-        self.storage_processed_up_to = 0;
-        // NOTE: `tx_journal_snapshot` is intentionally NOT cleared here. Chain-specific
-        // post-tx extras (OP Stack fee-vault credits, see `PostTxExtras`) run *after* this
-        // method and need the snapshot to resolve their `old_balance` via
-        // `resolve_post_tx_balance` — otherwise a FeeVault-withdrawal tx that drains the
-        // vault mid-execution would report a stale pre-tx balance. It is cleared at the start
-        // of the next tx in `enter_frame_pre_hook` (depth 0) and re-seeded at that tx's root
-        // exit before it is read again.
-
-        // Advance the block-wide log counter by the COMMITTED log count, not by the
-        // cached `trx_logs_count` which reflects `journal.logs().len()` at the last log
-        // emission. If the last log emitted in this tx sat inside a frame that later
-        // reverted, `trx_logs_count` overcounts. `committed_log_count` is read by the
-        // caller from `ExecutionResult::logs().len()` after `execute_transaction_without_commit`
-        // returned, so it only counts logs that survived revert.
-        self.log_block_index += committed_log_count;
-        self.trx_logs_count = 0;
-    }
-
-    /// Traces the root call of a transaction revm included without ever opening a frame, and
+    /// Traces the root call of a transaction evm2 included without ever opening a frame, and
     /// returns whether it did. A no-op for a transaction whose root frame ran.
     ///
     /// Under Amsterdam, EIP-2780 moves the state-dependent charges (EIP-8037 state gas for a
     /// created or newly funded account, the cold load of a delegation target) to a runtime phase
     /// that runs after the intrinsic check but before the first frame. When that phase runs out
-    /// of gas, revm skips execution and includes the transaction as an out-of-gas halt: the gas
-    /// buy stands, a creation still bumps the sender's nonce, and no inspector hook fires. Left
-    /// alone, the tracer would see a transaction with no call, which it treats as a bad block:
-    /// it drops the receipt and leaves the status unknown.
+    /// of gas, evm2 includes the transaction as an out-of-gas halt without entering execution and
+    /// no inspector hook fires: the gas buy stands and the sender nonce is bumped. Left alone, the
+    /// tracer would see a transaction with no call, which it treats as a bad block.
     ///
-    /// The root call is traced the way the frame would have ended had it been entered with
-    /// `tx.root_gas_limit` and run out of gas at once, like a creation sent with exactly its
-    /// intrinsic gas: the gas buy and the nonce bump, then a failed call that consumed all of its
-    /// gas. The live sender balance after the gas buy is recorded so the gas refund that
-    /// [`Self::process_post_tx_gas_accounting`] emits next starts from it.
-    ///
-    /// Must be called after the transaction executed and before
-    /// [`Self::process_post_tx_gas_accounting`]. Callers check [`Self::root_frame_entered`]
-    /// first so they only build `tx` for the rare transaction that needs it. `gas_buy_cost` is what
-    /// the sender was charged upfront, blob fee included; `get_pre_tx_balance` reads the
-    /// sender's balance before it.
-    pub fn trace_frameless_root_call<F>(
-        &mut self,
+    /// The root call is traced as if the frame had been entered with `tx.root_gas_limit` and run
+    /// out of gas at once: the gas buy and the nonce bump, then a failed call that consumed all of
+    /// its gas. `gas_buy_cost` is what the sender was charged upfront, blob fee included, and
+    /// `pre_tx_balance` the sender's balance before it.
+    pub fn trace_frameless_root_call(
+        &self,
         sender: Address,
         gas_buy_cost: U256,
         tx: FramelessTx,
-        mut get_pre_tx_balance: F,
-    ) -> bool
-    where
-        F: FnMut(Address) -> U256,
-    {
-        if std::mem::take(&mut self.root_frame_entered) {
+        pre_tx_balance: U256,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        if std::mem::take(&mut state.root_frame_entered) {
             return false;
         }
 
-        // Nothing ran, so nothing the post-tx accounting reads from a root exit exists.
-        self.tx_journal_snapshot.clear();
-
-        let pre_tx_balance = get_pre_tx_balance(sender);
         let post_gas_buy_balance = pre_tx_balance.saturating_sub(gas_buy_cost);
-        self.tx_post_pre_exec_sender_balance = Some(post_gas_buy_balance);
-        let reason = self
-            .root_balance_reason_override
-            .take()
-            .unwrap_or(pb::sf::ethereum::r#type::v2::balance_change::Reason::GasBuy);
-        self.tracer.on_balance_change(sender, pre_tx_balance, post_gas_buy_balance, reason);
-        self.tracer.on_nonce_change(sender, tx.nonce, tx.nonce + 1);
+        state.post_exec_balances.insert(sender, post_gas_buy_balance);
+        let reason = state.root_balance_reason_override.take().unwrap_or(Reason::GasBuy);
+        state.tracer.on_balance_change(sender, pre_tx_balance, post_gas_buy_balance, reason);
+        state.tracer.on_nonce_change(sender, tx.nonce, tx.nonce + 1);
 
         let (call_type, target) = match tx.kind {
-            TxKind::Create => (Opcode::Create as u8, sender.create(tx.nonce)),
-            TxKind::Call(to) => (Opcode::Call as u8, to),
+            alloy_primitives::TxKind::Create => (Opcode::Create as u8, sender.create(tx.nonce)),
+            alloy_primitives::TxKind::Call(to) => (Opcode::Call as u8, to),
         };
-        self.tracer.on_call_enter(
+        state.tracer.on_call_enter(
             0,
             call_type,
             sender,
@@ -1441,12 +323,8 @@ impl<'a> FirehoseInspector<'a> {
             tx.root_gas_limit,
             tx.value,
         );
-
-        let err = Self::failure_reason(
-            reth_revm::revm::interpreter::InstructionResult::OutOfGas,
-            tx.kind.is_create(),
-        );
-        self.tracer.on_call_exit(
+        let err = failure_reason(InstrStop::OutOfGas, tx.kind.is_create());
+        state.tracer.on_call_exit(
             0,
             &[],
             tx.root_gas_limit,
@@ -1457,133 +335,747 @@ impl<'a> FirehoseInspector<'a> {
         true
     }
 
-    /// Resets the per-transaction state that must not carry over from whatever ran before in the
-    /// block, a system call included. Call right before a transaction executes.
-    pub const fn start_transaction(&mut self) {
-        self.root_frame_entered = false;
-    }
+    /// Emits the post-execution balance changes of a transaction: the gas refund to the sender and
+    /// the fee reward to the beneficiary, then the nonce and code cleanup of the accounts it
+    /// self-destructed.
+    ///
+    /// evm2 settles gas after the root frame returned, with no inspector hook, so the changes are
+    /// derived here from the gas accounting rules. The refund is `(gas_limit - gas_used) *
+    /// accounting.refund_gas_price` and the reward `gas_used * accounting.reward_gas_price +
+    /// accounting.extra_reward`; each is only emitted when non-zero. The starting balances are the
+    /// root-exit balances captured by the inspector, falling back to `pre_tx_balance` for an
+    /// account the transaction did not touch.
+    ///
+    /// Must be called after the transaction executed and before it is committed.
+    #[expect(clippy::too_many_arguments)]
+    pub fn process_post_tx_gas_accounting(
+        &self,
+        sender: Address,
+        coinbase: Address,
+        gas_limit: u64,
+        gas_used: u64,
+        accounting: PostTxGasAccounting,
+        committed_log_count: u32,
+        mut pre_tx_balance: impl FnMut(Address) -> U256,
+    ) {
+        let mut state = self.state.borrow_mut();
+        let remaining_gas = gas_limit.saturating_sub(gas_used);
+        let refund_amount = U256::from(remaining_gas) * U256::from(accounting.refund_gas_price);
 
-    /// Whether the current transaction opened its root frame, see
-    /// [`Self::trace_frameless_root_call`].
-    pub const fn root_frame_entered(&self) -> bool {
-        self.root_frame_entered
-    }
-
-    /// Map EVM call scheme to Firehose call type opcode
-    fn map_call_type_opcode(scheme: &reth_revm::revm::interpreter::CallScheme) -> u8 {
-        use reth_revm::revm::interpreter::CallScheme;
-        match scheme {
-            CallScheme::Call => Opcode::Call as u8,
-            CallScheme::CallCode => Opcode::CallCode as u8,
-            CallScheme::DelegateCall => Opcode::DelegateCall as u8,
-            CallScheme::StaticCall => Opcode::StaticCall as u8,
-        }
-    }
-
-    /// Gas charged to a frame, as its caller will see it once revm settles the frame.
-    ///
-    /// [`Gas::total_gas_spent`] is `limit - remaining`, and under [EIP-8037] a frame's
-    /// `remaining` covers regular gas only. State gas paid out of the transaction's reservoir
-    /// therefore never shows up there, while the part that spilled into regular gas once the
-    /// reservoir ran dry does — a split the caller's own accounting does not make, so both have
-    /// to be folded back in here. Before Amsterdam every state-gas term is zero and this is
-    /// `total_gas_spent` unchanged.
-    ///
-    /// The hooks that call this run before revm reconciles the frame into its parent
-    /// (`handle_reservoir_remaining_gas`), so the counters still hold the charges it is about to
-    /// settle. That settlement is what each branch mirrors:
-    ///
-    /// - a halt consumes the frame's whole regular limit and hands the reservoir back untouched;
-    /// - a revert returns the state gas in full, spilled part included, leaving the regular gas
-    ///   minus that spill;
-    /// - a success keeps everything, so the reservoir-paid part — total charged less the spill —
-    ///   joins the regular figure.
-    ///
-    /// `state_gas_spent` is signed because a frame that restores more `0 -> x -> 0` slots than it
-    /// created hands the surplus back to a parent that charged the original `0 -> x`; that debt is
-    /// the parent's to report, hence the clamp.
-    ///
-    /// [EIP-8037]: https://eips.ethereum.org/EIPS/eip-8037
-    fn frame_gas_consumed(gas: &Gas, failed: bool, is_revert: bool) -> u64 {
-        // A halting error consumes all gas allocated to the frame. revm's spent counters only
-        // track opcodes that actually ran, so the limit is the only faithful figure.
-        if failed && !is_revert {
-            return gas.limit();
+        let sender_balance = state
+            .post_exec_balances
+            .get(&sender)
+            .copied()
+            .unwrap_or_else(|| pre_tx_balance(sender));
+        if remaining_gas > 0 {
+            state.tracer.on_balance_change(
+                sender,
+                sender_balance,
+                sender_balance + refund_amount,
+                Reason::GasRefund,
+            );
         }
 
-        let spilled = gas.state_gas_spilled();
-        if is_revert {
-            return gas.total_gas_spent().saturating_sub(spilled);
+        let reward_amount = (U256::from(gas_used) * U256::from(accounting.reward_gas_price))
+            .saturating_add(accounting.extra_reward);
+        if !reward_amount.is_zero() {
+            let coinbase_balance = if sender == coinbase {
+                sender_balance + refund_amount
+            } else {
+                state
+                    .post_exec_balances
+                    .get(&coinbase)
+                    .copied()
+                    .unwrap_or_else(|| pre_tx_balance(coinbase))
+            };
+            state.tracer.on_balance_change(
+                coinbase,
+                coinbase_balance,
+                coinbase_balance + reward_amount,
+                Reason::RewardTransactionFee,
+            );
         }
 
-        let from_reservoir = gas.state_gas_spent().saturating_sub_unsigned(spilled).max(0) as u64;
-        gas.total_gas_spent().saturating_add(from_reservoir)
-    }
-
-    /// Format EVM execution failure reason to match Geth's error strings.
-    ///
-    /// `is_create` distinguishes CREATE context (where OOG produces
-    /// "contract creation code storage out of gas") from CALL context ("out of gas").
-    ///
-    /// Geth reference: go-ethereum/core/vm/errors.go
-    fn failure_reason(
-        result: reth_revm::revm::interpreter::InstructionResult,
-        is_create: bool,
-    ) -> StringError {
-        use reth_revm::revm::interpreter::InstructionResult;
-        StringError(match result {
-            // Revert variants
-            InstructionResult::Revert => "execution reverted".to_string(),
-            InstructionResult::CallTooDeep => "max call depth exceeded".to_string(),
-            InstructionResult::OutOfFunds => "insufficient balance for transfer".to_string(),
-            InstructionResult::CreateInitCodeStartingEF00 |
-            InstructionResult::InvalidEOFInitCode |
-            InstructionResult::InvalidExtDelegateCallTarget => "execution reverted".to_string(),
-
-            // Out-of-gas variants — Geth distinguishes CREATE vs CALL context
-            InstructionResult::OutOfGas |
-            InstructionResult::MemoryOOG |
-            InstructionResult::MemoryLimitOOG |
-            InstructionResult::PrecompileOOG |
-            InstructionResult::InvalidOperandOOG |
-            InstructionResult::ReentrancySentryOOG => {
-                if is_create {
-                    "contract creation code storage out of gas".to_string()
-                } else {
-                    "out of gas".to_string()
-                }
+        // Geth's `Finalise` resets destroyed accounts after the gas refund and the reward.
+        let cleanups = std::mem::take(&mut state.pending_selfdestruct_cleanups);
+        for entry in cleanups {
+            if entry.nonce > 0 {
+                state.tracer.on_nonce_change(entry.address, entry.nonce, 0);
             }
-
-            // Specific error variants with known Geth equivalents
-            InstructionResult::InvalidFEOpcode => "invalid opcode: INVALID".to_string(),
-            InstructionResult::InvalidJump => "invalid jump destination".to_string(),
-            InstructionResult::StackOverflow => "stack limit reached 1024 (1023)".to_string(),
-            InstructionResult::StackUnderflow => "stack underflow".to_string(),
-            InstructionResult::CallNotAllowedInsideStatic |
-            InstructionResult::StateChangeDuringStaticCall => "write protection".to_string(),
-            InstructionResult::CreateCollision => "contract address collision".to_string(),
-            InstructionResult::CreateContractSizeLimit => "max code size exceeded".to_string(),
-            InstructionResult::CreateContractStartingWithEF => {
-                "invalid code: must not begin with 0xef".to_string()
+            if entry.code_hash != KECCAK256_EMPTY {
+                state.tracer.on_code_change(
+                    entry.address,
+                    entry.code_hash,
+                    KECCAK256_EMPTY,
+                    entry.code.as_ref(),
+                    &[],
+                );
             }
-            InstructionResult::CreateInitCodeSizeLimit => "max initcode size exceeded".to_string(),
-            InstructionResult::NonceOverflow => "nonce uint64 overflow".to_string(),
+        }
 
-            // Precompile errors — best effort, the specific error message (e.g. "point is
-            // not on curve") is lost by the time we reach call_end since revm collapses it
-            // into a single PrecompileError variant. We use the humanized form as fallback.
-            InstructionResult::PrecompileError => "precompile error".to_string(),
-
-            // Fallback: humanize CamelCase enum variant (e.g. "OutOfOffset" → "out of offset")
-            other => humanize_instruction_result(other),
-        })
+        state.selfdestruct_candidates.clear();
+        state.journal_processed_up_to = 0;
+        // Only logs that survived reverts count towards the next transaction's log indexes.
+        state.log_block_index += committed_log_count;
     }
 }
 
-/// Converts a CamelCase enum Debug representation into lowercase words.
-/// e.g. `NotActivated` → `"not activated"`, `FatalExternalError` → `"fatal external error"`
-fn humanize_instruction_result(result: reth_revm::revm::interpreter::InstructionResult) -> String {
-    let name = format!("{:?}", result);
+impl<G: DerefMut<Target = firehose_tracer::Tracer>> InspectorState<G> {
+    /// Emits the journal entries appended since the last scan, attributing balance changes per
+    /// [`Self::window`].
+    fn process_journal<T: EvmTypes>(&mut self, host: &mut Evm<'_, T>) {
+        let len = host.state().journal().len();
+        if self.journal_processed_up_to > len {
+            self.journal_processed_up_to = len;
+        }
+        if self.journal_processed_up_to == len {
+            return;
+        }
+        let entries = host.state().journal()[self.journal_processed_up_to..len].to_vec();
+        self.journal_processed_up_to = len;
+
+        let changes = resolve_changes(host, &entries);
+        let changes = if self.window == Window::Create {
+            // Nonce changes first, then the rest in journal order.
+            let (nonces, rest): (Vec<_>, Vec<_>) =
+                changes.into_iter().partition(|change| matches!(change, Change::Nonce { .. }));
+            nonces.into_iter().chain(rest).collect()
+        } else {
+            changes
+        };
+
+        for change in changes {
+            self.emit(change);
+        }
+    }
+
+    /// Drops the journal entries appended since the last scan without emitting them.
+    fn skip_journal<T: EvmTypes>(&mut self, host: &Evm<'_, T>) {
+        self.journal_processed_up_to = host.state().journal().len();
+    }
+
+    fn emit(&mut self, change: Change) {
+        match change {
+            Change::Balance { address, old, new } => {
+                let reason = match self.window {
+                    Window::Transfer | Window::Create => Reason::Transfer,
+                    Window::Selfdestruct if new < old => Reason::SuicideWithdraw,
+                    Window::Selfdestruct => Reason::SuicideRefund,
+                };
+                // The credit is the second half of the pending transfer: once it is emitted, the
+                // transfer no longer needs synthesizing at call exit.
+                if self.window == Window::Transfer &&
+                    let Some((_, to, value)) = self.pending_value_transfer &&
+                    address == to &&
+                    new.saturating_sub(old) == value
+                {
+                    self.pending_value_transfer = None;
+                }
+                self.tracer.on_balance_change(address, old, new, reason);
+            }
+            Change::Nonce { address, old, new } => self.tracer.on_nonce_change(address, old, new),
+            Change::Code { address, old_hash, new_hash, old_code, new_code } => {
+                self.tracer.on_code_change(address, old_hash, new_hash, &old_code, &new_code)
+            }
+            Change::Storage { address, key, old, new } => self.tracer.on_storage_change(
+                address,
+                B256::from(key.to_be_bytes::<32>()),
+                B256::from(old.to_be_bytes::<32>()),
+                B256::from(new.to_be_bytes::<32>()),
+            ),
+        }
+    }
+
+    /// Emits the pre-execution changes of a transaction before its root call opens: the gas buy
+    /// and the sender nonce bump, then the EIP-7702 authorizations.
+    ///
+    /// evm2 journals them in its own order (nonce bump, gas buy, authorizations); Geth emits the
+    /// gas buy first. For a CREATE transaction the sender nonce bump is held until the root call
+    /// opened, where Geth's `create` emits it.
+    fn process_pre_execution<T: EvmTypes>(
+        &mut self,
+        host: &mut Evm<'_, T>,
+        sender: Address,
+        is_create: bool,
+    ) {
+        let entries = host.state().journal().to_vec();
+        self.journal_processed_up_to = entries.len();
+        let changes = resolve_changes(host, &entries);
+
+        let gas_buy = changes.iter().position(
+            |change| matches!(change, Change::Balance { address, .. } if *address == sender),
+        );
+        let sender_nonce = changes.iter().position(
+            |change| matches!(change, Change::Nonce { address, .. } if *address == sender),
+        );
+
+        let reason = self.root_balance_reason_override.take().unwrap_or(Reason::GasBuy);
+        if let Some(Change::Balance { address, old, new }) = gas_buy.map(|index| &changes[index]) {
+            self.tracer.on_balance_change(*address, *old, *new, reason);
+        }
+        if let Some(Change::Nonce { address, old, .. }) = sender_nonce.map(|index| &changes[index])
+        {
+            if is_create {
+                self.deferred_creator_nonce = Some((*address, *old));
+            } else {
+                self.tracer.on_nonce_change(*address, *old, *old + 1);
+            }
+        }
+        for (index, change) in changes.into_iter().enumerate() {
+            if Some(index) != gas_buy && Some(index) != sender_nonce {
+                self.emit(change);
+            }
+        }
+    }
+
+    /// Snapshots, at root frame exit, the balances the post-transaction changes start from and the
+    /// destroyed accounts to clean up.
+    fn capture_root_exit<T: EvmTypes>(&mut self, host: &mut Evm<'_, T>, sender: Address) {
+        let mut addresses: Vec<Address> = host
+            .state()
+            .journal()
+            .iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::AccountChange { address, .. } => Some(*address),
+                _ => None,
+            })
+            .collect();
+        addresses.push(sender);
+        addresses.push(host.block().beneficiary);
+        for address in addresses {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.post_exec_balances.entry(address)
+            {
+                let balance = account_info(host, &address).balance;
+                entry.insert(balance);
+            }
+        }
+
+        self.capture_selfdestruct_cleanup(host);
+    }
+
+    /// Records the nonce and code of the accounts still destroyed at root exit, in ascending
+    /// address order like Geth's `Finalise`. A candidate whose SELFDESTRUCT was reverted is no
+    /// longer destroyed and is skipped.
+    fn capture_selfdestruct_cleanup<T: EvmTypes>(&mut self, host: &mut Evm<'_, T>) {
+        let mut candidates: Vec<Address> = self.selfdestruct_candidates.iter().copied().collect();
+        candidates.sort_unstable();
+        for address in candidates {
+            let destroyed =
+                host.state_mut().account(&address).is_ok_and(|account| account.is_destructed());
+            if !destroyed {
+                continue;
+            }
+            let info = account_info(host, &address);
+            let code = load_code(host, &info);
+            self.pending_selfdestruct_cleanups.push(SelfdestructCleanupEntry {
+                address,
+                nonce: info.nonce,
+                code_hash: info.code_hash,
+                code,
+            });
+        }
+    }
+
+    /// Emits the debit-then-credit pair Geth reports for a self-transfer, which leaves the balance
+    /// unchanged.
+    fn emit_self_transfer<T: EvmTypes>(
+        &mut self,
+        host: &mut Evm<'_, T>,
+        address: Address,
+        value: U256,
+    ) {
+        let current = account_info(host, &address).balance;
+        let intermediate = current.saturating_sub(value);
+        self.tracer.on_balance_change(address, current, intermediate, Reason::Transfer);
+        self.tracer.on_balance_change(address, intermediate, current, Reason::Transfer);
+    }
+
+    fn enter_frame<T: EvmTypes>(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+    ) {
+        let host = interp.host();
+        let depth = frame_depth(host, message);
+        let is_create = matches!(message.kind, MessageKind::Create | MessageKind::Create2);
+
+        if depth == 0 {
+            // The journal belongs to the transaction or system call this root frame opens, so it
+            // holds only its pre-execution changes.
+            self.root_frame_entered = true;
+            self.window = Window::Transfer;
+            self.process_pre_execution(host, message.caller, is_create);
+        } else {
+            self.process_journal(host);
+        }
+
+        let (call_type, from, to) = match message.kind {
+            MessageKind::StaticCall => (Opcode::StaticCall, message.caller, message.call_target),
+            // The issuing contract calls into the requested callee.
+            MessageKind::DelegateCall => {
+                (Opcode::DelegateCall, message.destination, message.call_target)
+            }
+            MessageKind::CallCode => (Opcode::CallCode, message.caller, message.call_target),
+            MessageKind::Create => (Opcode::Create, message.caller, message.destination),
+            MessageKind::Create2 => (Opcode::Create2, message.caller, message.destination),
+            // `MessageKind::Call`, and any call kind evm2 adds later.
+            _ => (Opcode::Call, message.caller, message.call_target),
+        };
+        let gas_limit = if depth == 0 && self.tracer.is_in_system_call() {
+            message.gas_limit + *SYSTEM_CALL_STATE_GAS_RESERVOIR
+        } else {
+            message.gas_limit
+        };
+        self.tracer.on_call_enter(
+            depth,
+            call_type as u8,
+            from,
+            to,
+            &message.input,
+            gas_limit,
+            message.value,
+        );
+
+        // EIP-7702: the code of a delegated callee is resolved from its delegation target.
+        if !is_create && message.code_address != message.call_target {
+            self.tracer.set_current_call_address_delegates_to(message.code_address);
+        }
+
+        if let Some((address, old)) = self.deferred_creator_nonce.take() {
+            self.tracer.on_nonce_change(address, old, old + 1);
+        }
+
+        self.window = if is_create { Window::Create } else { Window::Transfer };
+        // CALLCODE and DELEGATECALL move no value, and STATICCALL carries none.
+        if message.kind == MessageKind::Call && !message.value.is_zero() {
+            if message.caller == message.destination {
+                self.pending_self_transfer = Some((message.caller, message.value));
+            } else {
+                self.pending_value_transfer =
+                    Some((message.caller, message.destination, message.value));
+            }
+        }
+    }
+
+    fn exit_frame<T: EvmTypes>(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+        result: &MessageResult<T>,
+    ) {
+        let host = interp.host();
+        let depth = frame_depth(host, message);
+        let is_create = matches!(message.kind, MessageKind::Create | MessageKind::Create2);
+
+        // Changes of a frame that ran no opcode (a precompile, an account without code), and the
+        // code deposit of a successful create.
+        self.process_journal(host);
+        self.window = Window::Transfer;
+
+        if let Some((address, value)) = self.pending_self_transfer.take() &&
+            result.stop.is_success()
+        {
+            self.emit_self_transfer(host, address, value);
+        }
+
+        // A transfer still pending was rolled back before any hook could see it. It happened
+        // unless the call aborted before transferring.
+        if let Some((from, to, value)) = self.pending_value_transfer.take() &&
+            !matches!(result.stop, InstrStop::OutOfFunds | InstrStop::CallTooDeep)
+        {
+            let from_balance = account_info(host, &from).balance;
+            let to_balance = account_info(host, &to).balance;
+            self.tracer.on_balance_change(
+                from,
+                from_balance,
+                from_balance.saturating_sub(value),
+                Reason::Transfer,
+            );
+            self.tracer.on_balance_change(
+                to,
+                to_balance,
+                to_balance.saturating_add(value),
+                Reason::Transfer,
+            );
+        }
+
+        let failed = !result.stop.is_success();
+        let is_revert = result.stop.is_revert();
+        let err = failed.then(|| failure_reason(result.stop, is_create));
+        let gas_used = frame_gas_consumed(message.gas_limit, &result.gas, failed, is_revert);
+
+        if depth == 0 {
+            self.capture_root_exit(host, message.caller);
+        }
+
+        self.tracer.on_call_exit(
+            depth,
+            result.output.as_ref(),
+            gas_used,
+            err.as_ref().map(|e| e as &dyn std::error::Error),
+            failed,
+        );
+    }
+}
+
+impl<T: EvmTypes, G: DerefMut<Target = firehose_tracer::Tracer>> Inspector<T>
+    for FirehoseInspector<G>
+{
+    fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, T>) {
+        let mut state = self.state.borrow_mut();
+        // The frame's value transfer and account creation happened after `call`/`create` and
+        // before the first opcode.
+        state.process_journal(interp.host());
+        state.window = Window::Transfer;
+        if let Some((address, value)) = state.pending_self_transfer.take() {
+            state.emit_self_transfer(interp.host(), address, value);
+        }
+    }
+
+    fn step(&mut self, interp: &mut Interpreter<'_, '_, T>) {
+        let mut state = self.state.borrow_mut();
+        let opcode = interp.opcode();
+        let gas = interp.gas().remaining();
+
+        // SELFDESTRUCT is reported from `step_end`, once it is known whether it ran: the tracer
+        // marks the call as self-destructed as soon as it is told the opcode runs.
+        if opcode == Opcode::SelfDestruct as u8 {
+            state.window = Window::Selfdestruct;
+        } else {
+            state.tracer.on_opcode(interp.pc() as u64, opcode, gas, 0, &[], 0, None);
+        }
+
+        let keccak_preimage =
+            (opcode == Opcode::Keccak256 as u8).then(|| keccak256_preimage(interp)).flatten();
+        state.last_step = Some(StepContext { gas, opcode, keccak_preimage });
+    }
+
+    fn step_end(&mut self, interp: &mut Interpreter<'_, '_, T>) {
+        let mut state = self.state.borrow_mut();
+        let Some(step) = state.last_step.take() else { return };
+        let halted = matches!(interp.result(), Err(stop) if !stop.is_success());
+
+        // A halted opcode's writes are rolled back with its frame, and Geth, which charges gas
+        // before running the opcode body, never reports them. evm2's SSTORE journals the write
+        // before charging its dynamic gas.
+        if halted {
+            state.skip_journal(interp.host());
+        } else {
+            state.process_journal(interp.host());
+        }
+
+        if let Some((hash, preimage)) = step.keccak_preimage &&
+            !halted
+        {
+            state.tracer.on_keccak_preimage(hash, &preimage);
+        }
+
+        if step.opcode == Opcode::SelfDestruct as u8 {
+            state.window = Window::Transfer;
+            // Only `SelfDestruct` means the account was destroyed: a chain may replace the opcode
+            // with an undefined instruction, and an out-of-gas halt must not mark the call.
+            match interp.result() {
+                Err(InstrStop::SelfDestruct) => {
+                    state.tracer.on_opcode(0, step.opcode, step.gas, 0, &[], 0, None);
+                }
+                result => {
+                    let err = match result {
+                        Err(stop) => failure_reason(stop, false),
+                        Ok(()) => StringError("selfdestruct did not run".to_string()),
+                    };
+                    state.tracer.on_opcode(0, step.opcode, step.gas, 0, &[], 0, Some(&err));
+                }
+            }
+        }
+    }
+
+    fn log(&mut self, log: &AlloyLog, host: &mut Evm<'_, T>) {
+        let mut state = self.state.borrow_mut();
+        // The state change a log describes (an EIP-7708 transfer) comes before it, except for
+        // SELFDESTRUCT: Geth emits its transfer log before moving the balance, which the
+        // `selfdestruct` hook then reports.
+        if state.window != Window::Selfdestruct {
+            state.process_journal(host);
+        }
+        // evm2 notifies the inspector before recording the log, and truncates the recorded logs
+        // when a frame fails, so the count is this log's index in the transaction.
+        let block_index = host.logs().len() as u32 + state.log_block_index;
+        state.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
+    }
+
+    fn call(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &mut Message<T>,
+    ) -> Option<MessageResult<T>> {
+        self.state.borrow_mut().enter_frame(interp, message);
+        None
+    }
+
+    fn call_end(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+        result: &mut MessageResult<T>,
+    ) {
+        self.state.borrow_mut().exit_frame(interp, message, result);
+    }
+
+    fn create(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &mut Message<T>,
+    ) -> Option<MessageResult<T>> {
+        self.state.borrow_mut().enter_frame(interp, message);
+        None
+    }
+
+    fn create_end(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+        result: &mut MessageResult<T>,
+    ) {
+        self.state.borrow_mut().exit_frame(interp, message, result);
+    }
+
+    fn selfdestruct(
+        &mut self,
+        contract: &Address,
+        target: &Address,
+        value: &U256,
+        host: &mut Evm<'_, T>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        state.selfdestruct_candidates.insert(*contract);
+        state.process_journal(host);
+        // Geth models SELFDESTRUCT as a nested call. on_call_enter with SELFDESTRUCT sets the
+        // tracer's suicide flag and on_call_exit clears it; the depth is not used.
+        state.tracer.on_call_enter(
+            1,
+            Opcode::SelfDestruct as u8,
+            *contract,
+            *target,
+            &[],
+            0,
+            *value,
+        );
+        state.tracer.on_call_exit(1, &[], 0, None, false);
+    }
+}
+
+/// A state change resolved from the journal.
+enum Change {
+    Balance { address: Address, old: U256, new: U256 },
+    Nonce { address: Address, old: u64, new: u64 },
+    Code { address: Address, old_hash: B256, new_hash: B256, old_code: Bytes, new_code: Bytes },
+    Storage { address: Address, key: Word, old: Word, new: Word },
+}
+
+/// Resolves journal entries into state changes, in journal order.
+///
+/// An entry only records the previous value. The new value is the previous value of the next entry
+/// for the same account or slot, or the transaction overlay when there is none. An account entry
+/// yields its nonce change, then its code change, then its balance change: the order Geth emits an
+/// EIP-7702 authorization in.
+fn resolve_changes<T: EvmTypes>(host: &mut Evm<'_, T>, entries: &[JournalEntry]) -> Vec<Change> {
+    let mut changes = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        match entry {
+            JournalEntry::AccountChange { address, previous, .. } => {
+                let next = entries[index + 1..].iter().find_map(|later| match later {
+                    JournalEntry::AccountChange { address: a, previous, .. } if a == address => {
+                        Some(previous.clone().unwrap_or_default())
+                    }
+                    _ => None,
+                });
+                let new = next.unwrap_or_else(|| account_info(host, address));
+                let old = previous.clone().unwrap_or_default();
+
+                if old.nonce != new.nonce {
+                    changes.push(Change::Nonce {
+                        address: *address,
+                        old: old.nonce,
+                        new: new.nonce,
+                    });
+                }
+                if old.code_hash != new.code_hash {
+                    changes.push(Change::Code {
+                        address: *address,
+                        old_hash: old.code_hash,
+                        new_hash: new.code_hash,
+                        old_code: load_code(host, &old),
+                        new_code: load_code(host, &new),
+                    });
+                }
+                if old.balance != new.balance {
+                    changes.push(Change::Balance {
+                        address: *address,
+                        old: old.balance,
+                        new: new.balance,
+                    });
+                }
+            }
+            JournalEntry::StorageChange { address, key, previous } => {
+                let next = entries[index + 1..].iter().find_map(|later| match later {
+                    JournalEntry::StorageChange { address: a, key: k, previous }
+                        if a == address && k == key =>
+                    {
+                        Some(*previous)
+                    }
+                    _ => None,
+                });
+                let new = next.unwrap_or_else(|| {
+                    host.state_mut().storage_slot_untracked(address, key).unwrap_or_default()
+                });
+                changes.push(Change::Storage { address: *address, key: *key, old: *previous, new });
+            }
+            _ => {}
+        }
+    }
+    changes
+}
+
+/// The account as the transaction overlay currently holds it, an absent account reading as empty.
+fn account_info<T: EvmTypes>(host: &mut Evm<'_, T>, address: &Address) -> AccountInfo {
+    host.state_mut().account_info_untracked(address).ok().flatten().unwrap_or_default()
+}
+
+fn load_code<T: EvmTypes>(host: &mut Evm<'_, T>, info: &AccountInfo) -> Bytes {
+    if info.code_hash == KECCAK256_EMPTY {
+        return Bytes::new();
+    }
+    if let Some(code) = &info.code &&
+        !code.is_empty()
+    {
+        return code.original_bytes();
+    }
+    host.state_mut()
+        .overlay_db_mut()
+        .get_code_by_hash(&info.code_hash)
+        .map(|code| code.original_bytes())
+        .unwrap_or_default()
+}
+
+/// Call depth of a message as Firehose counts it, 0 for the root call.
+fn frame_depth<T: EvmTypes>(host: &Evm<'_, T>, message: &Message<T>) -> i32 {
+    i32::from(message.depth) - i32::from(host.version().initial_call_depth)
+}
+
+/// Captures the KECCAK256 input from the interpreter before the opcode runs.
+///
+/// `step` fires before memory is resized, so the region may not be allocated yet. Like Geth's
+/// `Memory.GetPtr`, bytes beyond the current memory are zero.
+fn keccak256_preimage<T: EvmTypes>(interp: &Interpreter<'_, '_, T>) -> Option<(B256, Vec<u8>)> {
+    let stack = interp.stack();
+    let (Some(offset), Some(size)) = (stack.peek(0), stack.peek(1)) else { return None };
+
+    let len = size.saturating_to::<usize>();
+    if len > MAX_KECCAK_PREIMAGE_SIZE {
+        return None;
+    }
+    if len == 0 {
+        return Some((KECCAK256_EMPTY, Vec::new()));
+    }
+
+    let offset = offset.saturating_to::<usize>();
+    let memory = interp.memory();
+    let mem_len = memory.len();
+    if offset.checked_add(len).is_some_and(|end| end <= mem_len) {
+        let preimage = memory.slice(offset, len).to_vec();
+        return Some((alloy_primitives::keccak256(&preimage), preimage));
+    }
+
+    // Growing memory costs 3*w + w^2/512 gas for w words, so a region the remaining gas cannot pay
+    // for halts before the opcode runs and step_end never emits it. w <= sqrt(512 * gas) bounds
+    // what can execute without hashing a region that never existed.
+    let gas = interp.gas().remaining() as u128;
+    let max_words = (512u128.saturating_mul(gas)).isqrt();
+    let max_len = max_words.saturating_mul(32).min(usize::MAX as u128) as usize;
+    if len > max_len {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    if offset < mem_len {
+        let copy_len = (mem_len - offset).min(len);
+        buf[..copy_len].copy_from_slice(memory.slice(offset, copy_len));
+    }
+    Some((alloy_primitives::keccak256(&buf), buf))
+}
+
+/// Gas charged to a frame, as its caller sees it.
+///
+/// evm2 settles a frame's gas before `call_end`: a halt consumed the whole regular limit, and a
+/// failure already refilled the state gas it spent. Under [EIP-8037] the state gas a successful
+/// frame paid from the transaction's reservoir is not part of its spent regular gas, but its
+/// caller's accounting counts it, so it is added back. Before Amsterdam every state-gas term is
+/// zero.
+///
+/// [EIP-8037]: https://eips.ethereum.org/EIPS/eip-8037
+fn frame_gas_consumed(
+    gas_limit: u64,
+    gas: &evm2::interpreter::GasTracker,
+    failed: bool,
+    is_revert: bool,
+) -> u64 {
+    if failed && !is_revert {
+        return gas_limit;
+    }
+    if failed {
+        return gas.spent();
+    }
+    let from_reservoir = gas.state_gas_spent().saturating_sub_unsigned(gas.state_gas_spilled());
+    gas.spent().saturating_add(from_reservoir.max(0) as u64)
+}
+
+/// Geth's error string for a failed frame.
+///
+/// `is_create` distinguishes the CREATE context, where an out-of-gas reads "contract creation code
+/// storage out of gas", from the CALL context ("out of gas").
+///
+/// Geth reference: go-ethereum/core/vm/errors.go
+fn failure_reason(stop: InstrStop, is_create: bool) -> StringError {
+    StringError(match stop {
+        InstrStop::Revert => "execution reverted".to_string(),
+        InstrStop::CallTooDeep => "max call depth exceeded".to_string(),
+        InstrStop::OutOfFunds => "insufficient balance for transfer".to_string(),
+        InstrStop::OutOfGas |
+        InstrStop::MemoryOOG |
+        InstrStop::MemoryLimitOOG |
+        InstrStop::PrecompileOOG |
+        InstrStop::InvalidOperandOOG |
+        InstrStop::ReentrancySentryOOG => {
+            if is_create {
+                "contract creation code storage out of gas".to_string()
+            } else {
+                "out of gas".to_string()
+            }
+        }
+        InstrStop::InvalidFEOpcode => "invalid opcode: INVALID".to_string(),
+        InstrStop::InvalidJump => "invalid jump destination".to_string(),
+        InstrStop::StackOverflow => "stack limit reached 1024 (1023)".to_string(),
+        InstrStop::StackUnderflow => "stack underflow".to_string(),
+        InstrStop::CallNotAllowedInsideStatic | InstrStop::StateChangeDuringStaticCall => {
+            "write protection".to_string()
+        }
+        InstrStop::CreateCollision => "contract address collision".to_string(),
+        InstrStop::CreateContractSizeLimit => "max code size exceeded".to_string(),
+        InstrStop::CreateContractStartingWithEF => {
+            "invalid code: must not begin with 0xef".to_string()
+        }
+        InstrStop::CreateInitCodeSizeLimit => "max initcode size exceeded".to_string(),
+        InstrStop::NonceOverflow => "nonce uint64 overflow".to_string(),
+        // The precompile's own message is not carried by the stop reason.
+        InstrStop::PrecompileError => "precompile error".to_string(),
+        other => humanize_stop(other),
+    })
+}
+
+/// Converts a `CamelCase` stop reason into lowercase words, e.g. `NotActivated` → `"not
+/// activated"`.
+fn humanize_stop(stop: InstrStop) -> String {
+    let name = format!("{stop:?}");
     let mut words = String::with_capacity(name.len() + 4);
     for (i, ch) in name.chars().enumerate() {
         if ch.is_uppercase() && i > 0 {
@@ -1592,788 +1084,6 @@ fn humanize_instruction_result(result: reth_revm::revm::interpreter::Instruction
         words.push(ch.to_ascii_lowercase());
     }
     words
-}
-
-impl<'a, CTX> Inspector<CTX, EthInterpreter> for FirehoseInspector<'a>
-where
-    CTX: ContextTr,
-    CTX::Journal: JournalExt,
-{
-    /// Called before each opcode executes (equivalent to Geth's OnOpcode hook)
-    fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
-        // On the first step of a new call frame, process journal changes to capture
-        // the value transfer BalanceTransfer pushed by frame_init after call/create returned.
-        // This must happen before any revert could remove the entry.
-        if self.pending_value_transfer_check {
-            self.pending_value_transfer_check = false;
-            self.process_journal_changes(context);
-            if let Some((address, value)) = self.pending_self_transfer.take() {
-                self.emit_self_transfer_balance_changes(context, address, value);
-            }
-            // The EIP-7708 log for that same value transfer sits on the journal with no
-            // opcode behind it. Drain it here, after the balance changes, so it attaches
-            // to this frame in effects-then-event order and before any LOG opcode of this
-            // frame moves the watermark past it.
-            //
-            // This rides on `pending_value_transfer_check` being set for EVERY frame, not
-            // only the value-bearing ones: `call` and `create` set it unconditionally and
-            // nothing clears it before the first `step`. Gating that flag on a non-zero
-            // value would silently disable the drain, and the next LOG opcode in the frame
-            // would strand the native log — a panic in the receipt-log validator, not a
-            // test failure here. If the flag ever needs narrowing, give the drain its own.
-            self.drain_journal_logs(context);
-        }
-
-        let journal = context.journal();
-
-        let pc = interp.bytecode.pc() as u64;
-        let op = interp.bytecode.opcode();
-        let gas = interp.gas.remaining();
-        let depth = journal.depth() as i32;
-
-        let start_journal_idx = journal.journal().len();
-
-        // SELFDESTRUCT is reported from `step_end`, once it is known whether the instruction
-        // table defines it: the tracer marks the call as self-destructed as soon as it is told
-        // the opcode runs, and a chain may replace SELFDESTRUCT with an undefined instruction.
-        if op != Opcode::SelfDestruct as u8 {
-            self.tracer.on_opcode(pc, op, gas, 0, &[], depth, None);
-        }
-
-        // For KECCAK256, capture the (hash, preimage) now while the stack still holds
-        // offset/size, but defer emission to `step_end` so that we only record preimages
-        // for opcodes that actually executed (not those that halt with OOG on memory
-        // expansion or other dynamic-gas failures). Matches Geth's firehose tracer, which
-        // hooks the opcode body after the gas charge.
-        let keccak_preimage =
-            (op == Opcode::Keccak256 as u8).then(|| Self::step_keccak256(interp)).flatten();
-
-        self.last_step =
-            Some(StepContext { start_journal_idx, pc, gas, depth, opcode: op, keccak_preimage });
-    }
-
-    /// Called after each opcode executes; used to detect SSTORE and SELFDESTRUCT state changes.
-    fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
-        let step_ctx = match self.last_step.take() {
-            Some(ctx) => ctx,
-            None => return,
-        };
-
-        // Emit KECCAK256 preimage only when the opcode actually executed. revm's interpreter
-        // loop calls step_end after every dispatched opcode regardless of outcome; a halted
-        // opcode (e.g., OOG on memory expansion) sets an action which we detect via is_end().
-        if let Some((hash, preimage)) = step_ctx.keccak_preimage {
-            if !interp.bytecode.is_end() {
-                self.tracer.on_keccak_preimage(hash, &preimage);
-            }
-        }
-
-        use reth_revm::revm::context::JournalEntry;
-
-        if step_ctx.opcode == Opcode::Sstore as u8 {
-            // revm's SSTORE writes the `StorageChanged` journal entry inside
-            // `sstore_skip_cold_load` BEFORE charging dynamic gas. If dynamic gas then
-            // OOGs, the journal entry is already present even though the opcode halted
-            // and the storage write will be reverted. Geth's firehose tracer hooks the
-            // opcode body after the gas charge, so it never records that
-            // would-have-been change. Mirror that: skip emission when the interpreter halted.
-            if !interp.bytecode.is_end() {
-                let journal = context.journal();
-                let new_entries = &journal.journal()[step_ctx.start_journal_idx..];
-                for entry in new_entries {
-                    if let JournalEntry::StorageChanged { address, key, had_value } = entry {
-                        let new_value =
-                            context.journal().evm_state()[address].storage[key].present_value();
-                        self.tracer.on_storage_change(
-                            *address,
-                            B256::from(key.to_be_bytes::<32>()),
-                            B256::from(had_value.to_be_bytes::<32>()),
-                            B256::from(new_value.to_be_bytes::<32>()),
-                        );
-                    }
-                }
-                // Mark these journal entries as storage-processed so the call_end
-                // precompile-storage gather does not re-emit this opcode's SSTOREs.
-                self.storage_processed_up_to = context.journal().journal().len();
-            }
-        } else if step_ctx.opcode == Opcode::SelfDestruct as u8 {
-            use reth_revm::revm::interpreter::InstructionResult;
-
-            // `SelfDestruct` is the only result that means the account was destroyed. The
-            // tracer marks the active call as self-destructed the moment it is told 0xff ran
-            // without an error, so every other outcome has to be reported as a failure:
-            //
-            // * `OpcodeNotFound` — a chain replaced SELFDESTRUCT with an undefined instruction.
-            // * `OutOfGas` — revm mutates the journal inside `Journal::selfdestruct` and charges
-            //   the dynamic cost afterwards, so the instruction can still halt on gas with the
-            //   `AccountDestroyed` entry already written. Geth charges before running the opcode
-            //   body, so its tracer never sees a suicide here.
-            // * a static-call violation, or any future halt.
-            //
-            // Reverting the frame rolls the journal entry back, so the emission below would be
-            // dropped as reverted state anyway — but the `suicide` marker sits on the call
-            // itself and outlives that.
-            let result = interp.bytecode.instruction_result();
-            if result == Some(InstructionResult::SelfDestruct) {
-                self.tracer.on_opcode(
-                    step_ctx.pc,
-                    step_ctx.opcode,
-                    step_ctx.gas,
-                    0,
-                    &[],
-                    step_ctx.depth,
-                    None,
-                );
-                self.process_selfdestruct_balance_changes(context, step_ctx.start_journal_idx);
-            } else {
-                let err = result.map_or_else(
-                    || StringError("selfdestruct did not run".to_string()),
-                    |result| Self::failure_reason(result, false),
-                );
-                self.tracer.on_opcode(
-                    step_ctx.pc,
-                    step_ctx.opcode,
-                    step_ctx.gas,
-                    0,
-                    &[],
-                    step_ctx.depth,
-                    Some(&err),
-                );
-            }
-        }
-    }
-
-    /// CALL, CALLCODE, DELEGATECALL, or STATICCALL is made
-    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        use reth_revm::revm::interpreter::CallScheme;
-
-        let depth = context.journal().depth() as i32;
-        let call_type = Self::map_call_type_opcode(&inputs.scheme);
-
-        // revm's CallInputs field semantics differ from Geth's for delegate-style calls:
-        //   - caller:           preserved msg.sender from parent context
-        //   - target_address:   the contract whose storage is used (the delegating contract)
-        //   - bytecode_address: the contract whose code actually executes
-        //
-        // Geth/Firehose expects:
-        //   - caller: the contract that issued the DELEGATECALL (= target_address)
-        //   - address: the contract whose code runs (= bytecode_address)
-        //
-        // CALLCODE is similar but only the address differs (caller is already correct).
-        let (from, to) = match inputs.scheme {
-            CallScheme::DelegateCall => (inputs.target_address, inputs.bytecode_address),
-            CallScheme::CallCode => (inputs.caller, inputs.bytecode_address),
-            _ => (inputs.caller, inputs.target_address),
-        };
-
-        log_journal("call_enter", context);
-
-        self.enter_frame_pre_hook(context, inputs.caller);
-
-        // `as_bytes` reads an internal call's input from the shared memory buffer without copying
-        // it, since the tracer copies only the part it records. It borrows `context` until the
-        // end of this block.
-        {
-            let input = inputs.input.as_bytes(context);
-            self.tracer.on_call_enter(
-                depth,
-                call_type,
-                from,
-                to,
-                &input,
-                inputs.gas_limit,
-                inputs.value.get(),
-            );
-        }
-
-        // EIP-7702: override address_delegates_to using the live EVM state.
-        // on_call_enter uses the pre-block state reader which misses delegations committed
-        // by earlier transactions in the same block. At call-hook time, first_frame_input
-        // has already loaded the 'to' account with code, so evm_state() reflects the
-        // in-block delegation set by any prior transaction.
-        {
-            if let Some(account) = context.journal().evm_state().get(&to) {
-                if let Some(eip7702) =
-                    account.info.code.as_ref().and_then(|code| code.eip7702_address())
-                {
-                    self.tracer.set_current_call_address_delegates_to(eip7702);
-                }
-            }
-        }
-
-        // After this hook returns, revm's frame_init will push a BalanceTransfer for the
-        // value transfer (if any). Set flag so the first `step` picks it up.
-        self.pending_value_transfer_check = true;
-
-        // Detect self-transfers (caller == target_address, value > 0) for regular CALLs.
-        // revm short-circuits these in `transfer_loaded` without pushing a BalanceTransfer
-        // entry, so we record the pending transfer here and emit the synthetic
-        // debit/credit pair when the frame starts executing or exits successfully.
-        if matches!(inputs.scheme, CallScheme::Call) && inputs.caller == inputs.target_address {
-            if let Some(value) = inputs.value.transfer() {
-                if !value.is_zero() {
-                    self.pending_self_transfer = Some((inputs.caller, value));
-                }
-            }
-        } else if let Some(value) = inputs.value.transfer() {
-            // Non-self value transfer. revm pushes a BalanceTransfer entry we normally read
-            // from the journal, but on a reverted no-step callee (precompile) that entry is
-            // truncated before call_end. Record it so call_end can re-emit it (see
-            // `pending_value_transfer`). `inputs.value.transfer()` is None for
-            // DELEGATECALL/CALLCODE (apparent value), so those never set it.
-            if !value.is_zero() {
-                self.pending_value_transfer = Some((inputs.caller, inputs.target_address, value));
-            }
-        }
-
-        None
-    }
-
-    /// CALL* operation completes
-    fn call_end(&mut self, context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
-        log_journal("call_exit", context);
-
-        // Scan journal entries accumulated during this call's execution BEFORE popping it,
-        // so changes are attributed to the call that caused them.
-        self.process_journal_changes(context);
-
-        // Gather state changes made straight on the journal (no opcode fired, so
-        // step_end/log_full were never called) and attach them to this call frame.
-        // Storage before logs to match the usual effects-then-event order. For a frame
-        // that executed at least one opcode the log drain already ran on its first
-        // `step`; this covers the step-less ones (precompiles, EOA targets).
-        self.gather_precompile_storage_changes(context);
-        self.drain_journal_logs(context);
-
-        // Emit synthetic balance changes for a pending self-transfer if the call succeeded
-        // (no-code target: step never fires but the transfer did happen). On failure
-        // (OutOfFunds / CallTooDeep) revm reverts the checkpoint, so we drop the pending
-        // entry without emitting.
-        if let Some((address, value)) = self.pending_self_transfer.take() {
-            if outcome.result.is_ok() {
-                self.emit_self_transfer_balance_changes(context, address, value);
-            }
-        }
-
-        // A non-self value transfer still pending here means process_journal_changes never
-        // saw its BalanceTransfer entry: the call reverted and revm truncated it before we
-        // could read it. For a no-step callee (precompile) the transfer is otherwise lost,
-        // so re-emit it to match Geth — unless the call aborted BEFORE the transfer
-        // (OutOfFunds / CallTooDeep), in which case no transfer ever happened.
-        if let Some((from, to, value)) = self.pending_value_transfer.take() {
-            use reth_revm::revm::interpreter::InstructionResult;
-            let aborted_pre_transfer = matches!(
-                outcome.result.result,
-                InstructionResult::OutOfFunds | InstructionResult::CallTooDeep
-            );
-            if !aborted_pre_transfer {
-                self.emit_reverted_value_transfer(context, from, to, value);
-            }
-        }
-
-        // Clear pending flag: if the call failed before executing any opcode (e.g.
-        // OutOfFunds, CallTooDeep), step never ran to clear it.
-        self.pending_value_transfer_check = false;
-
-        let depth = context.journal().depth() as i32;
-        let failed = !outcome.result.is_ok();
-        let is_revert = outcome.result.result.is_revert();
-        let err: Option<StringError> =
-            if failed { Some(Self::failure_reason(outcome.result.result, false)) } else { None };
-
-        let gas_used = Self::frame_gas_consumed(&outcome.result.gas, failed, is_revert);
-
-        // At root call exit, capture nonce/code state for self-destructed contracts.
-        // The actual emission happens later in process_post_tx_balance_changes (after
-        // gas refund and coinbase reward) to match Geth 1.17.x Finalise ordinal timing.
-        if depth == 0 && !self.selfdestruct_addresses.is_empty() {
-            self.capture_selfdestruct_cleanup(context);
-        }
-
-        // At root call exit, snapshot the committed journal. This is captured after
-        // process_journal_changes and before revm's post-execution (reimburse_caller /
-        // reward_beneficiary), giving process_post_tx_balance_changes the correct
-        // sender/coinbase balances to use as old_balance for gas refund and miner reward.
-        if depth == 0 {
-            self.tx_journal_snapshot = context.journal().journal().to_vec();
-        }
-
-        // The `reverted` parameter in on_call_exit means "did the call fail"
-        // (any failure), not specifically "was it a REVERT opcode". The tracer
-        // internally distinguishes reverts from other failures via the error string.
-        self.tracer.on_call_exit(
-            depth,
-            outcome.result.output.as_ref(),
-            gas_used,
-            err.as_ref().map(|e| e as &dyn std::error::Error),
-            failed,
-        );
-    }
-
-    /// CREATE or CREATE2 is made
-    fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
-        use reth_revm::revm::context_interface::CreateScheme;
-
-        let depth = context.journal().depth() as i32;
-        let (call_type, created_address) = match inputs.scheme() {
-            CreateScheme::Create2 { .. } => {
-                // CREATE2 address is deterministic, no nonce needed
-                (Opcode::Create2 as u8, inputs.created_address(0))
-            }
-            _ => {
-                // CREATE address requires caller nonce
-                let nonce = context
-                    .journal_mut()
-                    .load_account(inputs.caller())
-                    .map(|acc| acc.info.nonce)
-                    .unwrap_or(0);
-                (Opcode::Create as u8, inputs.created_address(nonce))
-            }
-        };
-
-        log_journal("create_enter", context);
-
-        self.enter_frame_pre_hook(context, inputs.caller());
-
-        // `on_call_enter` auto-patches the transaction's `to` field for root CREATE/CREATE2
-        // (the original `TxEvent.to` is None for contract-creation txs), so no explicit patch
-        // is needed here.
-        self.tracer.on_call_enter(
-            depth,
-            call_type,
-            inputs.caller(),
-            created_address,
-            inputs.init_code(),
-            inputs.gas_limit(),
-            inputs.value(),
-        );
-
-        // After this hook returns, revm's frame_init will push a BalanceTransfer for the
-        // value transfer (if any). Set flag so the first `step` picks it up.
-        self.pending_value_transfer_check = true;
-
-        None
-    }
-
-    /// CREATE* operation completes
-    fn create_end(
-        &mut self,
-        context: &mut CTX,
-        _inputs: &CreateInputs,
-        outcome: &mut CreateOutcome,
-    ) {
-        log_journal("create_exit", context);
-
-        // Scan journal entries accumulated during this create's execution (including the
-        // code-deployment `CodeChange` and, via our `AccountCreated` arm, the created
-        // contract's 0→1 nonce bump) BEFORE popping the call, so changes are attributed
-        // to the CREATE call.
-        self.process_journal_changes(context);
-
-        // Backstop for a CREATE frame that never reaches `step`. No such path is reachable
-        // today: zero-length initcode is NOT one, because `Bytecode::new_legacy` turns an
-        // empty input into a single STOP, which steps like any other opcode. The frame-init
-        // failures that do skip `step` (CreateCollision, OutOfFunds, CallTooDeep) all revert
-        // the checkpoint the endowment log lives under, so there is nothing to drain. Kept
-        // because the drain is idempotent through the watermark and the alternative failure
-        // mode — an endowment log picked up by an outer frame — is a validator panic mid-block.
-        self.drain_journal_logs(context);
-
-        // Clear pending flag: if the CREATE failed before executing any opcode (e.g.
-        // OutOfFunds, CallTooDeep, CreateCollision), step never ran to clear it.
-        self.pending_value_transfer_check = false;
-
-        let depth = context.journal().depth() as i32;
-        let failed = !outcome.result.is_ok();
-        let is_revert = outcome.result.result.is_revert();
-        let err: Option<StringError> =
-            if failed { Some(Self::failure_reason(outcome.result.result, true)) } else { None };
-
-        let gas_used = Self::frame_gas_consumed(&outcome.result.gas, failed, is_revert);
-
-        // At root create exit, capture nonce/code state for self-destructed contracts
-        // (same rationale as in call_end — emission deferred to process_post_tx_balance_changes).
-        if depth == 0 && !self.selfdestruct_addresses.is_empty() {
-            self.capture_selfdestruct_cleanup(context);
-        }
-
-        // Same rationale as in call_end: snapshot the committed journal at root exit so
-        // process_post_tx_balance_changes can derive correct post-execution balances.
-        if depth == 0 {
-            self.tx_journal_snapshot = context.journal().journal().to_vec();
-        }
-
-        self.tracer.on_call_exit(
-            depth,
-            outcome.result.output.as_ref(),
-            gas_used,
-            err.as_ref().map(|e| e as &dyn std::error::Error),
-            failed,
-        );
-    }
-
-    /// A log was journaled outside an opcode — intentionally ignored, see below.
-    ///
-    /// revm calls this from `inspect_frame_init` for logs that appear between entering a frame
-    /// and its first instruction: the [EIP-7708] native transfer log for the frame's own
-    /// incoming value, and the logs of a precompile. Forwarding them here would be the obvious
-    /// implementation and it is deliberately not what we do — [`Self::drain_journal_logs`]
-    /// picks them up later instead.
-    ///
-    /// The reason is ordinal ordering. This hook fires before the frame's first `step`, which is
-    /// where `process_journal_changes` emits the balance changes for that same value transfer.
-    /// Emitting the log here would order the event ahead of the effect it describes, inverting
-    /// the effects-then-event order Geth produces, and a Firehose consumer replaying by ordinal
-    /// would see the transfer announced before it happened.
-    ///
-    /// Overriding this hook for real is a plausible simplification — it would retire the drain
-    /// calls in `step` and `create_end` — but it is not a change to make on reading alone. The
-    /// ordering above is pinned by `native_transfer_log_is_ordered_after_its_balance_changes`,
-    /// which is the only test that fails if this body starts draining; every other native-log
-    /// test still passes, so the regression is easy to miss. Beyond that the tracer diverges
-    /// from Geth in ways unit tests do not surface, so it needs battlefield coverage and a
-    /// spell of reth mainnet comparison first.
-    ///
-    /// [EIP-7708]: https://eips.ethereum.org/EIPS/eip-7708
-    fn log(&mut self, _context: &mut CTX, _log: AlloyLog) {}
-
-    /// LOG opcode executed.
-    ///
-    /// This is the opcode half of the split whose other half is [`Self::log`]: revm routes a log
-    /// appended during an instruction here, and one appended around frame init there. Note the
-    /// watermark assignment below is why a log that never reaches either hook is lost for good —
-    /// it jumps `trx_logs_count` to the full journal length, stranding anything undrained
-    /// beneath it. See [`Self::drain_journal_logs`].
-    fn log_full(
-        &mut self,
-        _interp: &mut Interpreter<EthInterpreter>,
-        context: &mut CTX,
-        log: AlloyLog,
-    ) {
-        // The journal tracks all non-reverted logs. log_full fires after the
-        // log is appended, so logs().len() - 1 is this log's index in the transaction.
-        // On revert, the journal truncates logs back, so subsequent logs after
-        // a revert get correct indices automatically.
-        self.trx_logs_count = context.journal().logs().len() as u32;
-        let block_index = self.trx_logs_count.saturating_sub(1) + self.log_block_index;
-        self.tracer.on_log(log.address, log.topics(), &log.data.data, block_index);
-    }
-
-    /// SELFDESTRUCT is executed
-    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
-        // Note: selfdestruct_addresses is populated in process_selfdestruct_balance_changes
-        // (only for AccountDestroyed entries, not BalanceTransfer), because post-Cancun
-        // non-locally-created contracts are NOT destroyed and don't need cleanup.
-
-        // In Geth's tracer, SELFDESTRUCT is modelled as a nested call at depth+1.
-        // on_call_enter with OP_SELFDESTRUCT sets the `latest_call_enter_suicided` flag
-        // and on_call_exit immediately clears it (no-op on call stack).
-        // Depth doesn't affect SELFDESTRUCT handling so we use 1 (any non-zero value).
-        self.tracer.on_call_enter(1, Opcode::SelfDestruct as u8, contract, target, &[], 0, value);
-        self.tracer.on_call_exit(1, &[], 0, None, false);
-    }
-}
-
-/// Type-erased interface to a Firehose inspector, used by
-/// [`crate::executor::FirehoseWrappedExecutor`] to drive tracer hooks through the inspector that
-/// was installed into the EVM.
-///
-/// This trait exists because [`crate::executor::FirehoseWrappedExecutor`] parameterizes over an
-/// inner [`alloy_evm::block::BlockExecutor`] whose EVM's `Inspector` associated type is not the
-/// concrete [`FirehoseInspector`] directly — it is whatever type was plugged in through
-/// `evm_with_env_and_inspector`. This trait lets the wrapper bound `Inspector:
-/// FirehoseInspectorApi` to reach the tracer and the post-tx balance accounting without naming the
-/// concrete type.
-pub trait FirehoseInspectorApi {
-    /// Returns a mutable reference to the Firehose tracer, for direct event emission from the
-    /// executor wrapper (`on_system_call_start/end`, `on_tx_start/end`).
-    fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer;
-
-    /// Override the reason emitted for the depth-0 root-call sender balance change of the next
-    /// transaction (single-shot, consumed when the depth-0 hook fires). Default behavior — no
-    /// override — emits `GasBuy`. Chain-specific [`PreTxAdjust`](crate::PreTxAdjust) impls call
-    /// this to flag e.g. OP Stack deposit txs as `IncreaseMint`. See
-    /// [`FirehoseInspector::set_root_balance_reason`] for the full contract.
-    fn set_root_balance_reason(
-        &mut self,
-        reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
-    );
-
-    /// Type-erased version of [`FirehoseInspector::process_post_tx_balance_changes`].
-    ///
-    /// `get_pre_tx_balance` is passed as a trait object so the call site does not need to be
-    /// generic over `F`, keeping the wrapper's signature free of extra type parameters.
-    #[allow(clippy::too_many_arguments)]
-    fn process_post_tx_balance_changes_erased(
-        &mut self,
-        sender: Address,
-        coinbase: Address,
-        gas_limit: u64,
-        gas_used: u64,
-        effective_gas_price: u128,
-        base_fee: u64,
-        committed_log_count: u32,
-        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
-    );
-
-    /// Type-erased version of [`FirehoseInspector::process_post_tx_gas_accounting`].
-    #[allow(clippy::too_many_arguments)]
-    fn process_post_tx_gas_accounting_erased(
-        &mut self,
-        sender: Address,
-        coinbase: Address,
-        gas_limit: u64,
-        gas_used: u64,
-        accounting: PostTxGasAccounting,
-        committed_log_count: u32,
-        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
-    );
-
-    /// See [`FirehoseInspector::start_transaction`].
-    fn start_transaction(&mut self);
-
-    /// See [`FirehoseInspector::root_frame_entered`].
-    fn root_frame_entered(&self) -> bool;
-
-    /// Type-erased version of [`FirehoseInspector::trace_frameless_root_call`].
-    fn trace_frameless_root_call_erased(
-        &mut self,
-        sender: Address,
-        gas_buy_cost: U256,
-        tx: FramelessTx,
-        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
-    ) -> bool;
-
-    /// Type-erased version of [`FirehoseInspector::post_tx_balance`].
-    ///
-    /// Chain-specific [`PostTxExtras`](crate::PostTxExtras) impls call this to obtain the
-    /// post-execution balance of an account they credit, so their `old_balance` reflects any
-    /// intra-tx modification (e.g. an OP Stack FeeVault withdrawal draining the vault before
-    /// the fee reward is applied) instead of the stale pre-tx balance read from the DB.
-    fn post_tx_balance_erased(
-        &self,
-        address: Address,
-        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
-    ) -> U256;
-}
-
-impl<'a> FirehoseInspectorApi for FirehoseInspector<'a> {
-    fn tracer_mut(&mut self) -> &mut firehose_tracer::Tracer {
-        self.tracer
-    }
-
-    fn set_root_balance_reason(
-        &mut self,
-        reason: pb::sf::ethereum::r#type::v2::balance_change::Reason,
-    ) {
-        Self::set_root_balance_reason(self, reason);
-    }
-
-    fn process_post_tx_balance_changes_erased(
-        &mut self,
-        sender: Address,
-        coinbase: Address,
-        gas_limit: u64,
-        gas_used: u64,
-        effective_gas_price: u128,
-        base_fee: u64,
-        committed_log_count: u32,
-        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
-    ) {
-        self.process_post_tx_balance_changes(
-            sender,
-            coinbase,
-            gas_limit,
-            gas_used,
-            effective_gas_price,
-            base_fee,
-            committed_log_count,
-            |addr| get_pre_tx_balance(addr),
-        );
-    }
-
-    fn process_post_tx_gas_accounting_erased(
-        &mut self,
-        sender: Address,
-        coinbase: Address,
-        gas_limit: u64,
-        gas_used: u64,
-        accounting: PostTxGasAccounting,
-        committed_log_count: u32,
-        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
-    ) {
-        self.process_post_tx_gas_accounting(
-            sender,
-            coinbase,
-            gas_limit,
-            gas_used,
-            accounting,
-            committed_log_count,
-            get_pre_tx_balance,
-        );
-    }
-
-    fn start_transaction(&mut self) {
-        Self::start_transaction(self);
-    }
-
-    fn root_frame_entered(&self) -> bool {
-        Self::root_frame_entered(self)
-    }
-
-    fn trace_frameless_root_call_erased(
-        &mut self,
-        sender: Address,
-        gas_buy_cost: U256,
-        tx: FramelessTx,
-        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
-    ) -> bool {
-        self.trace_frameless_root_call(sender, gas_buy_cost, tx, get_pre_tx_balance)
-    }
-
-    fn post_tx_balance_erased(
-        &self,
-        address: Address,
-        get_pre_tx_balance: &mut dyn FnMut(Address) -> U256,
-    ) -> U256 {
-        self.post_tx_balance(address, &mut |addr| get_pre_tx_balance(addr))
-    }
-}
-
-/// Logs the current journal entries (since the last checkpoint) using firehose trace-level logging.
-///
-/// The journal records state mutations made by the EVM: balance transfers, nonce bumps, storage
-/// writes, account creation/warming, etc. This function is meant to be called at interesting
-/// points during execution (e.g. before/after call/create) to aid debugging.
-pub fn log_journal<CTX>(label: &str, context: &CTX)
-where
-    CTX: ContextTr,
-    CTX::Journal: JournalExt,
-{
-    use reth_revm::revm::context::JournalEntry;
-
-    if !firehose_tracer::logging::is_firehose_debug_enabled() {
-        return;
-    }
-
-    let journal = context.journal().journal();
-    if journal.is_empty() {
-        firehose_tracer::firehose_debug!("{}: journal empty", label);
-        return;
-    }
-
-    firehose_tracer::firehose_debug!("{}: journal ({} entries)", label, journal.len());
-    for (i, entry) in journal.iter().enumerate() {
-        match entry {
-            JournalEntry::AccountTouched { address } => {
-                firehose_tracer::firehose_debug!("  [{i}] AccountTouched addr={address}");
-            }
-            JournalEntry::AccountDestroyed { address, target, had_balance, .. } => {
-                firehose_tracer::firehose_debug!(
-                    "  [{i}] AccountDestroyed addr={address} target={target} balance={had_balance}"
-                );
-            }
-            JournalEntry::BalanceChange { address, old_balance } => {
-                firehose_tracer::firehose_debug!(
-                    "  [{i}] BalanceChange addr={address} old={old_balance}"
-                );
-            }
-            JournalEntry::BalanceTransfer { from, to, balance } => {
-                firehose_tracer::firehose_debug!(
-                    "  [{i}] BalanceTransfer from={from} to={to} amount={balance}"
-                );
-            }
-            JournalEntry::NonceChange { address, previous_nonce } => {
-                firehose_tracer::firehose_debug!(
-                    "  [{i}] NonceChange addr={address} prev_nonce={previous_nonce}"
-                );
-            }
-            JournalEntry::NonceBump { address } => {
-                firehose_tracer::firehose_debug!("  [{i}] NonceBump addr={address}");
-            }
-            JournalEntry::AccountCreated { address, is_created_globally } => {
-                firehose_tracer::firehose_debug!(
-                    "  [{i}] AccountCreated addr={address} global={is_created_globally}"
-                );
-            }
-            JournalEntry::StorageChanged { address, key, had_value } => {
-                firehose_tracer::firehose_debug!(
-                    "  [{i}] StorageChanged addr={address} key={key} had={had_value}"
-                );
-            }
-            JournalEntry::CodeChange { address, had_code_hash, .. } => {
-                firehose_tracer::firehose_debug!(
-                    "  [{i}] CodeChange addr={address} had_hash={had_code_hash}"
-                );
-            }
-            // Skip warm/cold tracking and transient storage — not relevant for Firehose
-            _ => {}
-        }
-    }
-}
-
-/// Logs the EvmState (accounts and their info) using firehose trace-level logging.
-///
-/// This logs all accounts that have been touched/modified in the state, along with their
-/// balance, nonce, code hash, and status flags. Useful for inspecting the full state picture
-/// at a given point (e.g. via the OnStateHook after each transaction/system call).
-pub fn log_evm_state(label: &str, state: &reth_revm::revm::state::EvmState) {
-    if !firehose_tracer::logging::is_firehose_debug_enabled() {
-        return;
-    }
-
-    if state.is_empty() {
-        firehose_tracer::firehose_debug!("{}: evm_state empty", label);
-        return;
-    }
-
-    firehose_tracer::firehose_debug!("{}: evm_state ({} accounts)", label, state.len());
-    for (addr, account) in state {
-        let info = &account.info;
-        let storage_count = account.storage.len();
-        firehose_tracer::firehose_debug!(
-            "  {addr} balance={} nonce={} code_hash={} status={:?} storage_slots={storage_count}",
-            info.balance,
-            info.nonce,
-            info.code_hash,
-            account.status,
-        );
-    }
-}
-
-/// Decide what `(old_nonce, new_nonce)` to emit at the depth-0 root call entry for
-/// the deduct_caller portion of the tx's pre-execution work.
-///
-/// On a vanilla CALL transaction the caller's nonce is bumped by exactly 1 by
-/// `validate_against_state_and_deduct_caller` (in revm and in
-/// `base_revm::OpHandler`), so `original_info.nonce` and `info.nonce` differ by 1
-/// and `(original, original + 1)` matches `(original, info.nonce)`.
-///
-/// On an EIP-7702 transaction whose **sender is also an authority** in the auth
-/// list, revm's `apply_auth_list` runs *before* the inspector's `call` hook fires
-/// and bumps the same nonce again per applied auth. By the time we read
-/// `account.info.nonce` here it reflects deduct_caller's `+1` *plus* every
-/// EIP-7702 auth's `+1` for the sender. Returning the live `(original, info.nonce)`
-/// here would emit a single change like `219 → 221` for what should be just the
-/// deduct_caller event; `process_eip7702_auth_list` (called a few lines later)
-/// then emits `220 → 221` correctly. The on-the-wire trace would carry both —
-/// double-counting the auth bump on the deduct_caller line.
-///
-/// Fix: emit only the deduct_caller portion, which is always `+1` for CALL on
-/// every chain we support (mainnet ETH and OP including OP deposit-typed CALLs).
-/// The auth bumps stay owned by `process_eip7702_auth_list`.
-///
-/// On CREATE the caller's nonce is bumped later in `create_account_checkpoint`,
-/// not by `deduct_caller`, so `original == current` here and we emit nothing.
-pub(crate) fn deduct_caller_nonce_emission(
-    original_nonce: u64,
-    current_nonce: u64,
-) -> Option<(u64, u64)> {
-    if original_nonce < current_nonce {
-        Some((original_nonce, original_nonce + 1))
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

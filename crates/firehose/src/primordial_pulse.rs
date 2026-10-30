@@ -37,8 +37,9 @@
 //! detect the selfdestruct event and zero the contract's storage themselves.
 //! Tracked as `FIXME(firehose-primordialpulse-eth-deposit-storage)`.
 
-use crate::inspector::FirehoseInspectorApi;
 use alloy_primitives::{Address, B256, U256};
+use evm2::evm::DynDatabase;
+use reth_trie_common::bundle_state::BundleState;
 use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
 use reth_pulsechain_forks::primordial_pulse as spec;
 
@@ -108,10 +109,7 @@ impl PrimordialPulsePreState {
     /// Walk the spec for `chain_id` and snapshot every address PrimordialPulse
     /// will touch. Returns `None` if the chain doesn't have a PrimordialPulse
     /// transition (i.e. anything other than 369 / 943).
-    pub fn capture<DB>(db: &mut DB, chain_id: u64, block_number: u64) -> Option<Self>
-    where
-        DB: reth_revm::Database,
-    {
+    pub fn capture(db: &mut dyn DynDatabase, chain_id: u64, block_number: u64) -> Option<Self> {
         // Skip chains without a PrimordialPulse transition.
         let _spec_blob = spec::sacrifice_credits_for(chain_id)?;
 
@@ -175,41 +173,24 @@ impl PrimordialPulsePreState {
 /// `balance_change` made it through: the block reward, emitted later by the
 /// existing `emit_block_reward_balance_changes` flow). The two-pass split fixes
 /// that.
-pub fn emit_primordial_pulse_changes<E>(evm: &mut E, pre: &PrimordialPulsePreState)
-where
-    E: reth_evm::Evm,
-    E::Inspector: FirehoseInspectorApi,
-    E::DB: reth_revm::Database,
-{
-    let (db, inspector, _) = evm.components_mut();
-    emit_primordial_pulse_into(db, inspector.tracer_mut(), pre);
-}
-
-/// Diff `pre` against the post-`inner.finish()` DB and emit firehose events via `tracer`.
-///
-/// Prefer [`emit_primordial_pulse_changes`] from production call sites. This entry point exists
-/// so unit tests can drive the emit shape with a mock [`Database`] and a real tracer without
-/// constructing a full [`reth_evm::Evm`].
-pub fn emit_primordial_pulse_into<DB>(
-    db: &mut DB,
+pub fn emit_primordial_pulse_changes(
     tracer: &mut firehose_tracer::Tracer,
     pre: &PrimordialPulsePreState,
-) where
-    DB: reth_revm::Database,
-{
+    state: &BundleState,
+) {
     // ── Pass 1: block-level balance + code changes ────────────────────────────
     // Sacrifice credits + (testnet) treasury. Reason::GenesisBalance is the
     // closest semantic fit — a hardfork-time allocation outside any EVM tx.
     // `on_balance_change` drops events with reason=Unknown so this matters.
     for &(addr, pre_bal, _credit) in &pre.balance_credits {
-        let post_bal = read_balance(db, addr);
+        let post_bal = final_balance(state, addr, pre_bal);
         tracer.on_balance_change(addr, pre_bal, post_bal, Reason::GenesisBalance);
     }
 
     // ETH_DEPOSIT_CONTRACT: balance → 0 (selfdestruct), code → empty.
     // Storage clearing is NOT emitted — see module-level docs.
     let eth_addr = spec::ETH_DEPOSIT_CONTRACT;
-    let eth_post = read_account(db, eth_addr, &[]);
+    let eth_post = final_account(state, eth_addr, &pre.eth_deposit_pre, &[]);
     if pre.eth_deposit_pre.balance != eth_post.balance {
         // Geth-pulse uses REASON_SUICIDE_WITHDRAW for this; we mirror.
         tracer.on_balance_change(
@@ -231,7 +212,7 @@ pub fn emit_primordial_pulse_into<DB>(
 
     // PULSE_DEPOSIT_CONTRACT: balance change (if any) + code installation.
     let pulse_addr = spec::PULSE_DEPOSIT_CONTRACT;
-    let pulse_post_basic = read_account(db, pulse_addr, &[]);
+    let pulse_post_basic = final_account(state, pulse_addr, &pre.pulse_deposit_pre, &[]);
     if pre.pulse_deposit_pre.balance != pulse_post_basic.balance {
         tracer.on_balance_change(
             pulse_addr,
@@ -263,7 +244,7 @@ pub fn emit_primordial_pulse_into<DB>(
 
     // ETH_DEPOSIT_CONTRACT: nonce change (storage skipped, see module-level docs).
     let eth_addr = spec::ETH_DEPOSIT_CONTRACT;
-    let eth_post = read_account(db, eth_addr, &[]);
+    let eth_post = final_account(state, eth_addr, &pre.eth_deposit_pre, &[]);
     if pre.eth_deposit_pre.nonce != eth_post.nonce {
         tracer.on_nonce_change(eth_addr, pre.eth_deposit_pre.nonce, eth_post.nonce);
     }
@@ -272,7 +253,7 @@ pub fn emit_primordial_pulse_into<DB>(
     let pulse_addr = spec::PULSE_DEPOSIT_CONTRACT;
     let pulse_slots: Vec<B256> =
         spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.iter().map(|(s, _)| *s).collect();
-    let pulse_post = read_account(db, pulse_addr, &pulse_slots);
+    let pulse_post = final_account(state, pulse_addr, &pre.pulse_deposit_pre, &pulse_slots);
     if pre.pulse_deposit_pre.nonce != pulse_post.nonce {
         tracer.on_nonce_change(pulse_addr, pre.pulse_deposit_pre.nonce, pulse_post.nonce);
     }
@@ -296,40 +277,100 @@ fn decode_chain_credits(chain_id: u64) -> Vec<(Address, U256)> {
     }
 }
 
-fn read_balance<DB>(db: &mut DB, addr: Address) -> U256
-where
-    DB: reth_revm::Database,
-{
-    db.basic(addr).ok().flatten().map(|info| info.balance).unwrap_or_default()
+fn read_balance(db: &mut dyn DynDatabase, addr: Address) -> U256 {
+    db.get_account(&addr).ok().flatten().map(|info| info.balance).unwrap_or_default()
 }
 
-/// Read an account's full state plus optionally pre-values of named storage slots.
-fn read_account<DB>(db: &mut DB, addr: Address, slots: &[B256]) -> AccountPreState
-where
-    DB: reth_revm::Database,
-{
-    let info = db.basic(addr).ok().flatten();
+/// Reads an account and the values of `slots` from the pre-finish state.
+fn read_account(db: &mut dyn DynDatabase, addr: Address, slots: &[B256]) -> AccountPreState {
+    let info = db.get_account(&addr).ok().flatten();
     let (balance, nonce, code_hash, code) = match info {
         Some(info) => {
             let code = info
                 .code
                 .clone()
-                .or_else(|| db.code_by_hash(info.code_hash).ok())
-                .map(|bc| bc.bytes().to_vec())
+                .or_else(|| db.get_code_by_hash(&info.code_hash).ok())
+                .map(|bytecode| bytecode.original_bytes().to_vec())
                 .unwrap_or_default();
             (info.balance, info.nonce, info.code_hash, code)
         }
         None => (U256::ZERO, 0, B256::ZERO, Vec::new()),
     };
-
     let storage_slots_pre = slots
         .iter()
         .map(|&slot| {
-            let v = db.storage(addr, U256::from_be_bytes(slot.0)).ok().unwrap_or(U256::ZERO);
-            (slot, B256::from(v.to_be_bytes::<32>()))
+            let value = db.get_storage(&addr, &U256::from_be_bytes(slot.0)).unwrap_or(U256::ZERO);
+            (slot, B256::from(value.to_be_bytes::<32>()))
         })
         .collect();
+    AccountPreState { balance, nonce, code_hash, code, storage_slots_pre }
+}
 
+/// Returns an account's balance in the block's final state, or `pre` when the block left the
+/// account unchanged.
+fn final_balance(state: &BundleState, addr: Address, pre: U256) -> U256 {
+    match state.account(&addr) {
+        Some(account) => account.info.as_ref().map(|info| info.balance).unwrap_or_default(),
+        None => pre,
+    }
+}
+
+/// Returns an account and the values of `slots` in the block's final state.
+///
+/// An account the block did not change keeps its pre-finish values. A destroyed account reads as
+/// empty, with every slot zero.
+fn final_account(
+    state: &BundleState,
+    addr: Address,
+    pre: &AccountPreState,
+    slots: &[B256],
+) -> AccountPreState {
+    let Some(account) = state.account(&addr) else {
+        return AccountPreState {
+            storage_slots_pre: slots
+                .iter()
+                .map(|slot| {
+                    let value = pre
+                        .storage_slots_pre
+                        .iter()
+                        .find(|(s, _)| s == slot)
+                        .map(|(_, v)| *v)
+                        .unwrap_or_default();
+                    (*slot, value)
+                })
+                .collect(),
+            ..pre.clone()
+        };
+    };
+    let (balance, nonce, code_hash, code) = match &account.info {
+        Some(info) => {
+            let code = info
+                .code
+                .clone()
+                .or_else(|| state.bytecode(&info.code_hash))
+                .map(|bytecode| bytecode.original_bytes().to_vec())
+                .unwrap_or_default();
+            (info.balance, info.nonce, info.code_hash, code)
+        }
+        None => (U256::ZERO, 0, B256::ZERO, Vec::new()),
+    };
+    let storage_slots_pre = slots
+        .iter()
+        .map(|&slot| {
+            let key = U256::from_be_bytes(slot.0);
+            let value = match account.storage.get(&key) {
+                Some(slot) => slot.present_value,
+                None if account.info.is_none() => U256::ZERO,
+                None => pre
+                    .storage_slots_pre
+                    .iter()
+                    .find(|(s, _)| *s == slot)
+                    .map(|(_, v)| U256::from_be_bytes(v.0))
+                    .unwrap_or_default(),
+            };
+            (slot, B256::from(value.to_be_bytes::<32>()))
+        })
+        .collect();
     AccountPreState { balance, nonce, code_hash, code, storage_slots_pre }
 }
 
@@ -439,9 +480,9 @@ mod tests {
         Tracer,
     };
     use prost::Message;
-    use revm::state::{AccountInfo, Bytecode};
+    use evm2::{bytecode::Bytecode, evm::AccountInfo};
 
-    /// Minimal [`reth_revm::Database`] returning scripted account/storage values.
+    /// Scripted post-finish state, turned into the [`BundleState`] the emitter reads.
     #[derive(Default)]
     struct MockDb {
         accounts: HashMap<Address, AccountInfo>,
@@ -449,24 +490,30 @@ mod tests {
         codes: HashMap<B256, Bytecode>,
     }
 
-    impl reth_revm::Database for MockDb {
-        type Error = core::convert::Infallible;
-
-        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-            Ok(self.accounts.get(&address).cloned())
+    impl MockDb {
+        fn into_bundle(&self) -> BundleState {
+            let mut builder = BundleState::builder(0..=0);
+            for (address, info) in &self.accounts {
+                builder = builder.state_present_account_info(*address, info.clone());
+            }
+            let mut storage: HashMap<Address, alloy_primitives::map::U256Map<(U256, U256)>> =
+                HashMap::new();
+            for (&(address, key), &value) in &self.storage {
+                storage.entry(address).or_default().insert(key, (U256::ZERO, value));
+            }
+            for (address, slots) in storage {
+                builder = builder.state_storage(address, slots);
+            }
+            let mut bundle = builder.build();
+            for (hash, code) in &self.codes {
+                bundle.contracts.insert(*hash, code.clone());
+            }
+            bundle
         }
+    }
 
-        fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-            Ok(self.codes.get(&code_hash).cloned().unwrap_or_default())
-        }
-
-        fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-            Ok(self.storage.get(&(address, index)).copied().unwrap_or(U256::ZERO))
-        }
-
-        fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
-            Ok(B256::ZERO)
-        }
+    fn account(balance: U256, nonce: u64, code_hash: B256, code: Option<Bytecode>) -> AccountInfo {
+        AccountInfo::new(balance, nonce, code_hash, code)
     }
 
     fn parse_fire_block(raw: &[u8]) -> FirehoseBlock {
@@ -495,7 +542,7 @@ mod tests {
             },
             ..Default::default()
         });
-        emit_primordial_pulse_into(db, &mut tracer, pre);
+        emit_primordial_pulse_changes(&mut tracer, pre, &db.into_bundle());
         tracer.on_block_end(None);
         parse_fire_block(&buffer.get_bytes())
     }
@@ -504,13 +551,7 @@ mod tests {
         // ETH deposit wiped.
         db.accounts.insert(
             spec::ETH_DEPOSIT_CONTRACT,
-            AccountInfo {
-                balance: U256::ZERO,
-                nonce: 0,
-                code_hash: B256::ZERO,
-                code: None,
-                ..Default::default()
-            },
+            account(U256::ZERO, 0, B256::ZERO, None),
         );
 
         let pulse_code = Bytecode::new_raw(spec::DEPOSIT_CONTRACT_BYTECODE.to_vec().into());
@@ -518,13 +559,7 @@ mod tests {
         db.codes.insert(pulse_hash, pulse_code.clone());
         db.accounts.insert(
             spec::PULSE_DEPOSIT_CONTRACT,
-            AccountInfo {
-                balance: U256::ZERO,
-                nonce: 1,
-                code_hash: pulse_hash,
-                code: Some(pulse_code),
-                ..Default::default()
-            },
+            account(U256::ZERO, 1, pulse_hash, Some(pulse_code)),
         );
         for &(slot, value) in spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.iter() {
             db.storage.insert(
@@ -567,7 +602,7 @@ mod tests {
 
         let mut db = MockDb::default();
         // Post credit balance = pre + credit.
-        db.accounts.insert(credit_addr, AccountInfo { balance: credit_amt, ..Default::default() });
+        db.accounts.insert(credit_addr, account(credit_amt, 0, B256::ZERO, None));
         seed_post_deposit_state(&mut db);
 
         let block = emit_and_decode(&pre, &mut db);
@@ -644,9 +679,9 @@ mod tests {
         let mut db = MockDb::default();
         db.accounts.insert(
             treasury,
-            AccountInfo { balance: spec::TESTNET_V4_TREASURY_BALANCE, ..Default::default() },
+            account(spec::TESTNET_V4_TREASURY_BALANCE, 0, B256::ZERO, None),
         );
-        db.accounts.insert(credit_addr, AccountInfo { balance: credit_amt, ..Default::default() });
+        db.accounts.insert(credit_addr, account(credit_amt, 0, B256::ZERO, None));
         seed_post_deposit_state(&mut db);
 
         let block = emit_and_decode(&pre, &mut db);
@@ -670,7 +705,7 @@ mod tests {
 
     #[test]
     fn capture_returns_none_for_non_pulse_chain() {
-        let mut db = MockDb::default();
+        let mut db = evm2::evm::EmptyDB::default();
         assert!(PrimordialPulsePreState::capture(&mut db, 1, 100).is_none());
     }
 }

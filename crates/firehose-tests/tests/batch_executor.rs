@@ -10,13 +10,13 @@
 use std::sync::Arc;
 
 use alloy_consensus::Header;
+use evm2::evm::EmptyDB;
 use reth_chainspec::{ChainSpecBuilder, MAINNET};
 use reth_ethereum_primitives::{Block, BlockBody};
 use reth_evm::execute::Executor;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_firehose::FirehoseBlockExecutor;
 use reth_primitives_traits::RecoveredBlock;
-use revm::database::EmptyDB;
 
 #[test]
 fn only_execute_and_trace_one_emits_the_block() {

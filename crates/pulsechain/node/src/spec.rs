@@ -39,7 +39,6 @@ use std::sync::Arc;
 
 use alloy_consensus::Header;
 use alloy_eips::eip7840::BlobParams;
-use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256};
 use reth_chainspec::{
@@ -177,12 +176,6 @@ impl EthChainSpec for PulsechainChainSpec {
 
     fn final_paris_total_difficulty(&self) -> Option<U256> {
         self.inner.final_paris_total_difficulty()
-    }
-}
-
-impl EthExecutorSpec for PulsechainChainSpec {
-    fn deposit_contract_address(&self) -> Option<Address> {
-        self.inner.deposit_contract_address()
     }
 }
 

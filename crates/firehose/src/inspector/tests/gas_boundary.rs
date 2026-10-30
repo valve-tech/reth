@@ -1,13 +1,12 @@
 //! Transactions and frames that run out of gas right at a boundary: a frame that starts with
 //! no gas at all, and value transfers whose frame is starved before it can finish. Each is
-//! driven through a real revm transaction so the gas figures are the ones the EVM produces,
+//! driven through a real transaction so the gas figures are the ones the EVM produces,
 //! not ones the fixture asserts about itself.
 
 use super::support::*;
 use crate::inspector::*;
-use reth_revm::revm::primitives::hardfork::SpecId;
-
-type Reason = pb::sf::ethereum::r#type::v2::balance_change::Reason;
+use evm2::SpecId;
+use firehose_tracer::pb;
 
 /// Contract that runs `to.transfer(1)` the way Solidity compiles it: `CALL` with a zero gas
 /// argument (the 2300 stipend is added by the EVM because value is non-zero), reverting when
@@ -44,7 +43,7 @@ fn transfers(
 /// A value-transferring CALL whose callee is handed only the 2300 stipend and burns all of
 /// it: the callee frame is entered (`executed_code`) and reports its whole gas limit as
 /// consumed, the caller reverts, and the attempted transfer still shows up as a debit and a
-/// credit even though revm rolled the journal back.
+/// credit even though evm2 rolled the journal back.
 #[test]
 fn starved_value_call_consumes_all_its_gas_and_keeps_transfer_changes() {
     const CALLER_CONTRACT: Address = Address::repeat_byte(0xdd);
@@ -92,9 +91,9 @@ const TX_CREATE_GAS: u64 = 32_000;
 /// Intrinsic gas of a creation transaction under Prague (Amsterdam prices creation
 /// differently, so this floor does not carry over): base, creation surcharge, calldata
 /// (4 gas per zero byte, 16 per non-zero) and EIP-3860's 2 gas per init code word. Written out
-/// by hand so it is an independent check on what revm charges rather than a call into it.
+/// by hand so it is an independent check on what evm2 charges rather than a call into it.
 fn create_intrinsic_gas(initcode: &[u8]) -> u64 {
-    let zeros = initcode.iter().filter(|b| **b == 0).count() as u64;
+    let zeros = initcode.iter().map(|b| u64::from(*b == 0)).sum::<u64>();
     let non_zeros = initcode.len() as u64 - zeros;
     TX_BASE_GAS +
         TX_CREATE_GAS +
@@ -138,7 +137,7 @@ fn create_at_intrinsic_gas_floor_gets_a_zero_gas_frame() {
 
 /// Amsterdam charges the account-creation state gas of a creation transaction (EIP-2780,
 /// EIP-8037) after the intrinsic phase but before the root `CREATE` frame exists. When that
-/// charge runs out of gas, revm includes the transaction as an out-of-gas halt without ever
+/// charge runs out of gas, evm2 includes the transaction as an out-of-gas halt without ever
 /// opening a frame, so no inspector call hook fires. The trace must still carry a failed root
 /// `CREATE`, its receipt and the sender's nonce bump — a transaction with no call at all is
 /// what the tracer treats as a bad block, dropping the receipt and leaving the status unknown.
@@ -189,10 +188,10 @@ fn amsterdam_create_starved_of_creation_state_gas_keeps_a_failed_root_call() {
 }
 
 /// Hoodi block 3171397: value sent straight to a precompile that is then starved of gas.
-/// The frame fails, revm rolls the transfer back, and geth still reports the debit and the
-/// credit — so must we. Unlike the hook-level test in [`super::precompile`], this runs a real
-/// transaction: a MODEXP call carries a minimum cost above the gas left after the 21000
-/// intrinsic, so the precompile itself runs out of gas.
+/// The frame fails, evm2 rolls the transfer back, and geth still reports the debit and the
+/// credit — so must we. Unlike the precompile rejecting its input in [`super::precompile`], a
+/// MODEXP call carries a minimum cost above the gas left after the 21000 intrinsic, so the
+/// precompile itself runs out of gas.
 #[test]
 fn value_sent_to_starved_precompile_keeps_transfer_changes() {
     const MODEXP: Address =

@@ -25,6 +25,7 @@ reth-ethereum-primitives.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
 reth-tracing.workspace = true
+reth-trie-common.workspace = true
 
 # PulseChain-specific (intentional cross-crate dep): the firehose wrapper layer
 # emits FIRE BLOCK events for the PrimordialPulse state transition by walking
@@ -41,6 +42,9 @@ alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
+
+# evm2
+evm2 = { workspace = true, features = ["std"] }
 
 # std
 eyre.workspace = true

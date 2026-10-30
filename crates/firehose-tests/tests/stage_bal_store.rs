@@ -24,11 +24,10 @@ use reth_provider::{
     test_utils::create_test_provider_factory_with_chain_spec, BalProvider, BlockWriter, DBProvider,
     DatabaseProviderFactory, StaticFileProviderFactory, StaticFileWriter,
 };
-use reth_revm::State;
 use reth_stages::stages::ExecutionStage;
 use reth_stages_api::{ExecInput, Stage};
 use reth_static_file_types::StaticFileSegment;
-use revm::database::{CacheDB, EmptyDB};
+use evm2::evm::InMemoryDB;
 
 #[test]
 fn execution_stage_stores_the_rebuilt_block_access_list() {
@@ -41,12 +40,9 @@ fn execution_stage_stores_the_rebuilt_block_access_list() {
     let evm_config = EthEvmConfig::new(chain_spec.clone());
 
     // Reference BAL from the upstream executor. A placeholder hash only arms its BAL builder.
-    let mut db = CacheDB::new(EmptyDB::default());
+    let mut db = InMemoryDB::default();
     seed_cache_db(&mut db, &prestate.genesis).unwrap();
-    let mut reference = BasicBlockExecutor::new(
-        evm_config.clone(),
-        State::builder().with_database(db).with_bundle_update().build(),
-    );
+    let mut reference = BasicBlockExecutor::new(evm_config.clone(), db);
     reference.execute_one(&block(&prestate, B256::repeat_byte(0x11))).unwrap();
     let expected_rlp = alloy_rlp::encode(reference.take_bal().expect("upstream builds a BAL"));
     let block = block(&prestate, keccak256(&expected_rlp));

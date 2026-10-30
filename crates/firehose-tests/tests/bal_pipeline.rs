@@ -18,11 +18,12 @@ use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, TransactionSigned};
 use reth_evm::execute::{BasicBlockExecutor, Executor};
 use reth_evm_ethereum::EthEvmConfig;
-use reth_firehose::{run_wrapped_block, take_traced_block_access_list, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust};
+use reth_firehose::{
+    record_block_access_list, run_wrapped_block, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust,
+};
 use reth_firehose_tests::prestate::{parse_fire_block_for, seed_cache_db, Prestate};
 use reth_primitives_traits::{Block as _, RecoveredBlock};
-use reth_revm::State;
-use revm::database::{CacheDB, EmptyDB};
+use evm2::evm::InMemoryDB;
 
 const RECIPIENT: Address = address!("0x000000000000000000000000000000000000beef");
 
@@ -89,7 +90,7 @@ fn pipeline_rebuilds_bal_of_a_block_with_transactions() {
 
     // The same block, now declaring the real hash, through the Firehose pipeline path.
     let block = block(&prestate, &transactions, expected);
-    let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
+    let (tracer, buffer) = firehose_tracer::Tracer::with_buffer(
         firehose_tracer::config::Config::default(),
         firehose_tracer::config::ChainConfig {
             chain_id: prestate.genesis.config.chain_id,
@@ -102,19 +103,22 @@ fn pipeline_rebuilds_bal_of_a_block_with_transactions() {
         env!("CARGO_PKG_VERSION"),
     );
     let mut guard =
-        FirehoseBlockTracer::start_local::<EthPrimitives>(&mut tracer, block.sealed_block(), None);
-    let mut db = state(&prestate);
+        FirehoseBlockTracer::start_local::<EthPrimitives>(
+            Box::new(tracer),
+            block.sealed_block(),
+            None,
+        );
     run_wrapped_block(
         &EthEvmConfig::new(chain_spec),
-        &mut db,
+        state(&prestate),
         &block,
         &mut guard,
         NoPreTxAdjust,
         NoPostTxExtras,
     )
-    .and_then(|result| {
-        take_traced_block_access_list(&mut db, &block, &mut guard)?;
-        Ok(result)
+    .and_then(|(output, bal)| {
+        record_block_access_list(&block, bal.as_ref(), &mut guard)?;
+        Ok(output)
     })
     .expect("the rebuilt BAL must match upstream's hash");
     guard.mark_verified();
@@ -127,10 +131,10 @@ fn pipeline_rebuilds_bal_of_a_block_with_transactions() {
     assert_eq!(emitted.transaction_traces.len(), 3);
 }
 
-fn state(prestate: &Prestate) -> State<CacheDB<EmptyDB>> {
-    let mut db = CacheDB::new(EmptyDB::default());
+fn state(prestate: &Prestate) -> InMemoryDB {
+    let mut db = InMemoryDB::default();
     seed_cache_db(&mut db, &prestate.genesis).unwrap();
-    State::builder().with_database(db).with_bundle_update().build()
+    db
 }
 
 fn block(

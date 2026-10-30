@@ -3,132 +3,42 @@
 
 use super::{scenario::*, support::*};
 use crate::inspector::*;
-use reth_revm::revm::primitives::hardfork::SpecId;
+use evm2::SpecId;
+use firehose_tracer::pb;
+
+/// Contract that self-destructs, its code being `code`.
+const SELFDESTRUCT_CONTRACT: Address = Address::repeat_byte(0xdd);
+
+/// Runs one transaction calling [`SELFDESTRUCT_CONTRACT`] holding `code` and returns its root
+/// call.
+fn lone_selfdestruct_call(code: &[u8]) -> pb::sf::ethereum::r#type::v2::Call {
+    let block = drive_tx(
+        SpecId::PRAGUE,
+        &[(SENDER, balance_account(1_000_000)), (SELFDESTRUCT_CONTRACT, code_account(code, 0))],
+        SELFDESTRUCT_CONTRACT,
+        0,
+    );
+    block.transaction_traces[0].calls.first().expect("one call").clone()
+}
 
 #[test]
 fn executed_selfdestruct_marks_call_as_suicide() {
-    use reth_revm::revm::interpreter::InstructionResult;
-
-    let block = decode_fire_block(&drive_lone_selfdestruct(InstructionResult::SelfDestruct));
-    let call = block.transaction_traces[0].calls.first().expect("one call");
+    // PUSH0 SELFDESTRUCT: self-destruct to the zero address.
+    let call = lone_selfdestruct_call(&[0x5f, 0xff]);
 
     assert!(call.suicide, "an executed SELFDESTRUCT must mark the call as self-destructed");
     assert!(!call.status_failed, "an executed SELFDESTRUCT succeeds");
 }
 
-/// A chain can replace SELFDESTRUCT with an undefined instruction. The frame then halts on
-/// `OpcodeNotFound` without self-destructing, so the call must not be reported as a suicide.
+/// A SELFDESTRUCT that halts the frame without self-destructing, as an undefined instruction
+/// does on a chain that replaced it, must not mark the call as a suicide. A lone `0xff` byte
+/// halts on its empty stack before destroying anything.
 #[test]
-fn undefined_selfdestruct_does_not_mark_call_as_suicide() {
-    use reth_revm::revm::interpreter::InstructionResult;
+fn halted_selfdestruct_does_not_mark_call_as_suicide() {
+    let call = lone_selfdestruct_call(&[0xff]);
 
-    let block = decode_fire_block(&drive_lone_selfdestruct(InstructionResult::OpcodeNotFound));
-    let call = block.transaction_traces[0].calls.first().expect("one call");
-
-    assert!(!call.suicide, "an undefined SELFDESTRUCT must not mark the call as self-destructed");
-    assert!(call.status_failed, "a frame halting on an undefined opcode fails");
-}
-
-/// Contract whose code is a lone `0xff` byte.
-const SELFDESTRUCT_CONTRACT: Address = Address::repeat_byte(0xdd);
-
-/// Drives one transaction calling [`SELFDESTRUCT_CONTRACT`] through the inspector's `call`,
-/// `step`, `step_end` and `call_end` hooks, with the `0xff` instruction halting the frame on
-/// `result`: `SelfDestruct` when the instruction table defines SELFDESTRUCT, `OpcodeNotFound`
-/// when a chain replaced it with an undefined instruction. Returns the raw FIRE output buffer.
-fn drive_lone_selfdestruct(result: reth_revm::revm::interpreter::InstructionResult) -> Vec<u8> {
-    use reth_revm::{
-        bytecode::Bytecode,
-        revm::{
-            context::Context,
-            database::{CacheDB, EmptyDB},
-            interpreter::{
-                interpreter::ExtBytecode, interpreter_action::CallScheme, CallInput, CallValue,
-                Gas, Interpreter, InterpreterResult,
-            },
-            state::AccountInfo,
-            MainContext,
-        },
-    };
-
-    let gas_limit = 100_000;
-    let code = Bytecode::new_raw(Bytes::from_static(&[0xff]));
-    let mut db = CacheDB::new(EmptyDB::default());
-    db.insert_account_info(
-        SELFDESTRUCT_CONTRACT,
-        AccountInfo { code_hash: code.hash_slow(), code: Some(code.clone()), ..Default::default() },
-    );
-    let mut ctx = Context::mainnet().with_db(db);
-
-    let (mut tracer, buffer) = firehose_tracer::Tracer::with_buffer(
-        firehose_tracer::config::Config::default(),
-        firehose_tracer::config::ChainConfig {
-            chain_id: 1,
-            shanghai_time: Some(0),
-            cancun_time: Some(0),
-            prague_time: None,
-            verkle_time: None,
-        },
-        "reth-firehose-test",
-        "0",
-    );
-
-    {
-        let mut insp = FirehoseInspector::new(&mut tracer);
-        insp.tracer_mut().on_block_start(firehose_tracer::types::BlockEvent {
-            block: firehose_tracer::types::BlockData { number: 1, ..Default::default() },
-            finalized: None,
-            flash_block: None,
-        });
-        insp.tracer_mut().on_tx_start(
-            firehose_tracer::types::TxEvent {
-                to: Some(SELFDESTRUCT_CONTRACT),
-                ..legacy_tx_event()
-            },
-            None,
-        );
-
-        let mut inputs = CallInputs {
-            input: CallInput::Bytes(Bytes::new()),
-            return_memory_offset: 0..0,
-            gas_limit,
-            reservoir: 0,
-            bytecode_address: SELFDESTRUCT_CONTRACT,
-            known_bytecode: (code.hash_slow(), code.clone()),
-            target_address: SELFDESTRUCT_CONTRACT,
-            caller: SENDER,
-            value: CallValue::Transfer(U256::ZERO),
-            scheme: CallScheme::Call,
-            is_static: false,
-            charged_new_account_state_gas: false,
-        };
-        let _ = insp.call(&mut ctx, &mut inputs);
-
-        // Stand-in for the interpreter loop running the lone instruction: `step`, the
-        // instruction halting the frame, then `step_end`.
-        let mut interp = Interpreter { bytecode: ExtBytecode::new(code), ..Default::default() };
-        insp.step(&mut interp, &mut ctx);
-        interp.halt(result);
-        insp.step_end(&mut interp, &mut ctx);
-
-        let mut outcome = CallOutcome {
-            result: InterpreterResult { result, output: Bytes::new(), gas: Gas::new(gas_limit) },
-            memory_offset: 0..0,
-            was_precompile_called: false,
-            precompile_call_logs: Vec::new(),
-            charged_new_account_state_gas: false,
-        };
-        insp.call_end(&mut ctx, &inputs, &mut outcome);
-
-        let status = if result.is_ok() { 1 } else { 0 };
-        let receipt = firehose_tracer::types::ReceiptData::new(0, gas_limit, status, gas_limit);
-        insp.tracer_mut().on_tx_end(Some(&receipt), None);
-    }
-
-    tracer.on_block_end(None);
-    drop(tracer);
-
-    buffer.get_bytes()
+    assert!(!call.suicide, "a halted SELFDESTRUCT must not mark the call as self-destructed");
+    assert!(call.status_failed, "a frame halting on SELFDESTRUCT fails");
 }
 
 // ---- EIP-8246 SELFDESTRUCT burn removal ----------------------------------------------
@@ -137,13 +47,12 @@ fn drive_lone_selfdestruct(result: reth_revm::revm::interpreter::InstructionResu
 // leaves the balance on the account, and at transaction finalization a self-destructed
 // account that still holds a balance keeps it, losing only its nonce, code and storage.
 //
-// revm implements the rule (`JournalInner::selfdestruct` and
-// `eip8246_clear_selfdestructed_accounts`); what the tests below pin is the Firehose side:
+// evm2 implements the rule; what the tests below pin is the Firehose side:
 // which balance changes the inspector reports on each side of the fork. Every case from the
 // EIP's own test-case list is driven at `PRAGUE` and at `AMSTERDAM` from the same scenario,
 // so a difference in the reported events is attributable to the fork and nothing else.
 //
-// No new event kind is introduced. In particular the storage that revm wipes at
+// No new event kind is introduced. In particular the storage that evm2 wipes at
 // finalization is not reported: nothing reported it before the fork and the Firehose
 // protocol has no account-clearing event to hang it on.
 //
@@ -564,7 +473,7 @@ fn nonce_bumped_then_selfdestruct_to_other() {
 /// EIP test case, finalization 11: a created account writes storage, then
 /// `selfdestruct-to-self`.
 ///
-/// revm wipes the storage of a surviving balance-only account at finalization, and that wipe
+/// evm2 wipes the storage of a surviving balance-only account at finalization, and that wipe
 /// is deliberately not reported: no event described it before the fork either, and the
 /// Firehose protocol has no account-clearing event to carry it. A consumer learns the
 /// account was cleared from the call's `suicide` marker, as it always has.
@@ -729,8 +638,8 @@ fn zero_balance_selfdestruct_to_self() {
 /// A `SELFDESTRUCT` that runs out of gas destroys nothing: no balance change, no nonce/code
 /// cleanup, and the call is not marked as self-destructed.
 ///
-/// revm mutates the journal inside `Journal::selfdestruct` and charges the dynamic cost
-/// afterwards, so the `AccountDestroyed` entry is already written when the instruction halts
+/// evm2 applies the SELFDESTRUCT to the state and charges the dynamic cost afterwards, so the
+/// account is already marked destroyed in the journal when the instruction halts
 /// on gas. Geth charges before running the opcode body, so its tracer never sees a suicide
 /// here; the inspector matches that by reporting the opcode as failed for every instruction
 /// result other than `SelfDestruct`.
@@ -761,14 +670,15 @@ fn out_of_gas_selfdestruct_reports_nothing() {
     }
 }
 
-/// A `SELFDESTRUCT` inside a frame that later reverts destroys nothing: revm rolls the
+/// A `SELFDESTRUCT` inside a frame that later reverts destroys nothing: evm2 rolls the
 /// journal entry back, the balance change the inspector emitted stays flagged as reverted,
 /// and no finalization cleanup follows.
 ///
-/// The cleanup is the part worth pinning. `selfdestruct_addresses` is filled when the opcode
-/// runs and revm truncates the journal entry without telling the inspector, so the set still
+/// The cleanup is the part worth pinning. `selfdestruct_candidates` is filled when the opcode
+/// runs and evm2 rolls the destruction back without telling the inspector, so the set still
 /// holds an account that kept its nonce and code; `capture_selfdestruct_cleanup` drops it by
-/// checking the committed journal. Geth's journal reverts its own self-destruct set.
+/// checking whether the account is still destroyed. Geth's journal reverts its own
+/// self-destruct set.
 #[test]
 fn reverted_selfdestruct_reports_no_cleanup() {
     let scenario = Scenario {
@@ -807,7 +717,7 @@ fn reverted_selfdestruct_reports_no_cleanup() {
 
 /// The same rollback one frame up: the root call itself reverts after a nested
 /// `SELFDESTRUCT` committed. The filter has to hold here too, because `call_end` at depth 0
-/// is where the cleanup is captured — if revm had not truncated the journal by then, a
+/// is where the cleanup is captured — if evm2 had not rolled the destruction back by then, a
 /// whole-transaction revert would still report the account as cleared.
 #[test]
 fn root_reverted_selfdestruct_reports_no_cleanup() {
