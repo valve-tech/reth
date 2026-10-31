@@ -251,7 +251,7 @@ pub fn run_prestate_via_block_executor(case_folder: &Path) -> eyre::Result<RunOu
     let mut db = InMemoryDB::default();
     seed_cache_db(&mut db, &prestate.genesis)?;
 
-    let evm_config = EthEvmConfig::new(chain_spec.clone());
+    let evm_config = EthEvmConfig::new(chain_spec);
 
     // Initialize the PROCESS-WIDE tracer (vs. the local tracer used by `run_prestate`). The
     // `FirehoseBlockExecutor` resolves it via `is_tracer_initialized()` / the global handle.
@@ -409,7 +409,7 @@ pub fn parse_fire_block_for(raw: &[u8], block_number: u64) -> eyre::Result<Fireh
         // Skip flash_idx, hash, prev_num, prev_hash, lib_num, ts_ns to reach payload (8th token,
         // 0-indexed token #8 from the start of the line — i.e. the last token).
         let payload =
-            parts.last().context("FIRE BLOCK line missing base64 payload (last token)")?;
+            parts.next_back().context("FIRE BLOCK line missing base64 payload (last token)")?;
         let bytes = general_purpose::STANDARD
             .decode(payload)
             .context("base64-decoding FIRE BLOCK payload")?;

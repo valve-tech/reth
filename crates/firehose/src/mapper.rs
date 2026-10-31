@@ -26,7 +26,7 @@ pub(crate) fn to_genesis_alloc(genesis: &Genesis) -> GenesisAlloc {
                 *address,
                 firehose_tracer::types::GenesisAccount {
                     code: account.code.clone(),
-                    balance: Some(account.balance.clone()),
+                    balance: Some(account.balance),
                     nonce: account.nonce.unwrap_or_default(),
                     storage: map_genesis_storage(&account.storage),
                 },
@@ -128,7 +128,7 @@ where
 /// finalized block's number/hash, if known.
 ///
 /// Callers on the live engine path read this from the in-memory canonical state (updated by
-/// forkchoiceUpdated); a `None` num_hash means no finalized head is known yet.
+/// forkchoiceUpdated); a `None` `num_hash` means no finalized head is known yet.
 pub fn finalized_ref_from_num_hash(
     num_hash: Option<alloy_eips::BlockNumHash>,
 ) -> Option<firehose_tracer::types::FinalizedBlockRef> {
@@ -164,7 +164,7 @@ where
     }
 }
 
-/// SignatureFields provides generic access to transaction signature (r, s, v) bytes.
+/// `SignatureFields` provides generic access to transaction signature (r, s, v) bytes.
 ///
 /// This trait is needed because reth's `SignedTransaction` does not expose a generic
 /// `signature()` method — only concrete types like `EthereumTxEnvelope` have it.
@@ -184,7 +184,7 @@ where
         let v = match self {
             // Legacy without EIP-155: V = 27 or 28
             // Legacy with EIP-155: V = chain_id * 2 + 35 + y_parity
-            EthereumTxEnvelope::Legacy(signed) => {
+            Self::Legacy(signed) => {
                 if let Some(chain_id) = signed.tx().chain_id {
                     chain_id * 2 + 35 + y_parity
                 } else {
@@ -202,14 +202,15 @@ where
     }
 }
 
-/// Encodes a u64 as big-endian bytes with no leading zeros (matching go-ethereum big.Int.Bytes()).
+/// Encodes a u64 as big-endian bytes with no leading zeros (matching go-ethereum
+/// `big.Int.Bytes()`).
 pub fn u64_to_trimmed_bytes(v: u64) -> Bytes {
     let bytes = v.to_be_bytes();
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(8);
     Bytes::copy_from_slice(&bytes[start..])
 }
 
-/// Converts a signed transaction to a firehose TxEvent.
+/// Converts a signed transaction to a firehose `TxEvent`.
 pub fn signed_tx_to_tx_event<Tx>(
     tx: &Tx,
     signer: Address,
@@ -238,11 +239,7 @@ where
         r,
         s,
         v: Some(v),
-        max_fee_per_gas: if tx.is_dynamic_fee() {
-            Some(U256::from(tx.max_fee_per_gas()))
-        } else {
-            None
-        },
+        max_fee_per_gas: tx.is_dynamic_fee().then(|| U256::from(tx.max_fee_per_gas())),
         max_priority_fee_per_gas: tx.max_priority_fee_per_gas().map(U256::from),
         access_list: tx
             .access_list()
@@ -265,10 +262,10 @@ where
     }
 }
 
-/// Wraps a StateProviderBox to implement the firehose StateReader trait.
+/// Wraps a `StateProviderBox` to implement the firehose `StateReader` trait.
 ///
-/// StateProviderBox is Box<dyn StateProvider + Send + 'static>, so StateReaderAdapter
-/// is automatically Send + 'static, satisfying the Box<dyn StateReader + Send> bound.
+/// `StateProviderBox` is Box<dyn `StateProvider` + Send + 'static>, so `StateReaderAdapter`
+/// is automatically Send + 'static, satisfying the Box<dyn `StateReader` + Send> bound.
 pub struct StateReaderAdapter(pub StateProviderBox);
 
 impl Debug for StateReaderAdapter {
@@ -326,10 +323,10 @@ pub fn receipt_data_from_parts(
     receipt_data
 }
 
-/// Converts a receipt to a firehose ReceiptData.
+/// Converts a receipt to a firehose `ReceiptData`.
 ///
 /// - `tx_index`: 0-based index of this transaction in the block
-/// - `gas_used`: gas consumed by this transaction alone (cumulative_gas - prev_cumulative_gas)
+/// - `gas_used`: gas consumed by this transaction alone (`cumulative_gas` - `prev_cumulative_gas`)
 /// - `log_index_start`: block-wide log index of the first log in this receipt
 /// - `blob_gas_used`: total blob gas consumed by this tx (0 for non-EIP-4844 transactions)
 /// - `blob_gas_price`: per-unit blob gas price from the block (None pre-Cancun)
@@ -624,7 +621,7 @@ mod tests {
                 bytes!("cafebabe"),
             ),
         };
-        let receipt = receipt_data_from_parts(2, 21_000, 42_000, 1, &[log.clone()], 5);
+        let receipt = receipt_data_from_parts(2, 21_000, 42_000, 1, std::slice::from_ref(&log), 5);
 
         assert_eq!(receipt.transaction_index, 2);
         assert_eq!(receipt.gas_used, 21_000);

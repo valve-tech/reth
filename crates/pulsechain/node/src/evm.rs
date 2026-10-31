@@ -13,7 +13,7 @@
 use std::{borrow::Cow, convert::Infallible, fmt::Debug, sync::Arc};
 
 use alloy_consensus::Header;
-use alloy_eips::{eip7685::Requests, Decodable2718};
+use alloy_eips::Decodable2718;
 use alloy_primitives::{map::AddressMap, Address, Bytes, B256, U256};
 use alloy_rpc_types_engine::ExecutionData;
 use evm2::{
@@ -25,7 +25,7 @@ use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks, MAIN
 use reth_ethereum_primitives::{Block, EthPrimitives, TransactionSigned};
 use reth_evm::{
     precompile_cache::PrecompileCacheMap, BlockExecutionError, BlockExecutionOutput, BlockExecutor,
-    BlockExecutorFactory, ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmEnvFor, EvmFor,
+    BlockExecutorFactory, ConfigureEngineEvm, ConfigureEvm, Database, EvmEnvFor, EvmFor,
     ExecutableTxIterator, ExecutionCtxFor, ExecutorTx, GasOutput, NextBlockEnvAttributes,
     ReceiptBuilder, SpecFor,
 };

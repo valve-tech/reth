@@ -1,12 +1,12 @@
-//! PulseChain consensus builder and wrapper.
+//! `PulseChain` consensus builder and wrapper.
 //!
-//! PulseChain replays Ethereum's full history from genesis. This creates a gap in the
+//! `PulseChain` replays Ethereum's full history from genesis. This creates a gap in the
 //! Shanghai timestamp handling:
 //!
 //! - Ethereum mainnet Shanghai activated at timestamp 1,681,338,455
-//! - PulseChain's chainspec has Shanghai at 1,683,786,515 (a later timestamp)
+//! - `PulseChain`'s chainspec has Shanghai at 1,683,786,515 (a later timestamp)
 //! - Blocks with timestamps between those two values were mined on Ethereum and carry a
-//!   `withdrawals_root`, but PulseChain's chainspec doesn't consider Shanghai active for them, so
+//!   `withdrawals_root`, but `PulseChain`'s chainspec doesn't consider Shanghai active for them, so
 //!   `EthBeaconConsensus` would incorrectly reject them.
 //!
 //! `PulsechainConsensus` fixes this by using the Ethereum mainnet Shanghai timestamp
@@ -41,10 +41,10 @@ use crate::spec::PulsechainChainSpec;
 // PulsechainConsensus — wrapper that fixes the Shanghai-timestamp gap
 // ---------------------------------------------------------------------------
 
-/// Consensus implementation for PulseChain.
+/// Consensus implementation for `PulseChain`.
 ///
 /// Wraps [`EthBeaconConsensus`] and overrides `validate_header` to handle
-/// the Shanghai activation timestamp gap that arises because PulseChain
+/// the Shanghai activation timestamp gap that arises because `PulseChain`
 /// replays Ethereum history but uses a different Shanghai timestamp in its
 /// chainspec.
 #[derive(Clone)]
@@ -67,8 +67,8 @@ impl PulsechainConsensus {
         Self { inner, chain_id }
     }
 
-    /// Returns the PrimordialPulse block number for this chain.
-    fn primordial_pulse_block(&self) -> u64 {
+    /// Returns the `PrimordialPulse` block number for this chain.
+    const fn primordial_pulse_block(&self) -> u64 {
         match self.chain_id {
             PULSECHAIN_MAINNET_CHAIN_ID => PRIMORDIAL_PULSE_MAINNET_BLOCK,
             PULSECHAIN_TESTNET_V4_CHAIN_ID => PRIMORDIAL_PULSE_TESTNET_V4_BLOCK,
@@ -78,7 +78,7 @@ impl PulsechainConsensus {
         }
     }
 
-    /// Returns true if this block number falls before the PrimordialPulse transition.
+    /// Returns true if this block number falls before the `PrimordialPulse` transition.
     fn is_pre_primordial_pulse(&self, block_number: u64) -> bool {
         block_number < self.primordial_pulse_block()
     }
@@ -121,8 +121,10 @@ where
             // we already validated the withdrawals_root above with the correct rule.
             match self.inner.validate_header(header) {
                 Ok(()) => Ok(()),
-                Err(ConsensusError::WithdrawalsRootMissing) |
-                Err(ConsensusError::WithdrawalsRootUnexpected) => {
+                Err(
+                    ConsensusError::WithdrawalsRootMissing |
+                    ConsensusError::WithdrawalsRootUnexpected,
+                ) => {
                     // We already applied the correct rule above; the inner validator fired
                     // a spurious withdrawals_root error due to the timestamp gap.
                     Ok(())
@@ -151,7 +153,7 @@ impl<B> Consensus<B> for PulsechainConsensus
 where
     B: Block,
     EthBeaconConsensus<PulsechainChainSpec>: Consensus<B> + HeaderValidator<B::Header>,
-    PulsechainConsensus: HeaderValidator<B::Header>,
+    Self: HeaderValidator<B::Header>,
 {
     fn validate_body_against_header(
         &self,
@@ -182,7 +184,7 @@ impl<N> FullConsensus<N> for PulsechainConsensus
 where
     N: NodePrimitives,
     EthBeaconConsensus<PulsechainChainSpec>: FullConsensus<N> + Consensus<N::Block>,
-    PulsechainConsensus: Consensus<N::Block>,
+    Self: Consensus<N::Block>,
 {
     fn validate_block_post_execution(
         &self,

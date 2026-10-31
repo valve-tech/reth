@@ -16,10 +16,10 @@ pub const PRIMORDIAL_PULSE_TESTNET_V4_BLOCK: u64 = 16_492_700;
 /// Timestamp of the `PrimordialPulse` block on `PulseChain` mainnet (chain 369).
 ///
 /// On-chain block 17,233,000 carries this timestamp. Used to discriminate pre-fork
-/// (Ethereum-replay) from post-fork (PulseChain) blocks via timestamp alone in
+/// (Ethereum-replay) from post-fork (`PulseChain`) blocks via timestamp alone in
 /// places where block number isn't available — notably the chain spec's
 /// `is_shanghai_active_at_timestamp` override. Note this is *earlier* than
-/// PulseChain's own Shanghai timestamp (1,683,786,515), so a brief window of
+/// `PulseChain`'s own Shanghai timestamp (1,683,786,515), so a brief window of
 /// post-fork blocks predates Shanghai.
 pub const PRIMORDIAL_PULSE_MAINNET_TIMESTAMP: u64 = 1_683_759_171;
 
@@ -29,17 +29,17 @@ pub const PRIMORDIAL_PULSE_MAINNET_TIMESTAMP: u64 = 1_683_759_171;
 /// [`PRIMORDIAL_PULSE_MAINNET_TIMESTAMP`] for usage.
 pub const PRIMORDIAL_PULSE_TESTNET_V4_TIMESTAMP: u64 = 1_681_264_700;
 
-/// The Ethereum mainnet Merge (Paris) block — first PoS block on Ethereum.
+/// The Ethereum mainnet Merge (Paris) block — first `PoS` block on Ethereum.
 ///
-/// PulseChain replays Ethereum history verbatim; blocks at or above this number are
+/// `PulseChain` replays Ethereum history verbatim; blocks at or above this number are
 /// post-Merge Ethereum blocks and must use `SpecId::MERGE` EVM rules, even though
-/// PulseChain's own Paris activation is much later (block 17,233,001).
+/// `PulseChain`'s own Paris activation is much later (block 17,233,001).
 pub const ETH_MAINNET_MERGE_BLOCK: u64 = 15_537_394;
 
 /// Ethereum mainnet Shanghai activation timestamp (April 12, 2023).
 ///
 /// Blocks between ETH Shanghai and `PrimordialPulse` need `SpecId::SHANGHAI` EVM rules
-/// (PUSH0, warm COINBASE, initcode metering) even though PulseChain's own Shanghai
+/// (PUSH0, warm COINBASE, initcode metering) even though `PulseChain`'s own Shanghai
 /// timestamp is later. Mirrors the Erigon override in `IsShanghai()`:
 ///
 /// ```text

@@ -1,7 +1,7 @@
-//! PulseChain network builder.
+//! `PulseChain` network builder.
 //!
-//! Wraps the stock Ethereum network setup and injects PulseChain peer discovery
-//! (static bootnodes + `enrtree://` DNS) so the node finds PulseChain peers
+//! Wraps the stock Ethereum network setup and injects `PulseChain` peer discovery
+//! (static bootnodes + `enrtree://` DNS) so the node finds `PulseChain` peers
 //! instead of falling back to upstream Ethereum mainnet bootnodes (which are
 //! present on the cloned `ChainSpec` and serve chain ID 1, not 369/943).
 
@@ -21,7 +21,7 @@ use reth_pulsechain_forks::chainspec::{
 use reth_tracing::tracing::info;
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
 
-/// Network builder that injects PulseChain peer discovery (static bootnodes +
+/// Network builder that injects `PulseChain` peer discovery (static bootnodes +
 /// DNS) before starting the P2P stack.
 ///
 /// The upstream `NetworkConfigBuilder` resolves bootnodes and DNS networks from
@@ -58,11 +58,11 @@ where
             config.boot_nodes = nodes.into_iter().map(TrustedPeer::from).collect();
         }
 
-        if let Some(url) = pulsechain_dns_for_chain(chain_id) {
-            if let Some(ref mut dns) = config.dns_discovery_config {
-                let networks = dns.bootstrap_dns_networks.get_or_insert_with(Default::default);
-                networks.insert(url.parse().expect("valid enrtree DNS link entry"));
-            }
+        if let Some(url) = pulsechain_dns_for_chain(chain_id) &&
+            let Some(ref mut dns) = config.dns_discovery_config
+        {
+            let networks = dns.bootstrap_dns_networks.get_or_insert_with(Default::default);
+            networks.insert(url.parse().expect("valid enrtree DNS link entry"));
         }
 
         let builder = NetworkManager::builder(config).await?;
@@ -72,7 +72,7 @@ where
     }
 }
 
-/// Returns the PulseChain static bootnode list for `chain_id`, or `None` for
+/// Returns the `PulseChain` static bootnode list for `chain_id`, or `None` for
 /// non-PulseChain chains.
 fn pulsechain_bootnodes_for_chain(chain_id: u64) -> Option<Vec<NodeRecord>> {
     match chain_id {
@@ -82,9 +82,9 @@ fn pulsechain_bootnodes_for_chain(chain_id: u64) -> Option<Vec<NodeRecord>> {
     }
 }
 
-/// Returns the PulseChain `enrtree://` DNS discovery URL for `chain_id`, or
+/// Returns the `PulseChain` `enrtree://` DNS discovery URL for `chain_id`, or
 /// `None` for non-PulseChain chains.
-fn pulsechain_dns_for_chain(chain_id: u64) -> Option<&'static str> {
+const fn pulsechain_dns_for_chain(chain_id: u64) -> Option<&'static str> {
     match chain_id {
         PULSECHAIN_MAINNET_CHAIN_ID => Some(PULSECHAIN_DNS_NETWORK),
         PULSECHAIN_TESTNET_V4_CHAIN_ID => Some(PULSECHAIN_TESTNET_V4_DNS_NETWORK),

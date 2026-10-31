@@ -1,6 +1,6 @@
-//! PulseChain transaction pool builder.
+//! `PulseChain` transaction pool builder.
 //!
-//! Post-fork, all new transactions use the native PulseChain chain ID (369 mainnet,
+//! Post-fork, all new transactions use the native `PulseChain` chain ID (369 mainnet,
 //! 943 testnet v4). The `chain_id = 1` CHAINID opcode override only applies to
 //! *historical block execution* (pre-PrimordialPulse), not the mempool.
 //!
@@ -28,10 +28,10 @@ use reth_transaction_pool::{
 // PulsechainPoolBuilder
 // ---------------------------------------------------------------------------
 
-/// Builder for the PulseChain transaction pool.
+/// Builder for the `PulseChain` transaction pool.
 ///
 /// Uses the stock Ethereum transaction validator, which validates against the
-/// native PulseChain chain ID (369 mainnet / 943 testnet v4). This is correct
+/// native `PulseChain` chain ID (369 mainnet / 943 testnet v4). This is correct
 /// because all post-fork mempool transactions must use the native chain ID.
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]

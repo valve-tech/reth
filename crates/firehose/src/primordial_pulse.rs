@@ -43,8 +43,8 @@ use firehose_tracer::pb::sf::ethereum::r#type::v2::balance_change::Reason;
 use reth_pulsechain_forks::primordial_pulse as spec;
 use reth_trie_common::bundle_state::BundleState;
 
-/// Returns the PrimordialPulse fork-block number for the given chain ID, or `None`
-/// if the chain doesn't have a PrimordialPulse transition.
+/// Returns the `PrimordialPulse` fork-block number for the given chain ID, or `None`
+/// if the chain doesn't have a `PrimordialPulse` transition.
 ///
 /// **Sync invariant**: must agree with
 /// `reth_pulsechain_forks::hardfork::PRIMORDIAL_PULSE_{MAINNET,TESTNET_V4}_BLOCK`.
@@ -57,7 +57,7 @@ pub const fn fork_block_for(chain_id: u64) -> Option<u64> {
     }
 }
 
-/// Pre-state snapshot of every account that PrimordialPulse will modify.
+/// Pre-state snapshot of every account that `PrimordialPulse` will modify.
 ///
 /// Captured BEFORE `inner.finish()` so the emit-phase can diff against fresh
 /// post-finish DB reads. Order of `sacrifice_pre` matters: events emit in the
@@ -67,7 +67,7 @@ pub const fn fork_block_for(chain_id: u64) -> Option<u64> {
 pub struct PrimordialPulsePreState {
     /// Chain ID this snapshot applies to (369 mainnet / 943 testnet v4).
     pub chain_id: u64,
-    /// Block number at which PrimordialPulse fires.
+    /// Block number at which `PrimordialPulse` fires.
     pub block_number: u64,
     /// `(address, pre_balance, credit_amount)` triples in spec-binary order.
     /// Includes treasury (testnet only) as the first entry, followed by
@@ -99,15 +99,15 @@ pub struct AccountPreState {
     /// is set, or if the code lookup failed (we tolerate the failure and
     /// emit an empty pre-code in the resulting `CodeChange` event).
     pub code: Vec<u8>,
-    /// `(slot, pre_value)` for slots that PrimordialPulse will set on this
+    /// `(slot, pre_value)` for slots that `PrimordialPulse` will set on this
     /// account. Empty for the ETH deposit contract (we don't enumerate the
     /// full pre-fork storage trie — see module-level docs).
     pub storage_slots_pre: Vec<(B256, B256)>,
 }
 
 impl PrimordialPulsePreState {
-    /// Walk the spec for `chain_id` and snapshot every address PrimordialPulse
-    /// will touch. Returns `None` if the chain doesn't have a PrimordialPulse
+    /// Walk the spec for `chain_id` and snapshot every address `PrimordialPulse`
+    /// will touch. Returns `None` if the chain doesn't have a `PrimordialPulse`
     /// transition (i.e. anything other than 369 / 943).
     pub fn capture(db: &mut dyn DynDatabase, chain_id: u64, block_number: u64) -> Option<Self> {
         // Skip chains without a PrimordialPulse transition.
@@ -431,7 +431,7 @@ mod tests {
 
     /// System-call pass iterates the 31-slot table for storage changes and emits
     /// the PULSE deposit nonce change (set to 0). The emit path reads exactly
-    /// `DEPOSIT_CONTRACT_INITIAL_STORAGE` so its length pins the 31 storage_changes.
+    /// `DEPOSIT_CONTRACT_INITIAL_STORAGE` so its length pins the 31 `storage_changes`.
     #[test]
     fn emit_path_iterates_31_storage_slots_and_one_nonce() {
         assert_eq!(
@@ -558,7 +558,7 @@ mod tests {
             spec::PULSE_DEPOSIT_CONTRACT,
             account(U256::ZERO, 1, pulse_hash, Some(pulse_code)),
         );
-        for &(slot, value) in spec::DEPOSIT_CONTRACT_INITIAL_STORAGE.iter() {
+        for &(slot, value) in &spec::DEPOSIT_CONTRACT_INITIAL_STORAGE {
             db.storage.insert(
                 (spec::PULSE_DEPOSIT_CONTRACT, U256::from_be_bytes(slot.0)),
                 U256::from_be_bytes(value.0),
@@ -636,7 +636,10 @@ mod tests {
         let call = &block.system_calls[0];
         assert_eq!(call.storage_changes.len(), 31, "one StorageChange per initial-storage slot");
         // ETH nonce 5→0 and PULSE nonce 0→1.
-        assert!(call.nonce_changes.len() >= 1, "at least the PULSE (and usually ETH) nonce change");
+        assert!(
+            !call.nonce_changes.is_empty(),
+            "at least the PULSE (and usually ETH) nonce change"
+        );
         assert_eq!(call.nonce_changes.len(), 2, "ETH + PULSE nonce changes");
     }
 

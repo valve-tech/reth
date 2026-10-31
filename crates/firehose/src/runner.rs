@@ -1,16 +1,11 @@
-use crate::{inspector, mapper, prelude::*};
-use alloy_consensus::transaction::TxHashRef as _;
-use alloy_primitives::Bytes;
-use eyre::Context;
+use crate::{mapper, prelude::*};
 use futures::StreamExt;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_forks::EthereumHardforks;
-use reth_evm::execute::BlockExecutor;
 use reth_exex::{ExExContext, ExExEvent};
-use reth_provider::{
-    BlockIdReader, BlockNumReader, BlockReader, EvmStateProviderBox, StateProviderFactory,
-};
+use reth_provider::{BlockNumReader, BlockReader, StateProviderFactory};
 
+/// Runs the Firehose ExEx, which publishes `health.json` for each committed block.
 pub async fn run_exex<Node>(mut ctx: ExExContext<Node>) -> eyre::Result<()>
 where
     Node: FullNodeComponents,

@@ -11,29 +11,41 @@ use std::{
 use reth_tracing::tracing::{info, warn};
 use serde::Serialize;
 
+/// Loopback address the health endpoint listens on.
 pub const HEALTH_LISTEN_ADDR: &str = "127.0.0.1:8754";
 
+/// HTTP path of the health document.
 pub const HEALTH_HTTP_PATH: &str = "/health.json";
 
+/// Path of the health file, relative to the datadir.
 pub const HEALTH_REL_PATH: &str = "firehose/health.json";
 
+/// The health document that freshness probes read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HealthStatus {
+    /// Chain ID of the node.
     #[serde(rename = "chainId")]
     pub chain_id: u64,
+    /// Name of the replica that writes this document.
     pub replica: String,
+    /// Unix time of the last finished block, as the merged view.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_block_time: Option<u64>,
+    /// Height of the last finished block, as the merged view.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_height: Option<u64>,
+    /// Unix time of the last finished block, as the one-block view.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub one_block_time: Option<u64>,
+    /// Height of the last finished block, as the one-block view.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub one_height: Option<u64>,
+    /// Whether the ExEx that writes this document is running.
     pub exex_alive: bool,
 }
 
 impl HealthStatus {
+    /// Status of a running ExEx with no finished block yet.
     pub fn alive_starting(chain_id: u64, replica: impl Into<String>) -> Self {
         Self {
             chain_id,
@@ -46,6 +58,7 @@ impl HealthStatus {
         }
     }
 
+    /// Status of a running ExEx that finished block `height`.
     pub fn alive_at_block(
         chain_id: u64,
         replica: impl Into<String>,
@@ -63,6 +76,7 @@ impl HealthStatus {
         }
     }
 
+    /// Status of a stopped ExEx.
     pub fn dead(chain_id: u64, replica: impl Into<String>) -> Self {
         Self {
             chain_id,
@@ -75,6 +89,7 @@ impl HealthStatus {
         }
     }
 
+    /// Serializes the status as JSON.
     pub fn to_json(&self) -> eyre::Result<String> {
         Ok(serde_json::to_string(self)?)
     }
@@ -135,10 +150,10 @@ pub fn resolve_replica_from(
             }
         }
     }
-    if let Some(host) = hostname {
-        if let Some(from_host) = replica_from_host(host) {
-            return from_host;
-        }
+    if let Some(host) = hostname &&
+        let Some(from_host) = replica_from_host(host)
+    {
+        return from_host;
     }
     "a".to_string()
 }
@@ -151,10 +166,12 @@ pub fn resolve_replica() -> String {
     resolve_replica_from(|k| std::env::var(k).ok(), current_hostname().as_deref())
 }
 
+/// Returns the health file path under `datadir`.
 pub fn default_health_path(datadir: impl AsRef<Path>) -> PathBuf {
     datadir.as_ref().join(HEALTH_REL_PATH)
 }
 
+/// Writes `status` to `path` through a temporary file and a rename.
 pub fn write_health_json(path: &Path, status: &HealthStatus) -> eyre::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -171,6 +188,7 @@ pub fn write_health_json(path: &Path, status: &HealthStatus) -> eyre::Result<()>
     Ok(())
 }
 
+/// Keeps the health file current for one node.
 #[derive(Debug)]
 pub struct HealthPublisher {
     path: PathBuf,
@@ -180,6 +198,7 @@ pub struct HealthPublisher {
 }
 
 impl HealthPublisher {
+    /// Writes the initial health file and starts the loopback HTTP listener.
     pub fn start(
         datadir: impl AsRef<Path>,
         chain_id: u64,
@@ -226,6 +245,7 @@ impl HealthPublisher {
         Ok(Self { path, chain_id, replica, last: status })
     }
 
+    /// Records `height` and its block time as the last finished block.
     pub fn record_finished_height(
         &mut self,
         height: u64,
@@ -242,6 +262,7 @@ impl HealthPublisher {
         Ok(())
     }
 
+    /// Marks the ExEx as stopped in the health file.
     pub fn mark_dead(&mut self) -> eyre::Result<()> {
         let status = HealthStatus::dead(self.chain_id, self.replica.clone());
         write_health_json(&self.path, &status)?;
@@ -254,6 +275,7 @@ impl HealthPublisher {
         Ok(())
     }
 
+    /// Returns the path of the health file.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -261,14 +283,14 @@ impl HealthPublisher {
 
 impl Drop for HealthPublisher {
     fn drop(&mut self) {
-        if self.last.exex_alive {
-            if let Err(err) = self.mark_dead() {
-                warn!(
-                    target: "firehose::health",
-                    error = %err,
-                    "Failed to write dead health.json on Drop"
-                );
-            }
+        if self.last.exex_alive &&
+            let Err(err) = self.mark_dead()
+        {
+            warn!(
+                target: "firehose::health",
+                error = %err,
+                "Failed to write dead health.json on Drop"
+            );
         }
     }
 }

@@ -12,13 +12,13 @@
 //! drops their withdrawals — execution then fails later with `lack of funds`
 //! errors from validator withdrawal recipients.
 //!
-//! Mirroring this on the post-fork side: PulseChain mainnet's PrimordialPulse
+//! Mirroring this on the post-fork side: `PulseChain` mainnet's `PrimordialPulse`
 //! block (17,233,000) has timestamp `1_683_759_171`, which is **earlier** than
-//! PulseChain's own Shanghai (`1_683_786_515`). So roughly 7.6 hours of
+//! `PulseChain`'s own Shanghai (`1_683_786_515`). So roughly 7.6 hours of
 //! post-fork blocks (17,233,001 → ~17,233,033) are post-PrimordialPulse but
 //! pre-PulseChain-Shanghai — they correctly carry no `withdrawals_root`, and
 //! claiming Shanghai is active for them would reject valid headers as
-//! `WithdrawalsRootMissing`. (Testnet v4 has the same shape: PrimordialPulse
+//! `WithdrawalsRootMissing`. (Testnet v4 has the same shape: `PrimordialPulse`
 //! at `1_681_264_700`, V4 Shanghai at `1_682_700_369` — a ~16.7-day gap.)
 //!
 //! ## What this fixes
@@ -27,12 +27,12 @@
 //! - **Pre-fork** (`timestamp < PRIMORDIAL_PULSE_*_TIMESTAMP`): return `timestamp >=
 //!   ETH_MAINNET_SHANGHAI_TIMESTAMP`. Treats Ethereum-replay blocks as Shanghai-active per
 //!   Ethereum's calendar.
-//! - **Post-fork**: delegate to the inner chain spec, which already knows PulseChain's own Shanghai
-//!   timestamp.
+//! - **Post-fork**: delegate to the inner chain spec, which already knows `PulseChain`'s own
+//!   Shanghai timestamp.
 //!
 //! The fork-ID schedule (used for peer handshakes) is left unchanged via
 //! `ethereum_fork_activation` delegating to the inner `ChainSpec`, so this node
-//! remains peer-compatible with the rest of the PulseChain network.
+//! remains peer-compatible with the rest of the `PulseChain` network.
 
 use core::fmt::Display;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ use std::sync::Arc;
 use alloy_consensus::Header;
 use alloy_eips::eip7840::BlobParams;
 use alloy_genesis::Genesis;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{B256, U256};
 use reth_chainspec::{
     BaseFeeParams, Chain, ChainSpec, DepositContract, EthChainSpec, EthereumHardfork,
     EthereumHardforks, ForkCondition, ForkFilter, ForkId, Hardfork, Hardforks, Head,
@@ -116,7 +116,7 @@ impl EthereumHardforks for PulsechainChainSpec {
     }
 
     /// Pre-`PrimordialPulse` (Ethereum-replay): true once Ethereum's Shanghai
-    /// timestamp is reached. Post-fork: delegate to the inner spec's PulseChain
+    /// timestamp is reached. Post-fork: delegate to the inner spec's `PulseChain`
     /// Shanghai. See module docs for the cross-over reasoning.
     fn is_shanghai_active_at_timestamp(&self, timestamp: u64) -> bool {
         let pp_timestamp = match self.inner.chain().id() {

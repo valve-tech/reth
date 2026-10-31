@@ -109,7 +109,7 @@ pub struct SynchronizedStdout {
 
 impl SynchronizedStdout {
     /// Creates a new `SynchronizedStdout` backed by the given lock.
-    pub fn new(lock: Arc<Mutex<()>>) -> Self {
+    pub const fn new(lock: Arc<Mutex<()>>) -> Self {
         Self { lock }
     }
 }
@@ -218,7 +218,7 @@ pub fn tracer() -> MutexGuard<'static, firehose_tracer::Tracer> {
 /// Use this from code paths that may be reached re-entrantly under the
 /// wrapper — `std::sync::Mutex` is non-reentrant, so a plain [`tracer`]
 /// call from such a path would deadlock on the same thread. The
-/// PulseChain `PrimordialPulse` handler in
+/// `PulseChain` `PrimordialPulse` handler in
 /// `crates/pulsechain/node/src/evm.rs` is the canonical example.
 pub fn try_lock_tracer() -> Option<MutexGuard<'static, firehose_tracer::Tracer>> {
     GLOBAL_TRACER.get().and_then(|m| m.try_lock().ok())

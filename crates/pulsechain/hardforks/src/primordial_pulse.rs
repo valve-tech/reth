@@ -55,7 +55,7 @@ pub static SACRIFICE_CREDITS_MAINNET: &[u8] =
 pub static SACRIFICE_CREDITS_TESTNET_V4: &[u8] =
     include_bytes!("../res/sacrifice_credits_testnet_v4.bin");
 
-/// 4898-byte PulseChain beacon deposit contract bytecode.
+/// 4898-byte `PulseChain` beacon deposit contract bytecode.
 /// Source: private-erigon-pulse/pulse/deposit_contract.go `depositContractBytes`.
 pub static DEPOSIT_CONTRACT_BYTECODE: &[u8] = include_bytes!("../res/deposit_contract.bin");
 
@@ -196,7 +196,7 @@ pub const DEPOSIT_CONTRACT_INITIAL_STORAGE: [(B256, B256); 31] = [
 /// Pick the right sacrifice-credit blob for a given chain ID.
 ///
 /// Returns `Some(&[u8])` for chains 369 (mainnet) and 943 (testnet v4); `None`
-/// for any other chain (firehose's PrimordialPulse emit-path uses this to decide
+/// for any other chain (firehose's `PrimordialPulse` emit-path uses this to decide
 /// whether to do anything at all).
 pub const fn sacrifice_credits_for(chain_id: u64) -> Option<&'static [u8]> {
     match chain_id {
@@ -273,11 +273,11 @@ pub fn decode_sacrifice_credits(data: &[u8]) -> Vec<(Address, U256)> {
 mod tests {
     use super::*;
 
-    /// Number of block-reward (coinbase) BalanceChange events PrimordialPulse
+    /// Number of block-reward (coinbase) `BalanceChange` events `PrimordialPulse`
     /// contributes — emitted by the existing `emit_block_reward_balance_changes`
-    /// flow, not the PrimordialPulse emit path, but part of the on-wire total.
+    /// flow, not the `PrimordialPulse` emit path, but part of the on-wire total.
     const REWARD_MINE_BLOCK_COUNT: usize = 1;
-    /// Number of SuicideWithdraw BalanceChange events — the ETH deposit
+    /// Number of `SuicideWithdraw` `BalanceChange` events — the ETH deposit
     /// contract balance going to zero on selfdestruct.
     const SUICIDE_WITHDRAW_COUNT: usize = 1;
 

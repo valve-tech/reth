@@ -92,8 +92,8 @@ fn apply_sacrifice_credits<S: PrimordialPulseStateWriter>(state: &mut S, data: &
 
 /// Selfdestruct the Ethereum deposit contract, clearing its code, storage, and balance.
 ///
-/// On-chain PulseChain state shows the ETH deposit contract has empty code (`0x`)
-/// after PrimordialPulse — no nil contract is installed. The selfdestruct alone
+/// On-chain `PulseChain` state shows the ETH deposit contract has empty code (`0x`)
+/// after `PrimordialPulse` — no nil contract is installed. The selfdestruct alone
 /// handles the full cleanup.
 fn destroy_eth_deposit_contract<S: PrimordialPulseStateWriter>(state: &mut S) {
     state.selfdestruct(ETH_DEPOSIT_CONTRACT);

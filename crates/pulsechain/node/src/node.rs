@@ -26,7 +26,7 @@ use reth_provider::EthStorage;
 ///
 /// Shares execution primitives with `EthereumNode` but swaps in PulseChain-specific
 /// builders for consensus (Shanghai gap fix), EVM execution (CHAINID override +
-/// PrimordialPulse), networking (DNS discovery), and transaction pool.
+/// `PrimordialPulse`), networking (DNS discovery), and transaction pool.
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct PulsechainNode;

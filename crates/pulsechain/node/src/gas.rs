@@ -1,7 +1,7 @@
-//! Gas estimation margin for PulseChain.
+//! Gas estimation margin for `PulseChain`.
 //!
-//! PulseChain's state is significantly larger than Ethereum mainnet due to the
-//! sacrifice credit distribution at PrimordialPulse. This can cause the standard
+//! `PulseChain`'s state is significantly larger than Ethereum mainnet due to the
+//! sacrifice credit distribution at `PrimordialPulse`. This can cause the standard
 //! binary-search gas estimator to return values that are too tight, leading to
 //! out-of-gas reverts when the transaction is actually mined.
 //!
@@ -11,7 +11,7 @@
 //!
 //! # This is the ONLY place the fork adds a gas margin
 //!
-//! It is installed from `bin/reth/src/main.rs` on the PulseChain node path
+//! It is installed from `bin/reth/src/main.rs` on the `PulseChain` node path
 //! alone, which is what keeps Ethereum mainnet on stock estimates.
 //!
 //! A second margin once existed inside the SHARED core estimator
@@ -63,7 +63,7 @@ use std::sync::Arc;
 const GAS_MARGIN_NUMERATOR: u64 = 6;
 const GAS_MARGIN_DENOMINATOR: u64 = 5;
 
-/// Applies the PulseChain gas-estimation margin (+20%) to a raw `eth_estimateGas` result.
+/// Applies the `PulseChain` gas-estimation margin (+20%) to a raw `eth_estimateGas` result.
 ///
 /// Uses saturating multiplication so a pathologically large estimate can never overflow (it
 /// saturates at `U256::MAX` instead of panicking).
