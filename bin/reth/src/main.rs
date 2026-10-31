@@ -18,7 +18,7 @@ use reth::{
 };
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_msgboard::{args::MsgboardArgs, launch::MSGBOARD_RPC_NAMESPACE, MsgboardLauncher};
-use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
+use reth_node_ethereum::{node::EthereumAddOns, snap::EthereumBackfill, EthereumNode};
 use reth_pulsechain_node::{
     consensus::PulsechainConsensus, evm::PulsechainEvmConfig, gas::install_gas_estimation_margin,
     launch::inject_pulsechain_bootnodes_if_unset, spec::PulsechainChainSpec,
@@ -253,6 +253,9 @@ fn run_ethereum_node() -> eyre::Result<()> {
                 info!(target: "reth::cli", "Launching Ethereum node (stock, firehose disabled)");
 
                 let launcher_for_rpc = launcher.clone();
+                // Stock Ethereum only: snap sync (`--snap.v2`) needs block access lists, which
+                // PulseChain lacks, and it skips execution, which Firehose must trace.
+                let backfill = EthereumBackfill::new(builder.config());
                 let handle = builder
                     .with_types::<EthereumNode>()
                     .with_components(
@@ -267,7 +270,10 @@ fn run_ethereum_node() -> eyre::Result<()> {
                         install_txpool_page_rpc(ctx.modules, pool, converter)?;
                         Ok(())
                     })
-                    .launch()
+                    .launch_with_fn(|builder| {
+                        let engine = builder.engine_api_launcher().with_backfill(backfill);
+                        builder.launch_with(engine)
+                    })
                     .await?;
 
                 launcher.install_post_launch_tasks(
