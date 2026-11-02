@@ -22,6 +22,7 @@ mod patch_wiped_storage;
 mod prune_checkpoints;
 mod repair_trie;
 mod scan_empty_hashed_accounts;
+mod scan_wiped_storage;
 mod settings;
 mod stage_checkpoints;
 mod state;
@@ -72,6 +73,8 @@ pub enum Subcommands {
     PatchWipedStorage(patch_wiped_storage::Command),
     /// Prints the stored account and storage changesets of a block range as JSON lines (read-only)
     ChangesetDump(changeset_dump::Command),
+    /// Finds self-destructs whose wiped storage has no changeset rows (read-only)
+    ScanWipedStorage(scan_wiped_storage::Command),
     /// Reads and displays the static file segment header
     StaticFileHeader(static_file_header::Command),
     /// Lists current and local database versions
@@ -212,6 +215,11 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                 });
             }
             Subcommands::ChangesetDump(command) => {
+                db_exec!(self.env, tool, N, AccessRights::RoInconsistent, {
+                    command.execute(&tool)?;
+                });
+            }
+            Subcommands::ScanWipedStorage(command) => {
                 db_exec!(self.env, tool, N, AccessRights::RoInconsistent, {
                     command.execute(&tool)?;
                 });
