@@ -622,6 +622,32 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         let rocksdb_enabled =
             rocksdb_ctx.as_ref().is_some_and(|ctx| ctx.storage_settings.storage_v2);
 
+        // Complete storage changeset rows for accounts a self-destruct wiped. Read before any
+        // write of this batch, so the database still holds the state below it.
+        let storage_wipes = if save_mode.with_state() &&
+            sf_ctx.is_some_and(|ctx| ctx.write_storage_changesets)
+        {
+            let hashed_frontier = self
+                .get_stage_checkpoint(StageId::Finish)?
+                .map(|checkpoint| {
+                    checkpoint
+                        .finish_stage_checkpoint()
+                        .and_then(|finish| finish.partial_state_trie())
+                        .unwrap_or(checkpoint.block_number)
+                })
+                .unwrap_or_default();
+            let overlay: Vec<_> =
+                state_trie_blocks.iter().chain(state_trie_masking_blocks).chain(blocks).collect();
+            let history = if self.cached_storage_settings().storage_v2 {
+                super::SlotHistory::RocksDB(&self.rocksdb_provider)
+            } else {
+                super::SlotHistory::Database(&self.tx)
+            };
+            super::wiped_storage_rows(&self.tx, history, hashed_frontier, blocks, &overlay)?
+        } else {
+            Default::default()
+        };
+
         let mut sf_result = None;
         let mut rocksdb_result = None;
 
@@ -640,7 +666,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                         sf_ctx.expect("static file context exists when blocks are persisted");
                     sf_result = Some(
                         sf_provider
-                            .write_blocks_data(blocks, &tx_nums, sf_ctx, runtime)
+                            .write_blocks_data(blocks, &tx_nums, sf_ctx, &storage_wipes, runtime)
                             .map(|()| start.elapsed()),
                     );
                 });
@@ -6147,6 +6173,136 @@ mod tests {
     #[test]
     fn test_save_blocks_v2_table_assertions() {
         run_save_blocks_and_verify(StorageMode::V2);
+    }
+
+    /// Builds an executed block from a bundle and its hashed state.
+    fn wipe_test_block(
+        number: u64,
+        parent_hash: B256,
+        bundle: BundleState,
+        hashed_state: HashedPostState,
+    ) -> ExecutedBlock {
+        let header = Header { number, parent_hash, difficulty: U256::ONE, ..Default::default() };
+        let block =
+            SealedBlock::<reth_ethereum_primitives::Block>::seal_parts(header, Default::default());
+        ExecutedBlock::new(
+            Arc::new(block.try_recover().unwrap()),
+            Arc::new(BlockExecutionOutput {
+                result: BlockExecutionResult {
+                    receipts: vec![],
+                    requests: Default::default(),
+                    gas_used: 0,
+                    blob_gas_used: 0,
+                },
+                state: bundle,
+            }),
+            SortedTrieData::new(Arc::new(hashed_state.into_sorted()), Default::default()),
+        )
+    }
+
+    /// A contract writes two slots in block 1 and self-destructs in block 2 without touching them.
+    /// Block 2's storage changeset must restore both slots. `one_batch` saves both blocks
+    /// together, so block 2's values must come from block 1 in memory, not from the database.
+    fn run_self_destruct_wipe_writes_all_slots(one_batch: bool) {
+        use alloy_primitives::map::{FbBuildHasher, HashMap};
+
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(StorageSettings::v2());
+
+        let genesis = SealedBlock::<reth_ethereum_primitives::Block>::from_sealed_parts(
+            SealedHeader::new(
+                Header { number: 0, difficulty: U256::ONE, ..Default::default() },
+                B256::ZERO,
+            ),
+            Default::default(),
+        );
+        let genesis_executed: ExecutedBlock = ExecutedBlock::new(
+            Arc::new(genesis.try_recover().unwrap()),
+            Arc::new(BlockExecutionOutput {
+                result: BlockExecutionResult {
+                    receipts: vec![],
+                    requests: Default::default(),
+                    gas_used: 0,
+                    blob_gas_used: 0,
+                },
+                state: Default::default(),
+            }),
+            SortedTrieData::default(),
+        );
+        let provider_rw = factory.provider_rw().unwrap();
+        save_genesis(&provider_rw, &genesis_executed).unwrap();
+        provider_rw.commit().unwrap();
+
+        let address = Address::with_last_byte(0x42);
+        let info =
+            AccountInfo { nonce: 1, code_hash: B256::with_last_byte(9), ..Default::default() };
+        let slots = [(U256::from(0), U256::from(7)), (U256::from(1), U256::from(9))];
+
+        // Block 1: the contract is created with two slots.
+        let storage: HashMap<U256, (U256, U256), FbBuildHasher<32>> =
+            slots.iter().map(|(slot, value)| (*slot, (U256::ZERO, *value))).collect();
+        let bundle_1 = BundleState::builder(1..=1)
+            .state_present_account_info(address, info.clone())
+            .revert_account_info(1, address, Some(None))
+            .state_storage(address, storage)
+            .revert_storage(1, address, slots.iter().map(|(slot, _)| (*slot, U256::ZERO)).collect())
+            .build();
+        let hashed_1 = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_1.state());
+        let block_1 = wipe_test_block(1, B256::ZERO, bundle_1, hashed_1);
+
+        // Block 2: the contract self-destructs and touches no slot. The engine's hashed state
+        // lists every slot of the destroyed account with a zero value.
+        let mut bundle_2 = BundleState::builder(2..=2)
+            .state_original_account_info(address, info.clone())
+            .revert_account_info(2, address, Some(Some(info)))
+            .build();
+        bundle_2.reverts[0][0].1.wipe_storage = true;
+        let mut hashed_2 = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_2.state());
+        hashed_2.accounts.insert(keccak256(address), None);
+        hashed_2.storages.insert(
+            keccak256(address),
+            reth_trie::HashedStorage::from_iter(
+                slots.iter().map(|(slot, _)| (keccak256(B256::from(*slot)), U256::ZERO)),
+            ),
+        );
+        let block_2 = wipe_test_block(2, block_1.recovered_block().hash(), bundle_2, hashed_2);
+
+        if one_batch {
+            let provider_rw = factory.provider_rw().unwrap();
+            provider_rw
+                .save_blocks(&SaveBlocksInput::new(vec![block_1, block_2], 0, 0, 2, 2))
+                .unwrap();
+            provider_rw.commit().unwrap();
+        } else {
+            let provider_rw = factory.provider_rw().unwrap();
+            provider_rw.save_blocks(&SaveBlocksInput::new(vec![block_1], 0, 0, 1, 1)).unwrap();
+            provider_rw.commit().unwrap();
+            let provider_rw = factory.provider_rw().unwrap();
+            provider_rw.save_blocks(&SaveBlocksInput::new(vec![block_2], 1, 1, 2, 2)).unwrap();
+            provider_rw.commit().unwrap();
+        }
+
+        let provider = factory.provider().unwrap();
+        let mut rows: Vec<_> = provider
+            .storage_changeset(2)
+            .unwrap()
+            .into_iter()
+            .map(|(key, entry)| (key.address(), entry.key, entry.value))
+            .collect();
+        rows.sort();
+        let expected: Vec<_> =
+            slots.iter().map(|(slot, value)| (address, B256::from(*slot), *value)).collect();
+        assert_eq!(rows, expected, "block 2 must restore every wiped slot");
+    }
+
+    #[test]
+    fn test_self_destruct_wipe_writes_all_slots_across_batches() {
+        run_self_destruct_wipe_writes_all_slots(false);
+    }
+
+    #[test]
+    fn test_self_destruct_wipe_writes_all_slots_in_one_batch() {
+        run_self_destruct_wipe_writes_all_slots(true);
     }
 
     #[test]

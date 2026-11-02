@@ -1279,6 +1279,35 @@ impl RocksDBProvider {
         Ok(result)
     }
 
+    /// Returns every plain storage slot key that `StoragesHistory` lists for `address`, sorted and
+    /// without duplicates.
+    pub fn storage_history_slots(&self, address: Address) -> ProviderResult<Vec<B256>> {
+        let cf = self.get_cf_handle::<tables::StoragesHistory>()?;
+        let start_bytes = StorageShardedKey::new(address, B256::ZERO, 0u64).encode();
+        let iter = self
+            .0
+            .iterator_cf(cf, IteratorMode::From(start_bytes.as_ref(), rocksdb::Direction::Forward));
+
+        let mut slots: Vec<B256> = Vec::new();
+        for item in iter {
+            let (key_bytes, _) = item.map_err(|e| {
+                ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                }))
+            })?;
+            let key = StorageShardedKey::decode(&key_bytes)
+                .map_err(|_| ProviderError::Database(DatabaseError::Decode))?;
+            if key.address != address {
+                break;
+            }
+            if slots.last() != Some(&key.sharded_key.key) {
+                slots.push(key.sharded_key.key);
+            }
+        }
+        Ok(slots)
+    }
+
     /// Returns all storage history shards for the given `(address, storage_key)` pair.
     ///
     /// Iterates through all shards in ascending `highest_block_number` order until
