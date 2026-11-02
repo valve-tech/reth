@@ -581,6 +581,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     fn write_storage_changesets(
         w: &mut StaticFileProviderRWRefMut<'_, N>,
         blocks: &[ExecutedBlock<N>],
+        storage_wipes: &crate::providers::StorageWipeRows,
     ) -> ProviderResult<()> {
         for block in blocks {
             let block_number = block.recovered_block().number();
@@ -591,13 +592,20 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 .into_iter()
                 .flatten()
                 .flat_map(|revert| {
-                    revert.storage_revert.into_iter().map(move |(key, revert_to_slot)| {
-                        StorageBeforeTx {
+                    // A wiped account needs a row for every slot it had, not only the touched
+                    // ones. `storage_wipes` holds those complete rows.
+                    if let Some(rows) = storage_wipes.get(&(block_number, revert.address)) {
+                        return rows.clone()
+                    }
+                    revert
+                        .storage_revert
+                        .into_iter()
+                        .map(move |(key, revert_to_slot)| StorageBeforeTx {
                             address: revert.address,
                             key: key.into(),
                             value: revert_to_slot.to_previous_value(),
-                        }
-                    })
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect();
             w.append_storage_changeset(changeset, block_number)?;
@@ -634,6 +642,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
         ctx: StaticFileWriteCtx,
+        storage_wipes: &crate::providers::StorageWipeRows,
         runtime: &reth_tasks::Runtime,
     ) -> ProviderResult<()> {
         if blocks.is_empty() {
@@ -709,7 +718,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     r_storage_changesets = Some(self.write_segment(
                         StaticFileSegment::StorageChangeSets,
                         first_block_number,
-                        |w| Self::write_storage_changesets(w, blocks),
+                        |w| Self::write_storage_changesets(w, blocks, storage_wipes),
                     ));
                 });
             }

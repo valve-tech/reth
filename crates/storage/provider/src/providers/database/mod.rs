@@ -51,6 +51,10 @@ pub use provider::{CommitOrder, DatabaseProvider, DatabaseProviderRO, DatabasePr
 mod save_blocks;
 pub use save_blocks::SaveBlocksInput;
 
+mod wiped_storage;
+pub use wiped_storage::StorageWipeRows;
+pub(crate) use wiped_storage::{wiped_storage_rows, SlotHistory};
+
 use super::ProviderNodeTypes;
 mod builder;
 pub use builder::{ProviderFactoryBuilder, ReadOnlyConfig};
