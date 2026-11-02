@@ -15,7 +15,14 @@ Options:
           [default: 0]
 
       --to <TO>
-          Last block to scan, inclusive. Defaults to the Finish checkpoint
+          Last block to report, inclusive. Defaults to the Finish checkpoint.
+
+          Pass 1 still reads account changesets up to the tip, because a destruction is only known from the account's next row.
+
+      --storage-from <STORAGE_FROM>
+          First block of storage changesets that pass 2 reads. Slots a contract wrote before this block are not seen, so keep the default of 0 unless no contract in the range is older
+
+          [default: 0]
 
       --chunk-blocks <CHUNK_BLOCKS>
           Blocks read per changeset batch
