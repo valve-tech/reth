@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 mod account_storage;
+mod changeset_dump;
 mod checksum;
 mod clear;
 mod copy;
@@ -69,6 +70,8 @@ pub enum Subcommands {
     ScanEmptyHashedAccounts(scan_empty_hashed_accounts::Command),
     /// Adds missing wiped-storage rows to storage changesets (dry run unless --apply)
     PatchWipedStorage(patch_wiped_storage::Command),
+    /// Prints the stored account and storage changesets of a block range as JSON lines (read-only)
+    ChangesetDump(changeset_dump::Command),
     /// Reads and displays the static file segment header
     StaticFileHeader(static_file_header::Command),
     /// Lists current and local database versions
@@ -205,6 +208,11 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                 let access_rights =
                     if command.writes() { AccessRights::RW } else { AccessRights::RoInconsistent };
                 db_exec!(self.env, tool, N, access_rights, {
+                    command.execute(&tool)?;
+                });
+            }
+            Subcommands::ChangesetDump(command) => {
+                db_exec!(self.env, tool, N, AccessRights::RoInconsistent, {
                     command.execute(&tool)?;
                 });
             }
