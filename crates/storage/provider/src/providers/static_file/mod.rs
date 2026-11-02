@@ -12,6 +12,12 @@ pub use writer::{StaticFileProviderRW, StaticFileProviderRWRefMut};
 
 mod metrics;
 
+mod storage_changeset_patch;
+pub use storage_changeset_patch::{
+    rewrite_storage_changeset_file, storage_changeset_files, verify_storage_changeset_file,
+    StorageChangesetPatch, StorageChangesetRewrite,
+};
+
 #[cfg(test)]
 mod writer_tests;
 

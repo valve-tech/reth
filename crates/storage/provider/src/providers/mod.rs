@@ -9,8 +9,10 @@ pub use database::*;
 
 mod static_file;
 pub use static_file::{
+    rewrite_storage_changeset_file, storage_changeset_files, verify_storage_changeset_file,
     StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderBuilder,
     StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileWriteCtx, StaticFileWriter,
+    StorageChangesetPatch, StorageChangesetRewrite,
 };
 
 mod state;
