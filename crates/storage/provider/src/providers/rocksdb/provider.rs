@@ -1279,6 +1279,59 @@ impl RocksDBProvider {
         Ok(result)
     }
 
+    /// Adds `blocks` to the storage history of one slot, re-sharding its index entries.
+    ///
+    /// Returns the shards that were replaced, so the change can be undone with
+    /// [`Self::replace_storage_history_shards`]. Offline repair only: the node must be stopped.
+    pub fn insert_storage_history_blocks(
+        &self,
+        address: Address,
+        storage_key: B256,
+        blocks: &[BlockNumber],
+    ) -> ProviderResult<Vec<(StorageShardedKey, BlockNumberList)>> {
+        let old = self.storage_history_shards(address, storage_key)?;
+        let mut all: std::collections::BTreeSet<u64> =
+            old.iter().flat_map(|(_, list)| list.iter()).collect();
+        all.extend(blocks.iter().copied());
+        let all: Vec<u64> = all.into_iter().collect();
+
+        let mut shards = Vec::new();
+        let chunks: Vec<&[u64]> = all.chunks(NUM_OF_INDICES_IN_SHARD).collect();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let key = if index + 1 == chunks.len() {
+                StorageShardedKey::last(address, storage_key)
+            } else {
+                StorageShardedKey::new(
+                    address,
+                    storage_key,
+                    *chunk.last().expect("chunks are not empty"),
+                )
+            };
+            shards.push((key, BlockNumberList::new_pre_sorted(chunk.iter().copied())));
+        }
+        self.replace_storage_history_shards(address, storage_key, &shards)?;
+        Ok(old)
+    }
+
+    /// Replaces every storage history shard of one slot with `shards`.
+    pub fn replace_storage_history_shards(
+        &self,
+        address: Address,
+        storage_key: B256,
+        shards: &[(StorageShardedKey, BlockNumberList)],
+    ) -> ProviderResult<()> {
+        let current = self.storage_history_shards(address, storage_key)?;
+        self.write_batch(|batch| {
+            for (key, _) in current {
+                batch.delete::<tables::StoragesHistory>(key)?;
+            }
+            for (key, list) in shards {
+                batch.put::<tables::StoragesHistory>(key.clone(), list)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Returns every plain storage slot key that `StoragesHistory` lists for `address`, sorted and
     /// without duplicates.
     pub fn storage_history_slots(&self, address: Address) -> ProviderResult<Vec<B256>> {
@@ -3329,6 +3382,60 @@ mod tests {
             LIMITED_MAX_OPEN_FILES
         );
         assert_eq!(max_open_files_for_limit(None), LIMITED_MAX_OPEN_FILES);
+    }
+
+    #[test]
+    fn insert_storage_history_blocks_merges_reshards_and_undoes() {
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+        let address = Address::with_last_byte(7);
+        let slot = B256::with_last_byte(1);
+        let other = B256::with_last_byte(2);
+
+        // One full shard and a sentinel shard, plus an unrelated slot of the same address.
+        let full: Vec<u64> = (0..NUM_OF_INDICES_IN_SHARD as u64).map(|i| i * 10).collect();
+        let highest = *full.last().unwrap();
+        provider
+            .put::<tables::StoragesHistory>(
+                StorageShardedKey::new(address, slot, highest),
+                &BlockNumberList::new_pre_sorted(full.iter().copied()),
+            )
+            .unwrap();
+        provider
+            .put::<tables::StoragesHistory>(
+                StorageShardedKey::last(address, slot),
+                &BlockNumberList::new_pre_sorted([highest + 10, highest + 20]),
+            )
+            .unwrap();
+        provider
+            .put::<tables::StoragesHistory>(
+                StorageShardedKey::last(address, other),
+                &BlockNumberList::new_pre_sorted([5]),
+            )
+            .unwrap();
+
+        // Insert a block in the middle of the first shard.
+        let old = provider.insert_storage_history_blocks(address, slot, &[15]).unwrap();
+        assert_eq!(old.len(), 2);
+
+        let shards = provider.storage_history_shards(address, slot).unwrap();
+        let blocks: Vec<u64> = shards.iter().flat_map(|(_, list)| list.iter()).collect();
+        let mut expected = full.clone();
+        expected.extend([15, highest + 10, highest + 20]);
+        expected.sort_unstable();
+        assert_eq!(blocks, expected);
+        assert!(shards.iter().all(|(_, list)| list.len() <= NUM_OF_INDICES_IN_SHARD as u64));
+        assert_eq!(shards.last().unwrap().0.sharded_key.highest_block_number, u64::MAX);
+        assert_eq!(
+            provider.storage_history_slots(address).unwrap(),
+            vec![slot, other],
+            "the other slot is untouched"
+        );
+
+        // Undo restores the exact shards.
+        provider.replace_storage_history_shards(address, slot, &old).unwrap();
+        let restored = provider.storage_history_shards(address, slot).unwrap();
+        assert_eq!(restored, old);
     }
 
     #[test]

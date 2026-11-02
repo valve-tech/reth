@@ -17,6 +17,7 @@ mod diff;
 mod get;
 mod list;
 mod migrate_v2;
+mod patch_wiped_storage;
 mod prune_checkpoints;
 mod repair_trie;
 mod scan_empty_hashed_accounts;
@@ -66,6 +67,8 @@ pub enum Subcommands {
     /// Finds all-zero `HashedAccounts` rows that EIP-161 deleted from `PlainAccountState`
     /// (read-only, safe on a running node; v1 checks PlainAccountState, v2 the AccountsTrie)
     ScanEmptyHashedAccounts(scan_empty_hashed_accounts::Command),
+    /// Adds missing wiped-storage rows to storage changesets (dry run unless --apply)
+    PatchWipedStorage(patch_wiped_storage::Command),
     /// Reads and displays the static file segment header
     StaticFileHeader(static_file_header::Command),
     /// Lists current and local database versions
@@ -195,6 +198,13 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                 // Skip the static file consistency check: a live node is mid-write, and the scan
                 // reads only MDBX tables and, in v2 mode, one header.
                 db_exec!(self.env, tool, N, AccessRights::RoInconsistent, {
+                    command.execute(&tool)?;
+                });
+            }
+            Subcommands::PatchWipedStorage(command) => {
+                let access_rights =
+                    if command.writes() { AccessRights::RW } else { AccessRights::RoInconsistent };
+                db_exec!(self.env, tool, N, access_rights, {
                     command.execute(&tool)?;
                 });
             }
