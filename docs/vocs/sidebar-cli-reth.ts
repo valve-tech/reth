@@ -120,6 +120,18 @@ export const rethCliSidebar: SidebarItem = {
                     link: "/cli/reth/db/scan-empty-hashed-accounts"
                 },
                 {
+                    text: "reth db patch-wiped-storage",
+                    link: "/cli/reth/db/patch-wiped-storage"
+                },
+                {
+                    text: "reth db changeset-dump",
+                    link: "/cli/reth/db/changeset-dump"
+                },
+                {
+                    text: "reth db scan-wiped-storage",
+                    link: "/cli/reth/db/scan-wiped-storage"
+                },
+                {
                     text: "reth db static-file-header",
                     link: "/cli/reth/db/static-file-header",
                     collapsed: true,
