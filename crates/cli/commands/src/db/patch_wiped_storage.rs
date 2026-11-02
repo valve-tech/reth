@@ -13,10 +13,15 @@
 //! files in, and adds each patched block to the slot's `StoragesHistory` entry. `--undo` reverses
 //! an applied patch from the same staging directory.
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use clap::Parser;
 use eyre::{ensure, eyre, WrapErr};
-use reth_db_api::models::{storage_sharded_key::StorageShardedKey, StorageBeforeTx};
+use reth_db_api::{
+    cursor::DbDupCursorRO,
+    models::{storage_sharded_key::StorageShardedKey, StorageBeforeTx},
+    tables,
+    transaction::DbTx,
+};
 use reth_db_common::DbTool;
 use reth_provider::{
     providers::{
@@ -26,6 +31,7 @@ use reth_provider::{
     RocksDBProviderFactory, StaticFileProviderFactory,
 };
 use reth_static_file_types::StaticFileSegment;
+use reth_storage_api::StorageChangeSetReader;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -88,6 +94,7 @@ impl Command {
         let patch = read_patch(&self.rows)?;
         let rows: usize = patch.values().map(Vec::len).sum();
         info!(target: "reth::cli", blocks = patch.len(), rows, "Read patch");
+        check_wiped_at_block(tool, &patch)?;
 
         let original = tool.provider_factory.static_file_provider();
         let mut ranges = BTreeMap::new();
@@ -162,6 +169,59 @@ fn read_patch(path: &Path) -> eyre::Result<StorageChangesetPatch> {
     }
     ensure!(!patch.is_empty(), "the input has no rows");
     Ok(patch)
+}
+
+/// Refuses rows whose slot is not zero right after its block.
+///
+/// A self-destruct leaves every slot of the account at zero after the block. A non-zero value
+/// there means the slot was not wiped in that block, so the row would be wrong. The value after
+/// block B is the `before` of the slot's next changeset row above B, or the current value if no
+/// later row exists. Neither depends on the missing row, so this check works on a damaged node.
+fn check_wiped_at_block<N: ProviderNodeTypes>(
+    tool: &DbTool<N>,
+    patch: &StorageChangesetPatch,
+) -> eyre::Result<()> {
+    let provider = tool.provider_factory.provider()?;
+    let rocksdb = tool.provider_factory.rocksdb_provider();
+    let mut hashed = provider.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
+    for (block, rows) in patch {
+        for row in rows {
+            let next_change = rocksdb
+                .storage_history_shards(row.address, row.key)?
+                .into_iter()
+                .flat_map(|(_, list)| list.iter().collect::<Vec<_>>())
+                .find(|changed| changed > block);
+            let after = match next_change {
+                Some(next) => provider
+                    .storage_changeset(next)?
+                    .into_iter()
+                    .find(|(key, entry)| key.address() == row.address && entry.key == row.key)
+                    .map(|(_, entry)| entry.value)
+                    .ok_or_else(|| {
+                        eyre!(
+                            "history lists block {next} for {} slot {}, but its changeset has no row",
+                            row.address,
+                            row.key
+                        )
+                    })?,
+                None => {
+                    let (hashed_address, hashed_slot) = (keccak256(row.address), keccak256(row.key));
+                    hashed
+                        .seek_by_key_subkey(hashed_address, hashed_slot)?
+                        .filter(|entry| entry.key == hashed_slot)
+                        .map(|entry| entry.value)
+                        .unwrap_or_default()
+                }
+            };
+            ensure!(
+                after.is_zero(),
+                "block {block}: {} slot {} reads {after} after the block, so it was not wiped there",
+                row.address,
+                row.key
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Swaps the rewritten files in and updates the history index. The node must be stopped.

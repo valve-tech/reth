@@ -19,7 +19,9 @@ use reth_db_common::DbTool;
 use reth_primitives_traits::Account;
 use reth_provider::{providers::ProviderNodeTypes, LatestStateProviderRef};
 use reth_stages::StageId;
-use reth_storage_api::{AccountReader, ChangeSetReader, StageCheckpointReader, StorageChangeSetReader};
+use reth_storage_api::{
+    AccountReader, ChangeSetReader, StageCheckpointReader, StorageChangeSetReader,
+};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,9 +37,17 @@ pub struct Command {
     #[arg(long, default_value_t = 0)]
     from: u64,
 
-    /// Last block to scan, inclusive. Defaults to the Finish checkpoint.
+    /// Last block to report, inclusive. Defaults to the Finish checkpoint.
+    ///
+    /// Pass 1 still reads account changesets up to the tip, because a destruction is only known
+    /// from the account's next row.
     #[arg(long)]
     to: Option<u64>,
+
+    /// First block of storage changesets that pass 2 reads. Slots a contract wrote before this
+    /// block are not seen, so keep the default of 0 unless no contract in the range is older.
+    #[arg(long, default_value_t = 0)]
+    storage_from: u64,
 
     /// Blocks read per changeset batch.
     #[arg(long, default_value_t = 10_000)]
@@ -63,21 +73,21 @@ impl Command {
     pub fn execute<N: ProviderNodeTypes>(self, tool: &DbTool<N>) -> eyre::Result<()> {
         eyre::ensure!(self.chunk_blocks > 0, "--chunk-blocks must be greater than zero");
         let provider = tool.provider_factory.provider()?;
-        let tip = provider.get_stage_checkpoint(StageId::Finish)?.map(|c| c.block_number);
-        let to = match (self.to, tip) {
-            (Some(to), _) => to,
-            (None, Some(tip)) => tip,
-            (None, None) => eyre::bail!("no Finish checkpoint; pass --to"),
-        };
+        let tip = provider
+            .get_stage_checkpoint(StageId::Finish)?
+            .map(|c| c.block_number)
+            .ok_or_else(|| eyre::eyre!("no Finish checkpoint"))?;
+        let to = self.to.unwrap_or(tip).min(tip);
         eyre::ensure!(to >= self.from, "--to must not be below --from");
+        eyre::ensure!(self.storage_from <= self.from, "--storage-from must not be above --from");
         let start = Instant::now();
 
-        let mut destructions = find_destructions(&provider, self.from, to, self.chunk_blocks)?;
+        let mut destructions = find_destructions(&provider, self.from, to, tip, self.chunk_blocks)?;
         let latest = LatestStateProviderRef::new(&provider);
         let destroyed = destructions.values().map(BTreeMap::len).sum::<usize>();
         info!(target: "reth::cli", destroyed, elapsed = ?start.elapsed(), "Pass 1 done");
 
-        collect_storage(&provider, &mut destructions, self.from, to, self.chunk_blocks)?;
+        collect_storage(&provider, &mut destructions, self.storage_from, to, self.chunk_blocks)?;
         info!(target: "reth::cli", elapsed = ?start.elapsed(), "Pass 2 done");
 
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -85,7 +95,9 @@ impl Command {
         let mut suspect_slots = 0usize;
         let mut rows: Vec<_> = destructions
             .iter()
-            .flat_map(|(address, blocks)| blocks.iter().map(move |(block, d)| (*block, *address, d)))
+            .flat_map(|(address, blocks)| {
+                blocks.iter().map(move |(block, d)| (*block, *address, d))
+            })
             .collect();
         rows.sort_unstable_by_key(|(block, address, _)| (*block, *address));
         for (block, address, destruction) in rows {
@@ -118,6 +130,7 @@ impl Command {
                 "kind": "summary",
                 "from": self.from,
                 "to": to,
+                "storage_from": self.storage_from,
                 "destructions": destroyed,
                 "affected": affected,
                 "suspect_slots": suspect_slots,
@@ -134,20 +147,28 @@ fn is_contract(account: &Account) -> bool {
     account.bytecode_hash.is_some_and(|hash| hash != KECCAK256_EMPTY)
 }
 
-/// Pass 1: finds blocks in which a contract was destroyed.
+/// Pass 1: finds blocks in `from..=to` in which a contract was destroyed.
 ///
 /// A changeset row holds the value before its block, so the value after block `b` is the `before`
-/// of the account's next row, or the tip state if no later row exists.
-fn find_destructions<P>(provider: &P, from: u64, to: u64, chunk: u64) -> eyre::Result<Destructions>
+/// of the account's next row, or the tip state if no later row exists. The next row can be above
+/// `to`, so this reads account changesets up to `tip`. Reading only to `to` and taking the tip
+/// state for the last row would report a later destruction at that row instead.
+fn find_destructions<P>(
+    provider: &P,
+    from: u64,
+    to: u64,
+    tip: u64,
+    chunk: u64,
+) -> eyre::Result<Destructions>
 where
     P: ChangeSetReader + AccountReader,
 {
-    // The last row seen for each contract: its block and the contract before that block.
-    let mut open = HashMap::<Address, (u64, Account)>::default();
+    // The last row seen for each contract: its block and the contract's nonce before that block.
+    let mut open = HashMap::<Address, (u64, u64)>::default();
     let mut destructions = Destructions::default();
-    let mut record = |address: Address, block: u64, before: &Account, after: Option<&Account>| {
-        let recreated = after.is_some_and(|after| after.nonce < before.nonce);
-        if after.is_none() || recreated {
+    let mut record = |address: Address, block: u64, nonce: u64, after: Option<&Account>| {
+        let recreated = after.is_some_and(|after| after.nonce < nonce);
+        if (after.is_none() || recreated) && block <= to {
             destructions
                 .entry(address)
                 .or_default()
@@ -156,24 +177,30 @@ where
     };
 
     let mut start = from;
-    while start <= to {
-        let end = start.saturating_add(chunk - 1).min(to);
+    while start <= tip {
+        let end = start.saturating_add(chunk - 1).min(tip);
         for (block, row) in provider.account_changesets_range(start..=end)? {
-            if let Some((open_block, before)) = open.remove(&row.address) {
-                record(row.address, open_block, &before, row.info.as_ref());
+            if let Some((open_block, nonce)) = open.remove(&row.address) {
+                record(row.address, open_block, nonce, row.info.as_ref());
             }
-            if let Some(before) = row.info.filter(is_contract) {
-                open.insert(row.address, (block, before));
+            // Only rows in the report range can start a destruction.
+            if block <= to &&
+                let Some(before) = row.info.filter(is_contract)
+            {
+                open.insert(row.address, (block, before.nonce));
             }
         }
         info!(target: "reth::cli", block = end, open = open.len(), "Pass 1: account changesets");
         start = end + 1;
+        if end >= to && open.is_empty() {
+            break
+        }
     }
 
-    // Contracts whose last row is in range: the value after that block is the tip state.
-    for (address, (block, before)) in open {
+    // Contracts with no later row: the value after their last row is the tip state.
+    for (address, (block, nonce)) in open {
         let after = provider.basic_account(&address)?;
-        record(address, block, &before, after.as_ref());
+        record(address, block, nonce, after.as_ref());
     }
     Ok(destructions)
 }
@@ -266,7 +293,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut destructions = find_destructions(&*provider, 0, 5, 2).unwrap();
+        let mut destructions = find_destructions(&*provider, 0, 5, 5, 2).unwrap();
         collect_storage(&*provider, &mut destructions, 0, 5, 2).unwrap();
 
         assert_eq!(destructions.len(), 1, "only the destroyed contract is a candidate");
@@ -277,6 +304,29 @@ mod tests {
         let suspects: Vec<_> =
             destruction.written_before.difference(&destruction.covered).copied().collect();
         assert_eq!(suspects, vec![slot_b]);
+    }
+
+    /// A report range that ends below the tip must not move a later destruction into the range.
+    #[test]
+    fn a_destruction_above_to_is_not_reported_at_the_last_row_in_range() {
+        let factory = create_test_provider_factory();
+        let provider = factory.provider_rw().unwrap();
+        let tx = provider.tx_ref();
+        let address = Address::with_last_byte(4);
+        // Touched in block 2, destroyed in block 8. The account is gone at the tip.
+        for block in [2, 8] {
+            tx.put::<tables::AccountChangeSets>(
+                block,
+                AccountBeforeTx { address, info: Some(contract(1)) },
+            )
+            .unwrap();
+        }
+
+        let in_range = find_destructions(&*provider, 0, 5, 10, 3).unwrap();
+        assert!(in_range.is_empty(), "the destruction at block 8 is above --to 5");
+
+        let full = find_destructions(&*provider, 0, 10, 10, 3).unwrap();
+        assert_eq!(full[&address].keys().copied().collect::<Vec<_>>(), vec![8]);
     }
 
     /// A destruction followed by re-creation in the same block shows as a lower nonce.
@@ -293,7 +343,7 @@ mod tests {
         .unwrap();
         tx.put::<tables::PlainAccountState>(address, contract(1)).unwrap();
 
-        let destructions = find_destructions(&*provider, 0, 3, 10).unwrap();
+        let destructions = find_destructions(&*provider, 0, 3, 3, 10).unwrap();
         assert!(destructions[&address][&2].recreated);
     }
 }
