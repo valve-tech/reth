@@ -124,6 +124,10 @@ export const rethCliSidebar: SidebarItem = {
                     link: "/cli/reth/db/patch-wiped-storage"
                 },
                 {
+                    text: "reth db repair-storage-history",
+                    link: "/cli/reth/db/repair-storage-history"
+                },
+                {
                     text: "reth db changeset-dump",
                     link: "/cli/reth/db/changeset-dump"
                 },

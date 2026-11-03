@@ -1344,6 +1344,37 @@ impl RocksDBProvider {
         Ok(old)
     }
 
+    /// Returns true if the storage history index lists `block` for one slot.
+    ///
+    /// Reads only the shard that would hold `block`: the first shard whose highest block number
+    /// is at or above it.
+    pub fn storage_history_contains(
+        &self,
+        address: Address,
+        storage_key: B256,
+        block: BlockNumber,
+    ) -> ProviderResult<bool> {
+        let cf = self.get_cf_handle::<tables::StoragesHistory>()?;
+        let start = StorageShardedKey::new(address, storage_key, block).encode();
+        let mut iter =
+            self.0.iterator_cf(cf, IteratorMode::From(start.as_ref(), rocksdb::Direction::Forward));
+        let Some(item) = iter.next() else { return Ok(false) };
+        let (key_bytes, value_bytes) = item.map_err(|e| {
+            ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+                message: e.to_string().into(),
+                code: -1,
+            }))
+        })?;
+        let key = StorageShardedKey::decode(&key_bytes)
+            .map_err(|_| ProviderError::Database(DatabaseError::Decode))?;
+        if key.address != address || key.sharded_key.key != storage_key {
+            return Ok(false)
+        }
+        let list = BlockNumberList::decompress(&value_bytes)
+            .map_err(|_| ProviderError::Database(DatabaseError::Decode))?;
+        Ok(list.0.contains(block))
+    }
+
     /// Replaces every storage history shard of one slot with `shards`.
     pub fn replace_storage_history_shards(
         &self,
