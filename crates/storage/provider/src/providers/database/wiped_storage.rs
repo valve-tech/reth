@@ -6,9 +6,11 @@
 //! through `save_blocks`, which before this module wrote only the touched slots. History reads,
 //! historical proofs and unwinds across such a block then lost the wiped values.
 //!
-//! The hashed state of an executed block already lists every slot of a destroyed account with a
-//! zero value. This module takes those slots, finds each slot's value before the block, and finds
-//! its plain key, which the changeset needs.
+//! The hashed state of an executed block lists every slot of a destroyed account with a zero
+//! value. The engine builds it that way on both the state root task path and the fallback path
+//! (`payload_validator`). This module takes those slots, finds each slot's value before the block,
+//! and finds its plain key, which the changeset needs. The storage history index writer lists the
+//! same rows, so historical reads find them.
 
 use crate::providers::rocksdb::RocksDBProvider;
 use alloy_primitives::{keccak256, map::HashMap, Address, BlockNumber, B256, U256};
@@ -124,14 +126,7 @@ where
                 )?;
                 let plain = match touched.get(&hashed_slot) {
                     Some((plain, _)) => Some(*plain),
-                    None => plain_key(
-                        &history,
-                        &mut plain_keys,
-                        &overlay,
-                        number,
-                        *address,
-                        hashed_slot,
-                    )?,
+                    None => plain_key(&history, &mut plain_keys, &overlay, *address, hashed_slot)?,
                 };
                 match plain {
                     // A touched slot always gets a row. An untouched slot only if it held a value.
@@ -197,13 +192,14 @@ where
 
 /// Returns the plain key of a hashed slot of `address`, or `None` if no source knows it.
 ///
-/// Sources, in order: the plain keys in the overlay's bundles up to `block`, then every slot the
-/// storage history index lists for the address.
+/// Sources: the plain keys in every bundle of the overlay, then every slot the storage history
+/// index lists for the address. The cache holds the keys of the whole overlay, so a later wipe of
+/// the same address in the batch also finds slots written after an earlier wipe. A key from a
+/// later block is harmless: it only matches a slot the hashed state lists.
 fn plain_key<N, TX>(
     history: &SlotHistory<'_, TX>,
     cache: &mut HashMap<Address, HashMap<B256, B256>>,
     overlay: &BTreeMap<BlockNumber, &ExecutedBlock<N>>,
-    block: BlockNumber,
     address: Address,
     hashed_slot: B256,
 ) -> ProviderResult<Option<B256>>
@@ -216,7 +212,7 @@ where
         let mut add = |plain: B256| {
             keys.insert(keccak256(plain), plain);
         };
-        for (_, earlier) in overlay.range(..=block) {
+        for earlier in overlay.values() {
             let state = &earlier.execution_outcome().state;
             if let Some(account) = state.state.get(&address) {
                 account.storage.keys().for_each(|slot| add(B256::from(*slot)));

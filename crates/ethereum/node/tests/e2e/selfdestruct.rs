@@ -269,6 +269,102 @@ async fn test_selfdestruct_pre_dencun() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Tests that the engine persists the history of storage that a pre-Dencun SELFDESTRUCT wipes.
+///
+/// The contract sets slot 0 in its constructor. A later block self-destructs it without touching
+/// slot 0. After the engine persists that block:
+/// 1. The block's storage changeset holds the old value of slot 0.
+/// 2. A historical read of slot 0 at the block below returns the old value. That read needs the
+///    storage history index to list the block.
+/// 3. No hashed storage row of the destroyed account is left behind.
+///
+/// The engine builds a block's hashed state in two ways: in the state root task, or from the
+/// execution output when the task is off. Both must lead to the same history.
+#[tokio::test]
+async fn test_selfdestruct_pre_dencun_persists_wiped_storage_history() -> eyre::Result<()> {
+    run_wiped_storage_history(false).await
+}
+
+/// Same as [`test_selfdestruct_pre_dencun_persists_wiped_storage_history`], with the state root
+/// task off.
+#[tokio::test]
+async fn test_selfdestruct_pre_dencun_persists_wiped_storage_history_without_task(
+) -> eyre::Result<()> {
+    run_wiped_storage_history(true).await
+}
+
+async fn run_wiped_storage_history(state_root_fallback: bool) -> eyre::Result<()> {
+    use alloy_eips::BlockNumberOrTag;
+    use alloy_primitives::{keccak256, Address, B256};
+    use reth_db::{cursor::DbCursorRO, tables, transaction::DbTx};
+    use reth_e2e_test_utils::trie::assert_trie_consistency;
+    use reth_provider::{DatabaseProviderFactory, StorageChangeSetReader};
+
+    reth_tracing::init_test_tracing();
+
+    let (mut node, wallet) = EthereumNode::test_setup_for(EthereumHardfork::Shanghai)
+        .with_tree_config_modifier(move |config| {
+            config
+                .without_prewarming(true)
+                .with_state_root_fallback(state_root_fallback)
+                .with_num_state_masking_blocks(0)
+                .with_persistence_threshold(0)
+                .with_memory_block_buffer_target(0)
+        })
+        .build_single()
+        .await?;
+    let mut account = wallet.account(0);
+    let provider = node.rpc_provider();
+
+    // Deploy the contract, then persist it, so the wipe reads slot 0 from the database.
+    let deploy = account.deploy(selfdestruct_contract_init_code()).await;
+    let mined = node.mine([deploy]).await?.ensure_success()?;
+    let contract = mined.receipts[0].contract_address.expect("Should have contract address");
+    for _ in 0..2 {
+        node.mine([account.transfer(Address::with_last_byte(1), U256::from(1)).await])
+            .await?
+            .ensure_success()?;
+    }
+
+    // Self-destruct without touching slot 0, then persist that block.
+    let mined = node.mine([account.tx().to(contract).await]).await?.ensure_success()?;
+    let destroyed_at = mined.block().number;
+    for _ in 0..3 {
+        node.mine([account.transfer(Address::with_last_byte(1), U256::from(1)).await])
+            .await?
+            .ensure_success()?;
+    }
+    node.wait_for_persisted_block(destroyed_at).await?;
+
+    let db = node.inner.provider.database_provider_ro()?;
+    let rows: Vec<_> = db
+        .storage_changeset(destroyed_at)?
+        .into_iter()
+        .filter(|(key, _)| key.address() == contract)
+        .map(|(_, entry)| (entry.key, entry.value))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(B256::ZERO, U256::from(0x42))],
+        "the changeset of the destroying block must restore slot 0"
+    );
+
+    let before = provider
+        .get_storage_at(contract, U256::ZERO)
+        .block_id(BlockNumberOrTag::Number(destroyed_at - 1).into())
+        .await?;
+    assert_eq!(before, U256::from(0x42), "a historical read must return the wiped value");
+
+    let mut hashed = db.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
+    assert!(
+        hashed.seek_exact(keccak256(contract))?.is_none(),
+        "no hashed storage of the destroyed account may remain"
+    );
+
+    assert_trie_consistency(&node.inner.provider)?;
+    Ok(())
+}
+
 /// Tests SELFDESTRUCT in same transaction as creation, where account previously had ETH
 /// (post-Dencun).
 ///
