@@ -72,7 +72,7 @@ struct InputRow {
 
 /// Undo record for one slot's history index entries.
 #[derive(Debug, Serialize, Deserialize)]
-struct HistoryUndo {
+pub(super) struct HistoryUndo {
     address: Address,
     slot: B256,
     /// The shards before the patch: `(highest block number, block numbers)`.
@@ -240,20 +240,7 @@ fn apply<N: ProviderNodeTypes>(
             slots.entry((row.address, row.key)).or_default().push(*block);
         }
     }
-    let undo_path = staging.join("history-undo.jsonl");
-    ensure!(!undo_path.exists(), "{} exists; use a new staging directory", undo_path.display());
-    let mut undo_file = std::io::BufWriter::new(std::fs::File::create(&undo_path)?);
-    for (address, slot) in slots.keys() {
-        let shards = rocksdb
-            .storage_history_shards(*address, *slot)?
-            .into_iter()
-            .map(|(key, list)| (key.sharded_key.highest_block_number, list.iter().collect()))
-            .collect();
-        let record = HistoryUndo { address: *address, slot: *slot, shards };
-        writeln!(undo_file, "{}", serde_json::to_string(&record)?)?;
-    }
-    undo_file.flush()?;
-    undo_file.get_ref().sync_all()?;
+    let undo_path = record_history(&rocksdb, staging, slots.keys().copied())?;
 
     // 2. Back up the original files, then copy each rewritten file over its original.
     let backup_dir = staging.join("backup");
@@ -308,7 +295,45 @@ fn undo<N: ProviderNodeTypes>(tool: &DbTool<N>, staging: &Path) -> eyre::Result<
         restored += 1;
     }
 
-    let rocksdb = tool.provider_factory.rocksdb_provider();
+    let slots = restore_history(&tool.provider_factory.rocksdb_provider(), staging)?;
+    println!(
+        "{}",
+        serde_json::json!({"kind": "undone", "files": restored, "history_slots": slots})
+    );
+    Ok(())
+}
+
+/// Writes `<staging>/history-undo.jsonl` with the current history shards of each slot, before
+/// anything changes. Refuses a staging directory that already holds one.
+pub(super) fn record_history(
+    rocksdb: &reth_provider::providers::RocksDBProvider,
+    staging: &Path,
+    slots: impl IntoIterator<Item = (Address, B256)>,
+) -> eyre::Result<PathBuf> {
+    reth_fs_util::create_dir_all(staging)?;
+    let undo_path = staging.join("history-undo.jsonl");
+    ensure!(!undo_path.exists(), "{} exists; use a new staging directory", undo_path.display());
+    let mut undo_file = std::io::BufWriter::new(std::fs::File::create(&undo_path)?);
+    for (address, slot) in slots {
+        let shards = rocksdb
+            .storage_history_shards(address, slot)?
+            .into_iter()
+            .map(|(key, list)| (key.sharded_key.highest_block_number, list.iter().collect()))
+            .collect();
+        let record = HistoryUndo { address, slot, shards };
+        writeln!(undo_file, "{}", serde_json::to_string(&record)?)?;
+    }
+    undo_file.flush()?;
+    undo_file.get_ref().sync_all()?;
+    Ok(undo_path)
+}
+
+/// Restores the history shards recorded in `<staging>/history-undo.jsonl`. Returns the number of
+/// slots restored.
+pub(super) fn restore_history(
+    rocksdb: &reth_provider::providers::RocksDBProvider,
+    staging: &Path,
+) -> eyre::Result<usize> {
     let undo_file = std::fs::File::open(staging.join("history-undo.jsonl"))?;
     let mut slots = 0;
     for line in std::io::BufReader::new(undo_file).lines() {
@@ -326,9 +351,5 @@ fn undo<N: ProviderNodeTypes>(tool: &DbTool<N>, staging: &Path) -> eyre::Result<
         rocksdb.replace_storage_history_shards(record.address, record.slot, &shards)?;
         slots += 1;
     }
-    println!(
-        "{}",
-        serde_json::json!({"kind": "undone", "files": restored, "history_slots": slots})
-    );
-    Ok(())
+    Ok(slots)
 }

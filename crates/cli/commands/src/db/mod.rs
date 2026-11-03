@@ -20,6 +20,7 @@ mod list;
 mod migrate_v2;
 mod patch_wiped_storage;
 mod prune_checkpoints;
+mod repair_storage_history;
 mod repair_trie;
 mod scan_empty_hashed_accounts;
 mod scan_wiped_storage;
@@ -71,6 +72,9 @@ pub enum Subcommands {
     ScanEmptyHashedAccounts(scan_empty_hashed_accounts::Command),
     /// Adds missing wiped-storage rows to storage changesets (dry run unless --apply)
     PatchWipedStorage(patch_wiped_storage::Command),
+    /// Adds history index entries for storage changeset rows that lack them (dry run unless
+    /// --apply)
+    RepairStorageHistory(repair_storage_history::Command),
     /// Prints the stored account and storage changesets of a block range as JSON lines (read-only)
     ChangesetDump(changeset_dump::Command),
     /// Finds self-destructs whose wiped storage has no changeset rows (read-only)
@@ -208,6 +212,13 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                 });
             }
             Subcommands::PatchWipedStorage(command) => {
+                let access_rights =
+                    if command.writes() { AccessRights::RW } else { AccessRights::RoInconsistent };
+                db_exec!(self.env, tool, N, access_rights, {
+                    command.execute(&tool)?;
+                });
+            }
+            Subcommands::RepairStorageHistory(command) => {
                 let access_rights =
                     if command.writes() { AccessRights::RW } else { AccessRights::RoInconsistent };
                 db_exec!(self.env, tool, N, access_rights, {
