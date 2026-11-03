@@ -1511,6 +1511,7 @@ impl RocksDBProvider {
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
         ctx: RocksDBWriteCtx,
+        storage_wipes: &crate::providers::StorageWipeRows,
         runtime: &reth_tasks::Runtime,
     ) -> ProviderResult<()> {
         if !ctx.storage_settings.storage_v2 {
@@ -1547,7 +1548,8 @@ impl RocksDBProvider {
             if write_storage_history {
                 s.spawn(|_| {
                     let _guard = span.enter();
-                    r_storage_history = Some(self.write_storage_history(blocks, &ctx));
+                    r_storage_history =
+                        Some(self.write_storage_history(blocks, &ctx, storage_wipes));
                 });
             }
         });
@@ -1631,12 +1633,14 @@ impl RocksDBProvider {
 
     /// Writes storage history indices for the given blocks.
     ///
-    /// Derives history indices from reverts (same source as changesets) to ensure consistency.
+    /// Derives history indices from the same sources as the storage changesets: the reverts, and
+    /// for an account that a self-destruct wiped, the complete rows in `storage_wipes`.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all)]
     fn write_storage_history<N: reth_node_types::NodePrimitives>(
         &self,
         blocks: &[ExecutedBlock<N>],
         ctx: &RocksDBWriteCtx,
+        storage_wipes: &crate::providers::StorageWipeRows,
     ) -> ProviderResult<()> {
         let mut storage_history: BTreeMap<(Address, B256), Vec<u64>> = BTreeMap::new();
 
@@ -1657,6 +1661,17 @@ impl RocksDBProvider {
                     }
                 }
             }
+        }
+
+        // A wiped account's changeset also holds the slots the block did not touch.
+        for ((block_number, address), rows) in storage_wipes {
+            for row in rows {
+                storage_history.entry((*address, row.key)).or_default().push(*block_number);
+            }
+        }
+        for indices in storage_history.values_mut() {
+            indices.sort_unstable();
+            indices.dedup();
         }
 
         let shard_puts = storage_history

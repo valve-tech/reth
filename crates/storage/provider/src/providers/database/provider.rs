@@ -681,7 +681,13 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                         rocksdb_ctx.clone().expect("RocksDB context exists when enabled");
                     rocksdb_result = Some(
                         rocksdb_provider
-                            .write_blocks_data(blocks, &tx_nums, rocksdb_ctx, runtime)
+                            .write_blocks_data(
+                                blocks,
+                                &tx_nums,
+                                rocksdb_ctx,
+                                &storage_wipes,
+                                runtime,
+                            )
                             .map(|()| start.elapsed()),
                     );
                 });
@@ -6303,6 +6309,115 @@ mod tests {
     #[test]
     fn test_self_destruct_wipe_writes_all_slots_in_one_batch() {
         run_self_destruct_wipe_writes_all_slots(true);
+    }
+
+    /// One batch wipes a contract, re-creates it with a new slot, and wipes it again. The second
+    /// wipe must restore the new slot, whose plain key exists only in the batch, and the history
+    /// index must list both wiping blocks.
+    #[test]
+    fn test_self_destruct_wipe_twice_in_one_batch() {
+        use alloy_primitives::map::{FbBuildHasher, HashMap};
+
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(StorageSettings::v2());
+        let genesis = SealedBlock::<reth_ethereum_primitives::Block>::from_sealed_parts(
+            SealedHeader::new(
+                Header { number: 0, difficulty: U256::ONE, ..Default::default() },
+                B256::ZERO,
+            ),
+            Default::default(),
+        );
+        let genesis_executed: ExecutedBlock = ExecutedBlock::new(
+            Arc::new(genesis.try_recover().unwrap()),
+            Arc::new(BlockExecutionOutput {
+                result: BlockExecutionResult {
+                    receipts: vec![],
+                    requests: Default::default(),
+                    gas_used: 0,
+                    blob_gas_used: 0,
+                },
+                state: Default::default(),
+            }),
+            SortedTrieData::default(),
+        );
+        let provider_rw = factory.provider_rw().unwrap();
+        save_genesis(&provider_rw, &genesis_executed).unwrap();
+        provider_rw.commit().unwrap();
+
+        let address = Address::with_last_byte(0x42);
+        let info =
+            AccountInfo { nonce: 1, code_hash: B256::with_last_byte(9), ..Default::default() };
+        let hashed_address = keccak256(address);
+        let hashed_slot = |slot: u64| keccak256(B256::from(U256::from(slot)));
+
+        // Creates the contract with `slot` set to `value`.
+        let create = |number: u64, slot: u64, value: u64| {
+            let storage: HashMap<U256, (U256, U256), FbBuildHasher<32>> =
+                std::iter::once((U256::from(slot), (U256::ZERO, U256::from(value)))).collect();
+            let bundle = BundleState::builder(number..=number)
+                .state_present_account_info(address, info.clone())
+                .revert_account_info(number, address, Some(None))
+                .state_storage(address, storage)
+                .revert_storage(number, address, vec![(U256::from(slot), U256::ZERO)])
+                .build();
+            let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
+            (bundle, hashed)
+        };
+        // Self-destructs the contract without touching `slot`. The hashed state lists the slot
+        // with a zero value, as the engine does.
+        let destroy = |number: u64, slot: u64| {
+            let mut bundle = BundleState::builder(number..=number)
+                .state_original_account_info(address, info.clone())
+                .revert_account_info(number, address, Some(Some(info.clone())))
+                .build();
+            bundle.reverts[0][0].1.wipe_storage = true;
+            let mut hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
+            hashed.accounts.insert(hashed_address, None);
+            hashed.storages.insert(
+                hashed_address,
+                reth_trie::HashedStorage::from_iter([(hashed_slot(slot), U256::ZERO)]),
+            );
+            (bundle, hashed)
+        };
+
+        let mut blocks = Vec::new();
+        let mut parent = B256::ZERO;
+        for (number, (bundle, hashed)) in
+            [(1, create(1, 0, 7)), (2, destroy(2, 0)), (3, create(3, 1, 5)), (4, destroy(4, 1))]
+        {
+            let block = wipe_test_block(number, parent, bundle, hashed);
+            parent = block.recovered_block().hash();
+            blocks.push(block);
+        }
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw.save_blocks(&SaveBlocksInput::new(blocks, 0, 0, 4, 4)).unwrap();
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        for (block, slot, value) in [(2, 0u64, 7u64), (4, 1, 5)] {
+            let rows: Vec<_> = provider
+                .storage_changeset(block)
+                .unwrap()
+                .into_iter()
+                .map(|(key, entry)| (key.address(), entry.key, entry.value))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![(address, B256::from(U256::from(slot)), U256::from(value))],
+                "block {block} must restore slot {slot}"
+            );
+        }
+
+        let rocksdb = factory.rocksdb_provider();
+        for (slot, expected) in [(0u64, vec![1u64, 2]), (1, vec![3, 4])] {
+            let blocks: Vec<u64> = rocksdb
+                .storage_history_shards(address, B256::from(U256::from(slot)))
+                .unwrap()
+                .into_iter()
+                .flat_map(|(_, list)| list.iter().collect::<Vec<_>>())
+                .collect();
+            assert_eq!(blocks, expected, "the history index of slot {slot}");
+        }
     }
 
     #[test]

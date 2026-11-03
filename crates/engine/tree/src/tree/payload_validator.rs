@@ -159,9 +159,9 @@ use reth_primitives_traits::{
 };
 use reth_provider::{
     BlockExecutionOutput, BlockReader, ChangeSetReader, DatabaseProviderFactory,
-    DatabaseProviderROFactory, EvmStateProvider, EvmStateProviderBox, HistoryReader, ProviderError,
-    PruneCheckpointReader, StageCheckpointReader, StateProvider, StateProviderFactory, StateReader,
-    StorageChangeSetReader, StorageSettingsCache,
+    DatabaseProviderROFactory, EvmStateProvider, EvmStateProviderBox, HashedPostStateProvider,
+    HistoryReader, ProviderError, PruneCheckpointReader, StageCheckpointReader, StateProvider,
+    StateProviderFactory, StateReader, StorageChangeSetReader, StorageSettingsCache,
 };
 use reth_revm::db::{states::bundle_state::BundleRetention, BundleAccount, State};
 use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
@@ -828,6 +828,7 @@ where
         // (keccak256 hashing of all changed addresses and storage slots).
         let hashed_state_output = output.clone();
         let mut hashed_state_rx = state_root_job.take_hashed_state_rx();
+        let hashed_state_factory = state_provider_factory.clone();
         let parent_span = Span::current();
         let mut hashed_state: LazyHashedPostState =
             self.runtime.spawn_blocking_named("hash-post-state", move || {
@@ -838,11 +839,27 @@ where
                 )
                 .entered();
                 if let Some(Ok(state)) = hashed_state_rx.as_mut().map(|rx| rx.recv()) {
-                    state
-                } else {
-                    Arc::new(HashedPostState::from_bundle_state::<KeccakKeyHasher>(
-                        hashed_state_output.state.state(),
-                    ))
+                    return state
+                }
+                // The parent state provider lists every slot of an account that a pre-Cancun
+                // self-destruct wiped, with a zero value. Persistence needs those slots to delete
+                // the account's hashed storage and to write complete changesets and history.
+                let state = &hashed_state_output.state;
+                match hashed_state_factory
+                    .database_provider_ro()
+                    .and_then(|provider| provider.hashed_post_state(state))
+                {
+                    Ok(hashed) => Arc::new(hashed),
+                    Err(err) => {
+                        error!(
+                            target: "engine::tree::payload_validator",
+                            %err,
+                            "Cannot read the parent state; the hashed state lacks wiped storage slots"
+                        );
+                        Arc::new(HashedPostState::from_bundle_state::<KeccakKeyHasher>(
+                            state.state(),
+                        ))
+                    }
                 }
             });
 
