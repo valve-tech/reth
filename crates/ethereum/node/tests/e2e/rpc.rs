@@ -1365,3 +1365,51 @@ async fn test_mine_signed() -> eyre::Result<()> {
 
     Ok(())
 }
+
+/// State overrides accept storage words in the spec's 32-byte form and in the short form that
+/// PulseChain's erigon 2.4.1 requires (`0x2a`), for every method that takes overrides.
+#[tokio::test]
+async fn test_state_override_accepts_short_storage_words() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let chain_spec = test_chain_spec(EthereumHardfork::Cancun);
+    let (node, _wallet) = EthereumNode::test_setup(1, chain_spec).build_single().await?;
+    let client = node.rpc_client().unwrap();
+
+    // Returns storage slot 1.
+    let target = "0x00000000000000000000000000000000000c0de1";
+    let call = serde_json::json!({"to": target, "data": "0x"});
+    let expected = format!("0x{:064x}", 0x2a);
+    for (key, value) in [
+        (
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "0x000000000000000000000000000000000000000000000000000000000000002a",
+        ),
+        ("0x0000000000000000000000000000000000000000000000000000000000000001", "0x2a"),
+        ("0x1", "0x2a"),
+    ] {
+        for field in ["state", "stateDiff"] {
+            let overrides = serde_json::json!({
+                target: {"code": "0x60015460005260206000f3", field: {key: value}}
+            });
+
+            let result: Bytes = client.request("eth_call", (&call, "latest", &overrides)).await?;
+            assert_eq!(result.to_string(), expected, "eth_call {field} {key}={value}");
+
+            let _: U256 = client.request("eth_estimateGas", (&call, "latest", &overrides)).await?;
+
+            let trace: serde_json::Value = client
+                .request(
+                    "debug_traceCall",
+                    (&call, "latest", serde_json::json!({"stateOverrides": overrides})),
+                )
+                .await?;
+            assert_eq!(
+                trace["returnValue"].as_str().map(|v| v.trim_start_matches("0x")),
+                Some(expected.trim_start_matches("0x")),
+                "debug_traceCall {field} {key}={value}"
+            );
+        }
+    }
+    Ok(())
+}
