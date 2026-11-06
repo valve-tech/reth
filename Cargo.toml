@@ -707,40 +707,11 @@ reth-rpc-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275
 reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
 
 ## State override compatibility
-# Valve fork of alloy that accepts short hex storage words (`0x2a`) in `state` / `stateDiff`
-# overrides, as PulseChain's erigon 2.4.1 requires, besides the spec's 32-byte words. Every
-# alloy 2.5.0 crate comes from the fork, so the types stay one copy. Branch `valve/v2.5.0`.
-alloy-consensus = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-consensus-any = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-contract = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-eips = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-genesis = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-json-rpc = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-network = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-network-primitives = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-node-bindings = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-provider = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-pubsub = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-client = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-admin = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-anvil = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-any = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-beacon = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-debug = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-engine = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-eth = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-mev = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-trace = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-rpc-types-txpool = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-serde = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-signer = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-signer-local = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-transport = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-transport-http = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-transport-ipc = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-transport-ws = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
-alloy-tx-macros = { git = "https://github.com/valve-tech/alloy.git", rev = "aa2279095a36f225d83466f647ef4be28b9229ee" }
+# Vendored alloy-rpc-types-eth 2.5.0 (crates.io source) with one change in `src/state.rs`: the
+# `state` / `stateDiff` override maps also accept short hex words (`0x2a`), as PulseChain's
+# erigon 2.4.1 requires, besides the spec's 32-byte words. Its siblings stay on crates.io. Must
+# match the workspace `alloy-rpc-types-eth` version, or cargo ignores it. See its README.
+alloy-rpc-types-eth = { path = "crates/vendor/alloy-rpc-types-eth" }
 
 ## Firehose additions
 # SF fork of evm2 that can run system calls (EIP-4788, EIP-2935, etc.) through the Inspector.
