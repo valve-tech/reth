@@ -4113,9 +4113,9 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "firehose-tracer"
-version = "5.5.0"
+version = "5.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a53eb86c6d17bd4e5517e46f56498d33d128d0641d78d15b86cf2c0605c814ee"
+checksum = "13e2e57e7576a3f4da038684d23aa2a69360b034e60feab88aeec0593ca4714d"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
