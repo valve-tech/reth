@@ -5,8 +5,8 @@ Firehose reth node serves and its effect on the Firehose block. Review the entri
 whose status changed at every upstream bump, and when an activation is announced between bumps.
 
 Statuses come from the `alloy-hardforks` timestamps compiled into the release (0.4.11 for
-`reth-v2.9.0-fh3.1`), checked 2026-10-29. "Not scheduled" means the fork has no timestamp in the
-code: it reaches the tracer only once a later release schedules it.
+`reth-v2.9.0-fh3.1` and `reth-v2.10.0-fh3.1`), checked 2026-11-06. "Not scheduled" means the fork
+has no timestamp in the code: it reaches the tracer only once a later release schedules it.
 
 | Fork | Mainnet | Sepolia | Hoodi | Effect on the Firehose block |
 |------|---------|---------|-------|------------------------------|
@@ -18,4 +18,4 @@ code: it reaches the tracer only once a later release schedules it.
 | BPO1 | Active (2025-12-09) | Active (2025-10-21) | Active (2025-11-05) | None: blob parameters only. |
 | BPO2 | Active (2026-01-07) | Active (2025-10-27) | Active (2025-11-12) | None: blob parameters only. |
 | BPO3, BPO4, BPO5 | Not scheduled | Not scheduled | Not scheduled | None expected: blob parameters only. Re-check when scheduled. |
-| Amsterdam | Not scheduled | Active (2026-10-06, block 11856337) | Not scheduled (unscheduled in v2.8.1) | Header gains `block_access_list_rlp` and `slot_number`; EIP-7708 native transfer logs; EIP-8037 state gas in call gas; EIP-2780 transactions included without a root frame are traced as an out-of-gas root call; EIP-8282 builder request system calls; EIP-8246 self-beneficiary SELFDESTRUCT no longer burns. Covered by the `amsterdam_*` prestate goldens and `firehose_live_tracing_amsterdam`. |
+| Amsterdam (Glamsterdam) | Not scheduled | Active (2026-10-06, block 11856337) | Not scheduled (unscheduled in v2.8.1, no new date as of 2026-11-06) | Header gains `block_access_list_rlp` and `slot_number`; EIP-7708 native transfer logs; EIP-8037 state gas in call gas; EIP-2780 transactions included without a root frame are traced as an out-of-gas root call; EIP-8282 builder request system calls; EIP-8246 self-beneficiary SELFDESTRUCT no longer burns. Covered by the `amsterdam_*` prestate goldens and `firehose_live_tracing_amsterdam`. |

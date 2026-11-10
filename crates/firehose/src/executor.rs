@@ -42,8 +42,12 @@ use crate::{
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction, TxReceipt};
 use alloy_eip7928::{BlockAccessIndex, BlockAccessList};
 use alloy_eips::eip4895::Withdrawals;
-use alloy_primitives::{Address, Log, Sealable, TxKind, U256};
+use alloy_primitives::{logs_bloom, Address, Log, Sealable, TxKind, U256};
 use evm2::evm::{CacheDB, Db};
+use firehose_tracer::{
+    pb::sf::ethereum::r#type::v2::TransactionTrace,
+    types::{ReceiptData, TransactionPlacement},
+};
 use reth_evm::{
     execute::{
         BlockExecutionError, BlockExecutionOutput, BlockExecutor, BlockExecutorFactory,
@@ -204,6 +208,15 @@ impl BlockFees {
 /// [`Self::commit_transaction`] forward untraced: the engine only calls them to commit prewarmed
 /// results, which the traced path never does.
 ///
+/// ## Parallel execution
+///
+/// When the transactions of a block execute in parallel (the engine's block access list path),
+/// one wrapper per worker executes them with [`Self::execute_transaction_detached`] into a tracer
+/// from [`FirehoseBlockTracer::detached_tracer`], and the wrapper over the block's own inspector
+/// commits the results in block order with [`Self::commit_traced_transaction`], which attaches
+/// each trace to the block. The system calls, withdrawals and the block lifecycle stay on that
+/// committing wrapper, so a worker wrapper takes no withdrawals and is never finished.
+///
 /// `Extras` plugs in a chain-specific [`PostTxExtras`] hook, `Adjust` a chain-specific
 /// [`PreTxAdjust`] hook. Both default to no-ops for mainnet Ethereum.
 pub struct FirehoseWrappedExecutor<
@@ -221,11 +234,26 @@ pub struct FirehoseWrappedExecutor<
     /// Beneficiaries of the block's ommer (uncle) headers, in block-body order. Empty after the
     /// Merge. See [`Self::with_ommer_beneficiaries`].
     ommer_beneficiaries: Vec<Address>,
-    /// Running count of logs emitted so far in this block, used to derive each receipt's
-    /// block-wide `log_index_start` when building `on_tx_end` receipt data.
+    /// Number of logs in the receipts committed so far in this block: the block-wide index of
+    /// the next transaction's first log. Stays 0 on a worker wrapper, which commits nothing.
     log_index: u32,
     extras: Extras,
     adjust: Adjust,
+}
+
+/// A transaction executed and traced by [`FirehoseWrappedExecutor::execute_transaction_detached`],
+/// waiting for [`FirehoseWrappedExecutor::commit_traced_transaction`].
+#[derive(Debug)]
+pub struct TracedTransaction<R> {
+    result: R,
+    trace: TransactionTrace,
+}
+
+/// What tracing an executed, uncommitted transaction leaves for the end of its trace.
+struct ExecutedTransaction<R> {
+    result: R,
+    gas_used: u64,
+    blob_gas_used: u64,
 }
 
 impl<Inner, G, Extras, Adjust> Debug for FirehoseWrappedExecutor<Inner, G, Extras, Adjust>
@@ -406,6 +434,166 @@ fn emit_block_reward_balance_changes<G: DerefMut<Target = firehose_tracer::Trace
     }
 }
 
+impl<Inner, G, Extras, Adjust> FirehoseWrappedExecutor<Inner, G, Extras, Adjust>
+where
+    Inner: BlockExecutor,
+    Inner::Transaction: Transaction + TxHashRef + SignatureFields,
+    Inner::Receipt: TxReceipt<Log = Log>,
+    G: DerefMut<Target = firehose_tracer::Tracer>,
+    Extras: PostTxExtras<Inner::Evm>,
+    Adjust: PreTxAdjust<Inner::Evm>,
+{
+    /// Executes a transaction without committing it and traces it into a tracer from
+    /// [`FirehoseBlockTracer::detached_tracer`], on any thread.
+    ///
+    /// The transaction's trace is completed with transaction-relative receipt values and returned
+    /// with the execution result, for [`Self::commit_traced_transaction`] on the wrapper that
+    /// commits the block's transactions in order. On an execution error the trace is discarded and
+    /// the tracer is ready for the next transaction.
+    pub fn execute_transaction_detached(
+        &mut self,
+        transaction: impl ExecutorTx<Self>,
+    ) -> Result<TracedTransaction<Inner::TransactionResultWithState>, BlockExecutionError> {
+        let executed = self.execute_and_trace_transaction(transaction)?;
+
+        let tx_result = &executed.result.result().result;
+        let mut receipt =
+            ReceiptData::new(0, executed.gas_used, tx_result.status as u64, executed.gas_used);
+        receipt.logs_bloom = *logs_bloom(&tx_result.logs).data();
+        receipt.blob_gas_used = executed.blob_gas_used;
+        receipt.blob_gas_price = self.fees.blob_gas_price;
+        for (index, log) in tx_result.logs.iter().enumerate() {
+            receipt.add_log(firehose_tracer::types::LogData::new(
+                log.address,
+                log.data.topics().to_vec(),
+                log.data.data.clone(),
+                index as u32,
+            ));
+        }
+        let trace = self.inspector.tracer_mut().on_tx_end_detached(Some(&receipt), None);
+
+        Ok(TracedTransaction { result: executed.result, trace })
+    }
+
+    /// Commits a transaction executed by [`Self::execute_transaction_detached`] on a worker
+    /// wrapper and attaches its trace to the block, as the transaction after the ones committed
+    /// so far. Call on the wrapper over the block's own inspector, in block order.
+    pub fn commit_traced_transaction(
+        &mut self,
+        traced: TracedTransaction<Inner::TransactionResultWithState>,
+    ) -> Result<GasOutput, BlockExecutionError> {
+        let TracedTransaction { result, trace } = traced;
+        let gas_output = self.inner.commit_transaction(result)?;
+
+        let committed = self.inner.receipts().last().expect("commit_transaction pushed a receipt");
+        let placement = TransactionPlacement {
+            index: (self.inner.receipts().len() - 1) as u32,
+            cumulative_gas_used: committed.cumulative_gas_used(),
+            log_index_start: self.log_index,
+        };
+        self.log_index += committed.logs().len() as u32;
+        self.inspector.tracer_mut().attach_transaction(trace, placement);
+
+        Ok(gas_output)
+    }
+
+    /// Opens the transaction on the tracer, executes it without committing, and emits what evm2
+    /// settles outside the inspector's hooks: the frameless root call of an Amsterdam transaction
+    /// whose runtime gas phase ran out of gas, the gas refund and fee reward, and the
+    /// chain-specific extras. The EVM still reads the state before the transaction throughout.
+    ///
+    /// On an execution error the transaction is ended with the error, so the tracer is ready for
+    /// the next transaction, and the error is returned.
+    fn execute_and_trace_transaction(
+        &mut self,
+        transaction: impl ExecutorTx<Self>,
+    ) -> Result<ExecutedTransaction<Inner::TransactionResultWithState>, BlockExecutionError> {
+        let (tx_env, recovered) = transaction.into_parts();
+        let sender = *recovered.signer();
+        let tx_index = self.inner.receipts().len();
+
+        let tx = recovered.tx();
+        let (r, s, v) = tx.signature_fields();
+        let mut tx_event = mapper::signed_tx_to_tx_event(tx, sender, tx_index, r, s, v);
+        let effective_gas_price = tx.effective_gas_price(Some(self.fees.base_fee));
+        let gas_limit = tx.gas_limit();
+        // EIP-4844: total blob gas consumed by this tx (num_blobs × GAS_PER_BLOB); 0 for
+        // non-blob tx types. Geth populates `receipt.BlobGasUsed` from this value.
+        let blob_gas_used = tx.blob_gas_used().unwrap_or(0);
+        let frameless = FramelessParts::of(tx);
+
+        // Chain-specific pre-tx patching of the event (e.g. OP Stack deposit nonce override).
+        self.adjust.adjust_tx_event(self.inner.evm_mut(), &self.inspector, &mut tx_event, sender);
+        self.inspector.tracer_mut().on_tx_start(tx_event, None);
+
+        // The transaction is executed and committed in two steps so the post-transaction balance
+        // changes are emitted while the EVM still reads the state before the transaction.
+        self.inspector.start_transaction(self.log_index);
+        let result = match self.inner.execute_transaction_without_commit((tx_env, &recovered)) {
+            Ok(result) => result,
+            Err(err) => {
+                self.inspector.tracer_mut().on_tx_end_detached(None, Some(&err));
+                return Err(err);
+            }
+        };
+        let tx_result = &result.result().result;
+        let gas_used = tx_result.tx_gas_used();
+
+        let accounting = self.extras.gas_accounting(
+            self.inner.evm_mut(),
+            PostTxGasAccounting::ethereum(effective_gas_price, self.fees.base_fee),
+        );
+
+        // An Amsterdam transaction whose EIP-2780 runtime gas phase ran out of gas is included
+        // without its root frame ever opening, see `trace_frameless_root_call`.
+        if !self.inspector.root_frame_entered() {
+            let tx = frameless.into_tx(&self.fees.version, sender, gas_limit);
+            let gas_buy_cost = U256::from(gas_limit) * U256::from(effective_gas_price) +
+                U256::from(blob_gas_used) * self.fees.blob_gas_price.unwrap_or_default();
+            let pre_tx_balance = account_balance(self.inner.evm_mut(), sender);
+            self.inspector.trace_frameless_root_call(sender, gas_buy_cost, tx, pre_tx_balance);
+        }
+
+        // Gas refund to the sender and fee reward to the coinbase.
+        let evm = self.inner.evm_mut();
+        self.inspector.process_post_tx_gas_accounting(
+            sender,
+            self.fees.coinbase,
+            gas_limit,
+            gas_used,
+            accounting,
+            |address| account_balance(evm, address),
+        );
+
+        // Chain-specific post-tx balance emissions (e.g. OP Stack fee vault credits), after the
+        // generic ones so ordinals follow the handler order.
+        self.extras.emit_post_tx_extras(
+            self.inner.evm_mut(),
+            &self.inspector,
+            gas_used,
+            self.fees.base_fee,
+        );
+
+        Ok(ExecutedTransaction { result, gas_used, blob_gas_used })
+    }
+
+    /// The receipt data of the transaction just committed, with its block-wide log index start,
+    /// which the next transaction's then follows.
+    fn committed_receipt_data(&mut self, gas_used: u64, blob_gas_used: u64) -> ReceiptData {
+        let committed = self.inner.receipts().last().expect("commit_transaction pushed a receipt");
+        let log_index_start = self.log_index;
+        self.log_index += committed.logs().len() as u32;
+        mapper::to_receipt_data(
+            committed,
+            (self.inner.receipts().len() - 1) as u32,
+            gas_used,
+            log_index_start,
+            blob_gas_used,
+            self.fees.blob_gas_price,
+        )
+    }
+}
+
 impl<Inner, G, Extras, Adjust> BlockExecutor for FirehoseWrappedExecutor<Inner, G, Extras, Adjust>
 where
     Inner: BlockExecutor,
@@ -469,94 +657,23 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         transaction: impl ExecutorTx<Self>,
-        f: impl FnOnce(&evm2::TxResult<<Self::Evm as reth_evm::Evm>::EvmTypes>) -> CommitChanges,
+        f: impl FnOnce(
+            &evm2::TxResult<<Self::Evm as reth_evm::Evm>::EvmTypes>,
+            evm2::TxStateChanges<'_>,
+        ) -> CommitChanges,
     ) -> Result<Option<GasOutput>, BlockExecutionError> {
-        let (tx_env, recovered) = transaction.into_parts();
-        let sender = *recovered.signer();
-        let tx_index = self.inner.receipts().len();
+        let executed = self.execute_and_trace_transaction(transaction)?;
 
-        let tx = recovered.tx();
-        let (r, s, v) = tx.signature_fields();
-        let mut tx_event = mapper::signed_tx_to_tx_event(tx, sender, tx_index, r, s, v);
-        let effective_gas_price = tx.effective_gas_price(Some(self.fees.base_fee));
-        let gas_limit = tx.gas_limit();
-        // EIP-4844: total blob gas consumed by this tx (num_blobs × GAS_PER_BLOB); 0 for
-        // non-blob tx types. Geth populates `receipt.BlobGasUsed` from this value.
-        let blob_gas_used = tx.blob_gas_used().unwrap_or(0);
-        let frameless = FramelessParts::of(tx);
-
-        // Chain-specific pre-tx patching of the event (e.g. OP Stack deposit nonce override).
-        self.adjust.adjust_tx_event(self.inner.evm_mut(), &self.inspector, &mut tx_event, sender);
-        self.inspector.tracer_mut().on_tx_start(tx_event, None);
-
-        // The transaction is executed and committed in two steps so the post-transaction balance
-        // changes are emitted while the EVM still reads the state before the transaction.
-        self.inspector.start_transaction();
-        let result = self.inner.execute_transaction_without_commit((tx_env, &recovered))?;
-        let tx_result = &result.result().result;
-        let gas_used = tx_result.tx_gas_used();
-        // Logs that survived reverts, which advance the block-wide log counter.
-        let committed_log_count = tx_result.logs.len() as u32;
-
-        let accounting = self.extras.gas_accounting(
-            self.inner.evm_mut(),
-            PostTxGasAccounting::ethereum(effective_gas_price, self.fees.base_fee),
-        );
-
-        // An Amsterdam transaction whose EIP-2780 runtime gas phase ran out of gas is included
-        // without its root frame ever opening, see `trace_frameless_root_call`.
-        if !self.inspector.root_frame_entered() {
-            let tx = frameless.into_tx(&self.fees.version, sender, gas_limit);
-            let gas_buy_cost = U256::from(gas_limit) * U256::from(effective_gas_price) +
-                U256::from(blob_gas_used) * self.fees.blob_gas_price.unwrap_or_default();
-            let pre_tx_balance = account_balance(self.inner.evm_mut(), sender);
-            self.inspector.trace_frameless_root_call(sender, gas_buy_cost, tx, pre_tx_balance);
-        }
-
-        // Gas refund to the sender and fee reward to the coinbase.
-        let evm = self.inner.evm_mut();
-        self.inspector.process_post_tx_gas_accounting(
-            sender,
-            self.fees.coinbase,
-            gas_limit,
-            gas_used,
-            accounting,
-            committed_log_count,
-            |address| account_balance(evm, address),
-        );
-
-        // Chain-specific post-tx balance emissions (e.g. OP Stack fee vault credits), after the
-        // generic ones so ordinals follow the handler order.
-        self.extras.emit_post_tx_extras(
-            self.inner.evm_mut(),
-            &self.inspector,
-            gas_used,
-            self.fees.base_fee,
-        );
-
-        if !f(&result.result().result).should_commit() {
+        let result = executed.result.result();
+        if !f(&result.result, result.pending_state.changes()).should_commit() {
             // Preserve the invariant that every on_tx_start is paired with on_tx_end.
             let err = std::io::Error::other("transaction not committed");
             self.inspector.tracer_mut().on_tx_end(None, Some(&err));
             return Ok(None);
         }
 
-        let gas_output = self.inner.commit_transaction(result)?;
-
-        let log_index_start = self.log_index;
-        let receipt_data = {
-            let committed =
-                self.inner.receipts().last().expect("commit_transaction pushed a receipt");
-            self.log_index += committed.logs().len() as u32;
-            mapper::to_receipt_data(
-                committed,
-                tx_index as u32,
-                gas_used,
-                log_index_start,
-                blob_gas_used,
-                self.fees.blob_gas_price,
-            )
-        };
+        let gas_output = self.inner.commit_transaction(executed.result)?;
+        let receipt_data = self.committed_receipt_data(executed.gas_used, executed.blob_gas_used);
         self.inspector.tracer_mut().on_tx_end(Some(&receipt_data), None);
 
         Ok(Some(gas_output))
@@ -820,7 +937,7 @@ where
         if let Some(hook) = state_hook &&
             !executor.set_state_hook(hook)
         {
-            return Err(BlockExecutionError::msg("block executor does not support state hooks"))
+            return Err(BlockExecutionError::msg("block executor does not support state hooks"));
         }
         executor.apply_pre_execution_changes()?;
         for transaction in block.transactions_recovered() {

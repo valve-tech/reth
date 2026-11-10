@@ -600,17 +600,14 @@ where
         // Get an iterator over the transactions in the payload
         let txs = self.tx_iterator_for(&input)?;
 
-        // Firehose: read once, so the execution mode set up here and the execution path chosen
-        // below cannot disagree.
+        // Firehose: read once, so the tracer set up below and the path it picks cannot disagree.
         let firehose_tracing = reth_firehose::is_tracer_initialized();
 
-        // The traced path executes transactions one after another, so it never takes the parallel
-        // BAL path. The flag also selects how the payload processor streams transactions: in BAL
-        // mode it sends them in completion order, not block order. A sequential executor that
-        // reads that stream runs a sender's later nonce first and rejects a valid block ("nonce
-        // too high"), as on Sepolia block 11856337 at the Amsterdam fork.
-        let parallel_bal_execution =
-            !firehose_tracing && ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
+        // A traced block can take the parallel BAL path: `execute_and_trace_block_bal` traces each
+        // transaction on its worker and attaches the traces in block order. In BAL mode the
+        // payload processor streams transactions in completion order, so only the parallel
+        // executors may read that stream; the serial ones read it in block order.
+        let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
 
         // Prepare the state-root job before execution so it can provide streaming hooks.
         let mut state_root_job =
@@ -762,20 +759,23 @@ where
             // guard is kept alive until mark_verified() below; any early return (via the
             // ensure_ok! on execution_result) drops the guard which calls on_block_end(Some(err)).
             //
-            // BAL parallel execution is incompatible with sequential Firehose tracing, so a block
-            // carrying a BAL is executed sequentially here, building its BAL like `execute_block`.
-            // `parallel_bal_execution` is forced off while tracing so the transactions arrive in
-            // block order.
-            match make_state_provider(false) {
-                Ok(state_provider) => self.execute_and_trace_block(
-                    state_provider,
-                    env,
-                    &input,
-                    &mut handle,
-                    execution_state_hook,
-                    tracer,
-                ),
-                Err(err) => Err(err.into()),
+            // Each path has a traced twin: the BAL path traces each transaction on the worker
+            // that executes it and attaches the traces in block order, the serial path traces
+            // in place.
+            if parallel_bal_execution {
+                self.execute_and_trace_block_bal(env, &input, &handle, &make_state_provider, tracer)
+            } else {
+                match make_state_provider(false) {
+                    Ok(state_provider) => self.execute_and_trace_block(
+                        state_provider,
+                        env,
+                        &input,
+                        &mut handle,
+                        execution_state_hook,
+                        tracer,
+                    ),
+                    Err(err) => Err(err.into()),
+                }
             }
         } else if parallel_bal_execution {
             self.execute_block_bal(env, &input, &handle, &make_state_provider)
@@ -822,7 +822,7 @@ where
             self.runtime.spawn_blocking_named("hash-post-state", move || {
                 let _span = debug_span!(
                     target: "engine::tree::payload_validator",
-                    parent: parent_span,
+                    parent: &parent_span,
                     "hashed_post_state",
                 )
                 .entered();
@@ -1062,7 +1062,7 @@ where
         self.runtime.spawn_blocking_named("payload-convert", move || {
             let _span = debug_span!(
                 target: "engine::tree::payload_validator",
-                parent: parent_span,
+                parent: &parent_span,
                 "convert_and_validate",
             )
             .entered();
@@ -1494,6 +1494,85 @@ where
         // The received BAL was already converted to the evm2 form to drive the workers. Once the
         // post-execution hash check against the rebuilt BAL passes, both have the same content, so
         // the converted one can be reused instead of converting the rebuilt BAL again.
+        Ok((
+            output,
+            senders,
+            result_rx,
+            Some(ExecutedBal { alloy: built_bal, evm: received_bal_evm }),
+        ))
+    }
+
+    /// Firehose-enabled twin of [`Self::execute_block_bal`].
+    ///
+    /// Calls [`crate::tree::payload_processor::bal::firehose::execute_and_trace_block`], whose
+    /// workers trace the transactions they execute into tracers detached from `tracer` and whose
+    /// canonical executor attaches the traces to the block in transaction order.
+    ///
+    /// MAINTENANCE CONTRACT: keep this function in sync with [`Self::execute_block_bal`].
+    #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
+    #[expect(clippy::type_complexity)]
+    fn execute_and_trace_block_bal<Tx, Err, MakeStateProvider, T>(
+        &self,
+        env: ExecutionEnv<Evm>,
+        input: &BlockOrPayload<T>,
+        handle: &PayloadHandle<Tx, Err, N::Receipt, EvmTypesFor<Evm>>,
+        make_state_provider: &MakeStateProvider,
+        tracer: &reth_firehose::FirehoseBlockTracer,
+    ) -> Result<
+        (BlockExecutionOutput<N::Receipt>, Vec<Address>, ReceiptRootReceiver, Option<ExecutedBal>),
+        InsertBlockErrorKind,
+    >
+    where
+        Tx: ExecutableTxFor<Evm> + Send,
+        Err: core::error::Error + Send + Sync + 'static,
+        MakeStateProvider: Fn(bool) -> ProviderResult<EvmStateProviderBox> + Sync,
+        Evm:
+            ConfigureEngineEvm<T::ExecutionData, Primitives = N> + reth_firehose::FirehoseLiveHooks,
+        T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
+        V: PayloadValidator<T, Block = N::Block>,
+        TxTy<N>: reth_firehose::mapper::SignatureFields,
+    {
+        debug!(target: "engine::tree::payload_validator", "Executing block via BAL path (with Firehose tracing)");
+
+        let (receipt_tx, result_rx) = self.spawn_receipt_root_task(env.transaction_count);
+        let input_bal = env.decoded_bal.ok_or_else(|| {
+            InsertBlockErrorKind::Other("BAL execute path: no decoded BAL available".into())
+        })?;
+
+        let make_db = |fill_on_miss| {
+            let provider = make_state_provider(fill_on_miss)
+                .map_err(crate::tree::payload_processor::bal::BalExecutionError::Provider)?;
+            Ok(StateProviderDatabase::new(provider))
+        };
+        let execution_start = Instant::now();
+        let ctx =
+            self.execution_ctx_for(input).map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
+        let withdrawals =
+            input.withdrawals().map(|w| alloy_eips::eip4895::Withdrawals::new(w.to_vec()));
+        let (output, senders, built_bal, received_bal_evm) =
+            crate::tree::payload_processor::bal::firehose::execute_and_trace_block(
+                &self.runtime,
+                &self.evm_config,
+                &make_db,
+                input_bal,
+                env.evm_env,
+                ctx,
+                env.transaction_count,
+                handle.clone_transaction_receiver(),
+                receipt_tx,
+                tracer,
+                withdrawals,
+            )?;
+        let execution_duration = execution_start.elapsed();
+
+        self.metrics.record_block_execution(&output, execution_duration);
+        self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
+        debug!(
+            target: "engine::tree::payload_validator",
+            elapsed = ?execution_duration,
+            "Executed block via BAL path (with Firehose tracing)",
+        );
+
         Ok((
             output,
             senders,

@@ -128,14 +128,17 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> Debug for FirehoseInspector<
     }
 }
 
+#[derive(Clone, Copy)]
 struct StepContext {
     gas: u64,
     opcode: u8,
-    /// For KECCAK256: preimage captured in `step` (where the stack still holds offset/size),
-    /// emitted from `step_end` only when the opcode did not halt. Mirrors Geth's firehose
-    /// tracer, which hooks the opcode body after the gas charge and so emits no preimage
-    /// when KECCAK256 fails (e.g. OOG on memory expansion).
-    keccak_preimage: Option<(B256, Vec<u8>)>,
+    /// For KECCAK256: the memory range hashed, read in `step` where the stack still holds the
+    /// offset and size. `step_end` records the preimage from that range and the hash from the
+    /// stack top only when the opcode did not halt: it then grew memory over the range and pushed
+    /// the hash, so nothing is copied or hashed a second time. Mirrors Geth's firehose tracer,
+    /// which hooks the opcode body after the gas charge and so emits no preimage when KECCAK256
+    /// fails (e.g. OOG on memory expansion).
+    keccak_range: Option<(usize, usize)>,
 }
 
 /// Pre-destruction state for a self-destructed account, captured at root call exit.
@@ -206,13 +209,18 @@ struct InspectorState<G> {
     /// [`FirehoseInspector::set_root_balance_reason`].
     root_balance_reason_override: Option<Reason>,
 
-    /// Logs emitted by earlier transactions of the block, to derive each log's block index.
+    /// Block-wide index of the first log of the current transaction, to derive each log's block
+    /// index. Set by [`FirehoseInspector::start_transaction`].
     log_block_index: u32,
 
     /// Whether the current transaction opened its root frame. Cleared by
     /// [`FirehoseInspector::start_transaction`], set by the depth-0 frame hook and consumed by
     /// [`FirehoseInspector::trace_frameless_root_call`].
     root_frame_entered: bool,
+
+    /// Whether the tracer was told that the active call executed an opcode. The tracer only
+    /// records that once per call, so later opcodes of the call skip the hook.
+    executed_code_reported: bool,
 }
 
 impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
@@ -233,6 +241,7 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
                 root_balance_reason_override: None,
                 log_block_index: 0,
                 root_frame_entered: false,
+                executed_code_reported: false,
             })),
         }
     }
@@ -254,12 +263,23 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
         self.state.borrow_mut().root_balance_reason_override = Some(reason);
     }
 
-    /// Resets the per-transaction state that must not carry over from whatever ran before in the
-    /// block, a system call included. Call right before a transaction executes.
-    pub fn start_transaction(&self) {
+    /// Resets the per-transaction state that must not carry over from whatever ran before, a
+    /// system call or a transaction that failed included, and sets the block-wide index of the
+    /// transaction's first log. Call right before a transaction executes.
+    pub fn start_transaction(&self, log_index_start: u32) {
         let mut state = self.state.borrow_mut();
-        state.root_frame_entered = false;
+        state.last_step = None;
+        state.journal_processed_up_to = 0;
+        state.window = Window::Transfer;
+        state.pending_self_transfer = None;
+        state.pending_value_transfer = None;
+        state.selfdestruct_candidates.clear();
+        state.pending_selfdestruct_cleanups.clear();
         state.post_exec_balances.clear();
+        state.deferred_creator_nonce = None;
+        state.log_block_index = log_index_start;
+        state.root_frame_entered = false;
+        state.executed_code_reported = false;
     }
 
     /// Whether the current transaction opened its root frame, see
@@ -347,7 +367,6 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
     /// account the transaction did not touch.
     ///
     /// Must be called after the transaction executed and before it is committed.
-    #[expect(clippy::too_many_arguments)]
     pub fn process_post_tx_gas_accounting(
         &self,
         sender: Address,
@@ -355,7 +374,6 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
         gas_limit: u64,
         gas_used: u64,
         accounting: PostTxGasAccounting,
-        committed_log_count: u32,
         mut pre_tx_balance: impl FnMut(Address) -> U256,
     ) {
         let mut state = self.state.borrow_mut();
@@ -415,22 +433,27 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> FirehoseInspector<G> {
 
         state.selfdestruct_candidates.clear();
         state.journal_processed_up_to = 0;
-        // Only logs that survived reverts count towards the next transaction's log indexes.
-        state.log_block_index += committed_log_count;
     }
 }
 
 impl<G: DerefMut<Target = firehose_tracer::Tracer>> InspectorState<G> {
     /// Emits the journal entries appended since the last scan, attributing balance changes per
     /// [`Self::window`].
+    ///
+    /// Runs after every opcode, so the no-change check is inlined and the rest stays out of line.
+    #[inline]
     fn process_journal<T: EvmTypes>(&mut self, host: &mut Evm<'_, T>) {
         let len = host.state().journal().len();
         if self.journal_processed_up_to > len {
             self.journal_processed_up_to = len;
         }
-        if self.journal_processed_up_to == len {
-            return;
+        if self.journal_processed_up_to != len {
+            self.process_new_journal_entries(host, len);
         }
+    }
+
+    #[inline(never)]
+    fn process_new_journal_entries<T: EvmTypes>(&mut self, host: &mut Evm<'_, T>, len: usize) {
         let entries = host.state().journal()[self.journal_processed_up_to..len].to_vec();
         self.journal_processed_up_to = len;
 
@@ -636,6 +659,7 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> InspectorState<G> {
             gas_limit,
             message.value,
         );
+        self.executed_code_reported = false;
 
         // EIP-7702: the code of a delegated callee is resolved from its delegation target.
         if !is_create && message.code_address != message.call_target {
@@ -716,6 +740,8 @@ impl<G: DerefMut<Target = firehose_tracer::Tracer>> InspectorState<G> {
             err.as_ref().map(|e| e as &dyn std::error::Error),
             failed,
         );
+        // The parent frame ran the opcode that issued this call.
+        self.executed_code_reported = true;
     }
 }
 
@@ -742,13 +768,14 @@ impl<T: EvmTypes, G: DerefMut<Target = firehose_tracer::Tracer>> Inspector<T>
         // marks the call as self-destructed as soon as it is told the opcode runs.
         if opcode == Opcode::SelfDestruct as u8 {
             state.window = Window::Selfdestruct;
-        } else {
+        } else if !state.executed_code_reported {
             state.tracer.on_opcode(interp.pc() as u64, opcode, gas, 0, &[], 0, None);
+            state.executed_code_reported = true;
         }
 
-        let keccak_preimage =
-            (opcode == Opcode::Keccak256 as u8).then(|| keccak256_preimage(interp)).flatten();
-        state.last_step = Some(StepContext { gas, opcode, keccak_preimage });
+        let keccak_range =
+            (opcode == Opcode::Keccak256 as u8).then(|| keccak256_range(interp)).flatten();
+        state.last_step = Some(StepContext { gas, opcode, keccak_range });
     }
 
     fn step_end(&mut self, interp: &mut Interpreter<'_, '_, T>) {
@@ -765,10 +792,22 @@ impl<T: EvmTypes, G: DerefMut<Target = firehose_tracer::Tracer>> Inspector<T>
             state.process_journal(interp.host());
         }
 
-        if let Some((hash, preimage)) = step.keccak_preimage &&
-            !halted
+        if let Some((offset, len)) = step.keccak_range &&
+            !halted &&
+            let Some(hash) = interp.stack().peek(0)
         {
-            state.tracer.on_keccak_preimage(hash, &preimage);
+            let memory = interp.memory();
+            let preimage = if len == 0 {
+                Some(&[][..])
+            } else {
+                offset
+                    .checked_add(len)
+                    .is_some_and(|end| end <= memory.len())
+                    .then(|| memory.slice(offset, len))
+            };
+            if let Some(preimage) = preimage {
+                state.tracer.on_keccak_preimage(B256::from(hash.to_be_bytes::<32>()), preimage);
+            }
         }
 
         if step.opcode == Opcode::SelfDestruct as u8 {
@@ -963,45 +1002,13 @@ fn frame_depth<T: EvmTypes>(host: &Evm<'_, T>, message: &Message<T>) -> i32 {
     i32::from(message.depth) - i32::from(host.version().initial_call_depth)
 }
 
-/// Captures the KECCAK256 input from the interpreter before the opcode runs.
-///
-/// `step` fires before memory is resized, so the region may not be allocated yet. Like Geth's
-/// `Memory.GetPtr`, bytes beyond the current memory are zero.
-fn keccak256_preimage<T: EvmTypes>(interp: &Interpreter<'_, '_, T>) -> Option<(B256, Vec<u8>)> {
+/// The memory range the KECCAK256 about to run hashes, when its preimage is small enough to
+/// record. The offset and size are still on the stack; the range is read back in `step_end`.
+fn keccak256_range<T: EvmTypes>(interp: &Interpreter<'_, '_, T>) -> Option<(usize, usize)> {
     let stack = interp.stack();
     let (Some(offset), Some(size)) = (stack.peek(0), stack.peek(1)) else { return None };
-
     let len = size.saturating_to::<usize>();
-    if len > MAX_KECCAK_PREIMAGE_SIZE {
-        return None;
-    }
-    if len == 0 {
-        return Some((KECCAK256_EMPTY, Vec::new()));
-    }
-
-    let offset = offset.saturating_to::<usize>();
-    let memory = interp.memory();
-    let mem_len = memory.len();
-    if offset.checked_add(len).is_some_and(|end| end <= mem_len) {
-        let preimage = memory.slice(offset, len).to_vec();
-        return Some((alloy_primitives::keccak256(&preimage), preimage));
-    }
-
-    // Growing memory costs 3*w + w^2/512 gas for w words, so a region the remaining gas cannot pay
-    // for halts before the opcode runs and step_end never emits it. w <= sqrt(512 * gas) bounds
-    // what can execute without hashing a region that never existed.
-    let gas = interp.gas().remaining() as u128;
-    let max_words = (512u128.saturating_mul(gas)).isqrt();
-    let max_len = max_words.saturating_mul(32).min(usize::MAX as u128) as usize;
-    if len > max_len {
-        return None;
-    }
-    let mut buf = vec![0u8; len];
-    if offset < mem_len {
-        let copy_len = (mem_len - offset).min(len);
-        buf[..copy_len].copy_from_slice(memory.slice(offset, copy_len));
-    }
-    Some((alloy_primitives::keccak256(&buf), buf))
+    (len <= MAX_KECCAK_PREIMAGE_SIZE).then(|| (offset.saturating_to::<usize>(), len))
 }
 
 /// Gas charged to a frame, as its caller sees it.

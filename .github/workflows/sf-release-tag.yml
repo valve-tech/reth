@@ -1,0 +1,52 @@
+name: Release tag
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - "release/*"
+    paths:
+      - "CHANGELOG.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sf-release-tag-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  SFRELEASER_VERSION: "v0.17.1-rc.8"
+
+jobs:
+  tag:
+    if: github.event.pull_request.merged && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Pushed with dfuse-bot's token, the tag triggers the branch's workflows like a manual tag does.
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.DFUSE_BOT_TOKEN }}
+
+      - name: Install sfreleaser
+        run: |
+          curl -sSfL "https://github.com/streamingfast/sfreleaser/releases/download/$SFRELEASER_VERSION/sfreleaser_linux_x86_64.tar.gz" | tar -xz -C "$RUNNER_TEMP" sfreleaser
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Detect version
+        id: detect
+        run: sfreleaser release detect --before "${{ github.event.pull_request.merge_commit_sha }}^1"
+
+      - name: Create tag on the merge commit
+        if: steps.detect.outputs.is_release_pr
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
+          COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
+        run: git push origin "$COMMIT:refs/tags/$VERSION"

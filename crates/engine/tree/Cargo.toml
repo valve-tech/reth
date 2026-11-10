@@ -37,6 +37,7 @@ reth-trie-sparse = { workspace = true, features = ["std", "metrics"] }
 reth-trie.workspace = true
 reth-trie-common.workspace = true
 reth-firehose.workspace = true
+firehose-tracer.workspace = true
 
 # alloy
 alloy-consensus.workspace = true
@@ -100,8 +101,11 @@ serde_json.workspace = true
 proptest.workspace = true
 rand.workspace = true
 alloy-rpc-types-eth.workspace = true
-firehose-tracer.workspace = true
-tracing-subscriber = { workspace = true, features = ["registry"] }
+alloy-provider.workspace = true
+firehose-tracer-test.workspace = true
+secp256k1.workspace = true
+criterion.workspace = true
+tracing-subscriber = { workspace = true, features = ["registry", "fmt", "env-filter"] }
 
 [features]
 asm-keccak = [
@@ -152,3 +156,7 @@ trie-debug = [
 [[test]]
 name = "e2e_testsuite"
 path = "tests/e2e-testsuite/main.rs"
+
+[[bench]]
+name = "firehose_bal_tracing"
+harness = false

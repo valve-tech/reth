@@ -714,18 +714,16 @@ impl<R: Send + Sync + 'static, H: evm2::EvmTypes> CacheTaskHandle<R, H> {
         &mut self,
         execution_outcome: Option<Arc<BlockExecutionOutput<R>>>,
     ) -> Option<CacheValidationGuard> {
-        if let Some(tx) = self.to_prewarm_task.take() {
+        self.to_prewarm_task.take().map(|tx| {
             let (valid_block_tx, valid_block_rx) = mpsc::channel();
             let event = PrewarmTaskEvent::Terminate { execution_outcome, valid_block_rx };
             let _ = tx.send(event);
 
-            Some(CacheValidationGuard {
+            CacheValidationGuard {
                 valid_block_tx: Some(valid_block_tx),
                 cancelled: Arc::clone(&self.cancelled),
-            })
-        } else {
-            None
-        }
+            }
+        })
     }
 }
 

@@ -7,6 +7,34 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.10.0-fh3.1
+
+### Changed
+
+- Update to upstream reth [v2.10.0](https://github.com/paradigmxyz/reth/releases/tag/v2.10.0).
+  evm2 comes from the `streamingfast/evm2` fork tag `reth-v2.10.0-sf`. No hardfork is scheduled
+  or changed, and the Firehose block output does not change.
+
+## reth-v2.9.0-fh3.1-1
+
+### Changed
+
+- Amsterdam blocks received through the Engine API are traced on the parallel block access list
+  path instead of falling back to serial execution while Firehose traces. Each worker traces the
+  transactions it executes into a tracer detached from the block's tracer, and the canonical
+  executor attaches the traces to the block in transaction order, rebasing their ordinals and the
+  block-cumulative receipt values. The Firehose block is the one serial tracing produces.
+  `--engine.disable-bal-parallel-execution` sends Amsterdam blocks back to the serial traced path.
+- Update `firehose-tracer` to the detached transaction tracing API (`Tracer::detached`,
+  `Tracer::on_tx_end_detached`, `Tracer::attach_transaction`), pinned to a git revision until
+  5.8.0 is released.
+- The inspector no longer hashes every KECCAK256 preimage a second time: it records the memory
+  range before the opcode runs and reads the preimage and the hash the EVM pushed once it has
+  run. It also tells the tracer that a call executed code once per call instead of once per
+  opcode, and checks the journal for new entries inline. With the `firehose-tracer` filter
+  changes, tracing a block of 200 calls hashing 1000 words each costs 1.6x untraced execution
+  instead of 3.2x (`firehose_bal_tracing` benchmark). The output is unchanged.
+
 ## reth-v2.9.0-fh3.1
 
 ### Changed

@@ -13,15 +13,47 @@ jobs:
   dependency-review:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Optional, owned by each repository: one path prefix per line, `#` starts a comment.
+      EXCLUDE_PATHS_FILE: .github/dependency-review-exclude-paths
     steps:
-      # The action reads both dependency graphs through the API, so it needs no checkout.
+      # The review reads both dependency graphs through the API. The checkout is for the
+      # exclude-paths file that the last step reads.
+      - name: "Checkout Repository"
+        uses: actions/checkout@v4
       - name: "Dependency Review"
+        id: review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
-          fail-on-severity: high # Fail on high, critical
+          warn-only: true
           # The graph snapshot for a new push can lag the workflow; wait for it instead of
           # reviewing a stale graph.
           retry-on-snapshot-warnings: true
           retry-on-snapshot-warnings-timeout: 120
           # Name the fixed version in the summary, so a failure says what to bump to.
           show-patched-versions: true
+      # The action cannot exclude paths, so the failure is decided here: high and critical
+      # advisories fail the check unless their manifest is under an excluded path.
+      - name: "Fail on high or critical advisories"
+        env:
+          VULNERABLE_CHANGES: ${{ steps.review.outputs.vulnerable-changes }}
+        run: |
+          excluded='[]'
+          if [ -f "$EXCLUDE_PATHS_FILE" ]; then
+            excluded=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$EXCLUDE_PATHS_FILE" \
+              | grep -v '^$' | sed 's|^/||' | jq -R . | jq -s .)
+          fi
+          failing=$(jq -r --argjson excluded "$excluded" '
+            .[]
+            | select(.change_type == "added")
+            | .manifest as $manifest
+            | select(any($excluded[]; . as $prefix | $manifest | startswith($prefix)) | not)
+            | .name as $name | .version as $version
+            | .vulnerabilities[]
+            | select(.severity == "high" or .severity == "critical")
+            | "\($manifest) » \($name)@\($version): \(.advisory_ghsa_id) (\(.severity))"
+          ' <<< "${VULNERABLE_CHANGES:-[]}")
+          if [ -n "$failing" ]; then
+            echo "$failing"
+            exit 1
+          fi

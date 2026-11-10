@@ -7,7 +7,8 @@
 # dispatch. Pull requests opened from a fork get a read-only GITHUB_TOKEN, so the
 # login/push steps are skipped for them (the image still builds, to validate the
 # Dockerfile); same-repo ("inner") PRs, branch pushes and tag pushes authenticate
-# and push normally. Only tag builds use the full-LTO `maxperf` profile.
+# and push normally. Only tag builds use the full-LTO `maxperf` profile, unless
+# the built commit's message contains `[maxperf]`.
 #
 # Single architecture (linux/amd64): the `reth` `maxperf` full-node build is too
 # heavy to reliably build on GitHub-hosted arm64 runners, so we do not produce a
@@ -91,6 +92,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Select build profile
+        id: profile
+        env:
+          # A pull request builds its merge commit; the marker lives in the
+          # head commit the author pushed, which the shallow checkout lacks.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          profile="release"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            profile="maxperf"
+          elif git fetch --quiet --depth=1 origin "${HEAD_SHA}" && git log -1 --format=%B FETCH_HEAD | grep -q '\[maxperf\]'; then
+            profile="maxperf"
+          fi
+          echo "PROFILE=${profile}" >> "$GITHUB_OUTPUT"
+
       - name: Extract version
         id: extract-version
         run: |
@@ -147,21 +163,23 @@ jobs:
           # Reads fall back to the default branch scope, which is where the
           # useful entries live.
           cache-from: |
-            type=gha,scope=${{ startsWith(github.ref, 'refs/tags/') && 'maxperf' || 'release' }}
+            type=gha,scope=${{ steps.profile.outputs.PROFILE }}
           # Pull requests read the cache but never write it. A PR's cache entries
           # are scoped to `refs/pull/N/merge`, so no other run can ever read them
           # — writing them is ~2 GB of pure waste per run that LRU-evicts the
           # default-branch entries every PR build actually depends on, and costs
           # ~3.5 minutes of export time on top.
           cache-to: |
-            ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope={0}', startsWith(github.ref, 'refs/tags/') && 'maxperf' || 'release') || '' }}
+            ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope={0}', steps.profile.outputs.PROFILE) || '' }}
           build-args: |
             VERSION=${{ steps.extract-version.outputs.VERSION }}
             FIREHOSE_ETHEREUM=${{ inputs.firehose_ethereum || 'latest' }}
             # Full LTO `maxperf` is only worth its long link tail for shippable
             # builds (tags); branch pushes, PRs and manual dispatch use the
-            # `release` profile (thin LTO) to validate faster.
-            BUILD_PROFILE=${{ startsWith(github.ref, 'refs/tags/') && 'maxperf' || 'release' }}
+            # `release` profile (thin LTO) to validate faster. A commit whose
+            # message contains `[maxperf]` opts in, for images meant to be
+            # measured on a real network.
+            BUILD_PROFILE=${{ steps.profile.outputs.PROFILE }}
 
   release:
     if: startsWith(github.ref, 'refs/tags/')

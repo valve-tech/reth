@@ -19,6 +19,7 @@
 
 use alloy_consensus::BlockHeader;
 use alloy_primitives::Sealable;
+use firehose_tracer::types::BlockEvent;
 use reth_node_api::NodePrimitives;
 use reth_primitives_traits::{Block as BlockTrait, BlockBody, SealedBlock};
 use std::{cell::RefMut, fmt::Debug, ops::DerefMut, sync::MutexGuard};
@@ -44,6 +45,8 @@ where
     G: DerefMut<Target = firehose_tracer::Tracer>,
 {
     inspector: FirehoseInspector<G>,
+    /// The event the block was started with, replayed on the detached tracers.
+    block_event: BlockEvent,
     status: Status,
 }
 
@@ -106,12 +109,10 @@ where
         <N::Block as BlockTrait>::Body: BlockBody,
         <<N::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: BlockHeader + Sealable,
     {
-        tracer.on_block_start(firehose_tracer::types::BlockEvent {
-            block: mapper::to_block_data(block),
-            finalized,
-            flash_block: None,
-        });
-        Self { inspector: FirehoseInspector::new(tracer), status: Status::Started }
+        let block_event =
+            BlockEvent { block: mapper::to_block_data(block), finalized, flash_block: None };
+        tracer.on_block_start(block_event.clone());
+        Self { inspector: FirehoseInspector::new(tracer), block_event, status: Status::Started }
     }
 
     /// Variant of the flashblock constructor that drives the block lifecycle
@@ -135,15 +136,16 @@ where
         <N::Block as BlockTrait>::Body: BlockBody,
         <<N::Block as BlockTrait>::Body as BlockBody>::OmmerHeader: BlockHeader + Sealable,
     {
-        tracer.on_block_start(firehose_tracer::types::BlockEvent {
+        let block_event = BlockEvent {
             block: mapper::to_block_data(block),
             finalized,
             flash_block: Some(firehose_tracer::types::FlashBlockData {
                 idx: flash_block_idx,
                 is_final,
             }),
-        });
-        Self { inspector: FirehoseInspector::new(tracer), status: Status::Started }
+        };
+        tracer.on_block_start(block_event.clone());
+        Self { inspector: FirehoseInspector::new(tracer), block_event, status: Status::Started }
     }
 
     /// Returns the held tracer, for in-block event emission.
@@ -151,6 +153,19 @@ where
     /// Panics when called while an inspector hook of this block is running.
     pub fn tracer_mut(&mut self) -> RefMut<'_, firehose_tracer::Tracer> {
         self.inspector.tracer_mut()
+    }
+
+    /// Returns a tracer that traces transactions of this block on another thread, for
+    /// [`crate::FirehoseWrappedExecutor::execute_transaction_detached`]. The traces it completes
+    /// are attached to this block by
+    /// [`crate::FirehoseWrappedExecutor::commit_traced_transaction`] on an executor wrapped over
+    /// [`Self::inspector`].
+    ///
+    /// Panics when called while an inspector hook of this block is running.
+    pub fn detached_tracer(&self) -> firehose_tracer::Tracer {
+        let mut tracer = self.inspector.tracer_mut().detached();
+        tracer.on_block_start(self.block_event.clone());
+        tracer
     }
 
     /// Returns the [`FirehoseInspector`] tracing this block into the held tracer.

@@ -148,7 +148,7 @@ pub(super) fn spawn_worker<'scope, Evm, Tx, Err, DB, MakeDb>(
 
 // Executor resets retain the same provider. The wrapper is created and used entirely on one
 // worker thread; its shared ownership decouples the database lifetime from each executor.
-struct WorkerDatabase<DB>(Rc<RefCell<DB>>);
+pub(super) struct WorkerDatabase<DB>(pub(super) Rc<RefCell<DB>>);
 
 impl<DB: Database> Database for WorkerDatabase<DB> {
     type Error = DB::Error;

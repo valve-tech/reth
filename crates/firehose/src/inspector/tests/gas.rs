@@ -46,7 +46,7 @@ fn drive_gas_accounting(
         });
         tracer.on_tx_start(legacy_tx_event(), None);
     }
-    insp.start_transaction();
+    insp.start_transaction(0);
     {
         let mut tracer = insp.tracer_mut();
         tracer.on_call_enter(0, Opcode::Call as u8, SENDER, PRECOMPILE, &[], gas_limit, U256::ZERO);
@@ -59,7 +59,6 @@ fn drive_gas_accounting(
         gas_limit,
         gas_used,
         accounting,
-        0,
         |address| if address == COINBASE { coinbase_balance } else { sender_balance },
     );
 

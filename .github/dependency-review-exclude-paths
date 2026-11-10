@@ -1,0 +1,3 @@
+# Path prefixes whose dependency advisories do not fail the Dependency Review check.
+# Upstream benchmark chart scripts; not part of the node.
+scripts/

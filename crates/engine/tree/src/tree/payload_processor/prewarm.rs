@@ -1110,7 +1110,10 @@ pub struct PrewarmMetrics {
 mod tests {
 
     use super::*;
-    use crate::tree::ExecutionCache;
+    use crate::tree::{
+        payload_processor::{CacheTaskHandle, PayloadHandle},
+        ExecutionCache,
+    };
     use alloy_consensus::{transaction::Recovered, TxLegacy};
     use alloy_eip7928::{
         bal::Bal, AccountChanges, BalanceChange, BlockAccessIndex, CodeChange, NonceChange,
@@ -1127,6 +1130,7 @@ mod tests {
     use reth_stages_api::{StageCheckpoint, StageId};
     use reth_storage_overlay::OverlayManager;
     use reth_tasks::WorkerPool;
+    use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, BundleState};
     use reth_trie_parallel::state_root_task::{
         StateRootHandle, StateRootMessage, StateRootTaskCancelGuard,
     };
@@ -1575,8 +1579,6 @@ mod tests {
 
     #[test]
     fn save_cache_freeing_waits_for_validator_cache_references() {
-        use crate::tree::payload_processor::{CacheTaskHandle, PayloadHandle};
-
         let runtime = Runtime::test();
         let execution_cache = PayloadExecutionCache::default();
         let saved = SavedCache::new(B256::repeat_byte(1), crate::tree::ExecutionCache::new(1_000));
@@ -1627,8 +1629,6 @@ mod tests {
     }
 
     fn assert_save_cache_drops_removed_caches(slot: CacheSlot, valid: bool, insert_error: bool) {
-        use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, BundleState};
-
         let runtime = Runtime::test();
         let execution_cache = PayloadExecutionCache::default();
         let cache_to_save =
