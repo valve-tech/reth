@@ -6,6 +6,7 @@ mod dev;
 mod eip6780;
 mod estimate;
 mod eth;
+mod executor_replay;
 mod exex;
 mod finality;
 mod forkchoice;

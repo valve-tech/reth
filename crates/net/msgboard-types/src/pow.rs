@@ -215,10 +215,10 @@ impl PoWMsg {
         if scalar.is_zero() || scalar >= U256::from_be_slice(&SECP256K1_ORDER) {
             return None;
         }
-        // `from_slice` enforces the same range rule a second time; the point at
-        // infinity the spec names is unreachable for a scalar in `[1, n)`.
-        let sk = secp256k1::SecretKey::from_slice(digest.as_slice()).ok()?;
-        let pk = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &sk);
+        // `from_secret_bytes` enforces the same range rule a second time; the point
+        // at infinity the spec names is unreachable for a scalar in `[1, n)`.
+        let sk = secp256k1::SecretKey::from_secret_bytes(digest.0).ok()?;
+        let pk = secp256k1::PublicKey::from_secret_key(&sk);
         Some(pk.serialize())
     }
 

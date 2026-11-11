@@ -23,7 +23,7 @@ use evm2_inspectors::{
 use futures::{FutureExt, StreamExt};
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
-use reth_evm::{ConfigureEvm, EvmEnv as _};
+use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{BlockBody, BlockHeader};
 use reth_rpc_api::{ParityLocalizedTrace, TraceApiServer};
 use reth_rpc_convert::RpcTxReq;
@@ -31,7 +31,7 @@ use reth_rpc_eth_api::{
     helpers::{LoadTransaction, Trace, TraceExt},
     FromEthApiError, RpcNodeCore,
 };
-use reth_rpc_eth_types::{error::EthApiError, trace_root::fill_unentered_root_trace, EthConfig};
+use reth_rpc_eth_types::{error::EthApiError, utils::CallManyBudget, EthConfig};
 use reth_storage_api::{BlockNumReader, BlockReader};
 use reth_tasks::{cancel::is_cancelled, pool::BlockingTaskGuard};
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
@@ -104,20 +104,12 @@ where
         let this = self.clone();
         self.eth_api()
             .spawn_with_call_at(trace_request.call, at, overrides, move |db, evm_env, tx_env| {
-                let version = *evm_env.version();
-                let (mut inspector, res) = this.eth_api().inspect(
+                let (inspector, res) = this.eth_api().inspect(
                     &mut *db,
                     evm_env,
                     &tx_env,
                     TracingInspector::new(config),
                 )?;
-                fill_unentered_root_trace(
-                    inspector.traces_mut(),
-                    tx_env.signer(),
-                    tx_env.inner(),
-                    &version,
-                    &res.result,
-                );
                 let trace_res = inspector
                     .into_parity_builder()
                     .into_trace_results_with_state(&res, &trace_request.trace_types, &mut *db)
@@ -144,24 +136,13 @@ where
         let config = TracingInspectorConfig::from_parity_config(&trace_types);
 
         let tx_env = self.eth_api().evm_config().tx_env(tx);
-        // A transaction that halts before its first frame leaves no root call; it is rebuilt
-        // from the transaction.
-        let root_tx = tx_env.clone();
-        let version = *evm_env.version();
         self.eth_api()
             .spawn_trace_at_with_state(
                 evm_env,
                 tx_env,
                 config,
                 at,
-                move |mut inspector, res, mut db| {
-                    fill_unentered_root_trace(
-                        inspector.traces_mut(),
-                        root_tx.signer(),
-                        root_tx.inner(),
-                        &version,
-                        &res.result,
-                    );
+                move |inspector, res, mut db| {
                     inspector
                         .into_parity_builder()
                         .into_trace_results_with_state(&res, &trace_types, &mut db)
@@ -180,6 +161,7 @@ where
         calls: Vec<(RpcTxReq<Eth::NetworkTypes>, HashSet<TraceType>)>,
         block_id: Option<BlockId>,
     ) -> Result<Vec<TraceResults>, Eth::Error> {
+        let mut budget = CallManyBudget::new(calls.len(), self.eth_api().call_gas_limit())?;
         let at = block_id.unwrap_or_default();
         let (evm_env, at) = self.eth_api().evm_env_at(at).await?;
 
@@ -193,27 +175,18 @@ where
                     if is_cancelled() {
                         return Err(EthApiError::InternalEthError.into())
                     }
-                    let (evm_env, tx_env) = eth_api.prepare_call_env(
+                    let (evm_env, mut tx_env) = eth_api.prepare_call_env(
                         evm_env.clone(),
                         call,
                         &mut db,
                         Default::default(),
                     )?;
+                    budget.admit(&mut tx_env)?;
                     let config = TracingInspectorConfig::from_parity_config(&trace_types);
-                    let version = *evm_env.version();
-                    let (mut inspector, res) = eth_api.inspect(
-                        &mut db,
-                        evm_env,
-                        &tx_env,
-                        TracingInspector::new(config),
-                    )?;
-                    fill_unentered_root_trace(
-                        inspector.traces_mut(),
-                        tx_env.signer(),
-                        tx_env.inner(),
-                        &version,
-                        &res.result,
-                    );
+                    let (inspector, res) = eth_api
+                        .inspect(&mut db, evm_env, &tx_env, TracingInspector::new(config))
+                        .map_err(|err| budget.map_call_err(err))?;
+                    budget.charge(&res.result)?;
 
                     let trace_res = inspector
                         .into_parity_builder()

@@ -24,7 +24,7 @@ use alloy_eip7928::{bal::DecodedBal, BlockAccessIndex, BlockAccessList};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::Address;
 use crossbeam_channel::{Receiver, Sender};
-use evm2::evm::Bal as EvmBal;
+use evm2::{evm::Bal as EvmBal, AnyError};
 use reth_engine_primitives::BlockAccessListDecodeError;
 use reth_evm::{
     BlockExecutionOutput, BlockExecutor, BlockExecutorFactory, BlockExecutorFor, ConfigureEvm,
@@ -263,8 +263,10 @@ fn spawn_traced_worker<'scope, Evm, Tx, Err, DB, MakeDb>(
                     let tx = match tx {
                         Ok(tx) => tx,
                         Err(source) => {
-                            let error =
-                                BalWorkerError::Transaction { tx_index, source: Box::new(source) };
+                            let error = BalWorkerError::Transaction {
+                                tx_index,
+                                source: AnyError::new(source),
+                            };
                             if result_tx.send(Err(error)).is_err() {
                                 break 'worker;
                             }
@@ -330,10 +332,7 @@ mod tests {
         record_block_access_list, run_wrapped_block, NoPostTxExtras, NoPreTxAdjust,
     };
     use reth_firehose_tests::parse_fire_block_for;
-    use reth_primitives_traits::{
-        crypto::secp256k1::public_key_to_address, Block as _, Recovered, RecoveredBlock,
-        SealedBlock,
-    };
+    use reth_primitives_traits::{Block as _, Recovered, RecoveredBlock, SealedBlock};
     use reth_testing_utils::generators::{generate_key, rng, sign_tx_with_key_pair};
     use secp256k1::Keypair;
     use std::convert::Infallible;
@@ -401,7 +400,7 @@ mod tests {
         });
         Recovered::new_unchecked(
             sign_tx_with_key_pair(*key, tx),
-            public_key_to_address(key.public_key()),
+            Address::from_raw_public_key(&key.public_key().serialize_uncompressed()[1..]),
         )
     }
 
@@ -551,9 +550,12 @@ mod tests {
     fn traced_block(evm_config: &EthEvmConfig) -> (CacheDB<EmptyDB>, RecoveredBlock<Block>) {
         let keys = (0..3).map(|_| generate_key(&mut rng())).collect::<Vec<_>>();
         let coinbase_key = generate_key(&mut rng());
-        let coinbase = public_key_to_address(coinbase_key.public_key());
-        let mut senders =
-            keys.iter().map(|key| public_key_to_address(key.public_key())).collect::<Vec<_>>();
+        let coinbase =
+            Address::from_raw_public_key(&coinbase_key.public_key().serialize_uncompressed()[1..]);
+        let mut senders = keys
+            .iter()
+            .map(|key| Address::from_raw_public_key(&key.public_key().serialize_uncompressed()[1..]))
+            .collect::<Vec<_>>();
         senders.push(coinbase);
 
         let mut txs = vec![

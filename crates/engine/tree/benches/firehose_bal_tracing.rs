@@ -31,9 +31,7 @@ use reth_evm::{
 };
 use reth_evm_ethereum::EthEvmConfig;
 use reth_firehose::{run_wrapped_block, FirehoseBlockTracer, NoPostTxExtras, NoPreTxAdjust};
-use reth_primitives_traits::{
-    crypto::secp256k1::public_key_to_address, Block as _, Recovered, RecoveredBlock, SealedBlock,
-};
+use reth_primitives_traits::{Block as _, Recovered, RecoveredBlock, SealedBlock};
 use reth_tasks::{RayonConfig, Runtime, RuntimeBuilder, RuntimeConfig, TokioConfig};
 use reth_testing_utils::generators::{generate_key, rng, sign_tx_with_key_pair};
 use std::{convert::Infallible, sync::Arc, time::Duration};
@@ -141,8 +139,10 @@ struct Fixture {
 fn fixture() -> Fixture {
     let evm_config = evm_config();
     let keys = (0..SENDERS).map(|_| generate_key(&mut rng())).collect::<Vec<_>>();
-    let senders =
-        keys.iter().map(|key| public_key_to_address(key.public_key())).collect::<Vec<_>>();
+    let senders = keys
+        .iter()
+        .map(|key| Address::from_raw_public_key(&key.public_key().serialize_uncompressed()[1..]))
+        .collect::<Vec<_>>();
     let txs = (0..CALLS)
         .map(|index| {
             let key = &keys[index % SENDERS];

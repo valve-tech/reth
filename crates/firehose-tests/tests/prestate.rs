@@ -102,11 +102,11 @@ fn amsterdam_builder_execution_requests() {
 }
 
 /// Amsterdam: a creation transaction whose gas covers its intrinsic cost but not the EIP-8037
-/// account-creation state gas that EIP-2780 charges before the root frame opens. revm includes it
-/// as an out-of-gas halt without ever opening that frame, so the root `CREATE` has to be traced
-/// by the executor, and it has to be the transaction's own even though the block's system calls
-/// opened depth-0 frames before it ran. Left untraced, the transaction had no call at all, and
-/// the tracer dropped its receipt and left its status unknown.
+/// account-creation state gas that EIP-2780 charges before the root frame runs. evm2 opens the
+/// root `CREATE` frame and halts it out of gas, as go-ethereum does, and the traced root call has
+/// to be the transaction's own even though the block's system calls opened depth-0 frames before
+/// it ran. Left untraced, the transaction had no call at all, and the tracer dropped its receipt
+/// and left its status unknown.
 ///
 /// Battlefield `contract_fail_code_copy` hits this with a 99309 gas deployment.
 #[test]

@@ -5,8 +5,10 @@
 //! firehose output depends on is actually in effect. The motivating regression: on
 //! the reth v2.3.0 upgrade the `[patch.crates-io] alloy-evm` override stopped
 //! version-matching the workspace requirement, so cargo silently dropped it and
-//! firehose stopped tracing pre-execution system calls. Since reth v2.9 the same patch is
-//! `[patch."https://github.com/alloy-rs/evm2"]`, pointing evm2 at the StreamingFast fork.
+//! firehose stopped tracing pre-execution system calls. From reth v2.9 to v2.10 the same patch
+//! pointed evm2 at the StreamingFast fork. Since v2.11 upstream evm2 has opt-in system-call
+//! inspection (alloy-rs/evm2#888), so no fork is needed, and the functional guard below checks
+//! that the opt-in is actually switched on.
 
 use std::path::{Path, PathBuf};
 
@@ -23,8 +25,8 @@ fn case_dir(name: &str) -> PathBuf {
 /// #2 — Functional guard: a Cancun block with a `parentBeaconBlockRoot` must produce a
 /// non-empty firehose `system_calls` (the EIP-4788 beacon-root call).
 ///
-/// If the evm2 system-call inspector patch is not in effect, stock evm2 runs system calls
-/// without the inspector ("System calls are not inspected"), the firehose inspector never
+/// If system-call inspection is not switched on (`set_inspect_system_calls`), evm2 runs system
+/// calls without the inspector ("System calls are not inspected"), the firehose inspector never
 /// sees the call frame, and `system_calls` comes back empty
 /// while every event ordinal shifts down by 2. This catches that immediately and with
 /// a clear message, instead of via an opaque binary-golden diff.
@@ -39,48 +41,9 @@ fn cancun_block_emits_beacon_root_system_call() {
     assert!(
         !outcome.block.system_calls.is_empty(),
         "firehose captured zero system calls for a Cancun block with a beacon-root \
-         (EIP-4788) system call. The evm2 system-call inspector patch is almost \
-         certainly not in effect: stock evm2 does not run system calls through the \
-         inspector. Check reth Cargo.toml's [patch.\"https://github.com/alloy-rs/evm2\"] \
-         section: it must point evm2 at the streamingfast/evm2 fork.",
-    );
-}
-
-/// #10 — Structural guard: the workspace `evm2` must resolve to the streamingfast/evm2 fork
-/// (which runs block system calls through the inspector), not upstream alloy-rs/evm2.
-///
-/// This catches the silent patch-drop at the dependency level — before any execution —
-/// with a message pointing straight at the fix. It complements the functional guard
-/// above: this one explains *why* `system_calls` would be empty.
-#[test]
-fn evm2_resolves_to_streamingfast_fork() {
-    let lock_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
-    let lock = std::fs::read_to_string(&lock_path)
-        .unwrap_or_else(|e| panic!("reading workspace Cargo.lock at {}: {e}", lock_path.display()));
-
-    // Cargo.lock is TOML: a sequence of `[[package]]` blocks. Find the evm2 block and read its
-    // `source` line. (A simple scan avoids pulling in a TOML parser dependency.)
-    let source = lock
-        .split("[[package]]")
-        .find(|block| block.lines().any(|line| line.trim() == "name = \"evm2\""))
-        .and_then(|block| {
-            block.lines().find_map(|line| line.trim().strip_prefix("source = ").map(str::trim))
-        });
-
-    let source = source.unwrap_or_else(|| {
-        panic!(
-            "could not find an `evm2` package with a `source` in Cargo.lock — the firehose \
-             build depends on a patched evm2. See [patch.\"https://github.com/alloy-rs/evm2\"] \
-             in Cargo.toml.",
-        )
-    });
-
-    assert!(
-        source.contains("streamingfast/evm2"),
-        "evm2 resolves to `{source}`, NOT the streamingfast/evm2 fork. The system-call \
-         inspector patch is not active, so firehose will not trace block system calls. \
-         Re-point reth Cargo.toml's [patch.\"https://github.com/alloy-rs/evm2\"] evm2, \
-         evm2-inspectors and evm2-jit at the streamingfast/evm2 tag for this reth release.",
+         (EIP-4788) system call. System-call inspection is almost certainly not switched \
+         on: evm2 runs system calls without the inspector unless the executor calls \
+         set_inspect_system_calls(true) (FirehoseWrappedExecutor does).",
     );
 }
 

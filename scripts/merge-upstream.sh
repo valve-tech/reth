@@ -104,8 +104,10 @@ $m"
   ./docs/cli/update.sh "$bin" >/dev/null
   ./docs/cli/update.sh "$bin" >/dev/null
 
-  echo "checking the workspace (reth and reth-bb build above; their default jit needs LLVM)"
-  cargo check --locked --workspace --all-targets --exclude reth --exclude reth-bb --exclude ef-test-runner
+  echo "checking the workspace (the node binaries' default jit needs LLVM, so they get the release set)"
+  cargo check --locked --workspace --all-targets \
+    --exclude reth --exclude reth-bb --exclude pulse-reth --exclude ef-test-runner
+  cargo check --locked -p reth -p pulse-reth --all-targets --no-default-features --features "$RETH_FEATURES"
 
   m=$(markers)
   [ -z "$m" ] || die "conflict markers left:

@@ -238,7 +238,7 @@ where
         if self.block_number != self.primordial_pulse_block {
             return
         }
-        let mut changes = PrimordialPulseChanges::new(&mut self.inner.evm);
+        let mut changes = PrimordialPulseChanges::new(self.inner.evm_mut());
         apply_primordial_pulse(&mut changes, self.chain_id);
         let pending = changes.into_pending_state();
         self.inner.commit_pending_state(&pending);

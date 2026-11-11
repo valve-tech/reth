@@ -6,7 +6,7 @@ use super::{scenario::*, support::*};
 use crate::{inspector::*, PreTxAdjust};
 use alloy_eips::eip7702::SignedAuthorization;
 use alloy_rlp::Decodable;
-use evm2::{ethereum::LazyAuthorization, SpecId};
+use evm2::{bytecode::Bytecode, ethereum::LazyAuthorization, SpecId, Version};
 use firehose_tracer::pb;
 
 /// Block beneficiary of the priced transactions below.
@@ -45,7 +45,7 @@ fn self_authorizations(count: usize) -> Vec<SignedAuthorization> {
             let authorization =
                 SignedAuthorization::decode(&mut rlp.as_slice()).expect("authorization is RLP");
             assert_eq!(
-                LazyAuthorization::from(authorization.clone()).authority(),
+                LazyAuthorization::Signed(&authorization).authority(),
                 Some(AUTHORITY),
                 "fixture signed by the wrong key"
             );
@@ -471,4 +471,77 @@ fn root_balance_reason_override_is_single_shot() {
         })
         .collect();
     assert_eq!(root_reasons, [Reason::IncreaseMint, Reason::GasBuy]);
+}
+
+/// The `Transfer` balance changes of `trx`, all calls together, as `(address, old, new)`.
+fn transfers(trx: &pb::sf::ethereum::r#type::v2::TransactionTrace) -> Vec<(Address, U256, U256)> {
+    trx.calls
+        .iter()
+        .flat_map(|call| &call.balance_changes)
+        .filter(|change| change.reason == Reason::Transfer as i32)
+        .map(|change| {
+            (Address::from_slice(&change.address), big(&change.old_value), big(&change.new_value))
+        })
+        .collect()
+}
+
+/// An Amsterdam transaction sending value to an empty account without the gas for its EIP-2780
+/// new-account charge runs out of gas before the value moves, so it reports no transfer.
+#[test]
+fn root_call_halted_on_new_account_gas_reports_no_transfer() {
+    let block = drive_txs(
+        SpecId::AMSTERDAM,
+        &[(SENDER, balance_account(SENDER_BALANCE))],
+        &[DriveTx::call(RECIPIENT, 3).with_gas(24_000)],
+    );
+    let trx = &block.transaction_traces[0];
+
+    assert!(trx.calls[0].status_failed, "the root call runs out of gas");
+    assert_eq!(trx.gas_used, 24_000);
+    assert_eq!(transfers(trx), []);
+}
+
+/// An Amsterdam transaction sending value to an EIP-7702 delegated account without the gas to
+/// access the delegate runs out of gas before the value moves, so it reports no transfer.
+#[test]
+fn root_call_halted_on_delegation_access_gas_reports_no_transfer() {
+    let block = drive_txs(
+        SpecId::AMSTERDAM,
+        &[
+            (SENDER, balance_account(SENDER_BALANCE)),
+            (RECIPIENT, AccountInfo::default().with_code(Bytecode::new_eip7702(DELEGATE))),
+        ],
+        &[DriveTx::call(RECIPIENT, 3).with_gas(21_050)],
+    );
+    let trx = &block.transaction_traces[0];
+
+    assert!(trx.calls[0].status_failed, "the root call runs out of gas");
+    assert_eq!(trx.gas_used, 21_050);
+    assert_eq!(transfers(trx), []);
+}
+
+/// An Amsterdam transaction that pays the new-account charge of an empty precompile, then runs
+/// out of gas in the precompile, moved its value before the rollback, so it reports the
+/// transfer as go-ethereum does.
+#[test]
+fn root_call_to_precompile_out_of_gas_reports_the_transfer() {
+    const ECRECOVER: Address = Address::with_last_byte(1);
+
+    let new_account_gas = Version::new(SpecId::AMSTERDAM).gas_params.new_account_state_gas();
+    let block = drive_txs(
+        SpecId::AMSTERDAM,
+        &[(SENDER, balance_account(SENDER_BALANCE))],
+        &[DriveTx::call(ECRECOVER, 3).with_gas(21_000 + new_account_gas + 100)],
+    );
+    let trx = &block.transaction_traces[0];
+    assert!(trx.calls[0].status_failed, "ecrecover runs out of gas");
+
+    let sender_balance = U256::from(SENDER_BALANCE);
+    assert_eq!(
+        transfers(trx),
+        [
+            (SENDER, sender_balance, sender_balance - U256::from(3)),
+            (ECRECOVER, U256::ZERO, U256::from(3)),
+        ]
+    );
 }

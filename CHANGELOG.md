@@ -7,6 +7,38 @@ This changelog covers Firehose-specific changes only. For upstream reth changes,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## reth-v2.11.0-fh3.1-1
+
+### Fixed
+
+- On Amsterdam, a transaction whose root call sends value and runs out of gas in its runtime gas
+  phase no longer reports a `REASON_TRANSFER` debit of the sender and credit of the recipient.
+  The value never moves, and go-ethereum reports no transfer. This happens when the recipient is
+  empty and the transaction cannot pay its new-account state gas, or when the recipient is an
+  EIP-7702 delegated account and the transaction cannot pay to access the delegate.
+  `reth-v2.11.0-fh3.1` reported the transfer.
+
+## reth-v2.9.0-fh3.1-not-a-real-version-alpha.2
+
+Tests the release made by sfreleaser, no Firehose changes.
+
+## reth-v2.11.0-fh3.1
+
+### Changed
+
+- Update to upstream reth [v2.11.0](https://github.com/paradigmxyz/reth/releases/tag/v2.11.0).
+  evm2 now comes from the upstream revision reth pins instead of the `streamingfast/evm2` fork,
+  because its only patch is upstream. No hardfork is scheduled or changed.
+- From Prague on, the EIP-4788 beacon root system call is traced before the EIP-2935 block hash
+  system call, the order evm2's block executor runs them in. Their content does not change.
+- On Amsterdam, a transaction that runs out of gas in its runtime gas phase opens its root call
+  before the sender's nonce change, as on go-ethereum. The block content does not change, only
+  the order of those two ordinals.
+
+## reth-v2.9.0-fh3.1-not-a-real-version-alpha
+
+Tests the automated release tag, no Firehose changes.
+
 ## reth-v2.10.0-fh3.1
 
 ### Changed

@@ -34,6 +34,7 @@ use reth_provider::{DatabaseProviderROFactory, ProviderError, ProviderResult, St
 use reth_tasks::{Runtime, WorkerPool};
 use reth_trie::{DecodedMultiProofV2, MultiProofTargetsV2, ProofV2Target};
 use std::{
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -95,8 +96,9 @@ impl AvailabilitySheet {
 ///
 /// Every job queued by [`Self::dispatch`] sends exactly one [`ProofWorkerResult`] to
 /// [`Self::results`], unless the handle's [`ProofCancellationToken`] is cancelled first. A worker
-/// that fails to start sends an error that belongs to no job instead, and jobs left queued when
-/// every worker of a pool has failed get no result. Workers shut down once the handle is dropped.
+/// that fails to open its provider, at start or after a panicking job, sends an error that belongs
+/// to no job instead, and jobs left queued when every worker of a pool has failed get no result.
+/// Workers shut down once the handle is dropped.
 #[derive(Debug)]
 pub struct ProofWorkerHandle {
     /// Sender shared with the workers, kept so that [`Self::results`] never disconnects while the
@@ -427,7 +429,8 @@ impl ProofWorkerKind {
 
 /// Runs `run` as `worker_count` workers of the given kind on a blocking task.
 ///
-/// A worker that fails to start sends a [`ProofWorkerError`] to the result channel.
+/// A worker that fails to open its provider, at start or after a panicking job, sends a
+/// [`ProofWorkerError`] to the result channel and stops.
 fn spawn_workers<Factory, J>(
     runtime: &Runtime,
     kind: ProofWorkerKind,
@@ -483,11 +486,21 @@ struct ProofWorker<Factory, J> {
     metrics: ProofWorkerIdleMetrics,
 }
 
-impl<Factory, J> ProofWorker<Factory, J> {
-    /// Runs `process` for every job until the handle is dropped, advertising the worker as busy
-    /// while a job runs. Jobs received after cancellation are discarded without a result. Returns
-    /// the total time spent waiting for jobs.
-    fn process_jobs(&self, worker_id: usize, mut process: impl FnMut(J)) -> Duration {
+impl<Factory: DatabaseProviderROFactory, J> ProofWorker<Factory, J> {
+    /// Runs `process` with `provider` for every job until the handle is dropped and sends each
+    /// job's result, advertising the worker as busy while a job runs. Jobs received after
+    /// cancellation are discarded without a result. Returns the total time spent waiting for jobs.
+    ///
+    /// A job that panics sends [`ProofJobError::Panicked`] instead of its result, so the job's
+    /// receiver fails instead of waiting for a result that never arrives. The worker then replaces
+    /// its provider, whose cached proof state must not be reused after a panic, and moves on to the
+    /// next job. Fails if the new provider cannot be opened.
+    fn process_jobs(
+        &self,
+        worker_id: usize,
+        mut provider: Factory::Provider,
+        mut process: impl FnMut(&Factory::Provider, J) -> ProofWorkerResult,
+    ) -> ProviderResult<Duration> {
         // Count this worker as available only after successful initialization.
         self.availability.mark_idle(worker_id);
 
@@ -516,13 +529,26 @@ impl<Factory, J> ProofWorker<Factory, J> {
                 std::thread::sleep(jitter);
             }
 
-            process(job);
+            match catch_unwind(AssertUnwindSafe(|| process(&provider, job))) {
+                Ok(result) => self.send_result(worker_id, result),
+                Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown panic")
+                        .to_string();
+                    error!(target: "trie::proof_task", worker_id, %message, "Proof job panicked");
+                    self.send_result(worker_id, Err(ProofJobError::Panicked { message }.into()));
+                    provider = self.task_ctx.factory.database_provider_ro()?;
+                }
+            }
 
             self.availability.mark_idle(worker_id);
             idle_start = Instant::now();
         }
 
-        total_idle_time
+        Ok(total_idle_time)
     }
 
     /// Sends a job result. The send fails only once the handle is dropped, when the result is no
@@ -549,7 +575,7 @@ where
         trace!(target: "trie::proof_task", worker_id, "Storage worker started");
 
         let mut storage_proofs_processed = 0u64;
-        let total_idle_time = self.process_jobs(worker_id, |job| {
+        let total_idle_time = self.process_jobs(worker_id, provider, |provider, job| {
             let StorageProofJob { hashed_address, targets, dispatched_at } = job;
             let _span = debug_span!(
                 target: "trie::proof_task",
@@ -577,11 +603,9 @@ where
                 "Storage proof completed"
             );
 
-            let result =
-                proof.map_err(|source| ProofJobError::Storage { hashed_address, source }.into());
-            self.send_result(worker_id, result);
             storage_proofs_processed += 1;
-        });
+            proof.map_err(|source| ProofJobError::Storage { hashed_address, source }.into())
+        })?;
 
         trace!(
             target: "trie::proof_task",
@@ -609,7 +633,7 @@ where
         trace!(target: "trie::proof_task", worker_id, "Account worker started");
 
         let mut account_proofs_processed = 0u64;
-        let total_idle_time = self.process_jobs(worker_id, |job| {
+        let total_idle_time = self.process_jobs(worker_id, provider, |provider, job| {
             let AccountProofJob { targets, dispatched_at } = job;
             let _span = debug_span!(
                 target: "trie::proof_task",
@@ -635,10 +659,9 @@ where
                 "Account proof completed"
             );
 
-            let result = proof.map_err(|source| ProofJobError::Account { source }.into());
-            self.send_result(worker_id, result);
             account_proofs_processed += 1;
-        });
+            proof.map_err(|source| ProofJobError::Account { source }.into())
+        })?;
 
         trace!(
             target: "trie::proof_task",
@@ -670,7 +693,7 @@ struct AccountProofJob {
     dispatched_at: Instant,
 }
 
-/// Context for a provider failure that prevents a proof worker from starting.
+/// Context for a provider failure that stops a proof worker, at start or after a panicking job.
 #[derive(Debug, thiserror::Error)]
 #[error("{} worker {worker_id}: {source}", kind.name())]
 struct ProofWorkerError {
@@ -694,6 +717,8 @@ enum ProofJobError {
         #[source]
         source: ProviderError,
     },
+    #[error("proof job panicked: {message}")]
+    Panicked { message: String },
 }
 
 impl From<ProofJobError> for StateRootTaskError {
@@ -875,6 +900,17 @@ mod tests {
         );
     }
 
+    /// A provider factory for workers whose jobs never read the database.
+    struct NoDatabase;
+
+    impl DatabaseProviderROFactory for NoDatabase {
+        type Provider = ();
+
+        fn database_provider_ro(&self) -> ProviderResult<()> {
+            Ok(())
+        }
+    }
+
     /// Ensures a worker discards jobs buffered before cancellation.
     #[test]
     fn worker_discards_buffered_jobs_after_cancellation() {
@@ -882,7 +918,7 @@ mod tests {
         let (result_tx, _result_rx) = unbounded();
         let cancellation = ProofCancellationToken::default();
         let worker = ProofWorker {
-            task_ctx: test_ctx(()),
+            task_ctx: test_ctx(NoDatabase),
             work_rx,
             result_tx,
             availability: Arc::new(AvailabilitySheet::new(1)),
@@ -896,7 +932,12 @@ mod tests {
         drop(work_tx);
 
         let mut processed = 0;
-        worker.process_jobs(0, |()| processed += 1);
+        worker
+            .process_jobs(0, (), |(), ()| {
+                processed += 1;
+                Err(ProofJobError::Panicked { message: String::new() }.into())
+            })
+            .unwrap();
 
         assert_eq!(processed, 0);
     }

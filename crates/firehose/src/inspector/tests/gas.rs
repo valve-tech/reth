@@ -206,3 +206,23 @@ fn call_gas_consumed_excludes_state_gas_returned_on_revert() {
         "the reverted store's state gas is reported as consumed but the receipt gave it back"
     );
 }
+
+/// A call that fails before its frame runs (here, a value transfer the caller cannot afford)
+/// returns all of its gas to the caller, as in go-ethereum, so it reports no gas consumed.
+#[test]
+fn call_failed_on_insufficient_balance_consumes_no_gas() {
+    let target = Address::repeat_byte(0xdd);
+    for spec in [SpecId::PRAGUE, SpecId::AMSTERDAM] {
+        let accounts = [
+            (SENDER, balance_account(u64::MAX)),
+            (RECIPIENT, code_account(&op_call_with_value(target, 1), 0)),
+        ];
+        let block = drive_tx(spec, &accounts, RECIPIENT, 0);
+        let trx = block.transaction_traces.first().expect("one transaction");
+        let inner = trx.calls.get(1).expect("the value call");
+
+        assert!(inner.status_failed, "{spec:?}: the value call fails");
+        assert_eq!(inner.failure_reason, "insufficient balance for transfer", "{spec:?}");
+        assert_eq!(inner.gas_consumed, 0, "{spec:?}: the failed call gives back all its gas");
+    }
+}

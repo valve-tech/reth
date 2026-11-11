@@ -77,16 +77,14 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to the Container registry
         if: env.IS_EXTERNAL_PR != 'true'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -122,7 +120,7 @@ jobs:
 
       - name: Generate docker tags/labels from github build context
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # The version-suffixed sha tag uniquely identifies the image for a given
@@ -144,7 +142,7 @@ jobs:
             latest=${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref, 'beta') && !contains(github.ref, 'rc') && !contains(github.ref, 'alpha') }}
 
       - name: Build and push Docker image (linux/amd64)
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.sf
@@ -191,7 +189,7 @@ jobs:
 
     steps:
       - name: Docker login
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -199,50 +197,22 @@ jobs:
 
       - name: Extract image
         id: image
-        env:
-          IMAGE_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
           version=${GITHUB_REF#refs/tags/}
           # Match the sanitization done in the build job's "Extract version" step
           # so this ID resolves to the same `<sha>-<version>` image tag.
           version=${version//\//-}
-          echo "ID=${IMAGE_REPO}:${GITHUB_SHA::7}-${version}" >> "$GITHUB_OUTPUT"
+          echo "ID=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${GITHUB_SHA::7}-${version}" >> "$GITHUB_OUTPUT"
 
       - name: Extract assets
-        env:
-          IMAGE_ID: ${{ steps.image.outputs.ID }}
         run: |
           # The --platform is not strictly needed for a single-arch image, but it
           # silences the buildx warning.
-          container=$(docker create --platform=linux/amd64 "$IMAGE_ID")
-          docker cp "${container}:/usr/local/bin/reth" ./reth_linux_amd64
-
-      - name: Extract Changelog
-        id: changelog
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          curl -L https://github.com/streamingfast/sfreleaser/releases/download/v0.12.1/sfreleaser_linux_x86_64.tar.gz | tar -xz
-          chmod +x sfreleaser
-
-          ./sfreleaser changelog extract-section \
-            "github://token:${GH_TOKEN}@${REPO}/${GITHUB_SHA}/CHANGELOG.md" \
-            --github-output="changelog:$GITHUB_OUTPUT"
+          docker cp $(docker create --platform=linux/amd64 ${{ steps.image.outputs.ID }}):/usr/local/bin/reth ./reth_linux_amd64
 
       - name: Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          NOTES: ${{ steps.changelog.outputs.changelog }}
-          PRERELEASE: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
-        run: |
-          set -euo pipefail
-          tag=${GITHUB_REF#refs/tags/}
-          printf '%s\n' "$NOTES" > notes.md
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release edit "$tag" --notes-file notes.md --prerelease="$PRERELEASE"
-            gh release upload "$tag" ./reth_linux_amd64 --clobber
-          else
-            gh release create "$tag" ./reth_linux_amd64 --verify-tag --title "$tag" --notes-file notes.md --prerelease="$PRERELEASE"
-          fi
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
+          files: |
+            ./reth_linux_amd64
