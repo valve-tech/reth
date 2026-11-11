@@ -483,7 +483,7 @@ where
     Self: ConfigureEvm,
 {
     type PreTxAdjust = reth_firehose::NoPreTxAdjust;
-    type PostTxExtras = reth_firehose::NoPostTxExtras;
+    type PostTxExtras = crate::firehose::PulsechainPostTxExtras;
 }
 
 impl<C, F> ConfigureEvm for PulsechainEvmConfig<C, F>

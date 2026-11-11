@@ -8,11 +8,11 @@
 //! (code + nonce + 31 initial storage slots). These writes happen via
 //! `db.increment_balances()` / `db.insert_account_with_storage()` / similar
 //! state methods that bypass revm's EVM journal entirely — so the firehose
-//! [`Inspector`](crate::inspector::FirehoseInspector) never sees them, and
+//! [`Inspector`](reth_firehose::FirehoseInspector) never sees them, and
 //! without explicit emission they leak from the firehose stream.
 //!
 //! This module bridges the gap. The wrapper layer
-//! ([`FirehoseWrappedExecutor::finish`](crate::executor::FirehoseWrappedExecutor)):
+//! ([`FirehoseWrappedExecutor::finish`](reth_firehose::FirehoseWrappedExecutor)):
 //!   1. Captures pre-state for every affected address BEFORE `inner.finish()` runs (via
 //!      [`PrimordialPulsePreState::capture`]).
 //!   2. Calls `inner.finish()`, which applies the transition silently.

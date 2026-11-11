@@ -92,6 +92,28 @@ pub trait PostTxExtras<E: reth_evm::Evm> {
     fn gas_accounting(&self, _evm: &mut E, ethereum: PostTxGasAccounting) -> PostTxGasAccounting {
         ethereum
     }
+
+    /// Snapshots, before the inner executor's `finish`, what the chain's own post-block changes
+    /// will write outside the EVM, where the inspector cannot see them.
+    ///
+    /// `evm` reads the state after the block's last transaction. The wrapper calls
+    /// [`PostBlockChanges::emit`] on the result after `finish`, after the withdrawal changes and
+    /// the block reward. The default captures nothing, so Ethereum emits nothing extra.
+    fn capture_post_block(
+        &self,
+        _evm: &mut E,
+        _block_number: u64,
+        _chain_id: u64,
+    ) -> Option<Box<dyn PostBlockChanges>> {
+        None
+    }
+}
+
+/// Chain-specific state changes that a block executor's `finish` makes outside the EVM, captured
+/// by [`PostTxExtras::capture_post_block`].
+pub trait PostBlockChanges: Debug + Send {
+    /// Emits the changes to `tracer`, given the block's final state.
+    fn emit(&self, tracer: &mut firehose_tracer::Tracer, state: &BundleState);
 }
 
 /// No-op [`PostTxExtras`] used on Ethereum mainnet (and any chain whose fee distribution is
@@ -154,7 +176,7 @@ impl<E: reth_evm::Evm> PreTxAdjust<E> for NoPreTxAdjust {
 #[derive(Debug, Clone)]
 pub struct BlockFees {
     coinbase: Address,
-    /// Number of the block, used to find the `PrimordialPulse` fork block.
+    /// Number of the block, for the uncle rewards and [`PostTxExtras::capture_post_block`].
     block_number: u64,
     base_fee: u64,
     /// EIP-4844 blob gas price, `None` before Cancun, matching Geth's omission of the field on
@@ -329,10 +351,11 @@ impl<Inner, G, Extras, Adjust> FirehoseWrappedExecutor<Inner, G, Extras, Adjust>
 where
     Inner: BlockExecutor,
     G: DerefMut<Target = firehose_tracer::Tracer>,
+    Extras: PostTxExtras<Inner::Evm>,
 {
     /// Snapshots, before the inner finish, the accounts whose post-block changes bypass the
-    /// inspector: the pre-Merge block and uncle reward recipients, and the accounts the
-    /// `PrimordialPulse` transition writes at its fork block.
+    /// inspector: the pre-Merge block and uncle reward recipients, and whatever the chain's
+    /// [`PostTxExtras::capture_post_block`] captures.
     fn capture_post_block_pre_state(&mut self) -> PostBlockPreState {
         // The static block reward exists only before the Merge, and every post-Shanghai block
         // carries withdrawals, so a block with withdrawals has no reward to sample.
@@ -352,18 +375,12 @@ where
             }
             BlockRewardPreState { credits, pre }
         });
-        let chain_id = self.fees.version.chain_id;
-        let block_number = self.fees.block_number;
-        let primordial_pulse = crate::primordial_pulse::fork_block_for(chain_id)
-            .filter(|&fork_block| fork_block == block_number)
-            .and_then(|_| {
-                crate::primordial_pulse::PrimordialPulsePreState::capture(
-                    self.inner.evm_mut().state_db_mut(),
-                    chain_id,
-                    block_number,
-                )
-            });
-        PostBlockPreState { reward, primordial_pulse }
+        let chain = self.extras.capture_post_block(
+            self.inner.evm_mut(),
+            self.fees.block_number,
+            self.fees.version.chain_id,
+        );
+        PostBlockPreState { reward, chain }
     }
 }
 
@@ -371,11 +388,12 @@ where
 #[derive(Debug)]
 struct PostBlockPreState {
     reward: Option<BlockRewardPreState>,
-    primordial_pulse: Option<crate::primordial_pulse::PrimordialPulsePreState>,
+    chain: Option<Box<dyn PostBlockChanges>>,
 }
 
 /// Emits the post-block changes that bypass the inspector, after the withdrawals, in this order:
-/// the uncle rewards, the block reward, then the `PrimordialPulse` transition.
+/// the uncle rewards, the block reward, then the chain's own changes
+/// ([`PostTxExtras::capture_post_block`]).
 fn emit_post_block_changes<G: DerefMut<Target = firehose_tracer::Tracer>>(
     inspector: &FirehoseInspector<G>,
     pre: &PostBlockPreState,
@@ -384,12 +402,8 @@ fn emit_post_block_changes<G: DerefMut<Target = firehose_tracer::Tracer>>(
     if let Some(reward) = &pre.reward {
         emit_block_reward_balance_changes(inspector, reward, state);
     }
-    if let Some(primordial_pulse) = &pre.primordial_pulse {
-        crate::primordial_pulse::emit_primordial_pulse_changes(
-            &mut inspector.tracer_mut(),
-            primordial_pulse,
-            state,
-        );
+    if let Some(chain) = &pre.chain {
+        chain.emit(&mut inspector.tracer_mut(), state);
     }
 }
 
@@ -924,6 +938,39 @@ where
     }
 }
 
+/// [`ChainHooks`] that installs the hooks the EVM configuration selects for the live path
+/// ([`FirehoseLiveHooks`]), so the pipeline traces a block the same way the engine does.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct LiveChainHooks;
+
+impl<F> ChainHooks<F> for LiveChainHooks
+where
+    F: FirehoseLiveHooks,
+    BlockTy<F::Primitives>: BlockTrait,
+    TxTy<F::Primitives>: Transaction + TxHashRef + SignatureFields,
+    <F::Primitives as NodePrimitives>::Receipt: TxReceipt<Log = Log>,
+{
+    fn execute_one_traced(
+        &self,
+        evm_config: &F,
+        database: impl DynDatabase,
+        block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
+        tracer: &mut FirehoseBlockTracer,
+    ) -> Result<
+        (BlockExecutionOutput<<F::Primitives as NodePrimitives>::Receipt>, Option<BlockAccessList>),
+        BlockExecutionError,
+    > {
+        run_wrapped_block(
+            evm_config,
+            database,
+            block,
+            tracer,
+            F::PreTxAdjust::default(),
+            F::PostTxExtras::default(),
+        )
+    }
+}
+
 /// Chain-specific hooks the live engine-API path installs on its traced block executor.
 ///
 /// The engine tree's block validator wraps the traced executor in
@@ -941,10 +988,11 @@ pub trait FirehoseLiveHooks: ConfigureEvm {
 
 impl<F> FirehoseLiveHooks for FirehoseEvmConfig<F>
 where
-    Self: ConfigureEvm,
+    F: FirehoseLiveHooks,
+    Self: ConfigureEvm<BlockExecutorFactory = F::BlockExecutorFactory>,
 {
-    type PreTxAdjust = NoPreTxAdjust;
-    type PostTxExtras = NoPostTxExtras;
+    type PreTxAdjust = F::PreTxAdjust;
+    type PostTxExtras = F::PostTxExtras;
 }
 
 impl<ChainSpec, EvmF> FirehoseLiveHooks for reth_evm_ethereum::EthEvmConfig<ChainSpec, EvmF>
@@ -1379,7 +1427,7 @@ impl<F: ConfigureEvm> FirehoseEvmConfig<F> {
 
 impl<F> ConfigureEvm for FirehoseEvmConfig<F>
 where
-    F: ConfigureEvm,
+    F: FirehoseLiveHooks,
     BlockTy<F::Primitives>: BlockTrait,
     <BlockTy<F::Primitives> as BlockTrait>::Header: BlockHeader + Sealable,
     <BlockTy<F::Primitives> as BlockTrait>::Body: BlockBody,
@@ -1462,7 +1510,7 @@ where
         &self,
         db: DB,
     ) -> impl Executor<DB, Primitives = Self::Primitives, Error = BlockExecutionError> {
-        FirehoseBlockExecutor::new(self.inner.clone(), db)
+        FirehoseBlockExecutor::new_with_chain_hooks(self.inner.clone(), db, LiveChainHooks)
     }
 }
 

@@ -42,16 +42,14 @@ pub mod inspector;
 pub mod mapper;
 /// Prelude module with common imports and utilities.
 pub mod prelude;
-/// PrimordialPulse state-transition emission (PulseChain-specific).
-pub mod primordial_pulse;
 /// Firehose ExEx: publishes the thatis health.json heartbeat per committed block.
 pub mod runner;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
     record_block_access_list, run_wrapped_block, BlockFees, ChainHooks, FirehoseBlockExecutor,
-    FirehoseEvmConfig, FirehoseLiveHooks, FirehoseWrappedExecutor, NoChainHooks, NoPostTxExtras,
-    NoPreTxAdjust, PostTxExtras, PreTxAdjust, TracedTransaction,
+    FirehoseEvmConfig, FirehoseLiveHooks, FirehoseWrappedExecutor, LiveChainHooks, NoChainHooks,
+    NoPostTxExtras, NoPreTxAdjust, PostBlockChanges, PostTxExtras, PreTxAdjust, TracedTransaction,
 };
 pub use finality::finalized_ref_for_block;
 pub use firehose_tracer::types::FinalizedBlockRef;
