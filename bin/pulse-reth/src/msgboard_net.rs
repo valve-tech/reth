@@ -25,13 +25,13 @@ use tracing::info;
 /// **zero** msgboard sessions until both processes happened to restart, while a
 /// mainnet pair fed by discovery churn looked healthy throughout.
 #[derive(Debug, Clone)]
-pub struct MsgboardNetworkBuilder {
+pub(crate) struct MsgboardNetworkBuilder {
     launcher: MsgboardLauncher,
 }
 
 impl MsgboardNetworkBuilder {
     /// Wrap a launcher whose board this network will serve.
-    pub const fn new(launcher: MsgboardLauncher) -> Self {
+    pub(crate) const fn new(launcher: MsgboardLauncher) -> Self {
         Self { launcher }
     }
 }
@@ -76,7 +76,7 @@ pub(crate) const MSGBOARD_RPC_MAX_RESPONSE_SIZE_MB: u32 = 200;
 
 /// Set this node's RPC server defaults. Call once, before the CLI parses:
 /// clap reads the defaults when it builds the parser.
-pub fn init_rpc_defaults() {
+pub(crate) fn init_rpc_defaults() {
     let _ = reth_node_core::args::DefaultRpcServerArgs::default()
         .with_rpc_max_response_size(MSGBOARD_RPC_MAX_RESPONSE_SIZE_MB.into())
         .try_init();

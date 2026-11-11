@@ -29,8 +29,10 @@ valve-ci:
     - cargo fmt --check -p reth-firehose -p reth-firehose-tests -p reth-pulsechain-node -p reth-pulsechain-forks || true
     - cargo clippy --no-deps -p reth-firehose -p reth-firehose-tests -p reth-pulsechain-node -p reth-pulsechain-forks --all-targets
     - cargo clippy --no-deps -p reth-msgboard -p reth-msgboard-types --all-targets -- -D warnings
-    - cargo check -p reth --no-default-features --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
+    - cargo clippy --no-deps -p pulse-reth --all-targets --no-default-features --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs" -- -D warnings
+    - cargo check -p reth -p pulse-reth --all-targets --no-default-features --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
     - cargo nextest run --no-fail-fast -p reth-firehose -p reth-firehose-tests -p reth-msgboard -p reth-msgboard-types -p reth-pulsechain-node -p reth-pulsechain-forks -p reth-cli-commands
+    - cargo nextest run --no-fail-fast -p pulse-reth --no-default-features --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
     - cargo nextest run -p reth-node-ethereum --test e2e -E 'test(estimate::)' --no-tests=fail
 
 # Unit tests of the upstream crates the fork modifies. The filter mirrors

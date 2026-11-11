@@ -17,7 +17,7 @@ use reth_pulsechain_node::evm::PulsechainEvmConfig;
 
 /// Node-builder executor builder that wraps [`EthEvmConfig`] in a [`FirehoseEvmConfig`].
 #[derive(Debug, Default, Clone, Copy)]
-pub struct FirehoseExecutorBuilder;
+pub(crate) struct FirehoseExecutorBuilder;
 
 impl<Node> ExecutorBuilder<Node> for FirehoseExecutorBuilder
 where
@@ -53,17 +53,17 @@ where
     }
 }
 
-/// PulseChain analogue of [`FirehoseExecutorBuilder`] — wraps
+/// `PulseChain` analogue of [`FirehoseExecutorBuilder`] — wraps
 /// [`PulsechainEvmConfig`] in [`FirehoseEvmConfig`] so the firehose tracer sees
-/// PulseChain's executor (CHAINID override, custom Shanghai gap, PrimordialPulse
+/// `PulseChain`'s executor (`CHAINID` override, custom Shanghai gap, `PrimordialPulse`
 /// transition) the same way it sees the upstream Ethereum executor.
 ///
 /// The trait bounds mirror [`PulsechainExecutorBuilder`] in
 /// `crates/pulsechain/node/src/evm.rs`: any chain spec that satisfies the
-/// EthExecutor trait stack with `Header`-typed headers is acceptable, which
+/// `EthExecutor` trait stack with `Header`-typed headers is acceptable, which
 /// covers both `PulsechainChainSpec` and the pulsechain testnet variant.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct PulsechainFirehoseExecutorBuilder;
+pub(crate) struct PulsechainFirehoseExecutorBuilder;
 
 impl<Node> ExecutorBuilder<Node> for PulsechainFirehoseExecutorBuilder
 where

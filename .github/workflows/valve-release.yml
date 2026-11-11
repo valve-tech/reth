@@ -111,7 +111,9 @@ jobs:
           # default `cargo build` needs LLVM + GMP that neither these runners nor
           # the boxes carry. The boxes build with exactly this set, and the JIT
           # stays off at runtime regardless, so this IS the fleet binary.
-          cargo build --release --bin reth --target "$TARGET" \
+          # The fleet's node is the `pulse-reth` binary. `bin/reth` is stock upstream reth,
+          # which has no PulseChain chain, Firehose or msgboard.
+          cargo build --release --bin pulse-reth --target "$TARGET" \
             --no-default-features \
             --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
 
@@ -123,7 +125,7 @@ jobs:
           MAX_GLIBC: "2.36"
         run: |
           set -euo pipefail
-          BIN="target/${TARGET}/release/reth"
+          BIN="target/${TARGET}/release/pulse-reth"
           need=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
           test -n "$need" || { echo "::error::found no GLIBC symbol versions in $BIN"; exit 1; }
           echo "binary needs glibc >= $need (limit $MAX_GLIBC)"
@@ -140,13 +142,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          BIN="target/${TARGET}/release/reth"
+          BIN="target/${TARGET}/release/pulse-reth"
           test -x "$BIN" || { echo "::error::no binary at $BIN"; exit 1; }
           # Smoke the binary on the two targets that can execute here (the
           # linux-arm64 runner is native arm64, macos-14 is native Apple
           # Silicon), so a broken build can't ship silently.
-          "$BIN" --version || { echo "::error::reth --version failed"; exit 1; }
-          tar -czf "dist/reth-${TAG}-${TARGET}.tar.gz" -C "target/${TARGET}/release" reth
+          "$BIN" --version || { echo "::error::pulse-reth --version failed"; exit 1; }
+          # Stock reth also passes --version. Only our binary lists the PulseChain chain.
+          "$BIN" node --help | grep -q pulsechain || { echo "::error::$BIN does not know --chain pulsechain"; exit 1; }
+          # The archive keeps the binary name `reth`, so the fleet's install path is unchanged.
+          mkdir -p stage && cp "$BIN" stage/reth
+          tar -czf "dist/reth-${TAG}-${TARGET}.tar.gz" -C stage reth
           # sha256sum is GNU-only; the macos-14 runner has `shasum -a 256`. Both
           # emit the same "<hash>  <file>" format, so the combined SHA256SUMS
           # stays uniform and `sha256sum -c`-verifiable.

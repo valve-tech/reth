@@ -93,7 +93,7 @@ jobs:
         # GMP/MPFR that the runner lacks. Check the config the fleet actually deploys:
         # --no-default-features + the v2.3-era feature set (verified to build without LLVM,
         # matches deploy.config.yaml rethBuildFeatures). Harmless on 2.2/2.3 (same set).
-        run: cargo check -p reth --no-default-features --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
+        run: cargo check -p reth -p pulse-reth --all-targets --no-default-features --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
 
       # Test our crates.
       #

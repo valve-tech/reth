@@ -87,7 +87,7 @@ fn evm2_resolves_to_streamingfast_fork() {
 /// Structural guard: the EVM config a firehose node actually builds must never expose a JIT
 /// backend, and must not acquire one when asked to.
 ///
-/// This mirrors `FirehoseExecutorBuilder::build_evm` (`bin/reth/src/firehose.rs`), which wraps
+/// This mirrors `FirehoseExecutorBuilder::build_evm` (`bin/pulse-reth/src/firehose.rs`), which wraps
 /// `EthEvmConfig::new(...)` — whose default factory is `alloy_evm::EthEvmFactory`, not reth's
 /// `RethEvmFactory` — so revmc is structurally absent from a firehose node's type graph.
 ///

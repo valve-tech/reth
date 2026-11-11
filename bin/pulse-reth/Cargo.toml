@@ -1,0 +1,88 @@
+[package]
+name = "pulse-reth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Reth for PulseChain and Ethereum, with Firehose and msgboard"
+default-run = "pulse-reth"
+
+# The fleet's node. `bin/reth` stays stock upstream, so upstream merges never touch it.
+# Its features forward to `reth`'s, so the same feature names select the same build.
+
+[lints]
+workspace = true
+
+[dependencies]
+reth = { path = "../reth", default-features = false }
+
+# reth
+reth-chainspec.workspace = true
+reth-cli-util.workspace = true
+reth-ethereum-cli.workspace = true
+reth-ethereum-forks.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-network = { workspace = true, features = ["serde"] }
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-node-core.workspace = true
+reth-node-ethereum.workspace = true
+reth-primitives-traits.workspace = true
+reth-rpc-builder.workspace = true
+reth-rpc-server-types.workspace = true
+reth-transaction-pool.workspace = true
+
+# pulsechain and valve
+reth-firehose.workspace = true
+reth-msgboard.workspace = true
+reth-pulsechain-node.workspace = true
+
+# misc
+alloy-consensus.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+eyre.workspace = true
+firehose-tracer.workspace = true
+tracing.workspace = true
+
+[features]
+default = [
+    "jemalloc",
+    "otlp",
+    "otlp-logs",
+    "js-tracer",
+    "jit",
+    "keccak-cache-global",
+    "asm-keccak",
+    "gmp",
+    "min-trace-logs",
+    "portable",
+]
+
+jit = ["reth/jit"]
+gmp = ["reth/gmp"]
+otlp = ["reth/otlp"]
+otlp-logs = ["reth/otlp-logs"]
+js-tracer = ["reth/js-tracer"]
+dev = ["reth/dev"]
+asm-keccak = ["reth/asm-keccak"]
+portable = ["reth/portable"]
+keccak-cache-global = ["reth/keccak-cache-global"]
+jemalloc = ["reth/jemalloc"]
+jemalloc-prof = ["reth/jemalloc-prof"]
+jemalloc-symbols = ["reth/jemalloc-symbols"]
+tracy-allocator = ["reth/tracy-allocator"]
+tracy = ["reth/tracy"]
+snmalloc = ["reth/snmalloc"]
+snmalloc-native = ["reth/snmalloc-native"]
+min-error-logs = ["reth/min-error-logs", "tracing/release_max_level_error"]
+min-warn-logs = ["reth/min-warn-logs", "tracing/release_max_level_warn"]
+min-info-logs = ["reth/min-info-logs", "tracing/release_max_level_info"]
+min-debug-logs = ["reth/min-debug-logs", "tracing/release_max_level_debug"]
+min-trace-logs = ["reth/min-trace-logs", "tracing/release_max_level_trace"]
+trie-debug = ["reth/trie-debug"]
+
+[[bin]]
+name = "pulse-reth"
+path = "src/main.rs"

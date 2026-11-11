@@ -11,7 +11,7 @@
 //!
 //! # This is the ONLY place the fork adds a gas margin
 //!
-//! It is installed from `bin/reth/src/main.rs` on the `PulseChain` node path
+//! It is installed from `bin/pulse-reth/src/main.rs` on the `PulseChain` node path
 //! alone, which is what keeps Ethereum mainnet on stock estimates.
 //!
 //! A second margin once existed inside the SHARED core estimator
