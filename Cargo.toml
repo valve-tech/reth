@@ -160,7 +160,7 @@ members = [
     "crates/net/msgboard-types",
     "crates/net/msgboard",
 ]
-default-members = ["bin/reth"]
+default-members = ["bin/reth", "bin/pulse-reth"]
 exclude = ["docs/cli"]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
