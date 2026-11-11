@@ -36,6 +36,7 @@ reth-transaction-pool.workspace = true
 
 # pulsechain and valve
 reth-firehose.workspace = true
+reth-firehose-health.workspace = true
 reth-msgboard.workspace = true
 reth-pulsechain-node.workspace = true
 

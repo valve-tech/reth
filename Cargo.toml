@@ -53,6 +53,7 @@ members = [
     "crates/exex/test-utils/",
     "crates/exex/types/",
     "crates/firehose",
+    "crates/firehose-health",
     "crates/firehose-tests",
     "crates/metrics/",
     "crates/net/banlist/",
@@ -685,6 +686,7 @@ ipnet = "2.11"
 firehose-tracer = "5.7.0"
 firehose-tracer-test = "5.7.0"
 reth-firehose = { path = "crates/firehose" }
+reth-firehose-health = { path = "crates/firehose-health" }
 reth-firehose-tests = { path = "crates/firehose-tests" }
 
 # evm2 is patched through its pre-transfer URL, which redirects to alloy-rs/evm2, because Cargo

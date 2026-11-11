@@ -67,6 +67,7 @@ jobs:
         run: |
           cargo fmt --check \
             -p reth-firehose \
+            -p reth-firehose-health \
             -p reth-firehose-tests \
             -p reth-pulsechain-node \
             -p reth-pulsechain-forks || true
@@ -81,6 +82,7 @@ jobs:
         run: |
           cargo clippy --no-deps \
             -p reth-firehose \
+            -p reth-firehose-health \
             -p reth-firehose-tests \
             -p reth-pulsechain-node \
             -p reth-pulsechain-forks \
@@ -107,6 +109,7 @@ jobs:
           cargo nextest run \
             --no-fail-fast \
             -p reth-firehose \
+            -p reth-firehose-health \
             -p reth-firehose-tests \
             -p reth-msgboard \
             -p reth-msgboard-types \

@@ -32,8 +32,6 @@ pub mod block_tracer;
 pub mod executor;
 /// Resolves which finalized block a Firehose block event may advertise.
 pub mod finality;
-/// thatis health.json publisher (on-disk + loopback GET).
-pub mod health;
 /// Startup module emitting `FIRE INIT` and the genesis block.
 pub mod init;
 /// Inspector module for analyzing blockchain data.
@@ -42,8 +40,6 @@ pub mod inspector;
 pub mod mapper;
 /// Prelude module with common imports and utilities.
 pub mod prelude;
-/// Firehose ExEx: publishes the thatis health.json heartbeat per committed block.
-pub mod runner;
 
 pub use block_tracer::{FirehoseBlockTracer, GlobalTracerGuard};
 pub use executor::{
@@ -53,13 +49,8 @@ pub use executor::{
 };
 pub use finality::finalized_ref_for_block;
 pub use firehose_tracer::types::FinalizedBlockRef;
-pub use health::{
-    default_health_path, resolve_replica, resolve_replica_from, write_health_json, HealthPublisher,
-    HealthStatus, HEALTH_HTTP_PATH, HEALTH_LISTEN_ADDR, HEALTH_REL_PATH,
-};
 pub use init::{emit_genesis_block_on_empty_chain, init_blockchain};
 pub use inspector::{FirehoseInspector, FramelessTx, PostTxGasAccounting};
-pub use runner::run_exex;
 
 use std::{
     io::Write,

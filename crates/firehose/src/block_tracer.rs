@@ -7,11 +7,6 @@
 //! being consumed, it emits `on_block_end(Some(err))` as a safety net so incomplete
 //! blocks are never flushed as valid.
 //!
-//! Block 0 (genesis) is NOT routed through this guard — it's emitted standalone at
-//! chain-init time by `runner::run_exex` via `tracer.on_genesis_block(...)` so the chain's
-//! pre-allocated state surfaces as a single FIRE BLOCK 0 event before any normal block
-//! execution begins. The downstream merger relies on that event as its chain anchor.
-//!
 //! This type exists so that the `on_block_end` call can be deferred until **after** all
 //! post-execution validation (receipt root, state root, consensus) has completed. Without
 //! this deferral, invalid blocks would be flushed to the downstream Firehose consumer

@@ -240,7 +240,7 @@ fn run_ethereum_node() -> eyre::Result<()> {
                     // exists, so no block is traced first. The ExEx only publishes health.
                     .on_component_initialized(|node| reth_firehose::init_blockchain(&node.provider))
                     .install_exex("firehose", |ctx| async move {
-                        Ok(async move { reth_firehose::run_exex(ctx).await })
+                        Ok(async move { reth_firehose_health::run_exex(ctx).await })
                     })
                     .launch()
                     .await?;
@@ -351,7 +351,7 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                     // exists, so no block is traced first. The ExEx only publishes health.
                     .on_component_initialized(|node| reth_firehose::init_blockchain(&node.provider))
                     .install_exex("firehose", |ctx| async move {
-                        Ok(async move { reth_firehose::run_exex(ctx).await })
+                        Ok(async move { reth_firehose_health::run_exex(ctx).await })
                     })
                     .launch()
                     .await?;

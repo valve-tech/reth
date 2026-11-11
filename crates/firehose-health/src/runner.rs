@@ -1,8 +1,8 @@
-use crate::{mapper, prelude::*};
 use futures::StreamExt;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_forks::EthereumHardforks;
 use reth_exex::{ExExContext, ExExEvent};
+use reth_firehose::{mapper, prelude::*};
 use reth_provider::{BlockNumReader, BlockReader, StateProviderFactory};
 
 /// Runs the Firehose ExEx, which publishes `health.json` for each committed block.
@@ -14,9 +14,9 @@ where
     SignedTx<Node>: mapper::SignatureFields,
 {
     let chain_id = ctx.config.chain.chain().id();
-    let replica = crate::health::resolve_replica();
+    let replica = crate::resolve_replica();
     let datadir = ctx.config.datadir().data_dir().to_path_buf();
-    let mut health = crate::health::HealthPublisher::start(&datadir, chain_id, replica)?;
+    let mut health = crate::HealthPublisher::start(&datadir, chain_id, replica)?;
 
     // `init_blockchain` (from the node builder's `on_component_initialized` hook) emits
     // FIRE INIT and the genesis block before the consensus engine starts. This ExEx only

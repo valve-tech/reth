@@ -7666,6 +7666,7 @@ dependencies = [
  "reth-ethereum-forks",
  "reth-ethereum-primitives",
  "reth-firehose",
+ "reth-firehose-health",
  "reth-msgboard",
  "reth-network",
  "reth-node-api",
@@ -9553,21 +9554,32 @@ dependencies = [
  "evm2-inspectors",
  "eyre",
  "firehose-tracer",
- "futures",
  "prost",
  "rayon",
  "reth-chainspec",
- "reth-ethereum-forks",
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
  "reth-execution-types",
- "reth-exex",
  "reth-node-api",
  "reth-primitives-traits",
  "reth-provider",
  "reth-tracing",
  "reth-trie-common",
+]
+
+[[package]]
+name = "reth-firehose-health"
+version = "2.10.0"
+dependencies = [
+ "eyre",
+ "futures",
+ "reth-chainspec",
+ "reth-ethereum-forks",
+ "reth-exex",
+ "reth-firehose",
+ "reth-provider",
+ "reth-tracing",
  "serde",
  "serde_json",
 ]
