@@ -161,6 +161,8 @@ pub struct BlockFees {
     /// pre-Cancun receipts.
     blob_gas_price: Option<U256>,
     version: evm2::Version,
+    /// The block's spec, which sets the pre-Merge block reward.
+    spec: evm2::SpecId,
 }
 
 impl BlockFees {
@@ -176,6 +178,7 @@ impl BlockFees {
             base_fee: evm_env.block_base_fee(),
             blob_gas_price,
             version,
+            spec,
         }
     }
 }
@@ -231,9 +234,9 @@ pub struct FirehoseWrappedExecutor<
     inspector: FirehoseInspector<G>,
     fees: BlockFees,
     withdrawals: Option<Withdrawals>,
-    /// Beneficiaries of the block's ommer (uncle) headers, in block-body order. Empty after the
-    /// Merge. See [`Self::with_ommer_beneficiaries`].
-    ommer_beneficiaries: Vec<Address>,
+    /// The block's ommer (uncle) headers as `(beneficiary, number)`, in block-body order. Empty
+    /// after the Merge. See [`Self::with_ommers`].
+    ommers: Vec<(Address, u64)>,
     /// Number of logs in the receipts committed so far in this block: the block-wide index of
     /// the next transaction's first log. Stays 0 on a worker wrapper, which commits nothing.
     log_index: u32,
@@ -304,19 +307,20 @@ where
             inspector,
             fees,
             withdrawals,
-            ommer_beneficiaries: Vec::new(),
+            ommers: Vec::new(),
             log_index: 0,
             extras,
             adjust,
         }
     }
 
-    /// Sets the block's ommer beneficiaries, for the `RewardMineUncle` changes emitted at finish.
+    /// Sets the block's ommers as `(beneficiary, number)` in block-body order, for the
+    /// `RewardMineUncle` changes emitted at finish.
     ///
     /// Only pre-Merge blocks have ommers. Without this the wrapper still emits the coinbase's
     /// `RewardMineBlock` change, but no uncle rewards.
-    pub fn with_ommer_beneficiaries(mut self, ommer_beneficiaries: Vec<Address>) -> Self {
-        self.ommer_beneficiaries = ommer_beneficiaries;
+    pub fn with_ommers(mut self, ommers: Vec<(Address, u64)>) -> Self {
+        self.ommers = ommers;
         self
     }
 }
@@ -333,16 +337,20 @@ where
         // The static block reward exists only before the Merge, and every post-Shanghai block
         // carries withdrawals, so a block with withdrawals has no reward to sample.
         let reward = self.withdrawals.is_none().then(|| {
+            let credits = reward_credits(
+                base_block_reward(self.fees.spec),
+                self.fees.block_number,
+                self.fees.coinbase,
+                &self.ommers,
+            );
             let evm = self.inner.evm_mut();
-            BlockRewardPreState {
-                coinbase: self.fees.coinbase,
-                coinbase_pre: account_balance(evm, self.fees.coinbase),
-                ommer_pre: self
-                    .ommer_beneficiaries
-                    .iter()
-                    .map(|&address| (address, account_balance(evm, address)))
-                    .collect(),
+            let mut pre = Vec::<(Address, U256)>::new();
+            for credit in &credits {
+                if !pre.iter().any(|(address, _)| *address == credit.address) {
+                    pre.push((credit.address, account_balance(evm, credit.address)));
+                }
             }
+            BlockRewardPreState { credits, pre }
         });
         let chain_id = self.fees.version.chain_id;
         let block_number = self.fees.block_number;
@@ -367,7 +375,7 @@ struct PostBlockPreState {
 }
 
 /// Emits the post-block changes that bypass the inspector, after the withdrawals, in this order:
-/// the block reward, the uncle rewards, then the `PrimordialPulse` transition.
+/// the uncle rewards, the block reward, then the `PrimordialPulse` transition.
 fn emit_post_block_changes<G: DerefMut<Target = firehose_tracer::Tracer>>(
     inspector: &FirehoseInspector<G>,
     pre: &PostBlockPreState,
@@ -385,14 +393,59 @@ fn emit_post_block_changes<G: DerefMut<Target = firehose_tracer::Tracer>>(
     }
 }
 
-/// Pre-finish balances of the accounts the pre-Merge block reward credits: the coinbase, and each
-/// ommer beneficiary in block-body order (Geth's firehose emits one `RewardMineUncle` change per
-/// uncle, in that order).
+/// The pre-Merge block reward credits and the pre-finish balance of each account they credit.
 #[derive(Debug)]
 struct BlockRewardPreState {
+    /// In the order Geth applies them. See [`reward_credits`].
+    credits: Vec<RewardCredit>,
+    /// Each credited account once, in first-credit order.
+    pre: Vec<(Address, U256)>,
+}
+
+/// One balance credit of the pre-Merge block reward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RewardCredit {
+    address: Address,
+    amount: U256,
+    uncle: bool,
+}
+
+/// The pre-Merge base block reward of a spec in wei, as Geth's ethash `accumulateRewards` pays it:
+/// 5 ETH, 3 ETH from Byzantium, 2 ETH from Constantinople (Petersburg here), none from the Merge.
+const fn base_block_reward(spec: evm2::SpecId) -> u128 {
+    const ETHER: u128 = 1_000_000_000_000_000_000;
+    if spec.enables(evm2::SpecId::MERGE) {
+        0
+    } else if spec.enables(evm2::SpecId::PETERSBURG) {
+        2 * ETHER
+    } else if spec.enables(evm2::SpecId::BYZANTIUM) {
+        3 * ETHER
+    } else {
+        5 * ETHER
+    }
+}
+
+/// The block reward credits in the order Geth's `accumulateRewards` applies them: one
+/// `RewardMineUncle` per ommer in block-body order, worth `(ommer + 8 - block) * base / 8`, then
+/// the coinbase's `RewardMineBlock`, worth `base + ommers * base / 32`. Empty when `base` is 0.
+fn reward_credits(
+    base: u128,
+    block_number: u64,
     coinbase: Address,
-    coinbase_pre: U256,
-    ommer_pre: Vec<(Address, U256)>,
+    ommers: &[(Address, u64)],
+) -> Vec<RewardCredit> {
+    if base == 0 {
+        return Vec::new();
+    }
+    let mut credits = Vec::with_capacity(ommers.len() + 1);
+    let mut miner = base;
+    for &(address, ommer_number) in ommers {
+        let factor = (ommer_number + 8).saturating_sub(block_number) as u128;
+        credits.push(RewardCredit { address, amount: U256::from(factor * base / 8), uncle: true });
+        miner += base / 32;
+    }
+    credits.push(RewardCredit { address: coinbase, amount: U256::from(miner), uncle: false });
+    credits
 }
 
 /// Returns an account's balance in the block's final state, or `pre` when the block left the
@@ -404,14 +457,68 @@ fn final_balance(state: &BundleState, address: Address, pre: U256) -> U256 {
     }
 }
 
-/// Emits the pre-Merge block reward (`RewardMineBlock`) and uncle rewards (`RewardMineUncle`).
+/// The balance changes for the block reward: `(address, old, new, uncle)` in Geth's order, each
+/// spanning only its own credit, so an account credited twice gets two changes.
+///
+/// The inner executor pays the reward. When every credited account's increase is zero, it paid
+/// none (a chain that replays post-Merge Ethereum blocks under a pre-Merge spec), so there is no
+/// change. When an increase differs from the computed credits in any other way, the computed
+/// split cannot be trusted, so each account gets one change over its whole increase instead, and
+/// a warning is logged.
+fn reward_balance_changes(
+    pre: &BlockRewardPreState,
+    final_of: impl Fn(Address, U256) -> U256,
+) -> Vec<(Address, U256, U256, bool)> {
+    let increase = |address: Address, before: U256| final_of(address, before).checked_sub(before);
+    let expected = |address: Address| {
+        pre.credits.iter().filter(|c| c.address == address).map(|c| c.amount).sum::<U256>()
+    };
+
+    if pre.pre.iter().all(|&(address, before)| increase(address, before) == Some(U256::ZERO)) {
+        return Vec::new();
+    }
+
+    if pre.pre.iter().all(|&(address, before)| increase(address, before) == Some(expected(address)))
+    {
+        let mut balances = pre.pre.clone();
+        return pre
+            .credits
+            .iter()
+            .map(|credit| {
+                let balance = &mut balances
+                    .iter_mut()
+                    .find(|(address, _)| *address == credit.address)
+                    .expect("every credited account has a pre-finish balance")
+                    .1;
+                let old = *balance;
+                *balance += credit.amount;
+                (credit.address, old, *balance, credit.uncle)
+            })
+            .collect();
+    }
+
+    reth_tracing::tracing::warn!(
+        target: "firehose",
+        credits = ?pre.credits,
+        "block reward does not match the computed credits; emitting whole-balance changes"
+    );
+    let mut changes: Vec<(Address, U256, U256, bool)> = Vec::new();
+    for credit in &pre.credits {
+        if changes.iter().any(|(address, ..)| *address == credit.address) {
+            continue;
+        }
+        let before =
+            pre.pre.iter().find(|(a, _)| *a == credit.address).map(|p| p.1).unwrap_or_default();
+        changes.push((credit.address, before, final_of(credit.address, before), credit.uncle));
+    }
+    changes
+}
+
+/// Emits the pre-Merge block reward: the uncle rewards (`RewardMineUncle`), then the block reward
+/// (`RewardMineBlock`), in Geth's order.
 ///
 /// The inner executor credits them during finish, outside the EVM, so the inspector never sees
-/// them. Each change is the account's pre-finish balance against its final balance.
-///
-/// Known edge case: if the coinbase is also an ommer beneficiary, both changes span the account's
-/// whole increase instead of Geth's sequential deltas. No Ethereum mainnet or `PulseChain` block is
-/// known to hit this.
+/// them. See [`reward_balance_changes`].
 fn emit_block_reward_balance_changes<G: DerefMut<Target = firehose_tracer::Tracer>>(
     inspector: &FirehoseInspector<G>,
     pre: &BlockRewardPreState,
@@ -421,16 +528,11 @@ fn emit_block_reward_balance_changes<G: DerefMut<Target = firehose_tracer::Trace
 
     let mut tracer = inspector.tracer_mut();
     // `on_balance_change` drops no-op changes itself.
-    let coinbase_post = final_balance(state, pre.coinbase, pre.coinbase_pre);
-    tracer.on_balance_change(
-        pre.coinbase,
-        pre.coinbase_pre,
-        coinbase_post,
-        Reason::RewardMineBlock,
-    );
-    for &(address, pre_balance) in &pre.ommer_pre {
-        let post_balance = final_balance(state, address, pre_balance);
-        tracer.on_balance_change(address, pre_balance, post_balance, Reason::RewardMineUncle);
+    for (address, old, new, uncle) in
+        reward_balance_changes(pre, |address, before| final_balance(state, address, before))
+    {
+        let reason = if uncle { Reason::RewardMineUncle } else { Reason::RewardMineBlock };
+        tracer.on_balance_change(address, old, new, reason);
     }
 }
 
@@ -1103,10 +1205,10 @@ where
     }
 
     let withdrawals = block.body().withdrawals().cloned();
-    let ommer_beneficiaries = block
+    let ommers = block
         .body()
         .ommers()
-        .map(|ommers| ommers.iter().map(|header| header.beneficiary()).collect())
+        .map(|ommers| ommers.iter().map(|header| (header.beneficiary(), header.number())).collect())
         .unwrap_or_default();
     let mut executor = FirehoseWrappedExecutor::with_hooks(
         inner,
@@ -1116,7 +1218,7 @@ where
         adjust,
         extras,
     )
-    .with_ommer_beneficiaries(ommer_beneficiaries);
+    .with_ommers(ommers);
     executor.apply_pre_execution_changes()?;
     for transaction in block.transactions_recovered() {
         executor.execute_transaction(transaction)?;
@@ -1394,6 +1496,136 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    mod block_reward {
+        use super::super::{
+            base_block_reward, reward_balance_changes, reward_credits, BlockRewardPreState,
+        };
+        use alloy_primitives::{Address, U256};
+
+        const ETHER: u128 = 1_000_000_000_000_000_000;
+        const MINER: Address = Address::with_last_byte(1);
+        const UNCLE_A: Address = Address::with_last_byte(2);
+        const UNCLE_B: Address = Address::with_last_byte(3);
+
+        fn eth(numerator: u128, denominator: u128) -> U256 {
+            U256::from(numerator * ETHER / denominator)
+        }
+
+        /// Pre-state built the way `capture_post_block_pre_state` builds it.
+        fn pre_state(base: u128, ommers: &[(Address, u64)], balance: U256) -> BlockRewardPreState {
+            let credits = reward_credits(base, 100, MINER, ommers);
+            let mut pre = Vec::<(Address, U256)>::new();
+            for credit in &credits {
+                if !pre.iter().any(|(a, _)| *a == credit.address) {
+                    pre.push((credit.address, balance));
+                }
+            }
+            BlockRewardPreState { credits, pre }
+        }
+
+        /// Final balances as the inner executor leaves them: each credit added to its account.
+        fn paid(pre: &BlockRewardPreState) -> impl Fn(Address, U256) -> U256 + '_ {
+            move |address, before| {
+                before +
+                    pre.credits
+                        .iter()
+                        .filter(|c| c.address == address)
+                        .map(|c| c.amount)
+                        .sum::<U256>()
+            }
+        }
+
+        #[test]
+        fn base_reward_follows_the_spec() {
+            assert_eq!(base_block_reward(evm2::SpecId::FRONTIER), 5 * ETHER);
+            assert_eq!(base_block_reward(evm2::SpecId::SPURIOUS_DRAGON), 5 * ETHER);
+            assert_eq!(base_block_reward(evm2::SpecId::BYZANTIUM), 3 * ETHER);
+            assert_eq!(base_block_reward(evm2::SpecId::PETERSBURG), 2 * ETHER);
+            assert_eq!(base_block_reward(evm2::SpecId::LONDON), 2 * ETHER);
+            assert_eq!(base_block_reward(evm2::SpecId::MERGE), 0);
+            assert_eq!(base_block_reward(evm2::SpecId::SHANGHAI), 0);
+        }
+
+        /// Geth credits each uncle in block-body order, then the miner.
+        #[test]
+        fn uncles_come_first_with_geth_amounts() {
+            let credits = reward_credits(3 * ETHER, 100, MINER, &[(UNCLE_A, 99), (UNCLE_B, 98)]);
+            let got: Vec<_> = credits.iter().map(|c| (c.address, c.amount, c.uncle)).collect();
+            assert_eq!(
+                got,
+                vec![
+                    (UNCLE_A, eth(21, 8), true),         // (99 + 8 - 100) * 3 / 8
+                    (UNCLE_B, eth(18, 8), true),         // (98 + 8 - 100) * 3 / 8
+                    (MINER, eth(3 * 32 + 6, 32), false), // 3 + 2 * 3 / 32
+                ]
+            );
+        }
+
+        #[test]
+        fn no_reward_after_the_merge() {
+            assert!(reward_credits(0, 100, MINER, &[(UNCLE_A, 99)]).is_empty());
+        }
+
+        /// Each change spans only its own credit, so the ordinals and values match Geth's.
+        #[test]
+        fn changes_are_sequential_per_credit() {
+            let start = U256::from(7u64);
+            let pre = pre_state(2 * ETHER, &[(UNCLE_A, 99)], start);
+            let changes = reward_balance_changes(&pre, paid(&pre));
+            let uncle = eth(14, 8);
+            let miner = eth(2 * 32 + 2, 32);
+            assert_eq!(
+                changes,
+                vec![(UNCLE_A, start, start + uncle, true), (MINER, start, start + miner, false)]
+            );
+        }
+
+        /// Two uncles with one beneficiary give two changes, the second starting where the first
+        /// ended.
+        #[test]
+        fn an_account_credited_twice_gets_two_changes() {
+            let pre = pre_state(2 * ETHER, &[(UNCLE_A, 99), (UNCLE_A, 98)], U256::ZERO);
+            let changes = reward_balance_changes(&pre, paid(&pre));
+            let (first, second) = (eth(14, 8), eth(12, 8));
+            assert_eq!(changes[0], (UNCLE_A, U256::ZERO, first, true));
+            assert_eq!(changes[1], (UNCLE_A, first, first + second, true));
+            assert_eq!(changes[2].0, MINER);
+            assert_eq!(changes.len(), 3);
+        }
+
+        /// A miner that is also an uncle beneficiary: the uncle credit first, then the block
+        /// reward on top of it.
+        #[test]
+        fn a_miner_that_is_also_an_uncle_beneficiary() {
+            let pre = pre_state(2 * ETHER, &[(MINER, 99)], U256::ZERO);
+            let changes = reward_balance_changes(&pre, paid(&pre));
+            let (uncle, miner) = (eth(14, 8), eth(2 * 32 + 2, 32));
+            assert_eq!(
+                changes,
+                vec![(MINER, U256::ZERO, uncle, true), (MINER, uncle, uncle + miner, false)]
+            );
+        }
+
+        /// A chain that replays post-Merge Ethereum blocks under a pre-Merge spec pays nothing.
+        #[test]
+        fn nothing_paid_means_no_change() {
+            let pre = pre_state(2 * ETHER, &[(UNCLE_A, 99)], U256::from(5u64));
+            assert!(reward_balance_changes(&pre, |_, before| before).is_empty());
+        }
+
+        /// An increase the credits do not explain falls back to one whole-increase change per
+        /// account, so the final balances stay right.
+        #[test]
+        fn a_mismatch_falls_back_to_whole_increases() {
+            let pre = pre_state(2 * ETHER, &[(MINER, 99)], U256::ZERO);
+            let extra = U256::from(1u64);
+            let changes =
+                reward_balance_changes(&pre, |address, before| paid(&pre)(address, before) + extra);
+            let total = eth(14, 8) + eth(2 * 32 + 2, 32) + extra;
+            assert_eq!(changes, vec![(MINER, U256::ZERO, total, true)]);
+        }
+    }
     use super::*;
     use alloy_eips::eip4895::Withdrawal;
 
