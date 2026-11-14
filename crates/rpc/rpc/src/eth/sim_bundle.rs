@@ -512,6 +512,13 @@ where
     }
 }
 
+/// Converts the `timeout` override to the simulation deadline.
+///
+/// The Flashbots builder and mev-share-node send the timeout in milliseconds.
+fn sim_timeout(timeout: Option<u64>) -> Duration {
+    timeout.map(Duration::from_millis).map_or(DEFAULT_SIM_TIMEOUT, |d| d.min(MAX_SIM_TIMEOUT))
+}
+
 #[async_trait::async_trait]
 impl<Eth> MevSimApiServer for EthSimBundle<Eth>
 where
@@ -525,13 +532,7 @@ where
         trace!("mev_simBundle called, request: {:?}, overrides: {:?}", request, overrides);
 
         let overrides = overrides.unwrap_or_default();
-        let override_timeout = overrides.timeout;
-
-        // The Flashbots builder reads the timeout in milliseconds.
-        let timeout = override_timeout
-            .map(Duration::from_millis)
-            .map(|d| d.min(MAX_SIM_TIMEOUT))
-            .unwrap_or(DEFAULT_SIM_TIMEOUT);
+        let timeout = sim_timeout(overrides.timeout);
 
         let bundle_res =
             tokio::time::timeout(timeout, Self::sim_bundle_inner(self, request, overrides, true))
@@ -998,5 +999,13 @@ mod tests {
         );
         let response = api(0).sim_bundle(bundle.into(), None).await.unwrap();
         assert_eq!(response.gas_used, 42_000);
+    }
+
+    /// mev-share-node sends `"timeout": 500`, meaning 500 ms, not 500 s.
+    #[test]
+    fn sim_timeout_reads_milliseconds() {
+        assert_eq!(sim_timeout(Some(500)), Duration::from_millis(500));
+        assert_eq!(sim_timeout(None), DEFAULT_SIM_TIMEOUT);
+        assert_eq!(sim_timeout(Some(u64::MAX)), MAX_SIM_TIMEOUT);
     }
 }
