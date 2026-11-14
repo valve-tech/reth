@@ -93,6 +93,8 @@ reth-tracing.workspace = true
 reth-node-ethereum.workspace = true
 reth-e2e-test-utils.workspace = true
 reth-firehose-tests.workspace = true
+reth-network = { workspace = true, features = ["test-utils"] }
+reth-provider = { workspace = true, features = ["test-utils"] }
 
 assert_matches.workspace = true
 eyre.workspace = true
