@@ -438,6 +438,25 @@ where
         recovered.map_err(|err| NewPayloadError::Other(err.into()).into())
     }
 
+    /// Core logic for validating the builder submission v2
+    async fn validate_builder_submission_v2(
+        &self,
+        request: BuilderBlockValidationRequestV2,
+    ) -> Result<(), ValidationApiError> {
+        let block = self.recover_payload(ExecutionData {
+            payload: ExecutionPayload::V2(request.request.execution_payload),
+            sidecar: ExecutionPayloadSidecar::none(),
+        })?;
+
+        self.validate_message_against_block(
+            block,
+            request.request.message,
+            request.registered_gas_limit,
+            None,
+        )
+        .await
+    }
+
     /// Core logic for validating the builder submission v3
     async fn validate_builder_submission_v3(
         &self,
@@ -602,12 +621,14 @@ where
         Err(internal_rpc_err("unimplemented"))
     }
 
+    /// Validates a block submitted to the relay
     async fn validate_builder_submission_v2(
         &self,
-        _request: BuilderBlockValidationRequestV2,
+        request: BuilderBlockValidationRequestV2,
     ) -> RpcResult<()> {
-        warn!(target: "rpc::flashbots", "Method `flashbots_validateBuilderSubmissionV2` is not supported");
-        Err(internal_rpc_err("unimplemented"))
+        let this = self.clone();
+        let validation = async move { Self::validate_builder_submission_v2(&this, request).await };
+        self.spawn_validation(validation).await
     }
 
     /// Validates a block submitted to the relay
@@ -838,16 +859,23 @@ mod tests {
         hash_disallow_list, validate_message_against_payload, AddressSet, ValidationApi,
         ValidationApiConfig, ValidationApiError,
     };
-    use alloy_consensus::{BlockHeader, Header};
+    use alloy_consensus::{BlockHeader, Header, EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
     use alloy_primitives::{Address, B256, U256};
-    use alloy_rpc_types_beacon::relay::BidTrace;
-    use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload, ExecutionPayloadV1};
+    use alloy_rpc_types_beacon::relay::{
+        BidTrace, BuilderBlockValidationRequestV2, SignedBidSubmissionV2,
+    };
+    use alloy_rpc_types_engine::{
+        ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV1,
+        ExecutionPayloadV2,
+    };
     use evm2::evm::AccountInfo;
+    use reth_chainspec::MAINNET;
     use reth_consensus::noop::NoopConsensus;
     use reth_engine_primitives::PayloadValidator;
     use reth_errors::ConsensusError;
     use reth_ethereum_engine_primitives::EthPayloadTypes;
-    use reth_ethereum_primitives::Block;
+    use reth_ethereum_payload_builder::validator::ensure_well_formed_payload;
+    use reth_ethereum_primitives::{Block, BlockBody};
     use reth_evm_ethereum::EthEvmConfig;
     use reth_execution_types::BlockExecutionOutput;
     use reth_payload_primitives::NewPayloadError;
@@ -1230,5 +1258,257 @@ mod tests {
             },
         );
         state
+    }
+
+    /// Converts payloads the way the Ethereum engine validator does, which is also the one
+    /// `PulsechainNode` installs.
+    #[derive(Debug)]
+    struct EthereumRulesPayloadValidator;
+
+    impl PayloadValidator<EthPayloadTypes> for EthereumRulesPayloadValidator {
+        type Block = Block;
+
+        fn convert_payload_to_block(
+            &self,
+            payload: ExecutionData,
+        ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
+            ensure_well_formed_payload(MAINNET.clone(), payload).map_err(Into::into)
+        }
+    }
+
+    /// Mainnet runs Shanghai and not yet Cancun at this timestamp, like `PulseChain` today.
+    const CAPELLA_TIMESTAMP: u64 = 1_700_000_000;
+    /// Mainnet runs Cancun at this timestamp.
+    const DENEB_TIMESTAMP: u64 = 1_720_000_000;
+
+    /// A V2 submission of an empty block on top of a parent known to the provider.
+    fn v2_submission(timestamp: u64) -> (MockEthProvider, BuilderBlockValidationRequestV2) {
+        let provider = MockEthProvider::default();
+
+        let parent = Header {
+            gas_limit: 30_000_000,
+            timestamp: timestamp - 10,
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(EMPTY_ROOT_HASH),
+            ..Default::default()
+        };
+        let parent = SealedHeader::seal_slow(parent);
+        provider.add_block(
+            parent.hash(),
+            Block { header: parent.clone_header(), body: Default::default() },
+        );
+
+        let header = Header {
+            parent_hash: parent.hash(),
+            number: parent.number() + 1,
+            gas_limit: parent.gas_limit(),
+            timestamp,
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(EMPTY_ROOT_HASH),
+            transactions_root: EMPTY_ROOT_HASH,
+            receipts_root: EMPTY_ROOT_HASH,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            ..Default::default()
+        };
+        let block = Block {
+            header,
+            body: BlockBody { withdrawals: Some(Default::default()), ..Default::default() },
+        };
+        provider.state_roots.lock().push(block.header.state_root);
+        let execution_payload = ExecutionPayloadV2::from_block_slow(&block);
+
+        let message = BidTrace {
+            parent_hash: parent.hash(),
+            block_hash: execution_payload.payload_inner.block_hash,
+            gas_limit: block.header.gas_limit,
+            gas_used: block.header.gas_used,
+            proposer_fee_recipient: Address::repeat_byte(0x42),
+            value: U256::ZERO,
+            ..Default::default()
+        };
+
+        let request = BuilderBlockValidationRequestV2 {
+            request: SignedBidSubmissionV2 {
+                message,
+                execution_payload,
+                signature: Default::default(),
+            },
+            registered_gas_limit: block.header.gas_limit,
+        };
+        (provider, request)
+    }
+
+    fn v2_validation_api(
+        provider: MockEthProvider,
+    ) -> ValidationApi<MockEthProvider, EthEvmConfig, EthPayloadTypes> {
+        ValidationApi::new(
+            provider,
+            NoopConsensus::arc(),
+            EthEvmConfig::mainnet(),
+            ValidationApiConfig::default(),
+            Runtime::test(),
+            Arc::new(EthereumRulesPayloadValidator),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_v2_accepts_a_capella_block() {
+        let (provider, request) = v2_submission(CAPELLA_TIMESTAMP);
+
+        v2_validation_api(provider).validate_builder_submission_v2(request).await.unwrap();
+    }
+
+    /// A V2 payload has no Cancun fields, so it must not pass once Cancun is active.
+    #[tokio::test]
+    async fn test_v2_rejects_a_block_after_cancun() {
+        let (provider, request) = v2_submission(DENEB_TIMESTAMP);
+
+        let err =
+            v2_validation_api(provider).validate_builder_submission_v2(request).await.unwrap_err();
+
+        assert!(matches!(err, ValidationApiError::Payload(_)), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_v2_rejects_an_unpaid_bid() {
+        let (provider, mut request) = v2_submission(CAPELLA_TIMESTAMP);
+        request.request.message.value = U256::from(1_000_000_000_000_000_000u64);
+
+        let err =
+            v2_validation_api(provider).validate_builder_submission_v2(request).await.unwrap_err();
+
+        assert!(matches!(err, ValidationApiError::ProposerPayment), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_v2_rejects_a_gas_limit_off_the_registered_target() {
+        let (provider, mut request) = v2_submission(CAPELLA_TIMESTAMP);
+        request.registered_gas_limit = 60_000_000;
+
+        let err =
+            v2_validation_api(provider).validate_builder_submission_v2(request).await.unwrap_err();
+
+        assert!(matches!(err, ValidationApiError::GasLimitMismatch(_)), "unexpected error: {err}");
+    }
+
+    /// The body `mev-boost-relay` sends: a Capella `SubmitBlockRequest` with
+    /// `registered_gas_limit` beside it.
+    #[test]
+    fn test_v2_request_decodes_the_relay_wire_format() {
+        let json = r#"{
+            "message": {
+                "slot": "1",
+                "parent_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "block_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+                "builder_pubkey": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "proposer_pubkey": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "proposer_fee_recipient": "0x4242424242424242424242424242424242424242",
+                "gas_limit": "30000000",
+                "gas_used": "0",
+                "value": "1000"
+            },
+            "execution_payload": {
+                "parent_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "fee_recipient": "0x4242424242424242424242424242424242424242",
+                "state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "receipts_root": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                "logs_bloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "prev_randao": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "block_number": "2",
+                "gas_limit": "30000000",
+                "gas_used": "0",
+                "timestamp": "1700000000",
+                "extra_data": "0x",
+                "base_fee_per_gas": "7",
+                "block_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+                "transactions": [],
+                "withdrawals": [
+                    {"index": "1", "validator_index": "2", "address": "0x4242424242424242424242424242424242424242", "amount": "3"}
+                ]
+            },
+            "signature": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "registered_gas_limit": "30000000"
+        }"#;
+
+        let request: BuilderBlockValidationRequestV2 = serde_json::from_str(json).unwrap();
+
+        assert_eq!(request.registered_gas_limit, 30_000_000);
+        assert_eq!(request.request.message.value, U256::from(1000));
+        assert_eq!(request.request.execution_payload.payload_inner.timestamp, 1_700_000_000);
+        assert_eq!(request.request.execution_payload.withdrawals.len(), 1);
+        assert_eq!(request.request.execution_payload.withdrawals[0].amount, 3);
+    }
+
+    /// Converts `PulseChain` testnet block 25,731,855 (one transaction, 16 withdrawals), taken
+    /// from a live node, into the V2 payload a builder would submit for it.
+    fn pulsechain_testnet_payload() -> ExecutionPayloadV2 {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            block: alloy_rpc_types_eth::Block,
+            raw_txs: Vec<alloy_primitives::Bytes>,
+        }
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../testdata/pulsechain-testnet-block-25731855.json"
+        ))
+        .unwrap();
+
+        let transactions = fixture
+            .raw_txs
+            .iter()
+            .map(|raw| {
+                <reth_ethereum_primitives::TransactionSigned as alloy_eips::Decodable2718>::decode_2718(
+                    &mut raw.as_ref(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let block = Block {
+            header: fixture.block.header.inner,
+            body: BlockBody {
+                transactions,
+                ommers: Default::default(),
+                withdrawals: fixture.block.withdrawals,
+            },
+        };
+        ExecutionPayloadV2::from_block_unchecked(fixture.block.header.hash, &block)
+    }
+
+    fn ensure_pulsechain_testnet_payload(
+        payload: ExecutionPayloadV2,
+    ) -> Result<SealedBlock<Block>, alloy_rpc_types_engine::PayloadError> {
+        ensure_well_formed_payload(
+            reth_pulsechain_forks::chainspec::PULSECHAIN_TESTNET_V4.clone(),
+            ExecutionData {
+                payload: ExecutionPayload::V2(payload),
+                sidecar: ExecutionPayloadSidecar::none(),
+            },
+        )
+    }
+
+    /// `PulseChain`'s own rules accept a V2 payload of a real block, and recompute its hash.
+    #[test]
+    fn test_v2_accepts_a_real_pulsechain_testnet_block() {
+        let payload = pulsechain_testnet_payload();
+        let expected = payload.payload_inner.block_hash;
+
+        let block = ensure_pulsechain_testnet_payload(payload).unwrap();
+
+        assert_eq!(block.hash(), expected);
+        assert_eq!(block.body().withdrawals.as_ref().map(|w| w.len()), Some(16));
+    }
+
+    /// The same block with one withdrawal changed no longer matches its hash.
+    #[test]
+    fn test_v2_rejects_a_tampered_pulsechain_testnet_block() {
+        let mut payload = pulsechain_testnet_payload();
+        payload.withdrawals[0].amount += 1;
+
+        let err = ensure_pulsechain_testnet_payload(payload).unwrap_err();
+
+        assert!(
+            matches!(err, alloy_rpc_types_engine::PayloadError::BlockHash { .. }),
+            "unexpected error: {err}"
+        );
     }
 }

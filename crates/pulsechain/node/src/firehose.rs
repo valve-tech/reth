@@ -72,4 +72,36 @@ mod tests {
             TypeId::of::<PulsechainPostTxExtras>()
         );
     }
+
+    /// The Firehose wrapper emits the block reward only for a spec before the Merge. Through the
+    /// wrapper, the Ethereum post-Merge replay range must get the Merge spec, which pays no
+    /// reward. The `PrimordialPulse` block must get a pre-Merge spec, because it pays one.
+    #[test]
+    fn firehose_wrapper_gets_the_spec_that_gates_the_block_reward() {
+        use alloy_consensus::Header;
+        use alloy_primitives::U256;
+        use evm2::SpecId;
+        use reth_evm::{ConfigureEvm, EvmEnv};
+        use reth_pulsechain_forks::{
+            chainspec::PULSECHAIN,
+            hardfork::{ETH_MAINNET_MERGE_BLOCK, PRIMORDIAL_PULSE_MAINNET_BLOCK},
+        };
+
+        let config = FirehoseEvmConfig::new(PulsechainEvmConfig::new(PULSECHAIN.clone()));
+        let spec = |number| -> SpecId {
+            let header = Header {
+                number,
+                difficulty: U256::from(1),
+                base_fee_per_gas: Some(1),
+                ..Default::default()
+            };
+            config.evm_env(&header).unwrap().spec_id()
+        };
+
+        assert!(!spec(ETH_MAINNET_MERGE_BLOCK - 1).enables(SpecId::MERGE));
+        assert!(spec(ETH_MAINNET_MERGE_BLOCK).enables(SpecId::MERGE));
+        assert!(spec(PRIMORDIAL_PULSE_MAINNET_BLOCK - 1).enables(SpecId::MERGE));
+        assert!(!spec(PRIMORDIAL_PULSE_MAINNET_BLOCK).enables(SpecId::MERGE));
+        assert!(spec(PRIMORDIAL_PULSE_MAINNET_BLOCK + 1).enables(SpecId::MERGE));
+    }
 }

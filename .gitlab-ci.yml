@@ -1,6 +1,7 @@
 # GitLab counterpart of .github/workflows/valve-ci.yml. Keep the two step lists identical.
 default:
-  image: rust:1-bookworm
+  # Pinned: rust:1-bookworm moved to 1.100.0 on 2026-11-12 and its clippy broke CI. Bump it on purpose.
+  image: rust:1.100.0-bookworm
   interruptible: true
 
 variables:
