@@ -1639,7 +1639,7 @@ mod tests {
                 .map(|msg| serde_json::from_value(msg["hash"].clone()).unwrap())
                 .collect();
             assert!(page.len() <= limit, "a page must hold at most `limit` messages");
-            let mut sorted = page.clone();
+            let mut sorted = page;
             sorted.sort_unstable();
             if !v["next"].is_null() {
                 assert_eq!(v["next"], json!(sorted.last().unwrap()), "`next` is the last hash");
