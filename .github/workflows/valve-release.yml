@@ -93,8 +93,8 @@ jobs:
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          rustup default 1.99.1
           rustc --version
 
       # No rust-cache here: release artifacts are built cold so a poisoned

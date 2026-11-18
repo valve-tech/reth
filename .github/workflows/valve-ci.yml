@@ -45,8 +45,8 @@ jobs:
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal -c rustfmt -c clippy --no-self-update
-          rustup default stable
+          rustup toolchain install 1.99.1 --profile minimal -c rustfmt -c clippy --no-self-update
+          rustup default 1.99.1
           rustc --version
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

@@ -1,7 +1,8 @@
 # GitLab counterpart of .github/workflows/valve-ci.yml. Keep the two step lists identical.
 default:
-  # Pinned: rust:1-bookworm moved to 1.100.0 on 2026-11-12 and its clippy broke CI. Bump it on purpose.
-  image: rust:1.100.0-bookworm
+  # Pinned to the compiler the release workflow uses (valve-release.yml). 1.100.0 builds made
+  # eth_getLogs about 2x slower on 2026-11-18, so bump both together and only on purpose.
+  image: rust:1.99.1-bookworm
   interruptible: true
 
 variables:
