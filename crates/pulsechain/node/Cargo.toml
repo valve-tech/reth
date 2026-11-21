@@ -90,6 +90,10 @@ prost = "0.14"
 reth-e2e-test-utils.workspace = true
 alloy-signer-local.workspace = true
 reth-node-builder = { workspace = true, features = ["test-utils"] }
+
+# body reader test (tests/storage.rs)
+reth-db-api.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
 reth-node-core.workspace = true
 reth-rpc-api = { workspace = true, features = ["client"] }
 reth-tasks.workspace = true

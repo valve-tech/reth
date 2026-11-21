@@ -10541,6 +10541,7 @@ dependencies = [
  "reth-chainspec",
  "reth-cli",
  "reth-consensus",
+ "reth-db-api",
  "reth-e2e-test-utils",
  "reth-ethereum-cli",
  "reth-ethereum-consensus",

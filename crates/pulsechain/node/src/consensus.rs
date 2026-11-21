@@ -301,4 +301,125 @@ mod tests {
             Err(ConsensusError::WithdrawalsRootMissing)
         ));
     }
+
+    // The tests below pin the full header check, not only the withdrawals rule. They use
+    // headers that pass the base-fee and gas checks, so a later check decides the result.
+
+    /// Mainnet `PulseChain` Shanghai timestamp.
+    const PULSECHAIN_SHANGHAI: u64 = reth_pulsechain_forks::hardfork::SHANGHAI_MAINNET_TIMESTAMP;
+
+    /// A pre-merge London header that passes every check before the withdrawals rule.
+    fn london_header(
+        number: u64,
+        timestamp: u64,
+        withdrawals_root: Option<B256>,
+        blob_gas_used: Option<u64>,
+    ) -> SealedHeader {
+        SealedHeader::seal_slow(Header {
+            number,
+            timestamp,
+            withdrawals_root,
+            blob_gas_used,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(7),
+            ..Default::default()
+        })
+    }
+
+    fn consensus_for(spec: Arc<reth_chainspec::ChainSpec>) -> PulsechainConsensus {
+        PulsechainConsensus::new(Arc::new(PulsechainChainSpec::new(spec)))
+    }
+
+    /// A pre-fork header in the Shanghai gap, with its withdrawals root, is valid.
+    #[test]
+    fn pre_pp_gap_block_with_withdrawals_root_is_valid() {
+        let consensus = mainnet_consensus();
+        let h = london_header(
+            PRIMORDIAL_PULSE_MAINNET_BLOCK - 1,
+            ETH_MAINNET_SHANGHAI_TIMESTAMP + 60,
+            Some(B256::ZERO),
+            None,
+        );
+        HeaderValidator::validate_header(&consensus, &h).unwrap();
+    }
+
+    /// Pre-fork headers on 369 and 943 still get every check after the withdrawals rule.
+    ///
+    /// The timestamps sit where the chain spec's own Shanghai rule says "not active" but the
+    /// Ethereum rule says "active". Only the block number marks these headers as pre-fork.
+    /// The Cancun check must still run and reject the blob gas field.
+    #[test]
+    fn pre_pp_header_runs_the_checks_after_withdrawals() {
+        use reth_pulsechain_forks::{
+            chainspec::PULSECHAIN_TESTNET_V4, hardfork::PRIMORDIAL_PULSE_TESTNET_V4_BLOCK,
+        };
+
+        let cases = [
+            (PULSECHAIN.clone(), PRIMORDIAL_PULSE_MAINNET_BLOCK - 1, PULSECHAIN_SHANGHAI - 10),
+            (
+                PULSECHAIN_TESTNET_V4.clone(),
+                PRIMORDIAL_PULSE_TESTNET_V4_BLOCK - 1,
+                ETH_MAINNET_SHANGHAI_TIMESTAMP + 60,
+            ),
+        ];
+        for (spec, number, timestamp) in cases {
+            let consensus = consensus_for(spec);
+            let valid = london_header(number, timestamp, Some(B256::ZERO), None);
+            HeaderValidator::validate_header(&consensus, &valid).unwrap();
+
+            let blob = london_header(number, timestamp, Some(B256::ZERO), Some(0));
+            assert!(
+                matches!(
+                    HeaderValidator::validate_header(&consensus, &blob),
+                    Err(ConsensusError::BlobGasUsedUnexpected)
+                ),
+                "chain {}: a pre-fork header with a blob gas field must be rejected",
+                consensus.chain_id,
+            );
+        }
+    }
+
+    /// After `PrimordialPulse` the chain spec's Shanghai rule decides, not Ethereum's.
+    ///
+    /// The header is post-merge and before `PulseChain`'s Shanghai, so a withdrawals root is
+    /// unexpected even though Ethereum's Shanghai passed long before.
+    #[test]
+    fn post_pp_header_uses_the_pulsechain_shanghai_rule() {
+        let consensus = mainnet_consensus();
+        let post_fork = |withdrawals_root| {
+            SealedHeader::seal_slow(Header {
+                number: PRIMORDIAL_PULSE_MAINNET_BLOCK + 1,
+                timestamp: PULSECHAIN_SHANGHAI - 10,
+                withdrawals_root,
+                gas_limit: 30_000_000,
+                base_fee_per_gas: Some(7),
+                ..Default::default()
+            })
+        };
+        HeaderValidator::validate_header(&consensus, &post_fork(None)).unwrap();
+        assert!(matches!(
+            HeaderValidator::validate_header(&consensus, &post_fork(Some(B256::ZERO))),
+            Err(ConsensusError::WithdrawalsRootUnexpected)
+        ));
+    }
+
+    /// A chain spec that no `PulseChain` network claims keeps the mainnet fallback.
+    ///
+    /// Below block 17,233,000 the wrapper applies the Ethereum rule. It then drops the inner
+    /// validator's withdrawals error, and with it the checks after that error. This pins that
+    /// legacy behavior; changing it is a separate decision.
+    #[test]
+    fn unknown_chain_keeps_the_mainnet_fallback() {
+        let mut spec = (**PULSECHAIN).clone();
+        spec.chain = reth_chainspec::Chain::from_id(12_345);
+        let consensus = consensus_for(Arc::new(spec));
+
+        let h = london_header(
+            PRIMORDIAL_PULSE_MAINNET_BLOCK - 1,
+            ETH_MAINNET_SHANGHAI_TIMESTAMP + 60,
+            Some(B256::ZERO),
+            Some(0),
+        );
+        HeaderValidator::validate_header(&consensus, &h).unwrap();
+    }
 }
