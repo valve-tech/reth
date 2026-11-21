@@ -25,7 +25,7 @@ use alloy_eips::{
 };
 use alloy_primitives::U256;
 use alloy_rlp::Encodable;
-use reth_chainspec::{is_pulsechain_chain_id, ChainSpecProvider, EthChainSpec, EthereumHardforks};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_evm::{ConfigureEvm, EvmEnv, EvmTransactionValidationGasRules};
 use reth_primitives_traits::{
     transaction::error::InvalidTransactionError, Account, BlockTy, GotExpected, HeaderTy,
@@ -588,15 +588,11 @@ where
         }
 
         // Checks for chainid
-        // PulseChain: also accept chain ID 1 (Ethereum mainnet) transactions. PulseChain
-        // replayed Ethereum history, so legacy transactions signed with chain ID 1 are valid.
         if let Some(chain_id) = transaction.chain_id() &&
-            chain_id != self.chain_id()
+            chain_id != self.chain_id() &&
+            !reth_chainspec::is_pulsechain_extra_tx_chain_id(self.chain_id(), chain_id)
         {
-            let is_pulsechain = is_pulsechain_chain_id(self.chain_id());
-            if !(is_pulsechain && chain_id == 1) {
-                return Err(InvalidTransactionError::ChainIdMismatch.into())
-            }
+            return Err(InvalidTransactionError::ChainIdMismatch.into())
         }
 
         if transaction.is_eip7702() {

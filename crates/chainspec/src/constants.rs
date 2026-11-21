@@ -25,3 +25,11 @@ pub const PULSECHAIN_TESTNET_V4_CHAIN_ID: u64 = 943;
 pub const fn is_pulsechain_chain_id(chain_id: u64) -> bool {
     matches!(chain_id, PULSECHAIN_MAINNET_CHAIN_ID | PULSECHAIN_TESTNET_V4_CHAIN_ID)
 }
+
+/// Returns whether a node on `chain_id` also accepts a transaction signed for `tx_chain_id`.
+///
+/// `PulseChain` replayed Ethereum history, so a transaction signed for chain ID 1 is valid on a
+/// `PulseChain` network too. The transaction pool calls this after its own chain ID check fails.
+pub const fn is_pulsechain_extra_tx_chain_id(chain_id: u64, tx_chain_id: u64) -> bool {
+    is_pulsechain_chain_id(chain_id) && tx_chain_id == 1
+}
