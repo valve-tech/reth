@@ -8,16 +8,18 @@
 //! spec read from a genesis file has no `PrimordialPulse` entry, but the node
 //! still treats chain 369 or 943 as `PulseChain`.
 
+use reth_ethereum_forks::ChainHardforks;
+
 use crate::{
     chainspec::{PULSECHAIN_MAINNET_CHAIN_ID, PULSECHAIN_TESTNET_V4_CHAIN_ID},
     hardfork::{
-        PRIMORDIAL_PULSE_MAINNET_BLOCK, PRIMORDIAL_PULSE_MAINNET_TIMESTAMP,
+        PulsechainHardfork, PRIMORDIAL_PULSE_MAINNET_BLOCK, PRIMORDIAL_PULSE_MAINNET_TIMESTAMP,
         PRIMORDIAL_PULSE_TESTNET_V4_BLOCK, PRIMORDIAL_PULSE_TESTNET_V4_TIMESTAMP,
     },
 };
 
 /// The per-network values of one `PulseChain` network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct PulsechainNetwork {
     /// The chain ID after `PrimordialPulse`.
     pub chain_id: u64,
@@ -30,6 +32,10 @@ pub struct PulsechainNetwork {
     /// This is the live network's gas limit. reth's own default for a chain it does not
     /// name is 36M, which would vote the limit away from it.
     pub default_gas_limit: u64,
+    /// The forks this binary implements for the network, with their activations.
+    ///
+    /// The chain spec parser refuses a spec for this chain ID whose forks differ.
+    pub hardforks: fn() -> ChainHardforks,
 }
 
 /// Every `PulseChain` network this node knows.
@@ -39,12 +45,14 @@ pub const PULSECHAIN_NETWORKS: [PulsechainNetwork; 2] = [
         primordial_pulse_block: PRIMORDIAL_PULSE_MAINNET_BLOCK,
         primordial_pulse_timestamp: PRIMORDIAL_PULSE_MAINNET_TIMESTAMP,
         default_gas_limit: 45_000_000,
+        hardforks: PulsechainHardfork::mainnet,
     },
     PulsechainNetwork {
         chain_id: PULSECHAIN_TESTNET_V4_CHAIN_ID,
         primordial_pulse_block: PRIMORDIAL_PULSE_TESTNET_V4_BLOCK,
         primordial_pulse_timestamp: PRIMORDIAL_PULSE_TESTNET_V4_TIMESTAMP,
         default_gas_limit: 30_000_000,
+        hardforks: PulsechainHardfork::testnet_v4,
     },
 ];
 
@@ -60,13 +68,17 @@ mod tests {
         chainspec::{PULSECHAIN, PULSECHAIN_TESTNET_V4},
         hardfork::PulsechainHardfork,
     };
-    use reth_chainspec::{ForkCondition, Hardforks};
+    use reth_chainspec::{ForkCondition, Hardfork, Hardforks};
 
     /// Each entry agrees with its chain spec static and hardfork list.
     #[test]
     fn entries_match_the_chain_specs() {
         for spec in [&*PULSECHAIN, &*PULSECHAIN_TESTNET_V4] {
             let network = pulsechain_network(spec.chain.id()).expect("a table entry");
+            let table: Vec<_> =
+                (network.hardforks)().forks_iter().map(|(f, c)| (f.name(), c)).collect();
+            let static_spec: Vec<_> = spec.forks_iter().map(|(f, c)| (f.name(), c)).collect();
+            assert_eq!(table, static_spec, "chain {}", network.chain_id);
             assert_eq!(
                 spec.fork(PulsechainHardfork::PrimordialPulse),
                 ForkCondition::Block(network.primordial_pulse_block),

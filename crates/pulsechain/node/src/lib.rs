@@ -17,6 +17,7 @@ pub mod consensus;
 pub mod evm;
 pub mod firehose;
 pub mod fork;
+pub mod fork_check;
 pub mod gas;
 pub mod launch;
 pub mod network;

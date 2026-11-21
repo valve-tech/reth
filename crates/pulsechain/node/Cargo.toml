@@ -84,6 +84,9 @@ alloy-rpc-types-eth.workspace = true
 # error handling (ChainSpecParser::parse returns eyre::Result)
 eyre.workspace = true
 
+# peer fork ID watch (fork_check.rs)
+futures-util.workspace = true
+
 [dev-dependencies]
 alloy-chains.workspace = true
 base64 = "0.22"

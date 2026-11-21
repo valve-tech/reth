@@ -23,9 +23,9 @@ use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_msgboard::{args::MsgboardArgs, launch::MSGBOARD_RPC_NAMESPACE, MsgboardLauncher};
 use reth_node_ethereum::{node::EthereumAddOns, snap::EthereumBackfill, EthereumNode};
 use reth_pulsechain_node::{
-    consensus::PulsechainConsensus, evm::PulsechainEvmConfig, gas::install_gas_estimation_margin,
-    launch::inject_pulsechain_bootnodes_if_unset, spec::PulsechainChainSpec,
-    PulsechainChainSpecParser, PulsechainNode,
+    consensus::PulsechainConsensus, evm::PulsechainEvmConfig, fork_check::watch_peer_fork_ids,
+    gas::install_gas_estimation_margin, launch::inject_pulsechain_bootnodes_if_unset,
+    spec::PulsechainChainSpec, PulsechainChainSpecParser, PulsechainNode,
 };
 use reth_rpc_builder::install_txpool_page_rpc;
 use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection, RpcModuleValidator};
@@ -360,6 +360,10 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                     handle.node.network.clone(),
                     handle.node.provider.clone(),
                 );
+                handle.node.task_executor.spawn_task(watch_peer_fork_ids(
+                    handle.node.network.clone(),
+                    handle.node.chain_spec().inner.clone(),
+                ));
                 let exit = handle.wait_for_node_exit().await;
                 launcher.final_flush();
                 exit
@@ -391,6 +395,10 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                     handle.node.network.clone(),
                     handle.node.provider.clone(),
                 );
+                handle.node.task_executor.spawn_task(watch_peer_fork_ids(
+                    handle.node.network.clone(),
+                    handle.node.chain_spec().inner.clone(),
+                ));
                 let exit = handle.wait_for_node_exit().await;
                 launcher.final_flush();
                 exit
@@ -527,5 +535,42 @@ mod firehose_args_tests {
 
         let without = firehose_tracer_config(None);
         assert!(without.output_path.is_none());
+    }
+}
+
+#[cfg(test)]
+mod chain_arg_tests {
+    use super::*;
+    use reth_ethereum_cli::interface::Commands;
+
+    type PulseCli = Cli<PulsechainChainSpecParser, PulsechainExtArgs, ValveRpcModuleValidator>;
+
+    fn parse_node(chain: &str) -> Result<u64, clap::error::Error> {
+        let cli =
+            <PulseCli as clap::Parser>::try_parse_from(["pulse-reth", "node", "--chain", chain])?;
+        let Commands::Node(node) = cli.command else { panic!("not the node command") };
+        Ok(node.chain.inner.chain.id())
+    }
+
+    /// `pulse-reth node --chain <name>` parses for both built-in PulseChain specs. The
+    /// fork schedule check runs inside that parse.
+    #[test]
+    fn node_parses_the_built_in_pulsechain_chains() {
+        assert_eq!(parse_node("pulsechain").unwrap(), 369);
+        assert_eq!(parse_node("pulsechain-testnet-v4").unwrap(), 943);
+    }
+
+    /// The node refuses a 369 genesis file with no PrimordialPulse, and says why.
+    #[test]
+    fn node_refuses_a_pulsechain_genesis_without_primordial_pulse() {
+        let genesis =
+            r#"{"config":{"chainId":369},"gasLimit":"0x1c9c380","difficulty":"0x1","alloc":{}}"#;
+        let err = parse_node(genesis).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "chain 369 is a PulseChain network, but its chain spec has no PrimordialPulse fork"
+            ),
+            "{err}"
+        );
     }
 }

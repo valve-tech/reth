@@ -10535,6 +10535,7 @@ dependencies = [
  "evm2",
  "eyre",
  "firehose-tracer",
+ "futures-util",
  "jsonrpsee",
  "jsonrpsee-core",
  "prost",
