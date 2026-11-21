@@ -25,6 +25,11 @@ pub struct PulsechainNetwork {
     pub primordial_pulse_block: u64,
     /// The timestamp of the `PrimordialPulse` block.
     pub primordial_pulse_timestamp: u64,
+    /// The block gas limit the payload builder targets when `--builder.gaslimit` is unset.
+    ///
+    /// This is the live network's gas limit. reth's own default for a chain it does not
+    /// name is 36M, which would vote the limit away from it.
+    pub default_gas_limit: u64,
 }
 
 /// Every `PulseChain` network this node knows.
@@ -33,11 +38,13 @@ pub const PULSECHAIN_NETWORKS: [PulsechainNetwork; 2] = [
         chain_id: PULSECHAIN_MAINNET_CHAIN_ID,
         primordial_pulse_block: PRIMORDIAL_PULSE_MAINNET_BLOCK,
         primordial_pulse_timestamp: PRIMORDIAL_PULSE_MAINNET_TIMESTAMP,
+        default_gas_limit: 45_000_000,
     },
     PulsechainNetwork {
         chain_id: PULSECHAIN_TESTNET_V4_CHAIN_ID,
         primordial_pulse_block: PRIMORDIAL_PULSE_TESTNET_V4_BLOCK,
         primordial_pulse_timestamp: PRIMORDIAL_PULSE_TESTNET_V4_TIMESTAMP,
+        default_gas_limit: 30_000_000,
     },
 ];
 

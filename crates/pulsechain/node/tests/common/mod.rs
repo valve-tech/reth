@@ -103,7 +103,7 @@ pub fn pulse_spec(base: &ChainSpec, gas_limit: u64, funded: Address) -> Arc<Puls
 /// A node config shaped like a fleet node, with every port unused.
 ///
 /// `builder_gas_limit` is what `--builder.gaslimit` would be set to. `None`
-/// keeps reth's default.
+/// keeps the PulseChain default.
 pub fn node_config(
     chain_spec: Arc<PulsechainChainSpec>,
     builder_gas_limit: Option<u64>,

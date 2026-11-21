@@ -13,13 +13,12 @@ use reth_node_builder::{
 };
 use reth_node_ethereum::{
     EthEngineTypes, EthereumAddOns, EthereumEngineValidatorBuilder, EthereumEthApiBuilder,
-    EthereumPayloadBuilder,
 };
 
 use crate::{
     consensus::PulsechainConsensusBuilder, evm::PulsechainExecutorBuilder,
-    network::PulsechainNetworkBuilder, pool::PulsechainPoolBuilder, spec::PulsechainChainSpec,
-    storage::PulsechainStorage,
+    network::PulsechainNetworkBuilder, payload::PulsechainPayloadBuilder,
+    pool::PulsechainPoolBuilder, spec::PulsechainChainSpec, storage::PulsechainStorage,
 };
 
 /// Type configuration for a `PulseChain` node.
@@ -39,7 +38,7 @@ impl PulsechainNode {
     pub fn components<N>() -> ComponentsBuilder<
         N,
         PulsechainPoolBuilder,
-        BasicPayloadServiceBuilder<EthereumPayloadBuilder>,
+        BasicPayloadServiceBuilder<PulsechainPayloadBuilder>,
         PulsechainNetworkBuilder,
         PulsechainExecutorBuilder,
         PulsechainConsensusBuilder,
@@ -71,7 +70,7 @@ where
     type ComponentsBuilder = ComponentsBuilder<
         N,
         PulsechainPoolBuilder,
-        BasicPayloadServiceBuilder<EthereumPayloadBuilder>,
+        BasicPayloadServiceBuilder<PulsechainPayloadBuilder>,
         PulsechainNetworkBuilder,
         PulsechainExecutorBuilder,
         PulsechainConsensusBuilder,

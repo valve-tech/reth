@@ -37,7 +37,10 @@ use reth_node_core::{
 use reth_node_ethereum::EthEngineTypes;
 use reth_primitives_traits::{Block as _, SealedHeader};
 use reth_provider::{BlockNumReader, BlockReaderIdExt, StateProviderFactory};
-use reth_pulsechain_forks::chainspec::{PULSECHAIN, PULSECHAIN_TESTNET_V4};
+use reth_pulsechain_forks::{
+    chainspec::{PULSECHAIN, PULSECHAIN_TESTNET_V4},
+    network::pulsechain_network,
+};
 use reth_pulsechain_node::consensus::PulsechainConsensus;
 use reth_rpc_api::EngineApiClient;
 
@@ -50,7 +53,7 @@ struct Proposal {
 /// Runs one full proposal on `base`'s schedule and checks it.
 ///
 /// `builder_gas_limit` is what `--builder.gaslimit` would be set to. `None`
-/// keeps reth's default.
+/// keeps the PulseChain default from the network table.
 async fn propose_one_block(
     base: &ChainSpec,
     parent_gas_limit: u64,
@@ -159,7 +162,7 @@ async fn propose_one_block(
     let expected_gas_limit = calculate_block_gas_limit(
         parent_gas_limit,
         builder_gas_limit.unwrap_or_else(|| {
-            PayloadBuilderArgs::default().gas_limit_for(Chain::from_id(chain_id))
+            pulsechain_network(chain_id).expect("a PulseChain network").default_gas_limit
         }),
     );
     assert_eq!(inner.gas_limit, expected_gas_limit);
@@ -292,24 +295,42 @@ async fn pulsechain_943_builds_and_imports_a_block() -> eyre::Result<()> {
 
 /// Chain 369 with no `--builder.gaslimit`, as the fleet runs today.
 ///
-/// reth's default target for a chain it does not name is 36M. The live 369
-/// target is 45M, so every block we propose without the flag votes the gas
-/// limit DOWN by parent/1024. The block is still valid; the vote is the
-/// problem.
+/// The `PulseChain` payload builder targets the live 369 limit, 45M, so the
+/// limit holds. reth's own default for a chain it does not name is 36M, which
+/// would vote the limit down by parent/1024 on every block we propose.
 #[tokio::test(flavor = "multi_thread")]
-async fn pulsechain_369_without_builder_gaslimit_votes_the_limit_down() -> eyre::Result<()> {
+async fn pulsechain_369_without_builder_gaslimit_holds_the_limit() -> eyre::Result<()> {
     let proposal = propose_one_block(&PULSECHAIN, 45_000_000, None).await?;
-    assert!(proposal.gas_limit < 45_000_000, "the default target pulls the limit down");
+    assert_eq!(proposal.gas_limit, 45_000_000, "the default target is the network target");
+    Ok(())
+}
+
+/// Chain 943 with no `--builder.gaslimit`: the 30M limit holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn pulsechain_943_without_builder_gaslimit_holds_the_limit() -> eyre::Result<()> {
+    let proposal = propose_one_block(&PULSECHAIN_TESTNET_V4, 30_000_000, None).await?;
+    assert_eq!(proposal.gas_limit, 30_000_000, "the default target is the network target");
+    Ok(())
+}
+
+/// An explicit `--builder.gaslimit` still wins over the `PulseChain` default.
+///
+/// With a 36M target under a 45M parent, the block votes the limit down by
+/// parent/1024, as the flag asks.
+#[tokio::test(flavor = "multi_thread")]
+async fn pulsechain_369_explicit_builder_gaslimit_wins() -> eyre::Result<()> {
+    let proposal = propose_one_block(&PULSECHAIN, 45_000_000, Some(36_000_000)).await?;
     assert_eq!(proposal.gas_limit, 45_000_000 - 45_000_000 / 1024 + 1);
     Ok(())
 }
 
-/// The default target reth applies when `--builder.gaslimit` is unset.
+/// reth's own default target when `--builder.gaslimit` is unset.
 ///
-/// 369 and 943 are not in reth's 60M list, so both get 36M. Neither matches
-/// the live chain: 369 runs at 45M and 943 at 30M.
+/// 369 and 943 are not in reth's 60M list, so reth's default is 36M for both.
+/// Neither matches the live chain: 369 runs at 45M and 943 at 30M. That is why
+/// `PulsechainPayloadBuilder` does not use this default on `PulseChain`.
 #[test]
-fn default_builder_gas_limit_matches_neither_pulsechain_network() {
+fn reth_default_builder_gas_limit_matches_neither_pulsechain_network() {
     let args = PayloadBuilderArgs::default();
     assert_eq!(args.gas_limit_for(Chain::from_id(369)), 36_000_000);
     assert_eq!(args.gas_limit_for(Chain::from_id(943)), 36_000_000);
