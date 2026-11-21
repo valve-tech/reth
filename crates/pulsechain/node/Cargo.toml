@@ -26,6 +26,7 @@ reth-chainspec.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
+reth-db-api.workspace = true
 
 # reth — node builder machinery
 reth-node-api.workspace = true
@@ -92,7 +93,6 @@ alloy-signer-local.workspace = true
 reth-node-builder = { workspace = true, features = ["test-utils"] }
 
 # body reader test (tests/storage.rs)
-reth-db-api.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-node-core.workspace = true
 reth-rpc-api = { workspace = true, features = ["client"] }

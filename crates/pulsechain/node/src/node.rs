@@ -19,8 +19,8 @@ use reth_node_ethereum::{
 use crate::{
     consensus::PulsechainConsensusBuilder, evm::PulsechainExecutorBuilder,
     network::PulsechainNetworkBuilder, pool::PulsechainPoolBuilder, spec::PulsechainChainSpec,
+    storage::PulsechainStorage,
 };
-use reth_provider::EthStorage;
 
 /// Type configuration for a `PulseChain` node.
 ///
@@ -60,7 +60,7 @@ impl PulsechainNode {
 impl NodeTypes for PulsechainNode {
     type Primitives = EthPrimitives;
     type ChainSpec = PulsechainChainSpec;
-    type Storage = EthStorage;
+    type Storage = PulsechainStorage;
     type Payload = EthEngineTypes;
 }
 

@@ -23,6 +23,7 @@ pub mod network;
 pub mod node;
 pub mod pool;
 pub mod spec;
+pub mod storage;
 
 // Re-export the hardfork and chainspec modules so external users (and the
 // tests) can continue using `reth_pulsechain_node::chainspec::PULSECHAIN`
@@ -36,3 +37,4 @@ pub use network::PulsechainNetworkBuilder;
 pub use node::PulsechainNode;
 pub use pool::PulsechainPoolBuilder;
 pub use spec::PulsechainChainSpec;
+pub use storage::PulsechainStorage;
