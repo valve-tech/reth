@@ -94,6 +94,9 @@ reth-node-builder = { workspace = true, features = ["test-utils"] }
 
 # body reader test (tests/storage.rs)
 reth-provider = { workspace = true, features = ["test-utils"] }
+
+# pool chain ID test (tests/pool.rs)
+reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-node-core.workspace = true
 reth-rpc-api = { workspace = true, features = ["client"] }
 reth-tasks.workspace = true
