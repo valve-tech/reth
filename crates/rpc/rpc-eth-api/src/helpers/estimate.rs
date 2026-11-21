@@ -270,18 +270,6 @@ pub trait EstimateCall: Call {
             mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
         }
 
-        // NO MARGIN HERE. This estimator is shared by every chain this binary
-        // serves, so a margin added at this layer also inflates Ethereum
-        // mainnet, where it has no justification and diverges from every other
-        // provider.
-        //
-        // The fork's PulseChain margin lives at the RPC layer instead, in
-        // `reth_pulsechain_node::gas`, which is installed only on the
-        // PulseChain node path. Adding one here as well compounds: measured
-        // 2026-09-08 on a plain 21,000-gas transfer, chains 369 and 943
-        // returned 30,564 (1.4554x) against mainnet's 25,470 (1.2129x) —
-        // exactly two stacked 20% margins, from two integration commits that
-        // each believed they were adding the only one.
         Ok(U256::from(highest_gas_limit))
     }
 
