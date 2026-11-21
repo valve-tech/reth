@@ -12,10 +12,7 @@
 //! [`PulsechainChainSpecParser::parse`]: crate::cli::PulsechainChainSpecParser
 //! [`PULSECHAIN_NETWORKS`]: reth_pulsechain_forks::network::PULSECHAIN_NETWORKS
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-};
+use std::{collections::HashMap, fmt};
 
 use alloy_eips::eip7892::BlobScheduleBlobParams;
 use futures_util::StreamExt;
@@ -183,6 +180,9 @@ pub const fn is_plausible_next_fork(next: u64, head_number: u64, head_timestamp:
     }
 }
 
+/// How often [`PeerForkWatch`] may repeat its "suppressed" line, in seconds.
+pub const SUPPRESSED_LINE_INTERVAL_SECS: u64 = 60 * 60;
+
 /// What [`PeerForkWatch::observe`] asks the caller to log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerForkEvent {
@@ -191,50 +191,117 @@ pub enum PeerForkEvent {
         /// The fork's block number or timestamp.
         next: u64,
     },
-    /// The watch reached [`MAX_TRACKED_FORKS`] and ignores new values from now on.
+    /// Every slot holds a confirmed value, so the watch ignored a new one.
     Suppressed,
+}
+
+/// One tracked `next` value.
+#[derive(Debug)]
+struct Entry {
+    /// Peers counted for the value, at most [`MIN_ANNOUNCING_PEERS`]. Empty once confirmed.
+    peers: Vec<PeerId>,
+    /// Whether [`MIN_ANNOUNCING_PEERS`] distinct peers announced it.
+    confirmed: bool,
+    /// Insertion order, for eviction.
+    seq: u64,
 }
 
 /// Bounded state for the peer fork ID warning.
 ///
-/// Peers control their fork IDs, so every limit here assumes a hostile peer: the watch
-/// tracks at most [`MAX_TRACKED_FORKS`] values, keeps at most [`MIN_ANNOUNCING_PEERS`]
-/// peers per value, and warns only once that many distinct peers agree.
+/// Peers control their fork IDs, so every limit here assumes a hostile peer:
+///
+/// - Each peer counts toward one value at a time. A new announcement replaces its old one.
+/// - The watch holds at most [`MAX_TRACKED_FORKS`] values. When full, a new value evicts an
+///   unconfirmed one, so junk from a few peers cannot crowd out a real fork. It refuses a new value
+///   only when every slot is confirmed, and then says so at most once an hour.
+/// - It warns about a value only once [`MIN_ANNOUNCING_PEERS`] distinct peers announce it, and only
+///   once per value.
 #[derive(Debug, Default)]
 pub struct PeerForkWatch {
-    /// Each tracked value, with up to [`MIN_ANNOUNCING_PEERS`] peers that announced it.
-    tracked: HashMap<u64, Vec<PeerId>>,
-    /// Values already warned about.
-    warned: HashSet<u64>,
-    /// Whether the cap was hit and reported.
-    suppressed: bool,
+    tracked: HashMap<u64, Entry>,
+    /// The value each counted peer announced. Holds only peers in an unconfirmed entry.
+    peer_value: HashMap<PeerId, u64>,
+    next_seq: u64,
+    /// When the "suppressed" line was last returned, in the caller's seconds.
+    last_suppressed: Option<u64>,
 }
 
 impl PeerForkWatch {
     /// Records that `peer` announced `next`, already checked as unconfigured and plausible.
     ///
-    /// Returns the line to log, if any. It returns at most [`MAX_TRACKED_FORKS`] warnings
-    /// and one [`PeerForkEvent::Suppressed`] over its lifetime.
-    pub fn observe(&mut self, peer: PeerId, next: u64) -> Option<PeerForkEvent> {
-        if self.warned.contains(&next) {
+    /// `now` is a monotonic time in seconds. Returns the line to log, if any.
+    pub fn observe(&mut self, peer: PeerId, next: u64, now: u64) -> Option<PeerForkEvent> {
+        if self.peer_value.get(&peer) == Some(&next) {
             return None;
         }
+        self.release(peer);
+
         if !self.tracked.contains_key(&next) && self.tracked.len() >= MAX_TRACKED_FORKS {
-            if self.suppressed {
+            if !self.evict_unconfirmed() {
+                let due = self
+                    .last_suppressed
+                    .is_none_or(|last| now.saturating_sub(last) >= SUPPRESSED_LINE_INTERVAL_SECS);
+                if due {
+                    self.last_suppressed = Some(now);
+                    return Some(PeerForkEvent::Suppressed);
+                }
                 return None;
             }
-            self.suppressed = true;
-            return Some(PeerForkEvent::Suppressed);
         }
-        let peers = self.tracked.entry(next).or_default();
-        if !peers.contains(&peer) && peers.len() < MIN_ANNOUNCING_PEERS {
-            peers.push(peer);
-        }
-        if peers.len() < MIN_ANNOUNCING_PEERS {
+
+        let seq = self.next_seq;
+        let entry = self.tracked.entry(next).or_insert_with(|| Entry {
+            peers: Vec::new(),
+            confirmed: false,
+            seq,
+        });
+        if entry.confirmed {
             return None;
         }
-        self.warned.insert(next);
+        self.next_seq += 1;
+        entry.peers.push(peer);
+        if entry.peers.len() < MIN_ANNOUNCING_PEERS {
+            self.peer_value.insert(peer, next);
+            return None;
+        }
+        entry.confirmed = true;
+        for counted in entry.peers.drain(..) {
+            self.peer_value.remove(&counted);
+        }
         Some(PeerForkEvent::Warn { next })
+    }
+
+    /// Stops counting `peer`, for example when its session closes.
+    ///
+    /// Drops the peer's unconfirmed value if no other peer holds it.
+    pub fn release(&mut self, peer: PeerId) {
+        let Some(old) = self.peer_value.remove(&peer) else { return };
+        if let Some(entry) = self.tracked.get_mut(&old) {
+            entry.peers.retain(|p| *p != peer);
+            if !entry.confirmed && entry.peers.is_empty() {
+                self.tracked.remove(&old);
+            }
+        }
+    }
+
+    /// Evicts the unconfirmed entry with the fewest peers, oldest first. Returns false if
+    /// every entry is confirmed.
+    fn evict_unconfirmed(&mut self) -> bool {
+        let Some(victim) = self
+            .tracked
+            .iter()
+            .filter(|(_, entry)| !entry.confirmed)
+            .min_by_key(|(_, entry)| (entry.peers.len(), entry.seq))
+            .map(|(next, _)| *next)
+        else {
+            return false;
+        };
+        if let Some(entry) = self.tracked.remove(&victim) {
+            for peer in entry.peers {
+                self.peer_value.remove(&peer);
+            }
+        }
+        true
     }
 
     /// Returns how many distinct values the watch holds.
@@ -256,12 +323,17 @@ where
     if pulsechain_network(spec.chain.id()).is_none() {
         return;
     }
+    let started = std::time::Instant::now();
     let mut events = network.event_listener();
     let mut watch = PeerForkWatch::default();
     while let Some(event) = events.next().await {
         let info = match &event {
             NetworkEvent::ActivePeerSession { info, .. } |
             NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => info,
+            NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. }) => {
+                watch.release(*peer_id);
+                continue;
+            }
             NetworkEvent::Peer(_) => continue,
         };
         let Some(next) = unconfigured_peer_fork(&spec, info.status.forkid) else { continue };
@@ -269,7 +341,7 @@ where
         if !is_plausible_next_fork(next, head.number(), head.timestamp()) {
             continue;
         }
-        match watch.observe(info.peer_id, next) {
+        match watch.observe(info.peer_id, next, started.elapsed().as_secs()) {
             Some(PeerForkEvent::Warn { next }) => warn!(
                 target: "reth::cli",
                 chain_id = spec.chain.id(),
@@ -281,8 +353,8 @@ where
             Some(PeerForkEvent::Suppressed) => warn!(
                 target: "reth::cli",
                 chain_id = spec.chain.id(),
-                "Further fork ID warnings suppressed: peers announced more than \
-                 {MAX_TRACKED_FORKS} unconfigured forks."
+                "Further fork ID warnings suppressed: all {MAX_TRACKED_FORKS} tracked forks are \
+                 already confirmed."
             ),
             None => {}
         }
@@ -382,16 +454,20 @@ mod tests {
         assert_eq!(unconfigured_peer_fork(&MAINNET, id(1_800_000_000)), None, "not PulseChain");
     }
 
-    fn peer(n: u8) -> PeerId {
-        PeerId::repeat_byte(n)
+    fn peer(n: u16) -> PeerId {
+        let mut id = PeerId::ZERO;
+        id[..2].copy_from_slice(&n.to_be_bytes());
+        id
     }
+
+    const NEXT: u64 = 1_800_000_000;
 
     /// One peer alone never triggers a warning, however often it repeats a value.
     #[test]
     fn a_single_peer_causes_no_warning() {
         let mut watch = PeerForkWatch::default();
         for _ in 0..10 {
-            assert_eq!(watch.observe(peer(1), 1_800_000_000), None);
+            assert_eq!(watch.observe(peer(1), NEXT, 0), None);
         }
     }
 
@@ -399,36 +475,62 @@ mod tests {
     #[test]
     fn two_peers_trigger_one_warning() {
         let mut watch = PeerForkWatch::default();
-        assert_eq!(watch.observe(peer(1), 1_800_000_000), None);
-        assert_eq!(
-            watch.observe(peer(2), 1_800_000_000),
-            Some(PeerForkEvent::Warn { next: 1_800_000_000 })
-        );
-        assert_eq!(watch.observe(peer(3), 1_800_000_000), None);
+        assert_eq!(watch.observe(peer(1), NEXT, 0), None);
+        assert_eq!(watch.observe(peer(2), NEXT, 0), Some(PeerForkEvent::Warn { next: NEXT }));
+        assert_eq!(watch.observe(peer(3), NEXT, 0), None);
     }
 
-    /// A peer that cycles through many values cannot grow the state past the cap.
+    /// A peer that cycles through many values holds one slot and logs nothing.
     #[test]
-    fn one_peer_cycling_values_stays_under_the_cap() {
+    fn one_peer_cycling_values_holds_one_slot() {
         let mut watch = PeerForkWatch::default();
-        let events: Vec<_> =
-            (0..10_000).filter_map(|i| watch.observe(peer(1), 1_800_000_000 + i)).collect();
-        assert_eq!(watch.tracked(), MAX_TRACKED_FORKS);
-        assert_eq!(events, vec![PeerForkEvent::Suppressed], "one suppressed line, no warnings");
+        for i in 0..1_000 {
+            assert_eq!(watch.observe(peer(1), NEXT + i, 0), None);
+            assert!(watch.tracked() <= 1);
+        }
+        assert_eq!(watch.tracked(), 1);
     }
 
-    /// Two colluding peers cycling values log at most cap + 1 lines.
+    /// Single-peer junk in every slot does not hide a value that two peers announce.
     #[test]
-    fn two_peers_cycling_values_log_at_most_cap_plus_one_lines() {
+    fn junk_in_every_slot_does_not_hide_a_real_fork() {
+        let mut watch = PeerForkWatch::default();
+        for p in 0..MAX_TRACKED_FORKS as u16 {
+            assert_eq!(watch.observe(peer(100 + p), NEXT + 1 + u64::from(p), 0), None);
+        }
+        assert_eq!(watch.tracked(), MAX_TRACKED_FORKS);
+
+        assert_eq!(watch.observe(peer(1), NEXT, 0), None);
+        assert_eq!(watch.observe(peer(2), NEXT, 0), Some(PeerForkEvent::Warn { next: NEXT }));
+        assert_eq!(watch.tracked(), MAX_TRACKED_FORKS);
+    }
+
+    /// Two colluding peers can confirm at most the cap, then get one suppressed line an hour.
+    #[test]
+    fn colluding_peers_are_capped_and_the_suppressed_line_repeats_hourly() {
         let mut watch = PeerForkWatch::default();
         let mut lines = 0;
-        for i in 0..10_000 {
+        for i in 0..1_000 {
             for p in [1, 2] {
-                lines += usize::from(watch.observe(peer(p), 1_800_000_000 + i).is_some());
+                lines += usize::from(watch.observe(peer(p), NEXT + i, 0).is_some());
             }
         }
         assert_eq!(watch.tracked(), MAX_TRACKED_FORKS);
-        assert_eq!(lines, MAX_TRACKED_FORKS + 1);
+        assert_eq!(lines, MAX_TRACKED_FORKS + 1, "cap warnings plus one suppressed line");
+
+        let hour = SUPPRESSED_LINE_INTERVAL_SECS;
+        assert_eq!(watch.observe(peer(3), NEXT + 5_000, hour - 1), None, "within the hour");
+        assert_eq!(watch.observe(peer(4), NEXT + 5_001, hour), Some(PeerForkEvent::Suppressed));
+    }
+
+    /// A closed session releases the peer's unconfirmed value.
+    #[test]
+    fn release_drops_the_peers_value() {
+        let mut watch = PeerForkWatch::default();
+        watch.observe(peer(1), NEXT, 0);
+        assert_eq!(watch.tracked(), 1);
+        watch.release(peer(1));
+        assert_eq!(watch.tracked(), 0);
     }
 
     /// Values in the past, or too far ahead, are not plausible forks.

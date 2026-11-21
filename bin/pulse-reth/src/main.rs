@@ -554,7 +554,7 @@ mod chain_arg_tests {
         Ok(node.chain.inner.chain.id())
     }
 
-    /// `pulse-reth node --chain <name>` parses for both built-in PulseChain specs. The
+    /// `pulse-reth node --chain <name>` parses for both built-in `PulseChain` specs. The
     /// fork schedule check runs inside that parse.
     #[test]
     fn node_parses_the_built_in_pulsechain_chains() {
@@ -562,7 +562,7 @@ mod chain_arg_tests {
         assert_eq!(parse_node("pulsechain-testnet-v4").unwrap(), 943);
     }
 
-    /// The node refuses a 369 genesis file with no PrimordialPulse, and says why.
+    /// The node refuses a 369 genesis file with no `PrimordialPulse`, and says why.
     #[test]
     fn node_refuses_a_pulsechain_genesis_without_primordial_pulse() {
         let genesis =
