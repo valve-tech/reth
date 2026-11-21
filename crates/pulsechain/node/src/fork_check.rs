@@ -12,12 +12,18 @@
 //! [`PulsechainChainSpecParser::parse`]: crate::cli::PulsechainChainSpecParser
 //! [`PULSECHAIN_NETWORKS`]: reth_pulsechain_forks::network::PULSECHAIN_NETWORKS
 
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use alloy_eips::eip7892::BlobScheduleBlobParams;
 use futures_util::StreamExt;
-use reth_chainspec::{ChainSpec, ForkCondition, ForkId, Hardfork, Hardforks};
+use reth_chainspec::{ChainSpec, ForkCondition, ForkId, Hardforks};
 use reth_network::{events::PeerEvent, NetworkEvent, NetworkEventListenerProvider};
+use reth_network_peers::PeerId;
+use reth_primitives_traits::AlloyBlockHeader;
+use reth_provider::BlockReaderIdExt;
 use reth_pulsechain_forks::{
     hardfork::PulsechainHardfork,
     network::{pulsechain_network, PulsechainNetwork},
@@ -148,37 +154,137 @@ pub fn unconfigured_peer_fork(spec: &ChainSpec, peer: ForkId) -> Option<u64> {
     (!known).then_some(peer.next)
 }
 
-/// Warns once for each fork that peers announce and this binary's schedule lacks.
+/// Fork IDs encode a fork at or above this value as a timestamp, and below it as a block
+/// number. The value is Ethereum's genesis timestamp, as in go-ethereum's `forkid` package.
+const TIMESTAMP_THRESHOLD: u64 = 1_438_269_973;
+
+/// How far ahead of the head a timestamp fork may be and still count: two years.
+const TIMESTAMP_HORIZON: u64 = 2 * 365 * 24 * 60 * 60;
+
+/// How far ahead of the head a block fork may be and still count: two years of 10-second
+/// `PulseChain` slots.
+const BLOCK_HORIZON: u64 = TIMESTAMP_HORIZON / 10;
+
+/// The most distinct `next` values [`PeerForkWatch`] tracks.
+pub const MAX_TRACKED_FORKS: usize = 16;
+
+/// How many distinct peers must announce a value before [`PeerForkWatch`] warns.
+pub const MIN_ANNOUNCING_PEERS: usize = 2;
+
+/// Returns whether a peer's `next` value is a plausible upcoming fork, given our head.
 ///
-/// It never disconnects or rejects a peer. Does nothing on a chain ID with no
+/// It must be after the head and within two years of it, by timestamp or block number as the
+/// fork ID encodes it.
+pub const fn is_plausible_next_fork(next: u64, head_number: u64, head_timestamp: u64) -> bool {
+    if next >= TIMESTAMP_THRESHOLD {
+        next > head_timestamp && next - head_timestamp <= TIMESTAMP_HORIZON
+    } else {
+        next > head_number && next - head_number <= BLOCK_HORIZON
+    }
+}
+
+/// What [`PeerForkWatch::observe`] asks the caller to log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerForkEvent {
+    /// Enough distinct peers announce an unconfigured fork at `next`.
+    Warn {
+        /// The fork's block number or timestamp.
+        next: u64,
+    },
+    /// The watch reached [`MAX_TRACKED_FORKS`] and ignores new values from now on.
+    Suppressed,
+}
+
+/// Bounded state for the peer fork ID warning.
+///
+/// Peers control their fork IDs, so every limit here assumes a hostile peer: the watch
+/// tracks at most [`MAX_TRACKED_FORKS`] values, keeps at most [`MIN_ANNOUNCING_PEERS`]
+/// peers per value, and warns only once that many distinct peers agree.
+#[derive(Debug, Default)]
+pub struct PeerForkWatch {
+    /// Each tracked value, with up to [`MIN_ANNOUNCING_PEERS`] peers that announced it.
+    tracked: HashMap<u64, Vec<PeerId>>,
+    /// Values already warned about.
+    warned: HashSet<u64>,
+    /// Whether the cap was hit and reported.
+    suppressed: bool,
+}
+
+impl PeerForkWatch {
+    /// Records that `peer` announced `next`, already checked as unconfigured and plausible.
+    ///
+    /// Returns the line to log, if any. It returns at most [`MAX_TRACKED_FORKS`] warnings
+    /// and one [`PeerForkEvent::Suppressed`] over its lifetime.
+    pub fn observe(&mut self, peer: PeerId, next: u64) -> Option<PeerForkEvent> {
+        if self.warned.contains(&next) {
+            return None;
+        }
+        if !self.tracked.contains_key(&next) && self.tracked.len() >= MAX_TRACKED_FORKS {
+            if self.suppressed {
+                return None;
+            }
+            self.suppressed = true;
+            return Some(PeerForkEvent::Suppressed);
+        }
+        let peers = self.tracked.entry(next).or_default();
+        if !peers.contains(&peer) && peers.len() < MIN_ANNOUNCING_PEERS {
+            peers.push(peer);
+        }
+        if peers.len() < MIN_ANNOUNCING_PEERS {
+            return None;
+        }
+        self.warned.insert(next);
+        Some(PeerForkEvent::Warn { next })
+    }
+
+    /// Returns how many distinct values the watch holds.
+    pub fn tracked(&self) -> usize {
+        self.tracked.len()
+    }
+}
+
+/// Warns about forks that peers announce and this binary's schedule lacks.
+///
+/// It never disconnects or rejects a peer, and logs only peer IDs, never peer-supplied
+/// strings. See [`PeerForkWatch`] for the limits. Does nothing on a chain ID with no
 /// `PulseChain` network.
-pub async fn watch_peer_fork_ids<N>(network: N, spec: std::sync::Arc<ChainSpec>)
+pub async fn watch_peer_fork_ids<N, P>(network: N, provider: P, spec: std::sync::Arc<ChainSpec>)
 where
     N: NetworkEventListenerProvider,
+    P: BlockReaderIdExt,
 {
     if pulsechain_network(spec.chain.id()).is_none() {
         return;
     }
     let mut events = network.event_listener();
-    let mut warned = HashSet::new();
+    let mut watch = PeerForkWatch::default();
     while let Some(event) = events.next().await {
         let info = match &event {
             NetworkEvent::ActivePeerSession { info, .. } |
             NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => info,
             NetworkEvent::Peer(_) => continue,
         };
-        if let Some(next) = unconfigured_peer_fork(&spec, info.status.forkid) &&
-            warned.insert(next)
-        {
-            warn!(
+        let Some(next) = unconfigured_peer_fork(&spec, info.status.forkid) else { continue };
+        let Ok(Some(head)) = provider.latest_header() else { continue };
+        if !is_plausible_next_fork(next, head.number(), head.timestamp()) {
+            continue;
+        }
+        match watch.observe(info.peer_id, next) {
+            Some(PeerForkEvent::Warn { next }) => warn!(
                 target: "reth::cli",
                 chain_id = spec.chain.id(),
                 peer_id = %info.peer_id,
-                client = %info.client_version,
                 next,
-                "A peer announces a fork at {next} that this binary does not configure. \
-                 Upgrade before it activates."
-            );
+                "At least {MIN_ANNOUNCING_PEERS} peers announce a fork at {next} that this \
+                 binary does not configure. Upgrade before it activates."
+            ),
+            Some(PeerForkEvent::Suppressed) => warn!(
+                target: "reth::cli",
+                chain_id = spec.chain.id(),
+                "Further fork ID warnings suppressed: peers announced more than \
+                 {MAX_TRACKED_FORKS} unconfigured forks."
+            ),
+            None => {}
         }
     }
 }
@@ -274,5 +380,68 @@ mod tests {
         );
         assert_eq!(unconfigured_peer_fork(&PULSECHAIN, id(1_800_000_000)), Some(1_800_000_000));
         assert_eq!(unconfigured_peer_fork(&MAINNET, id(1_800_000_000)), None, "not PulseChain");
+    }
+
+    fn peer(n: u8) -> PeerId {
+        PeerId::repeat_byte(n)
+    }
+
+    /// One peer alone never triggers a warning, however often it repeats a value.
+    #[test]
+    fn a_single_peer_causes_no_warning() {
+        let mut watch = PeerForkWatch::default();
+        for _ in 0..10 {
+            assert_eq!(watch.observe(peer(1), 1_800_000_000), None);
+        }
+    }
+
+    /// The second distinct peer triggers one warning, and later peers add nothing.
+    #[test]
+    fn two_peers_trigger_one_warning() {
+        let mut watch = PeerForkWatch::default();
+        assert_eq!(watch.observe(peer(1), 1_800_000_000), None);
+        assert_eq!(
+            watch.observe(peer(2), 1_800_000_000),
+            Some(PeerForkEvent::Warn { next: 1_800_000_000 })
+        );
+        assert_eq!(watch.observe(peer(3), 1_800_000_000), None);
+    }
+
+    /// A peer that cycles through many values cannot grow the state past the cap.
+    #[test]
+    fn one_peer_cycling_values_stays_under_the_cap() {
+        let mut watch = PeerForkWatch::default();
+        let events: Vec<_> =
+            (0..10_000).filter_map(|i| watch.observe(peer(1), 1_800_000_000 + i)).collect();
+        assert_eq!(watch.tracked(), MAX_TRACKED_FORKS);
+        assert_eq!(events, vec![PeerForkEvent::Suppressed], "one suppressed line, no warnings");
+    }
+
+    /// Two colluding peers cycling values log at most cap + 1 lines.
+    #[test]
+    fn two_peers_cycling_values_log_at_most_cap_plus_one_lines() {
+        let mut watch = PeerForkWatch::default();
+        let mut lines = 0;
+        for i in 0..10_000 {
+            for p in [1, 2] {
+                lines += usize::from(watch.observe(peer(p), 1_800_000_000 + i).is_some());
+            }
+        }
+        assert_eq!(watch.tracked(), MAX_TRACKED_FORKS);
+        assert_eq!(lines, MAX_TRACKED_FORKS + 1);
+    }
+
+    /// Values in the past, or too far ahead, are not plausible forks.
+    #[test]
+    fn implausible_values_are_ignored() {
+        let (number, timestamp) = (27_900_000, 1_761_000_000);
+        assert!(is_plausible_next_fork(timestamp + 86_400, number, timestamp));
+        assert!(is_plausible_next_fork(number + 1_000, number, timestamp));
+        assert!(!is_plausible_next_fork(timestamp, number, timestamp), "at the head");
+        assert!(!is_plausible_next_fork(timestamp - 1, number, timestamp), "in the past");
+        assert!(!is_plausible_next_fork(timestamp + TIMESTAMP_HORIZON + 1, number, timestamp));
+        assert!(!is_plausible_next_fork(u64::MAX, number, timestamp));
+        assert!(!is_plausible_next_fork(number - 1, number, timestamp), "a past block");
+        assert!(!is_plausible_next_fork(number + BLOCK_HORIZON + 1, number, timestamp));
     }
 }

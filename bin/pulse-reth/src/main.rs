@@ -362,6 +362,7 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                 );
                 handle.node.task_executor.spawn_task(watch_peer_fork_ids(
                     handle.node.network.clone(),
+                    handle.node.provider.clone(),
                     handle.node.chain_spec().inner.clone(),
                 ));
                 let exit = handle.wait_for_node_exit().await;
@@ -397,6 +398,7 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                 );
                 handle.node.task_executor.spawn_task(watch_peer_fork_ids(
                     handle.node.network.clone(),
+                    handle.node.provider.clone(),
                     handle.node.chain_spec().inner.clone(),
                 ));
                 let exit = handle.wait_for_node_exit().await;
