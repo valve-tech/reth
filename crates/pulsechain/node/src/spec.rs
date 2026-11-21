@@ -47,11 +47,8 @@ use reth_chainspec::{
 };
 use reth_network_peers::NodeRecord;
 use reth_pulsechain_forks::{
-    chainspec::{PULSECHAIN_MAINNET_CHAIN_ID, PULSECHAIN_TESTNET_V4_CHAIN_ID},
-    hardfork::{
-        ETH_MAINNET_SHANGHAI_TIMESTAMP, PRIMORDIAL_PULSE_MAINNET_TIMESTAMP,
-        PRIMORDIAL_PULSE_TESTNET_V4_TIMESTAMP,
-    },
+    hardfork::ETH_MAINNET_SHANGHAI_TIMESTAMP,
+    network::{pulsechain_network, PulsechainNetwork},
 };
 
 /// Newtype wrapper around [`ChainSpec`] that overrides Shanghai detection
@@ -66,6 +63,12 @@ impl PulsechainChainSpec {
     /// Wrap an existing `ChainSpec`.
     pub const fn new(inner: Arc<ChainSpec>) -> Self {
         Self { inner }
+    }
+
+    /// Returns the `PulseChain` network this spec's chain ID names, or `None`
+    /// for any other chain.
+    pub fn pulsechain_network(&self) -> Option<&'static PulsechainNetwork> {
+        pulsechain_network(self.inner.chain().id())
     }
 }
 
@@ -119,12 +122,7 @@ impl EthereumHardforks for PulsechainChainSpec {
     /// timestamp is reached. Post-fork: delegate to the inner spec's `PulseChain`
     /// Shanghai. See module docs for the cross-over reasoning.
     fn is_shanghai_active_at_timestamp(&self, timestamp: u64) -> bool {
-        let pp_timestamp = match self.inner.chain().id() {
-            PULSECHAIN_MAINNET_CHAIN_ID => Some(PRIMORDIAL_PULSE_MAINNET_TIMESTAMP),
-            PULSECHAIN_TESTNET_V4_CHAIN_ID => Some(PRIMORDIAL_PULSE_TESTNET_V4_TIMESTAMP),
-            _ => None,
-        };
-        match pp_timestamp {
+        match self.pulsechain_network().map(|network| network.primordial_pulse_timestamp) {
             Some(pp) if timestamp < pp => timestamp >= ETH_MAINNET_SHANGHAI_TIMESTAMP,
             _ => self.inner.is_shanghai_active_at_timestamp(timestamp),
         }
