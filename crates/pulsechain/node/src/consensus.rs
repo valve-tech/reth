@@ -11,28 +11,37 @@
 //!
 //! `PulsechainConsensus` fixes this by using the Ethereum mainnet Shanghai timestamp
 //! when validating headers for pre-PrimordialPulse blocks.
+//!
+//! On a known `PulseChain` network, a pre-fork header goes to a second
+//! [`EthBeaconConsensus`] built over [`EthereumReplaySpec`]. That spec answers Shanghai by
+//! Ethereum's timestamp, so every check after the withdrawals rule still runs. This keeps
+//! the upstream `EthBeaconConsensus` unpatched.
 
+use core::fmt::Display;
 use std::{fmt, sync::Arc};
 
-use alloy_primitives::B256;
-use reth_chainspec::EthChainSpec;
+use alloy_consensus::Header;
+use alloy_eips::eip7840::BlobParams;
+use alloy_genesis::Genesis;
+use alloy_primitives::{B256, U256};
+use reth_chainspec::{
+    BaseFeeParams, Chain, DepositContract, EthChainSpec, EthereumHardfork, EthereumHardforks,
+    ForkCondition,
+};
 use reth_consensus::{
     Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom, TransactionRoot,
 };
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_execution_types::BlockExecutionResult;
+use reth_network_peers::NodeRecord;
 use reth_node_builder::{components::ConsensusBuilder, BuilderContext};
 use reth_primitives_traits::{
     Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
 
 use reth_node_builder::node::{FullNodeTypes, NodeTypes};
-use reth_pulsechain_forks::{
-    chainspec::{PULSECHAIN_MAINNET_CHAIN_ID, PULSECHAIN_TESTNET_V4_CHAIN_ID},
-    hardfork::{
-        ETH_MAINNET_SHANGHAI_TIMESTAMP, PRIMORDIAL_PULSE_MAINNET_BLOCK,
-        PRIMORDIAL_PULSE_TESTNET_V4_BLOCK,
-    },
+use reth_pulsechain_forks::hardfork::{
+    ETH_MAINNET_SHANGHAI_TIMESTAMP, PRIMORDIAL_PULSE_MAINNET_BLOCK,
 };
 
 use crate::spec::PulsechainChainSpec;
@@ -50,6 +59,10 @@ use crate::spec::PulsechainChainSpec;
 #[derive(Clone)]
 pub struct PulsechainConsensus {
     inner: EthBeaconConsensus<PulsechainChainSpec>,
+    /// Validates pre-fork headers on a known `PulseChain` network. `None` on any other
+    /// chain, where `inner` validates them.
+    replay: Option<EthBeaconConsensus<EthereumReplaySpec>>,
+    primordial_pulse_block: u64,
     chain_id: u64,
 }
 
@@ -63,24 +76,20 @@ impl PulsechainConsensus {
     /// Creates a new `PulsechainConsensus` wrapping the given `EthBeaconConsensus`.
     pub fn new(chain_spec: Arc<PulsechainChainSpec>) -> Self {
         let chain_id = chain_spec.chain().id();
+        let network = chain_spec.pulsechain_network();
+        // A chain that no PulseChain network claims falls back to the mainnet boundary:
+        // blocks below it use the Ethereum mainnet Shanghai timestamp.
+        let primordial_pulse_block =
+            network.map_or(PRIMORDIAL_PULSE_MAINNET_BLOCK, |n| n.primordial_pulse_block);
+        let replay = network
+            .map(|_| EthBeaconConsensus::new(Arc::new(EthereumReplaySpec(chain_spec.clone()))));
         let inner = EthBeaconConsensus::new(chain_spec);
-        Self { inner, chain_id }
-    }
-
-    /// Returns the `PrimordialPulse` block number for this chain.
-    const fn primordial_pulse_block(&self) -> u64 {
-        match self.chain_id {
-            PULSECHAIN_MAINNET_CHAIN_ID => PRIMORDIAL_PULSE_MAINNET_BLOCK,
-            PULSECHAIN_TESTNET_V4_CHAIN_ID => PRIMORDIAL_PULSE_TESTNET_V4_BLOCK,
-            // Unknown chain — default to mainnet boundary (safe: blocks below this
-            // threshold will use the ETH mainnet Shanghai timestamp).
-            _ => PRIMORDIAL_PULSE_MAINNET_BLOCK,
-        }
+        Self { inner, replay, primordial_pulse_block, chain_id }
     }
 
     /// Returns true if this block number falls before the `PrimordialPulse` transition.
-    fn is_pre_primordial_pulse(&self, block_number: u64) -> bool {
-        block_number < self.primordial_pulse_block()
+    const fn is_pre_primordial_pulse(&self, block_number: u64) -> bool {
+        block_number < self.primordial_pulse_block
     }
 }
 
@@ -92,6 +101,7 @@ impl<H> HeaderValidator<H> for PulsechainConsensus
 where
     H: BlockHeader,
     EthBeaconConsensus<PulsechainChainSpec>: HeaderValidator<H>,
+    EthBeaconConsensus<EthereumReplaySpec>: HeaderValidator<H>,
 {
     fn validate_header(&self, header: &SealedHeader<H>) -> Result<(), ConsensusError> {
         let block_number = header.header().number();
@@ -114,12 +124,19 @@ where
                 return Err(ConsensusError::WithdrawalsRootUnexpected);
             }
 
-            // Delegate the rest of the validation to the inner consensus.
-            // The inner validator will also check the withdrawals_root condition using the
-            // PulseChain chainspec. For timestamps in the gap this may produce a spurious
-            // WithdrawalsRootUnexpected error, so we re-map that specific error to Ok since
-            // we already validated the withdrawals_root above with the correct rule.
-            match self.inner.validate_header(header) {
+            // Delegate the rest of the validation. On a known network the replay validator
+            // applies the same Ethereum rule, so it cannot fail on withdrawals here and every
+            // later check runs.
+            //
+            // On any other chain the inner validator uses the PulseChain chainspec timestamp.
+            // For timestamps in the gap it may produce a spurious withdrawals_root error, so
+            // we re-map that specific error to Ok since we already validated the
+            // withdrawals_root above with the correct rule.
+            let result = match &self.replay {
+                Some(replay) => replay.validate_header(header),
+                None => self.inner.validate_header(header),
+            };
+            match result {
                 Ok(()) => Ok(()),
                 Err(
                     ConsensusError::WithdrawalsRootMissing |
@@ -199,6 +216,92 @@ where
             receipt_root_bloom,
             block_access_list_hash,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EthereumReplaySpec — the chain spec view for pre-fork headers
+// ---------------------------------------------------------------------------
+
+/// A [`PulsechainChainSpec`] that answers Shanghai by Ethereum's timestamp.
+///
+/// Every method delegates to the wrapped spec, except
+/// [`EthereumHardforks::is_shanghai_active_at_timestamp`]. [`PulsechainConsensus`] uses it
+/// only for headers below the `PrimordialPulse` block, which are Ethereum blocks.
+#[derive(Debug, Clone)]
+pub struct EthereumReplaySpec(Arc<PulsechainChainSpec>);
+
+impl EthereumHardforks for EthereumReplaySpec {
+    fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
+        self.0.ethereum_fork_activation(fork)
+    }
+
+    fn is_shanghai_active_at_timestamp(&self, timestamp: u64) -> bool {
+        timestamp >= ETH_MAINNET_SHANGHAI_TIMESTAMP
+    }
+}
+
+impl EthChainSpec for EthereumReplaySpec {
+    type Header = Header;
+
+    fn chain(&self) -> Chain {
+        self.0.chain()
+    }
+
+    fn chain_id(&self) -> u64 {
+        self.0.chain_id()
+    }
+
+    fn base_fee_params_at_timestamp(&self, timestamp: u64) -> BaseFeeParams {
+        self.0.base_fee_params_at_timestamp(timestamp)
+    }
+
+    fn blob_params_at_timestamp(&self, timestamp: u64) -> Option<BlobParams> {
+        self.0.blob_params_at_timestamp(timestamp)
+    }
+
+    fn deposit_contract(&self) -> Option<&DepositContract> {
+        self.0.deposit_contract()
+    }
+
+    fn genesis_hash(&self) -> B256 {
+        self.0.genesis_hash()
+    }
+
+    fn prune_delete_limit(&self) -> usize {
+        self.0.prune_delete_limit()
+    }
+
+    fn display_hardforks(&self) -> Box<dyn Display> {
+        self.0.display_hardforks()
+    }
+
+    fn genesis_header(&self) -> &Self::Header {
+        self.0.genesis_header()
+    }
+
+    fn genesis(&self) -> &Genesis {
+        self.0.genesis()
+    }
+
+    fn bootnodes(&self) -> Option<Vec<NodeRecord>> {
+        self.0.bootnodes()
+    }
+
+    fn is_optimism(&self) -> bool {
+        self.0.is_optimism()
+    }
+
+    fn is_ethereum(&self) -> bool {
+        self.0.is_ethereum()
+    }
+
+    fn final_paris_total_difficulty(&self) -> Option<U256> {
+        self.0.final_paris_total_difficulty()
+    }
+
+    fn next_block_base_fee(&self, parent: &Self::Header, target_timestamp: u64) -> Option<u64> {
+        self.0.next_block_base_fee(parent, target_timestamp)
     }
 }
 
