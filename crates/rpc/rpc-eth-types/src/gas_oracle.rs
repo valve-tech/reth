@@ -152,8 +152,7 @@ where
         // we only return more than check_block blocks' worth of prices if one or more return empty
         // transactions
         let mut current_hash = header.hash();
-        let mut results = Vec::new();
-        let mut populated_blocks = 0;
+        let mut window = TipWindow::default();
 
         // we only check a maximum of 2 * max_block_history, or the number of blocks in the chain
         let max_blocks = header.number().min(self.oracle_config.max_block_history * 2);
@@ -175,31 +174,20 @@ where
                     (parent_hash, block_values)
                 };
 
-            if block_values.is_empty() {
-                // For empty blocks, use zero gas price to signal no demand
-                results.push(U256::ZERO);
-            } else {
-                results.extend(block_values);
-                populated_blocks += 1;
-            }
+            window.push_block(block_values);
 
             // break when we have enough populated blocks
-            if populated_blocks >= self.oracle_config.blocks {
+            if window.populated_blocks >= self.oracle_config.blocks {
                 break
             }
 
             current_hash = parent_hash;
         }
 
-        // sort results then take the configured percentile result
-        let mut price = if results.is_empty() {
-            inner.last_price.price
-        } else {
-            results.sort_unstable();
-            *results.get((results.len() - 1) * self.oracle_config.percentile as usize / 100).expect(
-                "gas price index is a percent of nonzero array length, so a value always exists",
-            )
-        };
+        // Take the configured percentile of the populated blocks. With no populated block in
+        // range, keep the last price: it is the last real observed tip, or the configured
+        // default suggested fee when the oracle has no history yet.
+        let mut price = window.price(self.oracle_config.percentile, inner.last_price.price);
 
         // constrain to the max price
         if let Some(max_price) = self.oracle_config.max_price &&
@@ -384,6 +372,42 @@ where
         Ok(median)
     }
 }
+/// The tip samples that [`GasPriceOracle::suggest_tip_cap`] collects over its block window.
+///
+/// valve-tech fork: a block with no usable sample is skipped. A block has no usable sample when
+/// it is empty, or when every transaction in it pays a tip under `ignore_price` or comes from the
+/// block's coinbase. Upstream (#23094) pushes a zero for such a block instead. On a quiet chain
+/// the zeros then fill the window, the percentile lands on zero, and `eth_maxPriorityFeePerGas`
+/// answers 0 while transactions with that tip mine slowly or not at all. Geth keeps its last
+/// price for these blocks; skipping them keeps the estimate on the last real observed tip.
+#[derive(Debug, Default)]
+struct TipWindow {
+    /// The tip samples of the populated blocks.
+    samples: Vec<U256>,
+    /// The number of blocks that gave at least one sample.
+    populated_blocks: u32,
+}
+
+impl TipWindow {
+    /// Adds one block's samples. A block with no sample adds nothing.
+    fn push_block(&mut self, block_values: Vec<U256>) {
+        if block_values.is_empty() {
+            return
+        }
+        self.samples.extend(block_values);
+        self.populated_blocks += 1;
+    }
+
+    /// Returns the `percentile` sample, or `fallback` when no block gave a sample.
+    fn price(mut self, percentile: u32, fallback: U256) -> U256 {
+        if self.samples.is_empty() {
+            return fallback
+        }
+        self.samples.sort_unstable();
+        self.samples[(self.samples.len() - 1) * percentile as usize / 100]
+    }
+}
+
 /// Container type for mutable inner state of the [`GasPriceOracle`]
 #[derive(Debug)]
 struct GasPriceOracleInner {
@@ -426,5 +450,113 @@ pub struct GasCap(pub u64);
 impl Default for GasCap {
     fn default() -> Self {
         RPC_DEFAULT_GAS_CAP
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PERCENTILE: u32 = DEFAULT_GAS_PRICE_PERCENTILE;
+    const BLOCKS: u32 = DEFAULT_GAS_PRICE_BLOCKS;
+
+    fn tips(values: &[u64]) -> Vec<U256> {
+        values.iter().copied().map(U256::from).collect()
+    }
+
+    /// Runs the window the way `suggest_tip_cap` does: blocks newest first, stop once `BLOCKS`
+    /// blocks gave a sample, and never scan more than `max_blocks` blocks.
+    fn suggest(blocks: &[Vec<U256>], max_blocks: usize, last_price: U256) -> U256 {
+        let mut window = TipWindow::default();
+        for values in blocks.iter().take(max_blocks) {
+            window.push_block(values.clone());
+            if window.populated_blocks >= BLOCKS {
+                break
+            }
+        }
+        window.price(PERCENTILE, last_price)
+    }
+
+    /// The upstream algorithm before this fix: an empty block pushes a zero.
+    fn suggest_upstream(blocks: &[Vec<U256>], max_blocks: usize, last_price: U256) -> U256 {
+        let mut results = Vec::new();
+        let mut populated = 0;
+        for values in blocks.iter().take(max_blocks) {
+            if values.is_empty() {
+                results.push(U256::ZERO);
+            } else {
+                results.extend(values.iter().copied());
+                populated += 1;
+            }
+            if populated >= BLOCKS {
+                break
+            }
+        }
+        if results.is_empty() {
+            return last_price
+        }
+        results.sort_unstable();
+        results[(results.len() - 1) * PERCENTILE as usize / 100]
+    }
+
+    #[test]
+    fn all_empty_window_returns_last_good_price() {
+        let last_good = U256::from(1_008_789u64);
+        let blocks = vec![Vec::new(); 40];
+
+        assert_eq!(suggest(&blocks, 40, last_good), last_good);
+        // The fault this fixes: upstream answers zero for the same window.
+        assert_eq!(suggest_upstream(&blocks, 40, last_good), U256::ZERO);
+    }
+
+    #[test]
+    fn all_empty_window_without_history_returns_default_fee() {
+        let default_fee = GasPriceOracleResult::default().price;
+        let blocks = vec![Vec::new(); 40];
+
+        assert_eq!(suggest(&blocks, 40, default_fee), U256::from(GWEI_TO_WEI));
+
+        let configured = U256::from(7_000_000u64);
+        assert_eq!(suggest(&blocks, 40, configured), configured);
+    }
+
+    #[test]
+    fn mixed_window_ignores_empty_blocks() {
+        // 38 empty blocks and 2 populated ones, as on chain 943 after a quiet stretch.
+        let mut blocks = vec![Vec::new(); 40];
+        blocks[3] = tips(&[1_008_789, 2_000_000, 3_000_000]);
+        blocks[17] = tips(&[1_500_000]);
+
+        let price = suggest(&blocks, 40, U256::from(GWEI_TO_WEI));
+
+        // Same answer as a window that holds only the populated blocks.
+        let populated_only = vec![blocks[3].clone(), blocks[17].clone()];
+        assert_eq!(price, suggest(&populated_only, 40, U256::ZERO));
+        // samples sorted: 1_008_789, 1_500_000, 2_000_000, 3_000_000; index 3 * 60 / 100 = 1
+        assert_eq!(price, U256::from(1_500_000u64));
+        assert_eq!(suggest_upstream(&blocks, 40, U256::from(GWEI_TO_WEI)), U256::ZERO);
+    }
+
+    #[test]
+    fn mixed_window_scans_past_empty_blocks_for_enough_samples() {
+        // Upstream stops at max_blocks too; empty blocks never count toward BLOCKS.
+        let mut blocks: Vec<Vec<U256>> = Vec::new();
+        for i in 0..60u64 {
+            blocks.push(if i % 3 == 0 { tips(&[1_000_000 + i]) } else { Vec::new() });
+        }
+        let price = suggest(&blocks, 60, U256::ZERO);
+        // 20 populated blocks: tips 1_000_000 + {0, 3, ..., 57}; index 19 * 60 / 100 = 11
+        assert_eq!(price, U256::from(1_000_033u64));
+    }
+
+    #[test]
+    fn full_blocks_control_is_unchanged() {
+        let blocks: Vec<Vec<U256>> = (0..40u64)
+            .map(|i| tips(&[1_000_000 + i, 2_000_000 + i * 7, 5_000_000 + i * 13]))
+            .collect();
+        let last = U256::from(GWEI_TO_WEI);
+
+        assert_eq!(suggest(&blocks, 40, last), suggest_upstream(&blocks, 40, last));
+        assert_ne!(suggest(&blocks, 40, last), U256::ZERO);
     }
 }
