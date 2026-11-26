@@ -86,6 +86,11 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
 * Block tags: `pending` is `latest`. The node has no transaction pool, so a pending nonce or
   balance is the confirmed one; ask the node that holds your pending transactions. As reth,
   `earliest` is the earliest available block: the lowest held block, not genesis.
+* Fee estimates: `eth_maxPriorityFeePerGas` is reth's oracle over the last 20 blocks, the 60th
+  percentile of each block's three lowest tips. It skips tips under 2 wei and the transactions
+  of the block's producer, never answers below the chain's minimum tip (0.001 gwei on 943), and
+  never above 500 gwei, as reth caps it. `eth_gasPrice` adds the head's base fee. The node
+  computes the tip once per head.
 * Batches: at most 1000 requests, as geth. A larger batch gets an array of one `-32600`
   `batch too large` error with the id of its first call, as geth answers it.
 * Responses: when a batch's answers pass 25,000,000 bytes, as geth, each later answer gets

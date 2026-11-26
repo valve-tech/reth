@@ -6,7 +6,7 @@ use crate::{
     store::Store,
     testing::{world, Acct, Honest, World},
 };
-use alloy_consensus::{BlockBody, Signed, TxLegacy};
+use alloy_consensus::{transaction::SignerRecoverable, BlockBody, Signed, TxLegacy};
 use alloy_primitives::{address, Signature};
 use proptest::{collection::vec, prelude::*};
 use std::time::Duration;
@@ -2973,11 +2973,17 @@ fn cfg_943() -> LiteConfig {
 
 /// Puts a block of `transactions` on the rig's head, with the same state and a fresh timestamp.
 fn push_head(r: &Rig, transactions: Vec<TxEnvelope>) -> HeldBlock {
+    let beneficiary = r.chain.head().unwrap().header.beneficiary;
+    push_head_by(r, transactions, beneficiary)
+}
+
+fn push_head_by(r: &Rig, transactions: Vec<TxEnvelope>, beneficiary: Address) -> HeldBlock {
     let parent = r.chain.head().unwrap();
     let header = Header {
         number: parent.header.number + 1,
         parent_hash: parent.hash,
         timestamp: now(),
+        beneficiary,
         ..parent.header
     };
     let b = HeldBlock {
@@ -3296,6 +3302,97 @@ async fn the_suggested_tip_is_the_60th_percentile_of_each_blocks_three_lowest() 
     let price = call(&r.api, "eth_gasPrice", json!([])).await;
     assert_eq!(result(&price), &json!(hex_u128(6 * gwei)));
 }
+
+#[tokio::test]
+async fn the_suggested_tip_skips_dust_and_the_beneficiarys_own_transactions() {
+    let r = rig(OnMiss::Fetch, true);
+    let gwei = 1_000_000_000u128;
+    // The producer's own zero-tip transaction and a 1 wei tip would be two of the three lowest.
+    let own = legacy_tx(0, gwei);
+    let producer = own.recover_signer().unwrap();
+    let mut txs = vec![own, legacy_tx(1, gwei + 1)];
+    txs.extend((2..6).map(|i| legacy_tx(i, gwei + 7 * gwei)));
+    for _ in 0..20 {
+        push_head_by(&r, txs.clone(), producer);
+    }
+    // Only the 7 gwei tips count: the zero tip is the producer's own and the 1 wei tip is dust.
+    let tip = call(&r.api, "eth_maxPriorityFeePerGas", json!([])).await;
+    assert_eq!(result(&tip), &json!(hex_u128(7 * gwei)));
+}
+
+#[tokio::test]
+async fn the_suggested_tip_is_never_below_the_943_minimum() {
+    let r = rig(OnMiss::Fetch, true);
+    let gwei = 1_000_000_000u128;
+    for _ in 0..20 {
+        push_head(&r, (0..3).map(|i| legacy_tx(i, gwei + 1_000)).collect());
+    }
+    let tip = call(&r.api, "eth_maxPriorityFeePerGas", json!([])).await;
+    assert_eq!(result(&tip), &json!(hex_u128(1_000_000)));
+}
+
+#[tokio::test]
+async fn a_window_of_empty_blocks_suggests_the_943_minimum() {
+    let r = rig(OnMiss::Fetch, true);
+    for _ in 0..20 {
+        push_head(&r, vec![]);
+    }
+    let tip = call(&r.api, "eth_maxPriorityFeePerGas", json!([])).await;
+    assert_eq!(result(&tip), &json!(hex_u128(1_000_000)));
+}
+
+thread_local! {
+    /// Senders [`recover`] recovered on this thread.
+    pub(super) static RECOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The tip is computed once per head: later fee estimates at the same head recover no sender.
+#[tokio::test]
+async fn the_suggested_tip_is_computed_once_per_head() {
+    let r = rig(OnMiss::Fetch, true);
+    for i in 0..20 {
+        push_head(&r, (0..3).map(|j| legacy_tx(10 * i + j, 3_000_000_000)).collect());
+    }
+    let tip = call(&r.api, "eth_maxPriorityFeePerGas", json!([])).await;
+    assert_eq!(result(&tip), &json!(hex_u128(2_000_000_000)));
+    assert!(RECOVERIES.with(|n| n.get()) > 0);
+    RECOVERIES.with(|n| n.set(0));
+    let batch: Vec<Value> = (0..1000)
+        .map(|i| json!({"jsonrpc": "2.0", "id": i, "method": "eth_gasPrice", "params": []}))
+        .collect();
+    let answers = handle(&r.api, &serde_json::to_vec(&batch).unwrap()).await;
+    assert!(answers
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|a| a["result"] == json!(hex_u128(3_000_000_000))));
+    assert_eq!(result(&call(&r.api, "eth_maxPriorityFeePerGas", json!([])).await), result(&tip));
+    assert_eq!(
+        RECOVERIES.with(|n| n.get()),
+        0,
+        "a fee estimate at the same head recovered senders"
+    );
+    // A new head computes it again.
+    push_head(&r, vec![legacy_tx(999, 2_500_000_000)]);
+    result(&call(&r.api, "eth_maxPriorityFeePerGas", json!([])).await);
+    assert!(RECOVERIES.with(|n| n.get()) > 0);
+}
+
+/// As reth's oracle, the suggested tip is at most 500 gwei.
+#[tokio::test]
+async fn the_suggested_tip_is_at_most_500_gwei() {
+    let r = rig(OnMiss::Fetch, true);
+    for i in 0..3 {
+        push_head(&r, vec![legacy_tx(i, 2_000 * GWEI_TIP)]);
+    }
+    let tip = call(&r.api, "eth_maxPriorityFeePerGas", json!([])).await;
+    assert_eq!(result(&tip), &json!(hex_u128(MAX_TIP)));
+    let price = call(&r.api, "eth_gasPrice", json!([])).await;
+    assert_eq!(result(&price), &json!(hex_u128(MAX_TIP + 1_000_000_000)));
+    assert_eq!(MAX_TIP, 500 * GWEI_TIP);
+}
+
+const GWEI_TIP: u128 = 1_000_000_000;
 
 // --- fee history ---
 
