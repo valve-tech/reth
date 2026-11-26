@@ -208,7 +208,33 @@ pub const SERVED: &[&str] = &[
     "eth_gasPrice",
     "eth_maxPriorityFeePerGas",
     "eth_feeHistory",
+    "eth_getUncleCountByBlockHash",
+    "eth_getUncleCountByBlockNumber",
+    "web3_clientVersion",
+    "web3_sha3",
+    "net_listening",
+    "net_peerCount",
+    "eth_accounts",
+    "eth_mining",
+    "eth_hashrate",
 ];
+
+/// The served methods that read no block and no state: they answer with no head, and while the
+/// node is halted, and their answers outlive a halt or a re-seed.
+const NODE_ANSWERS: &[&str] = &[
+    "eth_chainId",
+    "net_version",
+    "web3_clientVersion",
+    "web3_sha3",
+    "net_listening",
+    "net_peerCount",
+    "eth_accounts",
+    "eth_mining",
+    "eth_hashrate",
+];
+
+/// The `web3_clientVersion` answer.
+const CLIENT_VERSION: &str = concat!("reth-lite/v", env!("RETH_LITE_VERSION"));
 
 /// A JSON-RPC error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +301,22 @@ impl<T: crate::net::client::Transport> ReceiptSource for crate::net::client::P2p
     }
 }
 
+/// What the RPC reads from the peer-to-peer network.
+pub trait PeerNetwork: Send + Sync {
+    /// Connected eth peers, the `net_peerCount` answer.
+    fn peer_count(&self) -> usize;
+}
+
+/// The network of a node that has no peers: nothing to count.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPeers;
+
+impl PeerNetwork for NoPeers {
+    fn peer_count(&self) -> usize {
+        0
+    }
+}
+
 /// Everything the RPC methods read.
 pub struct Api {
     cfg: LiteConfig,
@@ -289,6 +331,7 @@ pub struct Api {
     receipt_source: Arc<dyn ReceiptSource>,
     metrics: LiteMetrics,
     hot: Arc<HotSet>,
+    net: Arc<dyn PeerNetwork>,
     receipts: Mutex<ReceiptCache>,
     /// The receipt fetches running, at most one per block. Each removes itself when it ends.
     receipt_fetches: Mutex<B256Map<ReceiptFetch>>,
@@ -320,6 +363,8 @@ pub struct ApiParts {
     pub metrics: LiteMetrics,
     /// The hot set.
     pub hot: Arc<HotSet>,
+    /// The peer-to-peer network.
+    pub net: Arc<dyn PeerNetwork>,
     /// "follows <host>; finalized checked against <host>".
     pub trust_label: String,
 }
@@ -356,6 +401,7 @@ impl Api {
             receipt_source: p.receipts,
             metrics: p.metrics,
             hot: p.hot,
+            net: p.net,
             receipts: Mutex::new(ReceiptCache::default()),
             receipt_fetches: Mutex::default(),
             warming: Mutex::new(WarmQueue::default()),
@@ -396,7 +442,7 @@ impl Api {
     fn count_reply(&self, method: &str, reply: &Answer) {
         let outcome = reply.code.map_or(Outcome::Local, error_outcome);
         self.metrics.request(metric_method(method), outcome);
-        if reply.data && !matches!(method, "eth_chainId" | "net_version") {
+        if reply.data && !NODE_ANSWERS.contains(&method) {
             // State, code, bodies and receipts are checked against a block's roots. The head
             // choice, the sync status and fee estimates are not.
             let unchecked = matches!(
@@ -425,10 +471,8 @@ impl Api {
         if p.as_array().is_some_and(|a| a.len() > want) {
             return Err(RpcError::params(format!("too many arguments, want at most {want}")));
         }
-        match method {
-            "eth_chainId" => return Rendered::of(&json!(format!("{:#x}", self.cfg.chain_id))),
-            "net_version" => return Rendered::of(&json!(self.cfg.chain_id.to_string())),
-            _ => {}
+        if NODE_ANSWERS.contains(&method) {
+            return self.node_answer(method, p).and_then(|v| Rendered::of(&v));
         }
         if let Some(reason) = self.chain.halt_reason() {
             return Err(RpcError::other(halted_message(reason)));
@@ -444,6 +488,23 @@ impl Api {
             "eth_getBlockReceipts" => self.block_receipts(p, mode).await,
             _ => self.answer_value(method, p, mode).await.and_then(|v| Rendered::of(&v)),
         }
+    }
+
+    /// The answers of [`NODE_ANSWERS`], as geth gives them for a node that does not mine and holds
+    /// no keys.
+    fn node_answer(&self, method: &str, p: &Value) -> Result<Value, RpcError> {
+        Ok(match method {
+            "eth_chainId" => json!(format!("{:#x}", self.cfg.chain_id)),
+            "net_version" => json!(self.cfg.chain_id.to_string()),
+            "web3_clientVersion" => json!(CLIENT_VERSION),
+            "web3_sha3" => json!(alloy_primitives::keccak256(hex_data(p, 0)?)),
+            "net_listening" => json!(true),
+            "net_peerCount" => json!(hex_u64(self.net.peer_count() as u64)),
+            "eth_accounts" => json!([]),
+            "eth_mining" => json!(false),
+            "eth_hashrate" => json!("0x0"),
+            _ => return Err(RpcError::new(-32601, REFUSED_MESSAGE)),
+        })
     }
 
     /// The answers [`Self::dispatch`] does not render as they are built.
@@ -473,6 +534,11 @@ impl Api {
             "eth_getBlockTransactionCountByNumber" | "eth_getBlockTransactionCountByHash" => {
                 let b = self.block_param(method, p, 0)?;
                 Ok(b.map_or(Value::Null, |b| json!(hex_u64(b.body.transactions.len() as u64))))
+            }
+            // As geth: the uncles of a held block, and null for a block not held.
+            "eth_getUncleCountByBlockNumber" | "eth_getUncleCountByBlockHash" => {
+                let b = self.block_param(method, p, 0)?;
+                Ok(b.map_or(Value::Null, |b| json!(hex_u64(b.body.ommers.len() as u64))))
             }
             "eth_getTransactionByHash" => self.tx_by_hash(p),
             "eth_getTransactionByBlockHashAndIndex" | "eth_getTransactionByBlockNumberAndIndex" => {
@@ -1174,6 +1240,9 @@ fn max_params(method: &str) -> usize {
     match method {
         "eth_getBlockTransactionCountByNumber" |
         "eth_getBlockTransactionCountByHash" |
+        "eth_getUncleCountByBlockNumber" |
+        "eth_getUncleCountByBlockHash" |
+        "web3_sha3" |
         "eth_getTransactionByHash" |
         "eth_getTransactionReceipt" |
         "eth_getBlockReceipts" => 1,
@@ -1240,6 +1309,17 @@ fn parse_hex_or_decimal(s: &str) -> Option<u64> {
 fn param<T: serde::de::DeserializeOwned>(p: &Value, i: usize, what: &str) -> Result<T, RpcError> {
     let v = p.get(i).ok_or_else(|| RpcError::params(format!("missing {what}")))?;
     serde_json::from_value(v.clone()).map_err(|_| RpcError::params(format!("invalid {what}")))
+}
+
+/// Param `i` as geth's `hexutil.Bytes`: `0x` and an even number of hex digits.
+fn hex_data(p: &Value, i: usize) -> Result<Vec<u8>, RpcError> {
+    let v = p.get(i).ok_or_else(|| RpcError::params("missing data"))?;
+    let invalid = || RpcError::params("invalid data");
+    let digits = v
+        .as_str()
+        .and_then(|s| s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")))
+        .ok_or_else(invalid)?;
+    alloy_primitives::hex::decode(digits).map_err(|_| invalid())
 }
 
 fn index_param(p: &Value, i: usize) -> Result<usize, RpcError> {
@@ -1854,11 +1934,11 @@ fn drop_stale_answers(api: &Api, epoch: u64, batch: &[Value], out: &mut [Answer]
 }
 
 /// A reply to `method` with error code `code` (`None` for a result) that holds across a halt or a
-/// re-seed: the chain id, refusals of the request itself, and the server's timeout (`-32002`) and
-/// size refusals (`-32003`, `-32005`), which tell the client what to send again. Any other reply,
-/// a revert or an EVM error included, came from the chain.
-const fn outlives_chain_change(method: &str, code: Option<i64>) -> bool {
-    matches!(method.as_bytes(), b"eth_chainId" | b"net_version") ||
+/// re-seed: the [`NODE_ANSWERS`], refusals of the request itself, and the server's timeout
+/// (`-32002`) and size refusals (`-32003`, `-32005`), which tell the client what to send again. Any
+/// other reply, a revert or an EVM error included, came from the chain.
+fn outlives_chain_change(method: &str, code: Option<i64>) -> bool {
+    NODE_ANSWERS.contains(&method) ||
         matches!(code, Some(-32602..=-32600 | -32002 | -32003 | -32005))
 }
 

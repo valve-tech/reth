@@ -155,6 +155,7 @@ fn rig(mode: OnMiss, seed: bool) -> Rig {
         receipts: Arc::new(Receipts(vec![wire_receipt(21_000), wire_receipt(42_000)])),
         metrics: metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: "follows test; finalized checked against test".into(),
     })
     .unwrap();
@@ -341,14 +342,19 @@ async fn only_answers_checked_against_a_root_count_as_verified() {
         ("eth_gasPrice", json!([])),
         ("eth_maxPriorityFeePerGas", json!([])),
         ("eth_feeHistory", json!(["0x1", "latest", []])),
-        // Configuration: not counted.
+        // Configuration and node facts: not counted.
         ("eth_chainId", json!([])),
+        ("net_peerCount", json!([])),
+        ("web3_clientVersion", json!([])),
+        ("eth_accounts", json!([])),
+        // A held header, checked by its hash.
+        ("eth_getUncleCountByBlockNumber", json!(["latest"])),
     ] {
         result(&call(&api, m, p).await);
     }
     let out = handle.render();
     for line in
-        ["lite_answers_total{verified=\"true\"} 2", "lite_answers_total{verified=\"false\"} 5"]
+        ["lite_answers_total{verified=\"true\"} 3", "lite_answers_total{verified=\"false\"} 5"]
     {
         assert!(out.lines().any(|l| l == line), "{line} missing from {out}");
     }
@@ -403,6 +409,7 @@ async fn a_revert_with_complete_state_is_not_a_miss() {
         receipts: Arc::new(Receipts(vec![])),
         metrics: again.metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: String::new(),
     })
     .unwrap();
@@ -449,6 +456,7 @@ async fn a_state_window_near_u64_max_does_not_overflow() {
         receipts: Arc::new(Receipts(vec![])),
         metrics: r.metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: String::new(),
     })
     .unwrap();
@@ -513,7 +521,7 @@ async fn send_raw_transaction_and_unlisted_methods_are_refused() {
         "debug_traceTransaction",
         "eth_newFilter",
         "eth_subscribe",
-        "eth_accounts",
+        "eth_sign",
         "no_such_method",
     ] {
         let v = call(&r.api, m, json!(["0x02f8"])).await;
@@ -522,6 +530,128 @@ async fn send_raw_transaction_and_unlisted_methods_are_refused() {
     // Even with no head and when halted: a refusal never depends on state.
     let empty = rig(OnMiss::Fetch, false);
     assert_eq!(error(&call(&empty.api, "eth_sendRawTransaction", json!([])).await).0, -32601);
+}
+
+/// A network whose peer count a test sets.
+#[derive(Default)]
+struct CountedPeers(std::sync::atomic::AtomicUsize);
+
+impl PeerNetwork for CountedPeers {
+    fn peer_count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A new API over the rig's chain, store and fetcher, on `net`.
+fn api_on(r: &Rig, net: Arc<dyn PeerNetwork>) -> Arc<Api> {
+    Api::new(ApiParts {
+        cfg: cfg_943(),
+        chain: r.chain.clone(),
+        store: r.honest.store.clone(),
+        fetcher: r.honest.clone(),
+        receipts: Arc::new(Receipts(vec![wire_receipt(21_000), wire_receipt(42_000)])),
+        metrics: r.metrics.clone(),
+        hot: Arc::new(HotSet::new(0)),
+        net,
+        trust_label: String::new(),
+    })
+    .unwrap()
+}
+
+/// The node answers that no block or state decides, as geth gives them.
+fn node_answers() -> Vec<(&'static str, Value, Value)> {
+    vec![
+        ("eth_chainId", json!([]), json!("0x3af")),
+        ("net_version", json!([]), json!("943")),
+        ("web3_clientVersion", json!([]), json!(CLIENT_VERSION)),
+        (
+            "web3_sha3",
+            json!(["0x68656c6c6f20776f726c64"]),
+            json!("0x47173285a8d7341e5e972fc677286384f802f8ef42a5ec5f03bbfa254cb01fad"),
+        ),
+        ("net_listening", json!([]), json!(true)),
+        ("net_peerCount", json!([]), json!("0x0")),
+        ("eth_accounts", json!([]), json!([])),
+        ("eth_mining", json!([]), json!(false)),
+        ("eth_hashrate", json!([]), json!("0x0")),
+    ]
+}
+
+#[tokio::test]
+async fn node_answers_need_no_head_and_are_served_while_halted() {
+    assert!(CLIENT_VERSION.starts_with("reth-lite/v"), "{CLIENT_VERSION}");
+    assert!(CLIENT_VERSION.ends_with(env!("RETH_LITE_VERSION")), "{CLIENT_VERSION}");
+    let empty = rig(OnMiss::Fetch, false);
+    let halted = rig(OnMiss::Fetch, true);
+    halted.chain.set_halted(Some(HaltReason::AnchorMismatch));
+    for r in [&empty, &halted] {
+        for (m, p, want) in node_answers() {
+            assert_eq!(result(&call(&r.api, m, p).await), &want, "{m}");
+        }
+    }
+    // Every node answer is served, and each outlives a halt or a re-seed.
+    for m in NODE_ANSWERS {
+        assert!(SERVED.contains(m), "{m}");
+        assert!(outlives_chain_change(m, None), "{m}");
+    }
+    assert_eq!(node_answers().len(), NODE_ANSWERS.len());
+}
+
+#[tokio::test]
+async fn net_peer_count_is_the_live_count_of_the_network() {
+    let r = rig(OnMiss::Fetch, true);
+    let peers = Arc::new(CountedPeers::default());
+    let api = api_on(&r, peers.clone());
+    for n in [3, 0, 12] {
+        peers.0.store(n, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            result(&call(&api, "net_peerCount", json!([])).await),
+            &json!(hex_u64(n as u64))
+        );
+    }
+}
+
+#[tokio::test]
+async fn web3_sha3_takes_geths_hex_data_and_refuses_anything_else() {
+    let r = rig(OnMiss::Fetch, false);
+    let empty_hash = "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
+    assert_eq!(result(&call(&r.api, "web3_sha3", json!(["0x"])).await), empty_hash);
+    assert_eq!(
+        result(&call(&r.api, "web3_sha3", json!(["0X68656C6C6F20776F726C64"])).await),
+        "0x47173285a8d7341e5e972fc677286384f802f8ef42a5ec5f03bbfa254cb01fad"
+    );
+    assert_eq!(error(&call(&r.api, "web3_sha3", json!([])).await), (-32602, "missing data"));
+    for bad in [json!("68656c6c6f"), json!("0x123"), json!("0xzz"), json!(5), json!(null)] {
+        let v = call(&r.api, "web3_sha3", json!([bad])).await;
+        assert_eq!(error(&v), (-32602, "invalid data"), "{bad}");
+    }
+    let v = call(&r.api, "web3_sha3", json!(["0x", "0x"])).await;
+    assert_eq!(error(&v), (-32602, "too many arguments, want at most 1"));
+}
+
+#[tokio::test]
+async fn uncle_counts_are_zero_for_a_held_block_and_null_for_one_not_held() {
+    let r = rig(OnMiss::Fetch, true);
+    let head = format!("{:#x}", r.blocks[3].hash);
+    let unknown = format!("{:#x}", B256::repeat_byte(0xee));
+    for (m, p, want) in [
+        ("eth_getUncleCountByBlockNumber", json!(["latest"]), json!("0x0")),
+        ("eth_getUncleCountByBlockNumber", json!(["0x3e9"]), json!("0x0")),
+        ("eth_getUncleCountByBlockNumber", json!(["0xfffffff"]), Value::Null),
+        ("eth_getUncleCountByBlockHash", json!([head]), json!("0x0")),
+        ("eth_getUncleCountByBlockHash", json!([unknown]), Value::Null),
+    ] {
+        assert_eq!(result(&call(&r.api, m, p.clone()).await), &want, "{m} {p}");
+    }
+    // As the other block reads: reth's pruned error below the lowest held block.
+    let v = call(&r.api, "eth_getUncleCountByBlockNumber", json!(["0x1"])).await;
+    assert_eq!(v["error"], pruned(1, 1000));
+    let v = call(&r.api, "eth_getUncleCountByBlockHash", json!([])).await;
+    assert_eq!(error(&v), (-32602, "missing block parameter"));
+    // A count reads a block, so a halted node refuses it.
+    r.chain.set_halted(Some(HaltReason::AnchorMismatch));
+    let v = call(&r.api, "eth_getUncleCountByBlockNumber", json!(["latest"])).await;
+    assert_eq!(error(&v), (-32000, HALTED_MESSAGE));
 }
 
 #[tokio::test]
@@ -1252,6 +1382,7 @@ async fn a_head_not_moved_within_the_bound_is_stale() {
         receipts: Arc::new(Receipts(vec![])),
         metrics: r.metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: String::new(),
     })
     .unwrap();
@@ -1277,6 +1408,7 @@ async fn eth_syncing_reports_a_sync_whenever_the_head_is_stale() {
         receipts: Arc::new(Receipts(vec![])),
         metrics: r.metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: String::new(),
     })
     .unwrap();
@@ -1318,6 +1450,7 @@ async fn a_halt_during_a_request_is_seen_before_the_answer_goes_out() {
         receipts: Arc::new(Receipts(vec![])),
         metrics: r.metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: String::new(),
     })
     .unwrap();
@@ -1349,6 +1482,7 @@ async fn a_halt_or_reseed_during_a_batch_drops_the_answers_computed_before_it() 
             receipts: Arc::new(Receipts(vec![])),
             metrics: r.metrics.clone(),
             hot: Arc::new(HotSet::new(0)),
+            net: Arc::new(NoPeers),
             trust_label: String::new(),
         })
         .unwrap();
@@ -1396,6 +1530,7 @@ async fn a_revert_or_evm_error_computed_before_a_halt_or_reseed_is_not_sent() {
             receipts: Arc::new(Receipts(vec![])),
             metrics: r.metrics.clone(),
             hot: Arc::new(HotSet::new(0)),
+            net: Arc::new(NoPeers),
             trust_label: String::new(),
         })
         .unwrap();
@@ -1483,6 +1618,7 @@ async fn a_reseed_during_a_request_is_seen_before_the_answer_goes_out() {
         receipts: Arc::new(Receipts(vec![])),
         metrics: r.metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: String::new(),
     })
     .unwrap();
@@ -1662,6 +1798,7 @@ async fn a_body_of_many_small_values_is_charged_for_its_parsed_form() {
         receipts: Arc::new(Receipts(vec![])),
         metrics: r.metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: String::new(),
     })
     .unwrap();
@@ -2318,6 +2455,7 @@ fn warm_rig(fetcher: Arc<dyn Fetcher>) -> Rig {
         receipts: Arc::new(Receipts(vec![])),
         metrics: r.metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: String::new(),
     })
     .unwrap();
@@ -2962,6 +3100,7 @@ fn api_with(
         receipts,
         metrics: r.metrics.clone(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: String::new(),
     })
     .unwrap()

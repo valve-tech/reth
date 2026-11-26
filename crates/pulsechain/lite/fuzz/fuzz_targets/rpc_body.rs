@@ -20,7 +20,7 @@ use reth_pulsechain_lite::{
     hot_set::HotSet,
     metrics::LiteMetrics,
     net::client::WireReceipt,
-    rpc::{handle_body, Api, ApiParts, ReceiptSource, SERVED},
+    rpc::{handle_body, Api, ApiParts, NoPeers, ReceiptSource, SERVED},
     state::{Lookup, MissKey, PartialState},
     store::{NodeStore, Store},
     verify::walk_path,
@@ -154,6 +154,7 @@ fn api(seed: bool, on_miss: OnMiss) -> Arc<Api> {
         receipts: Arc::new(Receipts),
         metrics: LiteMetrics::new(),
         hot: Arc::new(HotSet::new(0)),
+        net: Arc::new(NoPeers),
         trust_label: "follows test".into(),
     })
     .expect("api")

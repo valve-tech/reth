@@ -109,6 +109,15 @@ impl Transport for AnyNet {
     }
 }
 
+impl crate::rpc::PeerNetwork for AnyNet {
+    fn peer_count(&self) -> usize {
+        match self {
+            Self::Real(n) => n.connected_peers(),
+            Self::None(_) => 0,
+        }
+    }
+}
+
 impl AnyNet {
     /// Usable peers as `(static, discovered)`.
     fn counts(&self) -> (usize, usize) {
@@ -282,6 +291,7 @@ pub async fn run(
         receipts: fetcher,
         metrics: metrics.clone(),
         hot,
+        net: net.clone(),
         trust_label: label.clone(),
     })
     .ok_or("unsupported chain")?;

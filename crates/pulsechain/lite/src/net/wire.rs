@@ -588,6 +588,11 @@ impl LiteNetwork {
         (statics, usable.len() - statics)
     }
 
+    /// Connected eth sessions, of every kind, as geth counts `net_peerCount`.
+    pub fn connected_peers(&self) -> usize {
+        self.handle.num_connected_peers()
+    }
+
     /// The node's own record (ports are the bound ones).
     pub fn local_record(&self) -> NodeRecord {
         self.handle.local_node_record()

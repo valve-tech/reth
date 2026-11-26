@@ -71,10 +71,19 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
 * Served: `eth_blockNumber eth_chainId net_version eth_syncing eth_getBalance
   eth_getTransactionCount eth_getCode eth_getStorageAt eth_call eth_estimateGas
   eth_getBlockByNumber eth_getBlockByHash eth_getBlockTransactionCountBy{Number,Hash}
-  eth_getTransactionByHash eth_getTransactionByBlock{Hash,Number}AndIndex
-  eth_getTransactionReceipt eth_getBlockReceipts eth_gasPrice eth_maxPriorityFeePerGas
-  eth_feeHistory`. `eth_feeHistory` does not take `rewardPercentiles`. Everything else,
+  eth_getUncleCountByBlock{Hash,Number} eth_getTransactionByHash
+  eth_getTransactionByBlock{Hash,Number}AndIndex eth_getTransactionReceipt
+  eth_getBlockReceipts eth_gasPrice eth_maxPriorityFeePerGas eth_feeHistory
+  web3_clientVersion web3_sha3 net_listening net_peerCount eth_accounts eth_mining
+  eth_hashrate`. `eth_feeHistory` does not take `rewardPercentiles`. Everything else,
   including `eth_sendRawTransaction`, is `-32601` `method not served`.
+* Node answers: `web3_clientVersion` is `reth-lite/v` and the version that `--version`
+  prints. `net_peerCount` is the number of connected eth peers. `net_listening` is `true`.
+  The node holds no keys and does not mine, so `eth_accounts` is `[]`, `eth_mining` is
+  `false` and `eth_hashrate` is `0x0`. These, `eth_chainId`, `net_version` and `web3_sha3`
+  read no block, so they answer before the first head and while the node is halted.
+* Uncle counts: PulseChain blocks have no uncles, so a held block answers `0x0`. A block not
+  held is `null`, as geth answers it.
 * Miss: `-32046` `state not verified locally`, `data: {"missing": N}`, in `error` and
   `error-and-warm` for state not held, and for the receipts of a held block whose receipts are
   not held. Reverts are normal answers. Blocks above the head and unknown block hashes, with
@@ -175,7 +184,7 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   but counts as unavailable, not as a proof failure. `lite_answers_total{verified="true"}` counts
   answers checked against a block's roots; `verified="false"` counts `eth_blockNumber`,
   `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas` and `eth_feeHistory`, which no root
-  checks.
+  checks. The node answers above count in neither series.
 
 ## Trust model
 
