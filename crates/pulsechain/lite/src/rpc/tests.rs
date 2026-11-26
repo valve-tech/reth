@@ -70,9 +70,20 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
+/// The key of [`sender`], an account that the rig's state holds with nonce 5 and 1 PLS.
+fn sender_key() -> secp256k1::SecretKey {
+    secp256k1::SecretKey::from_secret_bytes([0x42; 32]).unwrap()
+}
+
+fn sender() -> Address {
+    let public = sender_key().public_key().serialize_uncompressed();
+    Address::from_raw_public_key(&public[1..])
+}
+
 fn rig(mode: OnMiss, seed: bool) -> Rig {
     let w: Arc<World> = Arc::new(world(&[
         (ALICE, Acct { balance: 1_000_000_000_000_000_000, nonce: 3, ..Default::default() }),
+        (sender(), Acct { balance: 1_000_000_000_000_000_000, nonce: 5, ..Default::default() }),
         (
             VIEW,
             Acct {
@@ -512,10 +523,9 @@ async fn call_fields_that_change_the_answer_but_are_not_modelled_are_refused() {
 }
 
 #[tokio::test]
-async fn send_raw_transaction_and_unlisted_methods_are_refused() {
+async fn unlisted_methods_are_refused() {
     let r = rig(OnMiss::Fetch, true);
     for m in [
-        "eth_sendRawTransaction",
         "eth_getProof",
         "debug_traceTransaction",
         "eth_newFilter",
@@ -528,16 +538,23 @@ async fn send_raw_transaction_and_unlisted_methods_are_refused() {
     }
     // Even with no head and when halted: a refusal never depends on state.
     let empty = rig(OnMiss::Fetch, false);
-    assert_eq!(error(&call(&empty.api, "eth_sendRawTransaction", json!([])).await).0, -32601);
+    assert_eq!(error(&call(&empty.api, "eth_getProof", json!([])).await).0, -32601);
 }
 
 /// A network whose peer count a test sets.
 #[derive(Default)]
 struct CountedPeers(std::sync::atomic::AtomicUsize);
 
+#[async_trait]
 impl PeerNetwork for CountedPeers {
     fn peer_count(&self) -> usize {
         self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    async fn broadcast_transaction(
+        &self,
+        _: &[u8],
+    ) -> Result<usize, alloy_eips::eip2718::Eip2718Error> {
+        Ok(0)
     }
 }
 
@@ -3921,7 +3938,7 @@ async fn params_of_the_wrong_shape_are_refused_as_geth_does() {
     // geth looks the method up before it reads the params: an unserved method is refused as
     // unserved, whatever its params.
     for params in [json!({"tx": "0x00"}), json!(1), json!(["0x00"])] {
-        let body = req("eth_sendRawTransaction", params);
+        let body = req("eth_getProof", params);
         let v = handle(&r.api, body.as_bytes()).await;
         assert_eq!(error(&v), (-32601, REFUSED_MESSAGE), "{body}");
     }
@@ -4950,4 +4967,322 @@ async fn get_logs_takes_its_logs_only_from_receipts_that_match_the_block() {
     let short = Arc::new(Receipts(vec![wire_receipt(21_000)]));
     let api = api_with(&r, cfg_943(), r.honest.clone(), short);
     assert_eq!(error(&call(&api, "eth_getLogs", latest).await), (-32000, RECEIPTS_MISMATCH));
+}
+
+// --- eth_sendRawTransaction ---
+
+/// `hash` signed by [`sender_key`].
+fn sign_hash(hash: B256) -> Signature {
+    let msg = secp256k1::Message::from_digest(hash.0);
+    let (id, bytes) =
+        secp256k1::ecdsa::RecoverableSignature::sign_ecdsa_recoverable(msg, &sender_key())
+            .serialize_compact();
+    Signature::from_bytes_and_parity(&bytes, u8::from(id) == 1)
+}
+
+/// `tx` signed by [`sender_key`], in its EIP-2718 form.
+fn signed<T>(tx: T) -> Vec<u8>
+where
+    T: alloy_consensus::SignableTransaction<Signature>,
+    alloy_consensus::Signed<T>: Into<TxEnvelope>,
+{
+    use alloy_eips::eip2718::Encodable2718;
+    let sig = sign_hash(tx.signature_hash());
+    let env: TxEnvelope = tx.into_signed(sig).into();
+    env.encoded_2718()
+}
+
+/// A transfer from [`sender`] at `nonce` of `value` wei, at 2 gwei, on chain `chain_id`.
+fn transfer(chain_id: u64, nonce: u64, value: u128) -> alloy_consensus::TxEip1559 {
+    alloy_consensus::TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit: 21_000,
+        max_fee_per_gas: 2 * GWEI,
+        max_priority_fee_per_gas: GWEI,
+        to: TxKind::Call(ALICE),
+        value: U256::from(value),
+        ..Default::default()
+    }
+}
+
+fn raw(bytes: &[u8]) -> Value {
+    json!([format!("0x{}", alloy_primitives::hex::encode(bytes))])
+}
+
+/// A network that records each transaction it is asked to send and reaches `peers` peers.
+#[derive(Default)]
+struct SentTxs {
+    peers: std::sync::atomic::AtomicUsize,
+    sent: Mutex<Vec<Vec<u8>>>,
+}
+
+#[async_trait]
+impl PeerNetwork for SentTxs {
+    fn peer_count(&self) -> usize {
+        self.peers.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    async fn broadcast_transaction(
+        &self,
+        raw: &[u8],
+    ) -> Result<usize, alloy_eips::eip2718::Eip2718Error> {
+        self.sent.lock().push(raw.to_vec());
+        Ok(self.peer_count())
+    }
+}
+
+/// An API over the rig's chain and store with `fetcher`, on a [`SentTxs`] of `peers` peers.
+fn send_api(
+    r: &Rig,
+    mode: OnMiss,
+    fetcher: Arc<dyn Fetcher>,
+    peers: usize,
+) -> (Arc<Api>, Arc<SentTxs>) {
+    let net = Arc::new(SentTxs::default());
+    net.peers.store(peers, std::sync::atomic::Ordering::SeqCst);
+    let api = Api::new(ApiParts {
+        cfg: LiteConfig { on_miss: mode, ..cfg_943() },
+        chain: r.chain.clone(),
+        store: r.honest.store.clone(),
+        fetcher,
+        receipts: Arc::new(Receipts(vec![])),
+        metrics: r.metrics.clone(),
+        hot: Arc::new(HotSet::new(0)),
+        net: net.clone(),
+        trust_label: String::new(),
+    })
+    .unwrap();
+    (api, net)
+}
+
+#[tokio::test]
+async fn send_raw_transaction_checks_the_transaction_and_its_sender_and_sends_it_to_peers() {
+    let r = rig(OnMiss::Fetch, true);
+    let (api, net) = send_api(&r, OnMiss::Fetch, r.honest.clone(), 3);
+    let send = |bytes: Vec<u8>| {
+        let api = api.clone();
+        async move { call(&api, "eth_sendRawTransaction", raw(&bytes)).await }
+    };
+    let legacy = TxLegacy {
+        chain_id: Some(943),
+        nonce: 6,
+        gas_price: 2 * GWEI,
+        gas_limit: 21_000,
+        to: TxKind::Call(ALICE),
+        ..Default::default()
+    };
+    // The sender's nonce is 5: a later one waits in a peer's pool, as geth takes it.
+    let good =
+        [signed(transfer(943, 5, 1000)), signed(transfer(943, 9, 0)), signed(legacy.clone())];
+    for bytes in &good {
+        let tx =
+            <TxEnvelope as alloy_eips::eip2718::Decodable2718>::decode_2718_exact(bytes).unwrap();
+        assert_eq!(result(&send(bytes.clone()).await), &json!(tx.tx_hash()));
+    }
+    assert_eq!(*net.sent.lock(), good.to_vec());
+
+    let from = sender();
+    let nonce_low = format!("{NONCE_TOO_LOW}: address {from}, tx: 4 state: 5");
+    let poor = format!(
+        "{INSUFFICIENT_FUNDS}: balance 1000000000000000000, tx cost 1000042000000000000, overshot \
+         42000000000000"
+    );
+    let unprotected = TxLegacy { chain_id: None, ..legacy };
+    let blob =
+        alloy_consensus::TxEip4844Variant::<alloy_eips::eip4844::BlobTransactionSidecar>::TxEip4844(
+            alloy_consensus::TxEip4844 { chain_id: 943, to: ALICE, ..Default::default() },
+        );
+    let set_code = alloy_consensus::TxEip7702 { chain_id: 943, to: ALICE, ..Default::default() };
+    let big =
+        alloy_consensus::TxEip1559 { input: vec![1; MAX_TX_BYTES].into(), ..transfer(943, 5, 0) };
+    let big = signed(big);
+    let oversized = format!("{OVERSIZED_TX}: transaction size {}, limit 131072", big.len());
+    let unsigned = {
+        use alloy_eips::eip2718::Encodable2718;
+        let bad = Signature::new(U256::ZERO, U256::ZERO, false);
+        TxEnvelope::from(alloy_consensus::SignableTransaction::into_signed(
+            transfer(943, 5, 0),
+            bad,
+        ))
+        .encoded_2718()
+    };
+    for (bytes, want) in [
+        (signed(transfer(943, 4, 0)), nonce_low.as_str()),
+        (signed(transfer(943, 5, 1_000_000_000_000_000_000)), poor.as_str()),
+        (signed(transfer(369, 5, 0)), "invalid chain id for signer: have 369, want 943"),
+        (signed(unprotected), UNPROTECTED_TX),
+        (signed(blob), TX_TYPE_NOT_SUPPORTED),
+        (signed(set_code), TX_TYPE_NOT_SUPPORTED),
+        (big, oversized.as_str()),
+        (unsigned, BAD_SENDER),
+    ] {
+        assert_eq!(error(&send(bytes).await), (-32000, want));
+    }
+    let v = send(vec![0x02, 0xf8]).await;
+    let (code, msg) = error(&v);
+    assert!(code == -32000 && msg.starts_with("invalid transaction: "), "{v}");
+    for (p, want) in [(json!([]), "missing data"), (json!(["02f8"]), "invalid data")] {
+        assert_eq!(error(&call(&api, "eth_sendRawTransaction", p).await), (-32602, want));
+    }
+    // Nothing that failed a check was sent.
+    assert_eq!(net.sent.lock().len(), good.len());
+}
+
+/// geth's pool checks, made before the node sends a transaction to its peers.
+#[tokio::test]
+async fn send_raw_transaction_refuses_what_a_peers_pool_would_drop() {
+    let r = rig(OnMiss::Fetch, true);
+    let (api, net) = send_api(&r, OnMiss::Fetch, r.honest.clone(), 3);
+    let send = |tx: alloy_consensus::TxEip1559| {
+        let api = api.clone();
+        async move { call(&api, "eth_sendRawTransaction", raw(&signed(tx))).await }
+    };
+    let t = || transfer(943, 5, 0);
+    let create = |input: Vec<u8>, gas_limit: u64| alloy_consensus::TxEip1559 {
+        to: TxKind::Create,
+        input: input.into(),
+        gas_limit,
+        ..t()
+    };
+    let gas_limit = r.chain.head().unwrap().header.gas_limit;
+    let initcode = format!("{INITCODE_TOO_LARGE}: code size 49153, limit 49152");
+    for (tx, want) in [
+        (
+            alloy_consensus::TxEip1559 { gas_limit: gas_limit + 1, ..t() },
+            GAS_LIMIT_EXCEEDED.to_owned(),
+        ),
+        (
+            alloy_consensus::TxEip1559 { max_priority_fee_per_gas: 3 * GWEI, ..t() },
+            TIP_ABOVE_FEE_CAP.to_owned(),
+        ),
+        (
+            alloy_consensus::TxEip1559 { gas_limit: 20_999, ..t() },
+            format!("{INTRINSIC_GAS_TOO_LOW}: gas 20999, needed 21000"),
+        ),
+        (
+            alloy_consensus::TxEip1559 { input: vec![0, 1].into(), ..t() },
+            format!("{INTRINSIC_GAS_TOO_LOW}: gas 21000, needed 21020"),
+        ),
+        (create(vec![1; 33], 53_531), format!("{INTRINSIC_GAS_TOO_LOW}: gas 53531, needed 53532")),
+        (create(vec![1; MAX_INITCODE_BYTES + 1], 2_000_000), initcode),
+    ] {
+        assert_eq!(error(&send(tx).await), (-32000, want.as_str()));
+    }
+    assert!(net.sent.lock().is_empty());
+    // At the limits each is taken. As geth's pool does, a fee cap below the base fee is taken:
+    // the transaction waits for the base fee to fall.
+    let list = alloy_eips::eip2930::AccessList(vec![alloy_eips::eip2930::AccessListItem {
+        address: ALICE,
+        storage_keys: vec![B256::ZERO, B256::ZERO],
+    }]);
+    for tx in [
+        alloy_consensus::TxEip1559 {
+            gas_limit,
+            max_fee_per_gas: GWEI / 1000,
+            max_priority_fee_per_gas: 0,
+            ..t()
+        },
+        alloy_consensus::TxEip1559 { max_priority_fee_per_gas: 2 * GWEI, nonce: 6, ..t() },
+        alloy_consensus::TxEip1559 {
+            nonce: 7,
+            gas_limit: 21_000 + 2_400 + 2 * 1_900,
+            access_list: list,
+            ..t()
+        },
+        alloy_consensus::TxEip1559 { nonce: 8, ..create(vec![1; 33], 53_532) },
+    ] {
+        result(&send(tx).await);
+    }
+    assert_eq!(net.sent.lock().len(), 4);
+}
+
+/// A transaction sent recently answers its hash and is not sent again.
+#[tokio::test]
+async fn send_raw_transaction_sends_a_transaction_once_while_it_is_recent() {
+    let r = rig(OnMiss::Fetch, true);
+    let (api, net) = send_api(&r, OnMiss::Fetch, r.honest.clone(), 3);
+    let (one, two) = (signed(transfer(943, 5, 0)), signed(transfer(943, 6, 0)));
+    let first = call(&api, "eth_sendRawTransaction", raw(&one)).await;
+    for _ in 0..3 {
+        assert_eq!(call(&api, "eth_sendRawTransaction", raw(&one)).await, first);
+    }
+    result(&call(&api, "eth_sendRawTransaction", raw(&two)).await);
+    assert_eq!(*net.sent.lock(), vec![one, two]);
+}
+
+#[test]
+fn recent_transactions_expire_and_are_bounded() {
+    let t = Instant::now();
+    let mut recent = RecentTxs::default();
+    let h = |i: u32| B256::from(U256::from(i));
+    recent.insert(h(0), t);
+    assert!(recent.contains(&h(0), t + RECENT_TX_FOR - Duration::from_millis(1)));
+    assert!(!recent.contains(&h(0), t + RECENT_TX_FOR));
+    assert!(recent.order.is_empty() && recent.hashes.is_empty());
+    for i in 0..=RECENT_TXS as u32 {
+        recent.insert(h(i), t);
+    }
+    assert_eq!((recent.order.len(), recent.hashes.len()), (RECENT_TXS, RECENT_TXS));
+    assert!(!recent.contains(&h(0), t) && recent.contains(&h(RECENT_TXS as u32), t));
+    assert_eq!(RECENT_TX_FOR, Duration::from_secs(300));
+}
+
+#[tokio::test]
+async fn send_raw_transaction_refuses_when_no_peer_is_connected() {
+    let r = rig(OnMiss::Fetch, true);
+    let (api, _net) = send_api(&r, OnMiss::Fetch, r.honest.clone(), 0);
+    let v = call(&api, "eth_sendRawTransaction", raw(&signed(transfer(943, 5, 0)))).await;
+    assert_eq!(error(&v), (-32000, NO_TX_PEERS));
+    // The rig's own API has no network at all.
+    let v = call(&r.api, "eth_sendRawTransaction", raw(&signed(transfer(943, 5, 0)))).await;
+    assert_eq!(error(&v), (-32000, NO_TX_PEERS));
+}
+
+#[tokio::test]
+async fn send_raw_transaction_sends_nothing_when_the_senders_state_cannot_be_read() {
+    let bytes = signed(transfer(943, 5, 0));
+    let r = rig(OnMiss::Fetch, true);
+    let (api, net) = send_api(&r, OnMiss::Fetch, Arc::new(Failing(FetchError::NoSource)), 8);
+    let v = call(&api, "eth_sendRawTransaction", raw(&bytes)).await;
+    assert_eq!(error(&v), (-32000, "state unavailable: no source could serve the request"));
+    let r = rig(OnMiss::Error, true);
+    let (api, net_error) = send_api(&r, OnMiss::Error, r.honest.clone(), 8);
+    assert_eq!(error(&call(&api, "eth_sendRawTransaction", raw(&bytes)).await).0, MISS_CODE);
+    assert!(net.sent.lock().is_empty() && net_error.sent.lock().is_empty());
+    // error-and-warm fetches the sender's account, so a retry is checked and sent.
+    let r = rig(OnMiss::ErrorAndWarm, true);
+    let (api, net) = send_api(&r, OnMiss::ErrorAndWarm, r.honest.clone(), 8);
+    assert_eq!(error(&call(&api, "eth_sendRawTransaction", raw(&bytes)).await).0, MISS_CODE);
+    assert!(net.sent.lock().is_empty());
+    let mut v = Value::Null;
+    for _ in 0..100 {
+        v = call(&api, "eth_sendRawTransaction", raw(&bytes)).await;
+        if v.get("result").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    result(&v);
+    assert_eq!(*net.sent.lock(), vec![bytes]);
+}
+
+#[tokio::test]
+async fn send_raw_transaction_needs_a_live_head_and_its_hash_outlives_a_reseed() {
+    let bytes = signed(transfer(943, 5, 0));
+    let r = rig(OnMiss::Fetch, false);
+    let (api, net) = send_api(&r, OnMiss::Fetch, r.honest.clone(), 8);
+    assert_eq!(error(&call(&api, "eth_sendRawTransaction", raw(&bytes)).await), (-32000, NO_HEAD));
+    let r = rig(OnMiss::Fetch, true);
+    let (api, halted_net) = send_api(&r, OnMiss::Fetch, r.honest.clone(), 8);
+    r.chain.set_halted(Some(HaltReason::AnchorMismatch));
+    let v = call(&api, "eth_sendRawTransaction", raw(&bytes)).await;
+    assert_eq!(error(&v), (-32000, HALTED_MESSAGE));
+    r.chain.set_halted(None);
+    push_head_with(&r, vec![], |h| h.timestamp = now() - 120);
+    let v = call(&api, "eth_sendRawTransaction", raw(&bytes)).await;
+    assert_eq!(error(&v), (-32000, STALE_HEAD));
+    assert!(net.sent.lock().is_empty() && halted_net.sent.lock().is_empty());
+    // Once sent, the hash is the answer even when the chain changed meanwhile.
+    assert!(outlives_chain_change("eth_sendRawTransaction", None));
+    assert!(!outlives_chain_change("eth_sendRawTransaction", Some(-32000)));
 }

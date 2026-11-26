@@ -109,11 +109,21 @@ impl Transport for AnyNet {
     }
 }
 
+#[async_trait]
 impl crate::rpc::PeerNetwork for AnyNet {
     fn peer_count(&self) -> usize {
         match self {
             Self::Real(n) => n.connected_peers(),
             Self::None(_) => 0,
+        }
+    }
+    async fn broadcast_transaction(
+        &self,
+        raw: &[u8],
+    ) -> Result<usize, alloy_eips::eip2718::Eip2718Error> {
+        match self {
+            Self::Real(n) => n.broadcast_transaction(raw).await,
+            Self::None(_) => Ok(0),
         }
     }
 }

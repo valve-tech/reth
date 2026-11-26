@@ -37,7 +37,7 @@ use reth_eth_wire_types::{
 };
 use reth_network::{
     protocol::{ConnectionHandler, OnNotSupported, ProtocolHandler},
-    EthNetworkPrimitives, NetworkHandle,
+    EthNetworkPrimitives, NetworkHandle, NetworkPrimitives,
 };
 use reth_network_api::{Direction, PeerKind, PeerRequest, Peers, PeersInfo, ReputationChangeKind};
 use reth_network_peers::{NodeRecord, PeerId};
@@ -500,6 +500,21 @@ const ETH_REQUEST_QUEUE: usize = 256;
 /// How often connected peers are checked against the keep rule.
 const AUDIT_EVERY: Duration = Duration::from_secs(1);
 
+/// The most peers one transaction is sent to.
+pub const TX_PEERS: usize = 8;
+
+/// How long the network manager may take to list its sessions.
+const LIST_PEERS_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The peers a transaction goes to, out of the `connected` ones: the static ones first, then the
+/// others, at most [`TX_PEERS`].
+fn tx_targets(statics: &HashSet<PeerId>, mut connected: Vec<PeerId>) -> Vec<PeerId> {
+    connected.sort_unstable_by_key(|p| (!statics.contains(p), *p));
+    connected.dedup();
+    connected.truncate(TX_PEERS);
+    connected
+}
+
 /// What the network is started with.
 #[derive(Debug, Clone)]
 pub struct NetOptions {
@@ -591,6 +606,39 @@ impl LiteNetwork {
     /// Connected eth sessions, of every kind, as geth counts `net_peerCount`.
     pub fn connected_peers(&self) -> usize {
         self.handle.num_connected_peers()
+    }
+
+    /// Sends the signed transaction `raw`, in its EIP-2718 form, to at most [`TX_PEERS`] connected
+    /// peers in an eth `Transactions` message, the static peers first. Returns how many peers it
+    /// went to. A session sends it when it can: nothing confirms that a peer took it.
+    pub async fn broadcast_transaction(
+        &self,
+        raw: &[u8],
+    ) -> Result<usize, alloy_eips::eip2718::Eip2718Error> {
+        use alloy_eips::eip2718::Decodable2718;
+        let tx =
+            <EthNetworkPrimitives as NetworkPrimitives>::BroadcastedTransaction::decode_2718_exact(
+                raw,
+            )?;
+        let tx = Arc::new(tx);
+        let connected = match tokio::time::timeout(LIST_PEERS_TIMEOUT, self.handle.get_all_peers())
+            .await
+        {
+            Ok(Ok(all)) => all.into_iter().map(|p| p.remote_id).collect(),
+            Ok(Err(e)) => {
+                tracing::debug!(%e, "the network manager is gone: no peer to send a transaction to");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::debug!("the network manager did not list its peers in time");
+                Vec::new()
+            }
+        };
+        let targets = tx_targets(&self.statics, connected);
+        for peer in &targets {
+            self.handle.send_transactions(*peer, vec![tx.clone()]);
+        }
+        Ok(targets.len())
     }
 
     /// The node's own record (ports are the bound ones).
@@ -1518,6 +1566,21 @@ mod tests {
             mpsc::Sender<reth_network::eth_requests::IncomingEthRequest<EthNetworkPrimitives>>,
         >,
     ) -> (NetworkHandle<EthNetworkPrimitives>, NodeRecord) {
+        eth_only_peer_with(rt, handler, None).await
+    }
+
+    /// [`eth_only_peer`], whose transaction events, when `txs` is given, go to it.
+    async fn eth_only_peer_with(
+        rt: reth_tasks::Runtime,
+        handler: Option<
+            mpsc::Sender<reth_network::eth_requests::IncomingEthRequest<EthNetworkPrimitives>>,
+        >,
+        txs: Option<
+            reth_metrics::common::mpsc::MemoryBoundedSender<
+                reth_network::transactions::NetworkTransactionEvent<EthNetworkPrimitives>,
+            >,
+        >,
+    ) -> (NetworkHandle<EthNetworkPrimitives>, NodeRecord) {
         use reth_network::{NetworkConfig, NetworkManager};
         let head = Head {
             number: u64::MAX,
@@ -1537,6 +1600,9 @@ mod tests {
         let mut manager = NetworkManager::new(cfg).await.unwrap();
         if let Some(tx) = handler {
             manager.set_eth_request_handler(tx);
+        }
+        if let Some(txs) = txs {
+            manager.set_transactions(txs);
         }
         let handle = manager.handle().clone();
         rt.spawn_task(manager);
@@ -1635,6 +1701,56 @@ mod tests {
         };
         let (res, ()) = tokio::join!(Transport::receipts(&a, b_rec.id, silent), leave);
         assert_eq!(res, Err(TransportError::Disconnected));
+    }
+
+    /// A transaction goes to a connected peer in an eth `Transactions` message, as the peer's
+    /// transaction manager sees it. Bytes that do not decode go nowhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_transaction_reaches_a_connected_peer_in_a_transactions_message() {
+        use alloy_consensus::{SignableTransaction, TxLegacy};
+        use alloy_eips::eip2718::Encodable2718;
+        use reth_network::transactions::NetworkTransactionEvent;
+        let rt = reth_tasks::Runtime::test();
+        let (txs, mut events) = reth_metrics::common::mpsc::memory_bounded_channel(1 << 20, "test");
+        let (_b, b_rec) = eth_only_peer_with(rt.clone(), None, Some(txs)).await;
+        let opts = NetOptions { statics: vec![b_rec], discovery: false, ..test_opts(369, vec![]) };
+        let a = LiteNetwork::start_with(opts, rt).await.unwrap();
+        wait_for("A to connect to B", || a.handle.num_connected_peers() == 1).await;
+        let tx =
+            TxLegacy { chain_id: Some(369), nonce: 7, gas_limit: 21_000, ..Default::default() };
+        let tx = alloy_consensus::TxEnvelope::from(
+            tx.into_signed(alloy_primitives::Signature::test_signature()),
+        );
+        assert_eq!(a.broadcast_transaction(&tx.encoded_2718()).await.unwrap(), 1);
+        let a_id = a.local_record().id;
+        let got = loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), events.recv())
+                .await
+                .expect("B got the transaction in time")
+                .expect("the channel is open");
+            if let NetworkTransactionEvent::IncomingTransactions { peer_id, msg } = event {
+                break (peer_id, msg.0.iter().map(|t| *t.tx_hash()).collect::<Vec<_>>());
+            }
+        };
+        assert_eq!(got, (a_id, vec![*tx.tx_hash()]));
+        let bad = a.broadcast_transaction(&[0x02, 0xf8]).await.unwrap_err();
+        assert_eq!(
+            bad.to_string(),
+            alloy_eips::eip2718::Eip2718Error::RlpError(alloy_rlp::Error::InputTooShort)
+                .to_string()
+        );
+    }
+
+    /// A transaction goes to the static peers first, then to the others, at most [`TX_PEERS`].
+    #[test]
+    fn a_transaction_goes_to_the_static_peers_first_and_to_at_most_eight() {
+        let peer = |n: u8| PeerId::repeat_byte(n);
+        let statics: HashSet<PeerId> = [peer(9), peer(12)].into();
+        let connected: Vec<PeerId> = (1..=12).rev().map(peer).chain([peer(3)]).collect();
+        let want: Vec<PeerId> = [9, 12, 1, 2, 3, 4, 5, 6].map(peer).to_vec();
+        assert_eq!(tx_targets(&statics, connected), want);
+        assert_eq!(tx_targets(&statics, vec![peer(5), peer(9)]), vec![peer(9), peer(5)]);
+        assert!(tx_targets(&statics, Vec::new()).is_empty());
     }
 
     /// A reth peer that asks this node for headers, bodies or receipts gets an empty answer at

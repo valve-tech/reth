@@ -74,9 +74,22 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   eth_getUncleCountByBlock{Hash,Number} eth_getTransactionByHash
   eth_getTransactionByBlock{Hash,Number}AndIndex eth_getTransactionReceipt
   eth_getBlockReceipts eth_gasPrice eth_maxPriorityFeePerGas eth_feeHistory
-  eth_getLogs web3_clientVersion web3_sha3 net_listening net_peerCount eth_accounts
-  eth_mining eth_hashrate`. Everything else, including `eth_sendRawTransaction`, is `-32601`
+  eth_getLogs eth_sendRawTransaction web3_clientVersion web3_sha3 net_listening
+  net_peerCount eth_accounts eth_mining eth_hashrate`. Everything else is `-32601`
   `method not served`.
+* Transactions: the node keeps no pool. `eth_sendRawTransaction` decodes the transaction and
+  recovers its sender. It makes the checks geth's pool makes before it takes a transaction:
+  the gas limit is at most the head's, the tip at most the fee cap, the gas limit at least the
+  intrinsic gas, and a creation's init code at most 49,152 bytes. As geth, it takes a fee cap
+  below the base fee. It reads the sender's account at the head, verified as any state read,
+  and refuses a nonce below the account's or a cost above its balance. A later nonce is sent:
+  a peer's pool keeps it until the gap fills. Then the node sends the transaction once, in an
+  eth/68 `Transactions` message, to at most 8 connected peers, the `--peer` nodes first, and
+  answers its hash. A transaction sent in the last 5 minutes (at most 4096 of them) answers its
+  hash and is not sent again. Nothing confirms that a peer took it: ask a node with a pool for its state.
+  When the sender's account cannot be read, the node sends nothing and answers the read's
+  error: the miss in `error` and `error-and-warm` (which fetches the account for a retry),
+  or `state unavailable` in `fetch`.
 * Fee history: `eth_feeHistory` with `rewardPercentiles` reads each block's receipts through
   the receipt path above, so the rewards come from receipts checked against the block's
   receipts root. A reward is geth's: the effective tips of the block's transactions, lowest
@@ -191,6 +204,22 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
     or `eth_estimateGas` read `BLOCKHASH` of a block below the held headers.
   * `block is not canonical`: a block given by hash with EIP-1898 `requireCanonical: true` is
     held but not on the followed chain.
+  * `invalid transaction: <reason>`: the raw transaction does not decode.
+  * `transaction type not supported`: a blob (EIP-4844) or set-code (EIP-7702) transaction,
+    which the chain does not schedule, as geth answers it.
+  * `only replay-protected (EIP-155) transactions allowed over RPC`: a transaction that names
+    no chain, as geth answers it by default.
+  * `invalid chain id for signer: have N, want M`: a transaction signed for another chain.
+  * `oversized data: transaction size N, limit 131072`: a transaction over geth's 128 KiB
+    limit.
+  * `nonce too low: address A, tx: N state: M` and `insufficient funds for gas * price + value:
+    balance B, tx cost C, overshot O`: geth's texts, checked against the head's verified state.
+    The cost is the gas limit times the fee cap (the gas price of a legacy transaction), plus
+    the value.
+  * `exceeds block gas limit`, `max priority fee per gas higher than max fee per gas`,
+    `intrinsic gas too low: gas N, needed M` and `max initcode size exceeded: code size N,
+    limit 49152`: geth's pool checks.
+  * `no peers to send the transaction to`: no eth peer is connected. Send it again later.
   * `invalid reward percentile: <reason>`: an `eth_feeHistory` with more than 100 reward
     percentiles, one outside 0 to 100, or one not above the one before it, as geth answers it.
   * `transaction sender could not be recovered from its signature`: a held transaction has a
@@ -223,8 +252,8 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   beacon block marked `execution_optimistic` is refused
   but counts as unavailable, not as a proof failure. `lite_answers_total{verified="true"}` counts
   answers checked against a block's roots; `verified="false"` counts `eth_blockNumber`,
-  `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas` and `eth_feeHistory`, which no root
-  checks. The node answers above count in neither series.
+  `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` and the hash
+  that `eth_sendRawTransaction` answers, which no root checks. The node answers above count in neither series.
 
 ## Trust model
 

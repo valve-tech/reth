@@ -83,6 +83,8 @@ smolgen = { workspace = true, features = ["emit_and_set", "gitcl"] }
 
 [dev-dependencies]
 reth-pulsechain-light-client = { workspace = true, features = ["test-utils"] }
+reth-metrics = { workspace = true, features = ["common"] }
+secp256k1.workspace = true
 blst.workspace = true
 proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }

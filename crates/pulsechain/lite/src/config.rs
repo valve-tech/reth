@@ -1706,6 +1706,16 @@ mod tests {
             ("RENDERING_FAILED", format!("{RENDERING_FAILED}: <reason>")),
             ("PRUNED_HISTORY", format!("{PRUNED_HISTORY}: requested N, earliest available M")),
             ("INVALID_PERCENTILE", format!("{INVALID_PERCENTILE}: <reason>")),
+            ("INVALID_TRANSACTION", format!("{INVALID_TRANSACTION}: <reason>")),
+            ("WRONG_CHAIN_ID", format!("{WRONG_CHAIN_ID}: have N, want M")),
+            ("OVERSIZED_TX", format!("{OVERSIZED_TX}: transaction size N, limit 131072")),
+            ("NONCE_TOO_LOW", format!("{NONCE_TOO_LOW}: address A, tx: N state: M")),
+            ("INTRINSIC_GAS_TOO_LOW", format!("{INTRINSIC_GAS_TOO_LOW}: gas N, needed M")),
+            ("INITCODE_TOO_LARGE", format!("{INITCODE_TOO_LARGE}: code size N, limit 49152")),
+            (
+                "INSUFFICIENT_FUNDS",
+                format!("{INSUFFICIENT_FUNDS}: balance B, tx cost C, overshot O"),
+            ),
         ];
         let texts = named![
             MISS_MESSAGE,
@@ -1734,6 +1744,11 @@ mod tests {
             INVALID_BLOCK_RANGE,
             TOO_MANY_TOPICS,
             TOO_MANY_FILTER_VALUES,
+            TX_TYPE_NOT_SUPPORTED,
+            UNPROTECTED_TX,
+            NO_TX_PEERS,
+            GAS_LIMIT_EXCEEDED,
+            TIP_ABOVE_FEE_CAP,
         ];
         // The RPC answers this `RoundsError` with its own text. Its round is `N` in the README.
         // `BlockHashUnavailable` never reaches a client: `eth_call` maps it to

@@ -136,6 +136,38 @@ pub const LOG_BLOCKS_TOO_MANY: &str = "query needs the receipts of more than 32 
 pub const INVALID_BLOCK_RANGE: &str = "invalid block range";
 /// geth's text for an `eth_getLogs` filter with more than [`MAX_LOG_TOPICS`] topic positions.
 pub const TOO_MANY_TOPICS: &str = "exceed max topics";
+/// The prefix of the text for raw transaction bytes that do not decode:
+/// `invalid transaction: <reason>`.
+pub const INVALID_TRANSACTION: &str = "invalid transaction";
+/// geth's text for a transaction of a type the chain does not schedule: blob (EIP-4844) and
+/// set-code (EIP-7702) transactions.
+pub const TX_TYPE_NOT_SUPPORTED: &str = "transaction type not supported";
+/// geth's text for a transaction that does not name a chain (pre-EIP-155).
+pub const UNPROTECTED_TX: &str = "only replay-protected (EIP-155) transactions allowed over RPC";
+/// The prefix of the text for a transaction signed for another chain, from geth's signer error:
+/// `invalid chain id for signer: have N, want M`.
+pub const WRONG_CHAIN_ID: &str = "invalid chain id for signer";
+/// The prefix of geth's text for a transaction past its 128 KiB size limit:
+/// `oversized data: transaction size N, limit 131072`.
+pub const OVERSIZED_TX: &str = "oversized data";
+/// The prefix of geth's text for a nonce below the sender's: `nonce too low: address A, tx: N
+/// state: M`.
+pub const NONCE_TOO_LOW: &str = "nonce too low";
+/// The prefix of geth's text for a sender that cannot pay for the transaction:
+/// `insufficient funds for gas * price + value: balance B, tx cost C, overshot O`.
+pub const INSUFFICIENT_FUNDS: &str = "insufficient funds for gas * price + value";
+/// geth's text for a transaction whose gas limit is above the head's.
+pub const GAS_LIMIT_EXCEEDED: &str = "exceeds block gas limit";
+/// geth's text for a fee cap below the tip cap.
+pub const TIP_ABOVE_FEE_CAP: &str = "max priority fee per gas higher than max fee per gas";
+/// The prefix of geth's text for a gas limit below the intrinsic gas:
+/// `intrinsic gas too low: gas N, needed M`.
+pub const INTRINSIC_GAS_TOO_LOW: &str = "intrinsic gas too low";
+/// The prefix of geth's text for a contract creation with too much init code (EIP-3860):
+/// `max initcode size exceeded: code size N, limit 49152`.
+pub const INITCODE_TOO_LARGE: &str = "max initcode size exceeded";
+/// The text for a transaction no connected peer can be sent.
+pub const NO_TX_PEERS: &str = "no peers to send the transaction to";
 /// geth's text for an `eth_getLogs` filter with more than [`MAX_LOG_FILTER_VALUES`] addresses,
 /// or alternatives at one topic position.
 pub const TOO_MANY_FILTER_VALUES: &str = "exceed max addresses or topics per search position";
@@ -222,6 +254,16 @@ const MAX_REWARD_PERCENTILES: usize = 100;
 /// cache holds, so a repeat of the request reads the cache. As geth truncates a long history, a
 /// longer count answers the newest blocks, from a later `oldestBlock`.
 const MAX_REWARD_BLOCKS: u64 = WIDE_RECEIPT_CACHE as u64;
+/// geth's size limit of one transaction (`txMaxSize`).
+const MAX_TX_BYTES: usize = 128 << 10;
+/// The init code limit of a contract creation (EIP-3860, Shanghai).
+const MAX_INITCODE_BYTES: usize = 49_152;
+/// Transactions sent recently: a repeat of one within [`RECENT_TX_FOR`] answers its hash and is
+/// not sent again, so a client cannot make the node resend one to its peers.
+const RECENT_TXS: usize = 4096;
+/// How long a sent transaction counts as recent. Past it the node sends it again, for a wallet
+/// whose transaction peers dropped.
+const RECENT_TX_FOR: Duration = Duration::from_secs(300);
 /// geth's caps on a log filter: topic positions, and addresses or alternatives at one position.
 const MAX_LOG_TOPICS: usize = 4;
 const MAX_LOG_FILTER_VALUES: usize = 1000;
@@ -319,6 +361,7 @@ pub const SERVED: &[&str] = &[
     "eth_mining",
     "eth_hashrate",
     "eth_getLogs",
+    "eth_sendRawTransaction",
 ];
 
 /// The served methods that read no block and no state: they answer with no head, and while the
@@ -403,19 +446,33 @@ impl<T: crate::net::client::Transport> ReceiptSource for crate::net::client::P2p
     }
 }
 
-/// What the RPC reads from the peer-to-peer network.
+/// What the RPC reads from and sends to the peer-to-peer network.
+#[async_trait]
 pub trait PeerNetwork: Send + Sync {
     /// Connected eth peers, the `net_peerCount` answer.
     fn peer_count(&self) -> usize;
+    /// Sends the signed transaction `raw`, in its EIP-2718 form, to at most
+    /// [`TX_PEERS`](crate::net::wire::TX_PEERS) connected peers. Returns how many it went to.
+    async fn broadcast_transaction(
+        &self,
+        raw: &[u8],
+    ) -> Result<usize, alloy_eips::eip2718::Eip2718Error>;
 }
 
-/// The network of a node that has no peers: nothing to count.
+/// The network of a node that has no peers: nothing to count, and no one to send to.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoPeers;
 
+#[async_trait]
 impl PeerNetwork for NoPeers {
     fn peer_count(&self) -> usize {
         0
+    }
+    async fn broadcast_transaction(
+        &self,
+        _: &[u8],
+    ) -> Result<usize, alloy_eips::eip2718::Eip2718Error> {
+        Ok(0)
     }
 }
 
@@ -442,6 +499,8 @@ pub struct Api {
     warming: Mutex<WarmQueue>,
     warm_calls: tokio::sync::Semaphore,
     warm_reads: tokio::sync::Semaphore,
+    /// The transactions sent within [`RECENT_TX_FOR`].
+    recent_txs: Mutex<RecentTxs>,
     /// Bounds the wide receipt reads that wait on a fetch at once, across all requests: each
     /// holds one permit for its block ([`Api::receipts_wide`]).
     wide_fetches: tokio::sync::Semaphore,
@@ -519,6 +578,7 @@ impl Api {
             warm_calls: tokio::sync::Semaphore::new(WARM_CALLS_RUNNING),
             warm_reads: tokio::sync::Semaphore::new(WARM_READS_RUNNING),
             wide_fetches: tokio::sync::Semaphore::new(WIDE_FETCHES),
+            recent_txs: Mutex::default(),
             trust_label: p.trust_label,
         }))
     }
@@ -563,7 +623,8 @@ impl Api {
                     "eth_syncing" |
                     "eth_gasPrice" |
                     "eth_maxPriorityFeePerGas" |
-                    "eth_feeHistory"
+                    "eth_feeHistory" |
+                    "eth_sendRawTransaction"
             );
             self.metrics.answer(!unchecked);
         }
@@ -671,6 +732,7 @@ impl Api {
                 self.head()?;
                 Ok(json!(hex_u128(self.suggested_tip())))
             }
+            "eth_sendRawTransaction" => self.send_raw_transaction(p, mode).await,
             "eth_feeHistory" => {
                 let res = self.fee_history(p, mode).await;
                 self.warm_if_needed(method, p, mode, &res);
@@ -1245,6 +1307,90 @@ impl Api {
         res
     }
 
+    // --- transactions ---
+
+    /// Checks a signed transaction against the verified state of the head and sends it to peers.
+    /// The node keeps no pool: it sends the transaction once and answers its hash. Nothing is
+    /// sent unless the sender's account was read: a transaction that its sender cannot pay for,
+    /// or whose nonce is used, would be dropped by every peer.
+    async fn send_raw_transaction(
+        self: &Arc<Self>,
+        p: &Value,
+        mode: OnMiss,
+    ) -> Result<Value, RpcError> {
+        use alloy_eips::eip2718::Decodable2718;
+        let raw = hex_data(p, 0)?;
+        if raw.len() > MAX_TX_BYTES {
+            return Err(RpcError::other(format!(
+                "{OVERSIZED_TX}: transaction size {}, limit {MAX_TX_BYTES}",
+                raw.len()
+            )));
+        }
+        let tx = TxEnvelope::decode_2718_exact(&raw)
+            .map_err(|e| RpcError::other(format!("{INVALID_TRANSACTION}: {e}")))?;
+        // The chain schedules neither Cancun nor Prague.
+        if tx.is_eip4844() || tx.is_eip7702() {
+            return Err(RpcError::other(TX_TYPE_NOT_SUPPORTED));
+        }
+        match tx.chain_id() {
+            None => return Err(RpcError::other(UNPROTECTED_TX)),
+            Some(have) if have != self.cfg.chain_id => {
+                return Err(RpcError::other(format!(
+                    "{WRONG_CHAIN_ID}: have {have}, want {}",
+                    self.cfg.chain_id
+                )));
+            }
+            Some(_) => {}
+        }
+        let hash = *tx.tx_hash();
+        // Sent already: peers have it, and a second send is what a peer penalises.
+        if self.recent_txs.lock().contains(&hash, Instant::now()) {
+            return Ok(json!(hash));
+        }
+        let head = self.head()?;
+        check_pool_rules(&tx, &head.header)?;
+        let from = recover(&tx)?;
+        let res = self
+            .state_read(&head, mode, |db| {
+                db.get_account(&from)
+                    .ok()
+                    .flatten()
+                    .map_or((U256::ZERO, 0), |a| (a.balance, a.nonce))
+            })
+            .await;
+        // A retry finds the sender's account held.
+        self.warm_if_needed("eth_getTransactionCount", &json!([from, "latest"]), mode, &res);
+        let (balance, nonce) = res?;
+        if tx.nonce() < nonce {
+            return Err(RpcError::other(format!(
+                "{NONCE_TOO_LOW}: address {from}, tx: {} state: {nonce}",
+                tx.nonce()
+            )));
+        }
+        // A cost past `U256` is more than any balance.
+        let cost = U256::from(tx.gas_limit())
+            .checked_mul(U256::from(tx.max_fee_per_gas()))
+            .and_then(|gas| gas.checked_add(tx.value()))
+            .unwrap_or(U256::MAX);
+        if balance < cost {
+            return Err(RpcError::other(format!(
+                "{INSUFFICIENT_FUNDS}: balance {balance}, tx cost {cost}, overshot {}",
+                cost - balance
+            )));
+        }
+        let sent = self
+            .net
+            .broadcast_transaction(&raw)
+            .await
+            .map_err(|e| RpcError::other(format!("{INVALID_TRANSACTION}: {e}")))?;
+        if sent == 0 {
+            return Err(RpcError::other(NO_TX_PEERS));
+        }
+        self.recent_txs.lock().insert(hash, Instant::now());
+        tracing::info!(hash = %tx.tx_hash(), %from, nonce = tx.nonce(), peers = sent, "sent a transaction");
+        Ok(json!(tx.tx_hash()))
+    }
+
     // --- logs ---
 
     /// `eth_getLogs` over held blocks: a block whose header bloom cannot hold a match is skipped,
@@ -1589,6 +1735,85 @@ fn block_rewards(
     Ok(out)
 }
 
+/// The checks geth's pool makes of a transaction before it takes one, without state, at `head`.
+/// A peer drops a transaction that fails one, and can count it against the node that sent it.
+/// geth takes a fee cap below the base fee (the transaction waits), so the node sends it too.
+fn check_pool_rules(tx: &TxEnvelope, head: &Header) -> Result<(), RpcError> {
+    let create = tx.kind().is_create();
+    if create && tx.input().len() > MAX_INITCODE_BYTES {
+        return Err(RpcError::other(format!(
+            "{INITCODE_TOO_LARGE}: code size {}, limit {MAX_INITCODE_BYTES}",
+            tx.input().len()
+        )));
+    }
+    if tx.gas_limit() > head.gas_limit {
+        return Err(RpcError::other(GAS_LIMIT_EXCEEDED));
+    }
+    if tx.max_priority_fee_per_gas().is_some_and(|tip| tip > tx.max_fee_per_gas()) {
+        return Err(RpcError::other(TIP_ABOVE_FEE_CAP));
+    }
+    let needed = intrinsic_gas(tx);
+    if tx.gas_limit() < needed {
+        return Err(RpcError::other(format!(
+            "{INTRINSIC_GAS_TOO_LOW}: gas {}, needed {needed}",
+            tx.gas_limit()
+        )));
+    }
+    Ok(())
+}
+
+/// geth's intrinsic gas of `tx` under the chain's rules (Shanghai, no Prague): 21,000, or 53,000
+/// for a creation, 16 for each non-zero and 4 for each zero byte of input, 2,400 for each
+/// access-list address and 1,900 for each key, and 2 for each 32-byte word of init code. The
+/// input is at most [`MAX_TX_BYTES`], so the sum cannot overflow.
+fn intrinsic_gas(tx: &TxEnvelope) -> u64 {
+    let input = tx.input();
+    let create = tx.kind().is_create();
+    let zeros: u64 = input.iter().map(|b| u64::from(*b == 0)).sum();
+    let nonzeros = input.len() as u64 - zeros;
+    let (addresses, keys) = tx
+        .access_list()
+        .map_or((0, 0), |l| (l.len() as u64, l.iter().map(|i| i.storage_keys.len() as u64).sum()));
+    let base = if create { 53_000 } else { 21_000 };
+    let words = if create { (input.len() as u64).div_ceil(32) * 2 } else { 0 };
+    base + nonzeros * 16 + zeros * 4 + addresses * 2_400 + keys * 1_900 + words
+}
+
+/// The hashes of transactions sent recently: at most [`RECENT_TXS`], each for [`RECENT_TX_FOR`].
+#[derive(Debug, Default)]
+struct RecentTxs {
+    /// When each was sent, oldest first.
+    order: VecDeque<(Instant, B256)>,
+    hashes: B256Set,
+}
+
+impl RecentTxs {
+    /// Whether `hash` was sent within [`RECENT_TX_FOR`] of `now`. Drops what is older.
+    fn contains(&mut self, hash: &B256, now: Instant) -> bool {
+        while let Some((at, h)) = self.order.front().copied() {
+            if now.saturating_duration_since(at) < RECENT_TX_FOR {
+                break;
+            }
+            self.order.pop_front();
+            self.hashes.remove(&h);
+        }
+        self.hashes.contains(hash)
+    }
+
+    /// Notes that `hash` was sent at `now`, dropping the oldest past [`RECENT_TXS`].
+    fn insert(&mut self, hash: B256, now: Instant) {
+        if !self.hashes.insert(hash) {
+            return;
+        }
+        if self.order.len() >= RECENT_TXS &&
+            let Some((_, oldest)) = self.order.pop_front()
+        {
+            self.hashes.remove(&oldest);
+        }
+        self.order.push_back((now, hash));
+    }
+}
+
 /// The address and topic criteria of an `eth_getLogs` filter. An empty list matches anything.
 #[derive(Debug)]
 struct LogQuery {
@@ -1752,7 +1977,8 @@ fn max_params(method: &str) -> usize {
         "eth_getTransactionByHash" |
         "eth_getTransactionReceipt" |
         "eth_getBlockReceipts" |
-        "eth_getLogs" => 1,
+        "eth_getLogs" |
+        "eth_sendRawTransaction" => 1,
         "eth_getBalance" |
         "eth_getTransactionCount" |
         "eth_getCode" |
@@ -2467,11 +2693,13 @@ fn drop_stale_answers(api: &Api, epoch: u64, batch: &[Value], out: &mut [Answer]
 }
 
 /// A reply to `method` with error code `code` (`None` for a result) that holds across a halt or a
-/// re-seed: the [`NODE_ANSWERS`], refusals of the request itself, and the server's timeout
-/// (`-32002`) and size refusals (`-32003`, `-32005`), which tell the client what to send again. Any
-/// other reply, a revert or an EVM error included, came from the chain.
+/// re-seed: the [`NODE_ANSWERS`], the hash of a transaction already sent to peers, refusals of the
+/// request itself, and the server's timeout (`-32002`) and size refusals (`-32003`, `-32005`),
+/// which tell the client what to send again. Any other reply, a revert or an EVM error included,
+/// came from the chain.
 fn outlives_chain_change(method: &str, code: Option<i64>) -> bool {
     NODE_ANSWERS.contains(&method) ||
+        (method == "eth_sendRawTransaction" && code.is_none()) ||
         matches!(code, Some(-32602..=-32600 | -32002 | -32003 | -32005))
 }
 
