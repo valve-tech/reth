@@ -550,6 +550,9 @@ impl PeerNetwork for CountedPeers {
     fn peer_count(&self) -> usize {
         self.0.load(std::sync::atomic::Ordering::SeqCst)
     }
+    fn state_peers(&self) -> usize {
+        self.peer_count()
+    }
     async fn broadcast_transaction(
         &self,
         _: &[u8],
@@ -5022,6 +5025,9 @@ impl PeerNetwork for SentTxs {
     fn peer_count(&self) -> usize {
         self.peers.load(std::sync::atomic::Ordering::SeqCst)
     }
+    fn state_peers(&self) -> usize {
+        self.peer_count()
+    }
     async fn broadcast_transaction(
         &self,
         raw: &[u8],
@@ -5285,4 +5291,183 @@ async fn send_raw_transaction_needs_a_live_head_and_its_hash_outlives_a_reseed()
     // Once sent, the hash is the answer even when the chain changed meanwhile.
     assert!(outlives_chain_change("eth_sendRawTransaction", None));
     assert!(!outlives_chain_change("eth_sendRawTransaction", Some(-32000)));
+}
+
+// --- GET /ready ---
+
+/// The `(id, ok, detail)` of each readiness check.
+fn checks(body: &Value) -> Vec<(String, bool, String)> {
+    body["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            let text = |k: &str| c[k].as_str().unwrap().to_owned();
+            (text("id"), c["ok"].as_bool().unwrap(), text("detail"))
+        })
+        .collect()
+}
+
+/// The checks that fail, with their details.
+fn failing(api: &Api) -> Vec<(String, String)> {
+    let (ready, body) = api.readiness();
+    assert_eq!(body["ready"], json!(ready));
+    let ids: Vec<String> = checks(&body).into_iter().map(|(id, ..)| id).collect();
+    assert_eq!(ids, ["consensus", "head", "peers", "state"]);
+    let failing: Vec<_> =
+        checks(&body).into_iter().filter(|(_, ok, _)| !ok).map(|(id, _, d)| (id, d)).collect();
+    assert_eq!(ready, failing.is_empty());
+    failing
+}
+
+fn fail(id: &str, detail: &str) -> (String, String) {
+    (id.to_owned(), detail.to_owned())
+}
+
+#[tokio::test]
+async fn readiness_checks_heads_the_head_age_state_peers_and_state_reads() {
+    let r = rig(OnMiss::Fetch, true);
+    let peers = Arc::new(CountedPeers::default());
+    peers.0.store(1, std::sync::atomic::Ordering::SeqCst);
+    let api = api_on(&r, peers.clone());
+    api.probe_state().await;
+    assert_eq!(failing(&api), vec![]);
+    let (_, body) = api.readiness();
+    let head = r.chain.head().unwrap().header.number;
+    assert_eq!(checks(&body)[3].2, format!("a state read at block {head} verified"));
+    assert!(checks(&body)[1].2.starts_with(&format!("block {head}, ")), "{body}");
+    assert_eq!(checks(&body)[2].2, "1 connected peers serve state (snap/1)");
+
+    peers.0.store(0, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(failing(&api), vec![fail("peers", "no connected peer serves state (snap/1)")]);
+    peers.0.store(2, std::sync::atomic::Ordering::SeqCst);
+
+    r.chain.set_halted(Some(HaltReason::AnchorMismatch));
+    assert_eq!(failing(&api), vec![fail("consensus", HALTED_MESSAGE)]);
+    r.chain.set_halted(None);
+    push_head_with(&r, vec![], |h| h.timestamp = now() - 120);
+    assert_eq!(failing(&api), vec![fail("head", STALE_HEAD)]);
+
+    let empty = rig(OnMiss::Fetch, false);
+    let api = api_on(&empty, peers);
+    api.probe_state().await;
+    let no_probe = fail("state", "no state probe has run yet");
+    assert_eq!(failing(&api), vec![fail("consensus", NO_HEAD), fail("head", NO_HEAD), no_probe]);
+}
+
+/// Only the node's own probe decides the state check: a client's read that fails, however it
+/// fails, does not take the node out of service.
+#[tokio::test]
+async fn readiness_follows_the_nodes_own_state_probe_and_no_clients_read() {
+    let r = rig(OnMiss::Fetch, true);
+    let flaky = Arc::new(Flaky { fail: false.into(), honest: r.honest.clone() });
+    let (api, _net) = send_api(&r, OnMiss::Fetch, flaky.clone(), 1);
+    assert_eq!(failing(&api), vec![fail("state", "no state probe has run yet")]);
+    api.probe_state().await;
+    assert_eq!(failing(&api), vec![]);
+    // Clients' reads fail; the node stays ready.
+    flaky.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The probe never fetches code, so these reads need a fetch, which fails.
+    for (m, p) in [
+        ("eth_getCode", json!([h(VIEW), "latest"])),
+        ("eth_call", json!([{"to": h(VIEW)}, "latest"])),
+    ] {
+        assert_eq!(error(&call(&api, m, p).await).0, -32000, "{m}");
+    }
+    assert_eq!(failing(&api), vec![]);
+    // The probe's own read fails at a new head, whose state the node does not hold: then the
+    // node is not ready.
+    push_head_with(&r, vec![], |h| h.state_root = B256::repeat_byte(0x77));
+    api.probe_state().await;
+    let head = r.chain.head().unwrap().header.number;
+    let why = format!(
+        "the state probe at block {head} failed: state unavailable: no source could serve the \
+         request"
+    );
+    assert_eq!(failing(&api), vec![fail("state", &why)]);
+    flaky.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let root = r.honest.world.root;
+    push_head_with(&r, vec![], |h| h.state_root = root);
+    api.probe_state().await;
+    assert_eq!(failing(&api), vec![]);
+    let head = r.chain.head().unwrap().header.number;
+    // A probe that falls behind the head stops counting.
+    for _ in 0..=PROBE_MAX_LAG {
+        push_head(&r, vec![]);
+    }
+    let lag = format!(
+        "the newest verified state probe is at block {head}, more than {PROBE_MAX_LAG} blocks \
+         below the head"
+    );
+    assert_eq!(failing(&api), vec![fail("state", &lag)]);
+}
+
+#[tokio::test]
+async fn the_probe_loop_probes_each_new_head() {
+    let r = rig(OnMiss::Error, true);
+    let (api, _net) = send_api(&r, OnMiss::Error, r.honest.clone(), 1);
+    let task = tokio::spawn(state_probe_loop(api.clone()));
+    let probed =
+        |api: &Arc<Api>| api.state_probe.lock().as_ref().map(|p| (p.block, p.outcome.is_ok()));
+    let mut want = r.chain.head().unwrap().header.number;
+    for _ in 0..2 {
+        for _ in 0..50 {
+            if probed(&api) == Some((want, true)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // In error mode too: the probe fetches what it misses.
+        assert_eq!(probed(&api), Some((want, true)));
+        want = push_head(&r, vec![]).header.number;
+    }
+    task.abort();
+}
+
+/// Fails every fetch while `fail` is set, and fetches honestly after.
+struct Flaky {
+    fail: std::sync::atomic::AtomicBool,
+    honest: Arc<Honest>,
+}
+
+#[async_trait]
+impl Fetcher for Flaky {
+    async fn fetch(&self, root: B256, misses: &[crate::state::MissKey]) -> Result<(), FetchError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(FetchError::NoSource);
+        }
+        self.honest.fetch(root, misses).await
+    }
+}
+
+#[tokio::test]
+async fn get_ready_answers_200_when_ready_and_503_with_the_failing_checks() {
+    let r = rig(OnMiss::Fetch, true);
+    let peers = Arc::new(CountedPeers::default());
+    let api = api_on(&r, peers.clone());
+    api.probe_state().await;
+    let (addr, task) = serve(api, "127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/ready");
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    let body: Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["ready"], json!(false));
+    let bad: Vec<_> =
+        checks(&body).into_iter().filter(|(_, ok, _)| !ok).map(|(id, ..)| id).collect();
+    assert_eq!(bad, ["peers"]);
+    peers.0.store(1, std::sync::atomic::Ordering::SeqCst);
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["ready"], json!(true));
+    assert_eq!(client.head(&url).send().await.unwrap().status(), 200);
+    // The host check comes first, and any other GET is still geth's empty health check.
+    let other = client.get(&url).header("host", "evil.example").send().await.unwrap();
+    assert_eq!(other.status(), 403);
+    let health = client.get(format!("http://{addr}/")).send().await.unwrap();
+    assert_eq!(health.status(), 200);
+    assert!(health.bytes().await.unwrap().is_empty());
+    task.abort();
 }

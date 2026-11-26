@@ -163,6 +163,16 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
 * Timeout: a request still unanswered after 60 s gets `-32002` `request timed out`, as geth. So
   does a large request body that sends nothing for 10 s or arrives slower than 256 KiB/s. A
   batch keeps the answers it finished before then.
+* Readiness: a `GET` or `HEAD` of `/ready` on the RPC address answers HTTP 200 when the node
+  is ready and 503 when it is not, with `{"ready": <bool>, "checks": [...]}`. Each check has
+  an `id`, a `label`, `ok` and a `detail` that says why it fails. The checks are `consensus`
+  (the node follows heads and is not halted), `head` (the head is fresh, by the stale-head
+  rule of `--head.max-age`), `peers` (a connected peer serves `snap/1`) and `state` (the
+  node's own state probe verified a read at most 6 blocks below the head). After each new
+  head the node reads the account of the head's beneficiary at the head, fetching what it
+  misses in every `--state.on-miss` mode, within 20 s. A client's read never counts, so an
+  odd key or block cannot take the node out of a load balancer. Any other `GET` is the empty
+  health check below.
 * Host check: a request whose `Host` header is not `localhost` or an IP literal gets HTTP 403
   `invalid host specified`, as geth's default `--http.vhosts`. The check stops DNS rebinding, and
   no flag turns it off. A reverse proxy must send a local `Host`. nginx `proxy_pass` does this by

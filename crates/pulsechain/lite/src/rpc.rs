@@ -451,6 +451,9 @@ impl<T: crate::net::client::Transport> ReceiptSource for crate::net::client::P2p
 pub trait PeerNetwork: Send + Sync {
     /// Connected eth peers, the `net_peerCount` answer.
     fn peer_count(&self) -> usize;
+    /// Connected peers that state can be fetched from: they passed the keep rule and speak
+    /// `snap/1`.
+    fn state_peers(&self) -> usize;
     /// Sends the signed transaction `raw`, in its EIP-2718 form, to at most
     /// [`TX_PEERS`](crate::net::wire::TX_PEERS) connected peers. Returns how many it went to.
     async fn broadcast_transaction(
@@ -466,6 +469,9 @@ pub struct NoPeers;
 #[async_trait]
 impl PeerNetwork for NoPeers {
     fn peer_count(&self) -> usize {
+        0
+    }
+    fn state_peers(&self) -> usize {
         0
     }
     async fn broadcast_transaction(
@@ -504,6 +510,8 @@ pub struct Api {
     /// Bounds the wide receipt reads that wait on a fetch at once, across all requests: each
     /// holds one permit for its block ([`Api::receipts_wide`]).
     wide_fetches: tokio::sync::Semaphore,
+    /// The newest state probe, for `GET /ready`.
+    state_probe: Mutex<Option<StateProbe>>,
     trust_label: String,
 }
 
@@ -579,6 +587,7 @@ impl Api {
             warm_reads: tokio::sync::Semaphore::new(WARM_READS_RUNNING),
             wide_fetches: tokio::sync::Semaphore::new(WIDE_FETCHES),
             recent_txs: Mutex::default(),
+            state_probe: Mutex::default(),
             trust_label: p.trust_label,
         }))
     }
@@ -586,6 +595,89 @@ impl Api {
     /// The trust label (hosts only).
     pub fn trust_label(&self) -> &str {
         &self.trust_label
+    }
+
+    /// The readiness checks of `GET /ready`, and whether every one passes: the node follows heads
+    /// and is not halted, the head is fresh, a state peer is connected, and the node's own
+    /// newest state probe ([`Self::probe_state`])
+    /// verified a read at most [`PROBE_MAX_LAG`] blocks below the head. A client's read never
+    /// counts: an odd key or block must not take the node out of a load balancer.
+    pub fn readiness(&self) -> (bool, Value) {
+        let consensus = match (self.chain.halt_reason(), self.chain.is_live()) {
+            (Some(reason), _) => Err(halted_message(reason).to_owned()),
+            (None, false) => Err(NO_HEAD.to_owned()),
+            (None, true) => Ok("following heads".to_owned()),
+        };
+        let head = self.head().map_err(|e| e.message).map(|b| {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let age = now.saturating_sub(b.header.timestamp);
+            format!("block {}, {age} s old", b.header.number)
+        });
+        let peers = match self.net.state_peers() {
+            0 => Err("no connected peer serves state (snap/1)".to_owned()),
+            n => Ok(format!("{n} connected peers serve state (snap/1)")),
+        };
+        let head_number = self.chain.head().map(|b| b.header.number);
+        let state = match &*self.state_probe.lock() {
+            None => Err("no state probe has run yet".to_owned()),
+            Some(StateProbe { block, outcome: Err(reason) }) => {
+                Err(format!("the state probe at block {block} failed: {reason}"))
+            }
+            Some(StateProbe { block, outcome: Ok(()) }) => {
+                if head_number.is_some_and(|h| h > block.saturating_add(PROBE_MAX_LAG)) {
+                    Err(format!(
+                        "the newest verified state probe is at block {block}, more than \
+                         {PROBE_MAX_LAG} blocks below the head"
+                    ))
+                } else {
+                    Ok(format!("a state read at block {block} verified"))
+                }
+            }
+        };
+        let checks = [
+            ("consensus", "Following verified heads", consensus),
+            ("head", "The head is fresh", head),
+            ("peers", "Connected to a state peer", peers),
+            ("state", "Verified state reads working", state),
+        ];
+        let ready = checks.iter().all(|(.., c)| c.is_ok());
+        let checks: Vec<Value> = checks
+            .into_iter()
+            .map(|(id, label, c)| {
+                let ok = c.is_ok();
+                let detail = c.unwrap_or_else(|e| e);
+                json!({"id": id, "label": label, "ok": ok, "detail": detail})
+            })
+            .collect();
+        (ready, json!({"ready": ready, "checks": checks}))
+    }
+
+    /// The node's own state probe for [`Self::readiness`]: a verified read, fetching whatever it
+    /// misses whatever `--state.on-miss` says, of the account of the head's beneficiary at the
+    /// head. The beneficiary's account changes in each block, so the read walks the new root's
+    /// nodes. It takes at most [`PROBE_TIMEOUT`]. Does nothing without a live head.
+    pub async fn probe_state(&self) {
+        let Some(head) = self.chain.head().filter(|_| self.chain.is_live()) else { return };
+        let state = PartialState::new(self.store.clone(), head.header.state_root);
+        let who = head.header.beneficiary;
+        let read = run_rounds(
+            &state,
+            &self.hashes,
+            &*self.fetcher,
+            None,
+            OnMiss::Fetch,
+            self.cfg.max_rounds,
+            |db| db.get_account(&who).is_ok(),
+        );
+        let outcome = match tokio::time::timeout(PROBE_TIMEOUT, read).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(self.map_rounds(e).message),
+            Err(_) => Err(format!("no answer within {} s", PROBE_TIMEOUT.as_secs())),
+        };
+        if let Err(reason) = &outcome {
+            tracing::debug!(block = head.header.number, %reason, "the state probe failed");
+        }
+        *self.state_probe.lock() = Some(StateProbe { block: head.header.number, outcome });
     }
 
     /// Answers one request. The server counts the reply it sends ([`Self::count_reply`]).
@@ -1882,6 +1974,34 @@ impl LogQuery {
     }
 }
 
+/// How long the state probe may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How far below the head the newest verified probe may be: a few slots of probes that did not
+/// finish yet.
+const PROBE_MAX_LAG: u64 = 6;
+
+/// The outcome of the node's newest state probe.
+#[derive(Debug)]
+struct StateProbe {
+    /// The block it read at.
+    block: u64,
+    /// `Ok` when the read verified, else why not.
+    outcome: Result<(), String>,
+}
+
+/// Runs [`Api::probe_state`] after each new head, one at a time, until the task is aborted.
+pub async fn state_probe_loop(api: Arc<Api>) {
+    let mut probed = None;
+    loop {
+        let head = api.chain.head().map(|b| b.hash);
+        if head.is_some() && head != probed {
+            api.probe_state().await;
+            probed = head;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// The warm jobs queued or running.
 #[derive(Debug, Default)]
 struct WarmQueue {
@@ -2943,6 +3063,14 @@ where
                     let ok = |data: Vec<u8>, status: u16| reply(data.into(), status, None);
                     if !local_host(req.headers()) {
                         return ok(b"{\"error\":\"invalid host specified\"}".to_vec(), 403);
+                    }
+                    // The readiness probe: 200 when ready, 503 with the failing checks.
+                    if matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD) &&
+                        req.uri().path() == "/ready"
+                    {
+                        let (ready, body) = api.readiness();
+                        let text = serde_json::to_vec(&body).map_err(std::io::Error::other)?;
+                        return ok(text, if ready { 200 } else { 503 });
                     }
                     // As geth: a GET with no body and no query is a load balancer's health check.
                     if req.method() == hyper::Method::GET &&

@@ -117,6 +117,9 @@ impl crate::rpc::PeerNetwork for AnyNet {
             Self::None(_) => 0,
         }
     }
+    fn state_peers(&self) -> usize {
+        Transport::peers(self).len()
+    }
     async fn broadcast_transaction(
         &self,
         raw: &[u8],
@@ -305,6 +308,7 @@ pub async fn run(
         trust_label: label.clone(),
     })
     .ok_or("unsupported chain")?;
+    let probe_task = tokio::spawn(crate::rpc::state_probe_loop(api.clone()));
     let (addr, server) = serve_listener(api, listener)?;
     tracing::info!(%addr, "{label}");
 
@@ -333,6 +337,7 @@ pub async fn run(
     signals.recv().await;
     tracing::info!("shutting down");
     server.abort();
+    probe_task.abort();
     follower_task.abort();
     hot_task.abort();
     gauges.abort();
