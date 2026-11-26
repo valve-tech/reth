@@ -87,9 +87,9 @@ pub const FINALITY_STALLED: &str =
     "not serving state: the head is too far past the finalized block (finality stalled)";
 /// The unrecoverable-sender text.
 pub const BAD_SENDER: &str = "transaction sender could not be recovered from its signature";
-/// The fee-history rewards text.
-pub const NO_REWARDS: &str =
-    "rewardPercentiles are not supported by the lite node: rewards need receipts it does not hold";
+/// The prefix of geth's text for reward percentiles `eth_feeHistory` refuses:
+/// `invalid reward percentile: <reason>`.
+pub const INVALID_PERCENTILE: &str = "invalid reward percentile";
 /// The re-seeded-during-the-request text.
 pub const RESEEDED: &str = "not serving: the chain was re-seeded during the request";
 /// The EIP-1898 requireCanonical text.
@@ -216,6 +216,12 @@ const LOG_RECEIPT_FETCHES: usize = 8;
 /// The log bytes one `eth_getLogs` collects ([`log_bytes`]), so its answer stays well under
 /// [`MAX_SINGLE_RESPONSE`]: hex doubles the data, and each log adds a few hundred bytes of text.
 const MAX_LOG_BYTES: usize = 24 << 20;
+/// The most reward percentiles one `eth_feeHistory` takes, as geth.
+const MAX_REWARD_PERCENTILES: usize = 100;
+/// The most blocks one `eth_feeHistory` with reward percentiles covers: the receipt sets the wide
+/// cache holds, so a repeat of the request reads the cache. As geth truncates a long history, a
+/// longer count answers the newest blocks, from a later `oldestBlock`.
+const MAX_REWARD_BLOCKS: u64 = WIDE_RECEIPT_CACHE as u64;
 /// geth's caps on a log filter: topic positions, and addresses or alternatives at one position.
 const MAX_LOG_TOPICS: usize = 4;
 const MAX_LOG_FILTER_VALUES: usize = 1000;
@@ -665,7 +671,11 @@ impl Api {
                 self.head()?;
                 Ok(json!(hex_u128(self.suggested_tip())))
             }
-            "eth_feeHistory" => self.fee_history(p),
+            "eth_feeHistory" => {
+                let res = self.fee_history(p, mode).await;
+                self.warm_if_needed(method, p, mode, &res);
+                res
+            }
             _ => Err(RpcError::new(-32601, REFUSED_MESSAGE)),
         }
     }
@@ -1423,7 +1433,7 @@ impl Api {
         tips[(tips.len() - 1) * 60 / 100].max(min.unwrap_or(0)).min(MAX_TIP)
     }
 
-    fn fee_history(&self, p: &Value) -> Result<Value, RpcError> {
+    async fn fee_history(self: &Arc<Self>, p: &Value, mode: OnMiss) -> Result<Value, RpcError> {
         let count = match p.get(0) {
             Some(Value::String(s)) => parse_hex_or_decimal(s),
             Some(v) => v.as_u64(),
@@ -1431,9 +1441,9 @@ impl Api {
         }
         .ok_or_else(|| RpcError::params("invalid block count"))?
         .min(1024);
-        let rewards = match p.get(2) {
-            None | Some(Value::Null) => false,
-            Some(Value::Array(a)) => !a.is_empty(),
+        let percentiles: &[Value] = match p.get(2) {
+            None | Some(Value::Null) => &[],
+            Some(Value::Array(a)) => a,
             Some(_) => return Err(RpcError::params("invalid reward percentiles")),
         };
         let newest = self.resolve(p.get(1).unwrap_or(&Value::Null), 0);
@@ -1445,12 +1455,9 @@ impl Api {
                 _ => Ok(json!({"oldestBlock": "0x0", "gasUsedRatio": null})),
             };
         }
+        let percentiles = reward_percentiles(percentiles)?;
+        let count = if percentiles.is_empty() { count } else { count.min(MAX_REWARD_BLOCKS) };
         let newest = newest?.ok_or_else(|| RpcError::other(NOT_IN_WINDOW))?;
-        // Rewards need each transaction's gas used, which only receipts hold. Zeros would be a
-        // wrong answer, so percentiles are refused.
-        if rewards {
-            return Err(RpcError::other(NO_REWARDS));
-        }
         // Walk the newest block's own ancestry and stop at the first block not held: the held
         // numbers are not contiguous (the finalized block is kept below the window), and entry i
         // must be block oldestBlock + i.
@@ -1477,13 +1484,109 @@ impl Api {
             .iter()
             .map(|b| b.header.gas_used as f64 / b.header.gas_limit.max(1) as f64)
             .collect();
-        let out = json!({
+        let mut out = json!({
             "oldestBlock": hex_u64(first),
             "baseFeePerGas": base_fees,
             "gasUsedRatio": ratios,
         });
+        if !percentiles.is_empty() {
+            out["reward"] = json!(self.rewards(&blocks, &percentiles, mode).await?);
+        }
         Ok(out)
     }
+
+    /// The reward at each of `percentiles` of each of `blocks`, from their verified receipts. The
+    /// receipts of up to [`LOG_RECEIPT_FETCHES`] blocks are read at once, through
+    /// [`Self::receipts_wide`]: a set it fetches never pushes out one other reads use.
+    async fn rewards(
+        self: &Arc<Self>,
+        blocks: &[HeldBlock],
+        percentiles: &[f64],
+        mode: OnMiss,
+    ) -> Result<Vec<Vec<String>>, RpcError> {
+        use futures::{StreamExt, TryStreamExt};
+        if mode != OnMiss::Fetch {
+            // Every block whose receipts are not held counts in the miss. A block without
+            // transactions needs none.
+            let missing = blocks.iter().filter(|b| !self.receipts_held(b)).count();
+            if missing > 0 {
+                return Err(RpcError::miss(missing as u64));
+            }
+        }
+        // At most `MAX_REWARD_BLOCKS` blocks, so the fetch cap is never reached.
+        let fetches = std::sync::atomic::AtomicUsize::new(0);
+        let fetches = &fetches;
+        futures::stream::iter(blocks.iter().cloned())
+            .map(|b| async move {
+                let receipts =
+                    self.receipts_wide(&b, mode, fetches, MAX_REWARD_BLOCKS as usize).await?;
+                block_rewards(&b, &receipts, percentiles)
+            })
+            .buffered(LOG_RECEIPT_FETCHES)
+            .try_collect()
+            .await
+    }
+}
+
+/// The reward percentiles of an `eth_feeHistory`, checked as geth checks them: at most
+/// [`MAX_REWARD_PERCENTILES`], each from 0 to 100, each above the one before.
+fn reward_percentiles(raw: &[Value]) -> Result<Vec<f64>, RpcError> {
+    let invalid = |reason: String| RpcError::other(format!("{INVALID_PERCENTILE}: {reason}"));
+    if raw.len() > MAX_REWARD_PERCENTILES {
+        return Err(invalid(format!("over the query limit {MAX_REWARD_PERCENTILES}")));
+    }
+    let mut out: Vec<f64> = Vec::with_capacity(raw.len());
+    for (i, v) in raw.iter().enumerate() {
+        let p = v.as_f64().ok_or_else(|| RpcError::params("invalid reward percentiles"))?;
+        if !(0.0..=100.0).contains(&p) {
+            return Err(invalid(format!("{p:.6}")));
+        }
+        if let Some(prev) = out.last().filter(|prev| p <= **prev) {
+            return Err(invalid(format!("#{}:{prev:.6} >= #{i}:{p:.6}", i - 1)));
+        }
+        out.push(p);
+    }
+    Ok(out)
+}
+
+/// geth's rewards of block `b` at `percentiles`: the effective tips of its transactions, lowest
+/// first, each weighted by the gas it used, read at each percentile of the block's gas used. A
+/// block without transactions has a zero reward at each.
+fn block_rewards(
+    b: &HeldBlock,
+    receipts: &[WireReceipt],
+    percentiles: &[f64],
+) -> Result<Vec<String>, RpcError> {
+    if b.body.transactions.is_empty() {
+        return Ok(vec![hex_u128(0); percentiles.len()]);
+    }
+    check_receipts(b, receipts)?;
+    let base = b.header.base_fee_per_gas.unwrap_or(0);
+    let mut prev = 0u64;
+    let mut txs = Vec::with_capacity(receipts.len());
+    for (tx, r) in b.body.transactions.iter().zip(receipts) {
+        let cumulative = r.receipt.cumulative_gas_used;
+        // A verified receipt set never goes down: the receipts root commits to every total.
+        let used =
+            cumulative.checked_sub(prev).ok_or_else(|| RpcError::other(RECEIPTS_MISMATCH))?;
+        prev = cumulative;
+        // A held block's transactions pay at least its base fee, so a tip always exists.
+        txs.push((tx.effective_tip_per_gas(base).unwrap_or(0), used));
+    }
+    // Stable, as geth's sort: equal tips keep the block's order.
+    txs.sort_by_key(|(tip, _)| *tip);
+    let (mut at, mut sum) = (0, txs[0].1);
+    let mut out = Vec::with_capacity(percentiles.len());
+    for p in percentiles {
+        // As geth: the float threshold truncated to whole gas.
+        let threshold = (b.header.gas_used as f64 * p / 100.0) as u64;
+        while sum < threshold && at < txs.len() - 1 {
+            at += 1;
+            sum = sum.saturating_add(txs[at].1);
+        }
+        out.push(hex_u128(txs[at].0));
+    }
+    Ok(out)
 }
 
 /// The address and topic criteria of an `eth_getLogs` filter. An empty list matches anything.

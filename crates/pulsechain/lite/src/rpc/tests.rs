@@ -1222,16 +1222,183 @@ async fn only_an_oversized_body_is_answered_413() {
     task.abort();
 }
 
+const GWEI: u128 = 1_000_000_000;
+
+/// geth's reward rule: tips lowest first, each weighted by its gas, read at each percentile of
+/// the block's gas used. A block without transactions rewards zero at each percentile.
 #[tokio::test]
-async fn fee_history_rewards_are_refused_not_zeros() {
+async fn fee_history_rewards_weight_each_tip_by_the_gas_its_transaction_used() {
     let r = rig(OnMiss::Fetch, true);
-    let v = call(&r.api, "eth_feeHistory", json!(["0x2", "latest", [25, 75]])).await;
-    let (code, msg) = error(&v);
-    assert_eq!(code, -32000);
-    assert!(msg.contains("rewardPercentiles"), "{msg}");
-    // No percentiles: no rewards asked, an answer.
-    let v = call(&r.api, "eth_feeHistory", json!(["0x2", "latest", []])).await;
-    assert!(result(&v).get("reward").is_none());
+    let source = Arc::new(ReceiptsByNumber::default());
+    push_head_with(&r, vec![], |h| h.gas_used = 0);
+    // Tips over the 1 gwei base fee of 3, 1 and 2 gwei, which used 60k, 20k and 20k gas.
+    let txs = vec![legacy_tx(10, 4 * GWEI), legacy_tx(11, 2 * GWEI), legacy_tx(12, 3 * GWEI)];
+    let b = push_head_with(&r, txs, |h| h.gas_used = 100_000);
+    let receipts = [60_000, 80_000, 100_000].map(|c| receipt_of(c, vec![])).to_vec();
+    source.sets.lock().insert(b.header.number, receipts);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), source.clone());
+    let percentiles = json!([0, 10, 20, 25, 40, 41, 100]);
+    let v = call(&api, "eth_feeHistory", json!(["0x2", "latest", percentiles])).await;
+    let (one, two, three) = (hex_u128(GWEI), hex_u128(2 * GWEI), hex_u128(3 * GWEI));
+    assert_eq!(
+        result(&v)["reward"],
+        json!([
+            ["0x0", "0x0", "0x0", "0x0", "0x0", "0x0", "0x0"],
+            [one, one, one, two, two, three, three],
+        ])
+    );
+    assert_eq!(result(&v)["oldestBlock"], json!(hex_u64(b.header.number - 1)));
+    // The empty block needs no receipts.
+    assert_eq!(*source.fetches.lock(), vec![b.header.number]);
+    // Without percentiles there is no reward field, as before.
+    let v = call(&api, "eth_feeHistory", json!(["0x2", "latest", []])).await;
+    assert!(result(&v).get("reward").is_none(), "{v}");
+    let v = call(&api, "eth_feeHistory", json!(["0x2", "latest"])).await;
+    assert!(result(&v).get("reward").is_none(), "{v}");
+}
+
+#[tokio::test]
+async fn fee_history_reward_percentiles_are_checked_as_geth_checks_them() {
+    let r = rig(OnMiss::Fetch, true);
+    let fee = |percentiles: Value| {
+        let api = r.api.clone();
+        async move { call(&api, "eth_feeHistory", json!(["0x1", "latest", percentiles])).await }
+    };
+    for (percentiles, reason) in [
+        (json!([101]), "101.000000"),
+        (json!([-1]), "-1.000000"),
+        (json!([50, 25]), "#0:50.000000 >= #1:25.000000"),
+        (json!([10, 50, 50]), "#1:50.000000 >= #2:50.000000"),
+        (json!((0..=100).collect::<Vec<_>>()), "over the query limit 100"),
+    ] {
+        let want = format!("{INVALID_PERCENTILE}: {reason}");
+        assert_eq!(
+            error(&fee(percentiles.clone()).await),
+            (-32000, want.as_str()),
+            "{percentiles}"
+        );
+    }
+    let most: Vec<f64> = (0..MAX_REWARD_PERCENTILES).map(|i| i as f64 / 1.5).collect();
+    let v = fee(json!(most)).await;
+    assert_eq!(result(&v)["reward"][0].as_array().unwrap().len(), MAX_REWARD_PERCENTILES);
+    for bad in [json!(["50"]), json!([null]), json!([[1]])] {
+        assert_eq!(error(&fee(bad.clone()).await), (-32602, "invalid reward percentiles"), "{bad}");
+    }
+    // As geth: a zero count answers no blocks before the percentiles are read.
+    let v = call(&r.api, "eth_feeHistory", json!(["0x0", "latest", [101]])).await;
+    assert_eq!(result(&v), &json!({"oldestBlock": "0x0", "gasUsedRatio": null}));
+}
+
+#[tokio::test]
+async fn fee_history_with_rewards_covers_at_most_the_receipt_cache() {
+    let r = rig(OnMiss::Fetch, true);
+    extend_head(&r, 2 * MAX_REWARD_BLOCKS);
+    let head = r.chain.head().unwrap().header.number;
+    let v = call(&r.api, "eth_feeHistory", json!(["0x400", "latest", [50]])).await;
+    assert_eq!(result(&v)["oldestBlock"], json!(hex_u64(head + 1 - MAX_REWARD_BLOCKS)));
+    assert_eq!(result(&v)["reward"].as_array().unwrap().len() as u64, MAX_REWARD_BLOCKS);
+    assert_eq!(result(&v)["gasUsedRatio"].as_array().unwrap().len() as u64, MAX_REWARD_BLOCKS);
+    // Without rewards no receipts are read, and the history reaches further back.
+    let v = call(&r.api, "eth_feeHistory", json!(["0x400", "latest", []])).await;
+    let oldest = result(&v)["oldestBlock"].as_str().unwrap();
+    assert!(u64::from_str_radix(&oldest[2..], 16).unwrap() < head + 1 - MAX_REWARD_BLOCKS);
+    assert_eq!(MAX_REWARD_BLOCKS, RECEIPT_CACHE as u64);
+}
+
+#[tokio::test]
+async fn fee_history_rewards_miss_for_receipts_not_held_and_warm_them() {
+    // The rig's head has two transactions of tips 2 and 1 gwei, 21k gas each.
+    let r = rig(OnMiss::Error, true);
+    let v = call(&r.api, "eth_feeHistory", json!(["0x4", "latest", [50, 75]])).await;
+    // Only the head has transactions.
+    assert_eq!(
+        v["error"],
+        json!({"code": MISS_CODE, "message": MISS_MESSAGE, "data": {"missing": 1}})
+    );
+    let r = rig(OnMiss::ErrorAndWarm, true);
+    let p = json!(["0x1", "latest", [50, 75]]);
+    assert_eq!(error(&call(&r.api, "eth_feeHistory", p.clone()).await).0, MISS_CODE);
+    let mut v = Value::Null;
+    for _ in 0..100 {
+        v = call(&r.api, "eth_feeHistory", p.clone()).await;
+        if v.get("result").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(result(&v)["reward"], json!([[hex_u128(GWEI), hex_u128(2 * GWEI)]]));
+}
+
+/// Rewards over many blocks read the cached sets and never push one out.
+#[tokio::test]
+async fn fee_history_rewards_never_push_out_cached_receipt_sets() {
+    let r = rig(OnMiss::Fetch, true);
+    let source = Arc::new(ReceiptsByNumber::default());
+    let cached: Vec<HeldBlock> =
+        (0..RECEIPT_CACHE).map(|_| push_logged(&r, &source, vec![vec![]])).collect();
+    for _ in 0..10 {
+        push_logged(&r, &source, vec![vec![]]);
+    }
+    let api = api_with(&r, cfg_943(), r.honest.clone(), source.clone());
+    for b in &cached {
+        result(&call(&api, "eth_getBlockReceipts", json!([format!("{:#x}", b.hash)])).await);
+    }
+    source.fetches.lock().clear();
+    let v = call(&api, "eth_feeHistory", json!(["0xa", "latest", [50]])).await;
+    assert_eq!(result(&v)["reward"].as_array().unwrap().len(), 10);
+    assert_eq!(source.fetches.lock().len(), 10);
+    let shared = api.receipts.lock();
+    assert!(cached.iter().all(|b| shared.contains(&b.hash)), "rewards pushed out a set");
+}
+
+/// Rewards and logs of one block read at once share one receipt fetch.
+#[tokio::test]
+async fn fee_history_rewards_and_logs_of_one_block_share_one_fetch() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let r = rig(OnMiss::Fetch, true);
+    let gated = Arc::new(GatedReceipts {
+        answer: Ok(vec![wire_receipt(21_000)]),
+        gate: tokio::sync::Semaphore::new(0),
+        started: Default::default(),
+    });
+    let b = push_head(&r, vec![legacy_tx(77, 2_000_000_000)]);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), gated.clone());
+    let fee = tokio::spawn({
+        let api = api.clone();
+        async move { call(&api, "eth_feeHistory", json!(["0x1", "latest", [50]])).await }
+    });
+    let logs = tokio::spawn({
+        let (api, p) = (api.clone(), json!([{"blockHash": format!("{:#x}", b.hash)}]));
+        async move { call(&api, "eth_getLogs", p).await }
+    });
+    for _ in 0..100 {
+        if gated.started.load(SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gated.gate.add_permits(10);
+    result(&fee.await.unwrap());
+    result(&logs.await.unwrap());
+    assert_eq!(gated.started.load(SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fee_history_rewards_come_only_from_receipts_that_match_the_block() {
+    let r = rig(OnMiss::Fetch, true);
+    let failing = Arc::new(Failing(FetchError::NoSource));
+    let api = api_with(&r, cfg_943(), r.honest.clone(), failing);
+    let p = json!(["0x1", "latest", [50]]);
+    let want = "receipts unavailable: no source could serve the request";
+    assert_eq!(error(&call(&api, "eth_feeHistory", p.clone()).await), (-32000, want));
+    let short = Arc::new(Receipts(vec![wire_receipt(21_000)]));
+    let api = api_with(&r, cfg_943(), r.honest.clone(), short);
+    assert_eq!(error(&call(&api, "eth_feeHistory", p).await), (-32000, RECEIPTS_MISMATCH));
+    // A total that goes down is not a set the receipts root could commit to.
+    let head = r.chain.head().unwrap();
+    let falling = [wire_receipt(42_000), wire_receipt(21_000)];
+    assert_eq!(block_rewards(&head, &falling, &[50.0]), Err(RpcError::other(RECEIPTS_MISMATCH)));
 }
 
 #[tokio::test]
@@ -3617,7 +3784,9 @@ proptest! {
                 (json!({"blockHash": format!("{:#x}", b.hash)}), b)
             }
         };
-        let v = r.api.fee_history(&json!([hex_u64(count), newest_param, []])).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let p = json!([hex_u64(count), newest_param, []]);
+        let v = rt.block_on(r.api.fee_history(&p, OnMiss::Fetch)).unwrap();
         // The model: walk parent links from the newest block while the blocks are held.
         let mut want = vec![newest_block.clone()];
         while (want.len() as u64) < count.min(1024) &&
@@ -4634,6 +4803,16 @@ async fn wide_reads_keep_their_sets_when_single_reads_fill_their_cache() {
     for _ in 0..2 {
         assert_eq!(log_ids(&call(&api, "eth_getLogs", logs.clone()).await).len(), 5);
     }
+    let fee = json!(["0x5", "latest", [50]]);
+    for _ in 0..2 {
+        assert_eq!(
+            result(&call(&api, "eth_feeHistory", fee.clone()).await)["reward"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+    }
     assert_eq!(source.fetches.lock().len(), 5, "a repeat fetched again");
     assert!(
         narrow.iter().all(|b| api.receipts.lock().contains(&b.hash)),
@@ -4668,7 +4847,10 @@ fn the_wide_cache_pushes_out_only_its_own_sets() {
     }
     assert_eq!(wide.sets.len(), WIDE_RECEIPT_CACHE);
     assert!(!wide.contains(&B256::with_last_byte(0)) && wide.contains(&B256::with_last_byte(1)));
-    assert_eq!(MAX_LOG_FETCHES, WIDE_RECEIPT_CACHE);
+    assert_eq!(
+        (MAX_LOG_FETCHES, MAX_REWARD_BLOCKS as usize),
+        (WIDE_RECEIPT_CACHE, WIDE_RECEIPT_CACHE)
+    );
 }
 
 /// A few logs that carry much data are rendered under a render permit, as a large receipt is.

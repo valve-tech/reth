@@ -1705,6 +1705,7 @@ mod tests {
             ("RECEIPTS_UNAVAILABLE", format!("{RECEIPTS_UNAVAILABLE}: <reason>")),
             ("RENDERING_FAILED", format!("{RENDERING_FAILED}: <reason>")),
             ("PRUNED_HISTORY", format!("{PRUNED_HISTORY}: requested N, earliest available M")),
+            ("INVALID_PERCENTILE", format!("{INVALID_PERCENTILE}: <reason>")),
         ];
         let texts = named![
             MISS_MESSAGE,
@@ -1714,7 +1715,6 @@ mod tests {
             BEHIND_ANCHOR,
             FINALITY_STALLED,
             BAD_SENDER,
-            NO_REWARDS,
             RESEEDED,
             NOT_CANONICAL,
             FINALITY_UNCONFIRMED,

@@ -75,8 +75,18 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   eth_getTransactionByBlock{Hash,Number}AndIndex eth_getTransactionReceipt
   eth_getBlockReceipts eth_gasPrice eth_maxPriorityFeePerGas eth_feeHistory
   eth_getLogs web3_clientVersion web3_sha3 net_listening net_peerCount eth_accounts
-  eth_mining eth_hashrate`. `eth_feeHistory` does not take `rewardPercentiles`. Everything else,
-  including `eth_sendRawTransaction`, is `-32601` `method not served`.
+  eth_mining eth_hashrate`. Everything else, including `eth_sendRawTransaction`, is `-32601`
+  `method not served`.
+* Fee history: `eth_feeHistory` with `rewardPercentiles` reads each block's receipts through
+  the receipt path above, so the rewards come from receipts checked against the block's
+  receipts root. A reward is geth's: the effective tips of the block's transactions, lowest
+  first, each weighted by the gas it used, read at each percentile of the block's gas used. A
+  block without transactions rewards `0x0` and needs no receipts. As for `eth_getLogs`, a set
+  the request fetches is kept in the wide receipt cache. With percentiles the history covers at
+  most the newest 32 blocks, the sets the wide cache keeps, so a repeat reads them; as geth
+  truncates a long history, `oldestBlock` then says where it starts. In `error` and
+  `error-and-warm`, each block with transactions whose receipts are not held counts in the
+  miss.
 * Node answers: `web3_clientVersion` is `reth-lite/v` and the version that `--version`
   prints. `net_peerCount` is the number of connected eth peers. `net_listening` is `true`.
   The node holds no keys and does not mine, so `eth_accounts` is `[]`, `eth_mining` is
@@ -181,8 +191,8 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
     or `eth_estimateGas` read `BLOCKHASH` of a block below the held headers.
   * `block is not canonical`: a block given by hash with EIP-1898 `requireCanonical: true` is
     held but not on the followed chain.
-  * `rewardPercentiles are not supported by the lite node: rewards need receipts it does not hold`:
-    `eth_feeHistory` with a non-empty `rewardPercentiles`. Send an empty list.
+  * `invalid reward percentile: <reason>`: an `eth_feeHistory` with more than 100 reward
+    percentiles, one outside 0 to 100, or one not above the one before it, as geth answers it.
   * `transaction sender could not be recovered from its signature`: a held transaction has a
     signature that does not recover. The node never answers the zero address instead.
   * `state unavailable: <reason>`: in `fetch` mode, no peer served the state, or every answer
