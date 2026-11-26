@@ -1277,6 +1277,86 @@ mod tests {
         );
     }
 
+    /// Adds a linked chain to `provider`: one block per entry of `tips`, oldest first, numbered
+    /// from 1. A block with `Some(tip)` holds four transactions that pay that tip; `None` is an
+    /// empty block.
+    fn add_tip_chain(provider: &MockEthProvider, tips: &[Option<u128>]) {
+        const BASE_FEE: u64 = 7;
+        let mut parent_hash = B256::ZERO;
+        for (i, tip) in tips.iter().enumerate() {
+            let header = Header {
+                number: i as u64 + 1,
+                parent_hash,
+                gas_limit: 30_000_000,
+                base_fee_per_gas: Some(BASE_FEE),
+                ..Default::default()
+            };
+            let hash = header.hash_slow();
+            let transactions = tip
+                .map(|tip| {
+                    (0..4)
+                        .map(|_| {
+                            TransactionSigned::new_unhashed(
+                                reth_ethereum_primitives::Transaction::Eip1559(
+                                    alloy_consensus::TxEip1559 {
+                                        max_priority_fee_per_gas: tip,
+                                        max_fee_per_gas: tip + BASE_FEE as u128,
+                                        ..Default::default()
+                                    },
+                                ),
+                                Signature::test_signature(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            provider.add_block(
+                hash,
+                Block {
+                    header: header.clone(),
+                    body: BlockBody { transactions, ..Default::default() },
+                },
+            );
+            provider.add_header(hash, header);
+            parent_hash = hash;
+        }
+    }
+
+    /// A quiet chain: 30 blocks that pay a 10 gwei tip, then 100 empty blocks. The oracle must
+    /// still suggest the observed tip. Counting each empty block as a zero tip (upstream #23094)
+    /// puts the 60th percentile on zero, which is what the `PulseChain` testnet (chain 943)
+    /// answered.
+    #[tokio::test]
+    async fn gas_oracle_ignores_empty_blocks_on_a_quiet_chain() {
+        use reth_rpc_eth_api::helpers::LoadFee;
+        const TIP: u128 = 10_000_000_000;
+        let provider = MockEthProvider::default();
+        let mut tips = vec![Some(TIP); 30];
+        tips.extend(std::iter::repeat_n(None, 100));
+        add_tip_chain(&provider, &tips);
+        let api = build_test_eth_api(provider);
+
+        let tip = api.gas_oracle().suggest_tip_cap().await.unwrap();
+        assert_eq!(tip, U256::from(TIP), "a quiet chain must keep the observed tip, not fall to 0");
+    }
+
+    /// With no populated block in range, the oracle keeps its last price (the configured default
+    /// suggested fee before any history), not zero.
+    #[tokio::test]
+    async fn gas_oracle_keeps_the_default_fee_when_every_block_is_empty() {
+        use reth_rpc_eth_api::helpers::LoadFee;
+        let provider = MockEthProvider::default();
+        add_tip_chain(&provider, &[None; 50]);
+        let api = build_test_eth_api(provider);
+
+        let tip = api.gas_oracle().suggest_tip_cap().await.unwrap();
+        assert_eq!(
+            tip,
+            U256::from(alloy_consensus::constants::GWEI_TO_WEI),
+            "empty blocks must not suggest 0"
+        );
+    }
+
     /// Requesting all blocks should be ok
     #[tokio::test]
     async fn test_fee_history_all_blocks() {
