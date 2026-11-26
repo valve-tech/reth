@@ -2,8 +2,9 @@
 
 use crate::{eth::core::EthApiInner, EthApi};
 use alloy_network::Ethereum;
+use alloy_primitives::U256;
 use reth_chain_state::CanonStateSubscriptions;
-use reth_chainspec::ChainSpecProvider;
+use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::SenderRecoveryCache;
 use reth_primitives_traits::HeaderTy;
 use reth_rpc_convert::{RpcConvert, RpcConverter};
@@ -560,6 +561,8 @@ where
             )
         });
         let gas_oracle = gas_oracle.unwrap_or_else(|| {
+            let gas_oracle_config =
+                with_chain_min_tip(gas_oracle_config, provider.chain_spec().chain_id());
             GasPriceOracle::new(provider.clone(), gas_oracle_config, eth_cache.clone())
         });
         let fee_history_cache =
@@ -643,5 +646,56 @@ where
     pub const fn force_blob_sidecar_upcasting(mut self, force: bool) -> Self {
         self.force_blob_sidecar_upcasting = force;
         self
+    }
+}
+
+/// valve-tech fork: the lowest tip that gets a transaction mined on chain `chain_id`, for chains
+/// whose block producers enforce one. On `PulseChain` testnet v4 (943) that is 0.001 gwei.
+const fn chain_min_tip(chain_id: u64) -> Option<U256> {
+    match chain_id {
+        943 => Some(U256::from_limbs([1_000_000, 0, 0, 0])),
+        _ => None,
+    }
+}
+
+/// Sets the chain's minimum tip as the oracle's floor, and as its default suggested fee, where
+/// the operator set neither. A quiet chain then suggests the minimum, not zero.
+fn with_chain_min_tip(mut config: GasPriceOracleConfig, chain_id: u64) -> GasPriceOracleConfig {
+    if let Some(min_tip) = chain_min_tip(chain_id) {
+        config.min_price.get_or_insert(min_tip);
+        config.default_suggested_fee.get_or_insert(min_tip);
+    }
+    config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_min_tip_fills_only_unset_values_on_943() {
+        let min = U256::from(1_000_000u64);
+        let config = with_chain_min_tip(GasPriceOracleConfig::default(), 943);
+        assert_eq!((config.min_price, config.default_suggested_fee), (Some(min), Some(min)));
+
+        let set = GasPriceOracleConfig {
+            min_price: Some(U256::from(5)),
+            default_suggested_fee: Some(U256::from(7)),
+            ..Default::default()
+        };
+        let config = with_chain_min_tip(set, 943);
+        assert_eq!(
+            (config.min_price, config.default_suggested_fee),
+            (Some(U256::from(5)), Some(U256::from(7)))
+        );
+
+        assert_eq!(
+            with_chain_min_tip(GasPriceOracleConfig::default(), 369),
+            GasPriceOracleConfig::default()
+        );
+        assert_eq!(
+            with_chain_min_tip(GasPriceOracleConfig::default(), 1),
+            GasPriceOracleConfig::default()
+        );
     }
 }

@@ -1357,6 +1357,43 @@ mod tests {
         );
     }
 
+    /// A mock provider for `PulseChain` testnet v4 (chain 943), whose producers enforce a minimum
+    /// tip of 0.001 gwei.
+    fn chain_943_provider() -> MockEthProvider {
+        let spec = ChainSpecBuilder::mainnet().chain(reth_chainspec::Chain::from_id(943)).build();
+        MockEthProvider::default().with_chain_spec(spec)
+    }
+
+    const MIN_TIP_943: u128 = 1_000_000;
+
+    /// A quiet 943 suggests exactly the chain's minimum tip.
+    #[tokio::test]
+    async fn gas_oracle_suggests_the_943_minimum_on_a_quiet_chain() {
+        use reth_rpc_eth_api::helpers::LoadFee;
+        let provider = chain_943_provider();
+        add_tip_chain(&provider, &[None; 50]);
+        let api = build_test_eth_api(provider);
+
+        let tip = api.gas_oracle().suggest_tip_cap().await.unwrap();
+        assert_eq!(tip, U256::from(MIN_TIP_943));
+    }
+
+    /// On 943 a window of tips under the minimum still suggests the minimum, and a window above
+    /// it suggests the observed tip.
+    #[tokio::test]
+    async fn gas_oracle_never_suggests_less_than_the_943_minimum() {
+        use reth_rpc_eth_api::helpers::LoadFee;
+        for (observed, want) in [(MIN_TIP_943 / 2, MIN_TIP_943), (3 * MIN_TIP_943, 3 * MIN_TIP_943)]
+        {
+            let provider = chain_943_provider();
+            add_tip_chain(&provider, &[Some(observed); 30]);
+            let api = build_test_eth_api(provider);
+
+            let tip = api.gas_oracle().suggest_tip_cap().await.unwrap();
+            assert_eq!(tip, U256::from(want), "observed tip {observed}");
+        }
+    }
+
     /// Requesting all blocks should be ok
     #[tokio::test]
     async fn test_fee_history_all_blocks() {

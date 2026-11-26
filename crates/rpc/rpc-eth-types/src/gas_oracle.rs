@@ -56,6 +56,11 @@ pub struct GasPriceOracleConfig {
 
     /// The minimum gas price, under which the sample will be ignored
     pub ignore_price: Option<U256>,
+
+    /// valve-tech fork: the lowest tip the oracle suggests, when the chain has a minimum tip
+    /// that transactions must pay to be mined. `None` leaves the suggestion unbounded below.
+    #[serde(default)]
+    pub min_price: Option<U256>,
 }
 
 impl Default for GasPriceOracleConfig {
@@ -69,6 +74,7 @@ impl Default for GasPriceOracleConfig {
             default_suggested_fee: None,
             max_price: Some(DEFAULT_MAX_GAS_PRICE),
             ignore_price: Some(DEFAULT_IGNORE_GAS_PRICE),
+            min_price: None,
         }
     }
 }
@@ -116,6 +122,7 @@ where
                 block_hash: B256::ZERO,
                 price: oracle_config
                     .default_suggested_fee
+                    .or(oracle_config.min_price)
                     .unwrap_or_else(|| GasPriceOracleResult::default().price),
             },
             lowest_effective_tip_cache: EffectiveTipLruCache(LruMap::with_hasher(
@@ -194,6 +201,11 @@ where
             price > max_price
         {
             price = max_price;
+        }
+
+        // never suggest less than the chain's minimum tip
+        if let Some(min_price) = self.oracle_config.min_price {
+            price = price.max(min_price);
         }
 
         inner.last_price = GasPriceOracleResult { block_hash: header.hash(), price };
