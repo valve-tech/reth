@@ -157,7 +157,11 @@ members = [
     "testing/runner",
     "crates/tracing-otlp",
     "crates/pulsechain/hardforks",
+    "crates/pulsechain/lc-server",
+    "crates/pulsechain/light-client",
+    "crates/pulsechain/lite",
     "crates/pulsechain/node",
+    "crates/pulsechain/snap",
     "crates/net/msgboard-types",
     "crates/net/msgboard",
 ]
@@ -331,8 +335,12 @@ incremental = false
 
 [workspace.dependencies]
 # pulsechain
+reth-pulsechain-lc-server = { path = "crates/pulsechain/lc-server" }
+reth-pulsechain-lite = { path = "crates/pulsechain/lite" }
 reth-pulsechain-forks = { path = "crates/pulsechain/hardforks", default-features = false }
+reth-pulsechain-light-client = { path = "crates/pulsechain/light-client" }
 reth-pulsechain-node = { path = "crates/pulsechain/node" }
+reth-pulsechain-snap = { path = "crates/pulsechain/snap" }
 reth-msgboard-types = { path = "crates/net/msgboard-types", default-features = false }
 reth-msgboard = { path = "crates/net/msgboard" }
 
@@ -628,6 +636,10 @@ test-case = "3"
 # ssz encoding
 ethereum_ssz = "0.10.4"
 ethereum_ssz_derive = "0.10.4"
+tree_hash = "0.12.1"
+
+# bls
+blst = { version = "0.3.17", default-features = false }
 
 # allocators
 jemalloc_pprof = { version = "0.8", default-features = false }

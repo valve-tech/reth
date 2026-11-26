@@ -82,3 +82,5 @@ __pycache__/
 .dev/tasks.md
 .dev/todo/
 /.worktrees
+# The pulsechain fuzz READMEs build into <top>/fuzz-target.
+/fuzz-target/

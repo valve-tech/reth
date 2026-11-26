@@ -1,0 +1,88 @@
+[package]
+name = "reth-pulsechain-lite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: the root workspace ignores this crate.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+
+reth-pulsechain-lite = { path = "..", features = ["fuzzing"] }
+reth-cli-util = { path = "../../../cli/util" }
+reth-pulsechain-snap = { path = "../../snap" }
+reth-eth-wire-types = { path = "../../../net/eth-wire-types" }
+reth-network-peers = { path = "../../../net/peers", features = ["std"] }
+
+alloy-consensus = { version = "2.5.0", features = ["k256"] }
+alloy-eips = { version = "2.5.0", features = ["sha2"] }
+alloy-primitives = { version = "1.6.1", features = ["map-foldhash"] }
+alloy-rlp = "0.3.16"
+alloy-trie = "0.9.9"
+
+async-trait = "0.1.68"
+humantime = "2.1"
+serde_json = "1.0"
+tokio = { version = "1.52.3", features = ["rt", "time", "sync", "test-util"] }
+
+[[bin]]
+name = "beacon_block_json"
+path = "fuzz_targets/beacon_block_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "beacon_sse"
+path = "fuzz_targets/beacon_sse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_responses"
+path = "fuzz_targets/wire_responses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proofs"
+path = "fuzz_targets/proofs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_body"
+path = "fuzz_targets/rpc_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parsers"
+path = "fuzz_targets/config_parsers.rs"
+test = false
+doc = false
+bench = false
+
+# The root workspace's patches this crate's graph uses: a separate workspace does not inherit them.
+[patch."https://github.com/alloy-rs/evm2"]
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+
+[patch.crates-io]
+reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+alloy-rpc-types-eth = { path = "../../../vendor/alloy-rpc-types-eth" }

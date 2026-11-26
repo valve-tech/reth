@@ -1,0 +1,89 @@
+[package]
+name = "reth-pulsechain-lite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage = "https://github.com/valve-tech/reth"
+repository = "https://github.com/valve-tech/reth"
+description = "reth-lite: a small verifying PulseChain node that follows a beacon API"
+
+[lints]
+workspace = true
+
+[lib]
+name = "reth_pulsechain_lite"
+
+[features]
+# Exposes thin wrappers over crate-private parsers for the cargo-fuzz targets in `fuzz/`.
+fuzzing = []
+
+[[bin]]
+name = "reth-lite"
+path = "src/main.rs"
+
+[dependencies]
+# reth
+reth-chainspec = { workspace = true, features = ["std"] }
+reth-cli-util.workspace = true
+reth-evm = { workspace = true, features = ["std"] }
+reth-evm-ethereum = { workspace = true, features = ["std"] }
+reth-eth-wire.workspace = true
+reth-libmdbx.workspace = true
+reth-network = { workspace = true }
+reth-network-api.workspace = true
+reth-tasks = { workspace = true, features = ["rayon"] }
+reth-pulsechain-snap.workspace = true
+reth-network-peers = { workspace = true, features = ["std"] }
+reth-discv4.workspace = true
+reth-pulsechain-forks.workspace = true
+reth-pulsechain-light-client.workspace = true
+
+reth-eth-wire-types.workspace = true
+
+# alloy
+alloy-consensus = { workspace = true, features = ["k256"] }
+alloy-eips.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-rlp.workspace = true
+alloy-rpc-types-eth = { workspace = true, features = ["serde"] }
+alloy-trie.workspace = true
+
+# evm
+evm2 = { workspace = true, features = ["std"] }
+
+# consensus
+ethereum_ssz.workspace = true
+
+# misc
+async-trait.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+sha2.workspace = true
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true, features = ["std"] }
+reqwest = { workspace = true }
+sysinfo = { workspace = true, features = ["system"] }
+tracing.workspace = true
+futures.workspace = true
+humantime.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal", "net"] }
+metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "std", "ansi"] }
+parking_lot.workspace = true
+clap = { workspace = true, features = ["derive"] }
+metrics.workspace = true
+thiserror.workspace = true
+url = { workspace = true, features = ["std"] }
+
+[build-dependencies]
+smolgen = { workspace = true, features = ["emit_and_set", "gitcl"] }
+
+[dev-dependencies]
+reth-pulsechain-light-client = { workspace = true, features = ["test-utils"] }
+blst.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+tempfile.workspace = true

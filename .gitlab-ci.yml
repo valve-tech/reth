@@ -1,4 +1,5 @@
-# GitLab counterpart of .github/workflows/valve-ci.yml. Keep the two step lists identical.
+# GitLab counterpart of .github/workflows/valve-ci.yml. Keep the two step lists identical. The
+# fuzz workspace check is a step there and the fuzz-check job here, so that it runs only on changes.
 default:
   # Pinned to the compiler the release workflow uses (valve-release.yml). 1.100.0 builds made
   # eth_getLogs about 2x slower on 2026-11-18, so bump both together and only on purpose.
@@ -9,6 +10,8 @@ variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   CARGO_INCREMENTAL: "0"
   GIT_DEPTH: "50"
+  # The reth-lite private-reference scan fails here instead of skipping without a checkout.
+  RETH_LITE_REQUIRE_GIT: "1"
 
 workflow:
   rules:
@@ -31,11 +34,44 @@ valve-ci:
     - cargo fmt --check -p reth-firehose -p reth-firehose-tests -p reth-pulsechain-node -p reth-pulsechain-forks || true
     - cargo clippy --no-deps -p reth-firehose -p reth-firehose-tests -p reth-pulsechain-node -p reth-pulsechain-forks --all-targets
     - cargo clippy --no-deps -p reth-msgboard -p reth-msgboard-types -p reth-firehose-health --all-targets -- -D warnings
+    - cargo clippy --no-deps -p reth-pulsechain-lite -p reth-pulsechain-light-client -p reth-pulsechain-lc-server -p reth-pulsechain-snap --all-targets -- -D warnings
+    - cargo check -p reth-pulsechain-lite -p reth-pulsechain-snap --features fuzzing --all-targets
     - cargo clippy --no-deps -p pulse-reth --all-targets --no-default-features --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs" -- -D warnings
     - cargo check -p reth -p pulse-reth --all-targets --no-default-features --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
     - cargo nextest run --no-fail-fast -p reth-firehose -p reth-firehose-health -p reth-firehose-tests -p reth-msgboard -p reth-msgboard-types -p reth-pulsechain-node -p reth-pulsechain-forks -p reth-cli-commands
     - cargo nextest run --no-fail-fast -p pulse-reth --no-default-features --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
+    - cargo nextest run --no-fail-fast -p reth-pulsechain-lite -p reth-pulsechain-light-client -p reth-pulsechain-lc-server -p reth-pulsechain-snap
     - cargo nextest run -p reth-node-ethereum --test e2e -E 'test(estimate::)' --no-tests=fail
+    - cargo nextest run -p reth-node-core --test build_version --no-tests=fail
+
+# The fuzz crates are workspaces of their own, each with its own Cargo.lock, so valve-ci does
+# not build them. This job checks them only when a change can break them: the fuzz crates, the
+# fuzzing APIs, the lite and snap manifests, or the root manifest and lockfile (the fuzz crates
+# copy the root [patch] sections). Keep the paths and commands the same as in valve-ci.yml. It
+# reads the valve-ci cache and shares its target directory, so it reuses what valve-ci built.
+fuzz-check:
+  stage: test
+  tags: [reth]
+  timeout: 1h
+  rules:
+    - changes:
+        - crates/pulsechain/lite/fuzz/**/*
+        - crates/pulsechain/snap/fuzz/**/*
+        - crates/pulsechain/lite/src/fuzz_api.rs
+        - crates/pulsechain/snap/src/fuzz_api.rs
+        - crates/pulsechain/lite/Cargo.toml
+        - crates/pulsechain/snap/Cargo.toml
+        - Cargo.toml
+        - Cargo.lock
+  cache:
+    key: valve-ci-$CI_DEFAULT_BRANCH
+    paths: [.cargo/registry, .cargo/git, target]
+    policy: pull
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq clang libclang-dev pkg-config
+  script:
+    - cargo check --locked --manifest-path crates/pulsechain/lite/fuzz/Cargo.toml --all-targets --target-dir target
+    - cargo check --locked --manifest-path crates/pulsechain/snap/fuzz/Cargo.toml --all-targets --target-dir target
 
 # Unit tests of the upstream crates the fork modifies. The filter mirrors
 # upstream's unit.yml: library and binary tests, no integration tests.

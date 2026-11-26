@@ -39,6 +39,7 @@ reth-firehose.workspace = true
 reth-firehose-health.workspace = true
 reth-msgboard.workspace = true
 reth-pulsechain-node.workspace = true
+reth-pulsechain-snap.workspace = true
 
 # misc
 alloy-consensus.workspace = true

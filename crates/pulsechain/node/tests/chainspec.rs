@@ -41,7 +41,8 @@ fn test_pulsechain_genesis_hash_matches_eth_mainnet() {
     use reth_pulsechain_node::chainspec::pulsechain_mainnet;
     let _chain = pulsechain_mainnet(); // stubs out for now; hash checked once PULSECHAIN exists
                                        // Real assertion (Phase 2):
-                                       // assert_eq!(*PULSECHAIN.genesis_header.hash(), MAINNET_GENESIS_HASH);
+                                       // assert_eq!(*PULSECHAIN.genesis_header.hash(),
+                                       // MAINNET_GENESIS_HASH);
     todo!("check genesis hash against MAINNET_GENESIS_HASH once PULSECHAIN static exists");
 }
 

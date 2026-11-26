@@ -1,0 +1,54 @@
+[package]
+name = "reth-pulsechain-snap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage = "https://github.com/valve-tech/reth"
+repository = "https://github.com/valve-tech/reth"
+description = "snap/1 serving for PulseChain light clients"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-eth-wire.workspace = true
+reth-eth-wire-types.workspace = true
+reth-metrics.workspace = true
+reth-network.workspace = true
+reth-network-api.workspace = true
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-stages-types.workspace = true
+reth-storage-api.workspace = true
+
+# alloy
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-trie.workspace = true
+
+# misc
+futures.workspace = true
+metrics.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing.workspace = true
+
+[features]
+# Exposes `fuzz_api`, the in-memory test state and helpers the cargo-fuzz targets in `fuzz/` use.
+fuzzing = ["alloy-trie/ethereum"]
+
+[dev-dependencies]
+proptest.workspace = true
+eyre.workspace = true
+metrics-util = { workspace = true, features = ["debugging"] }
+reth-chain-state.workspace = true
+reth-db-api.workspace = true
+reth-execution-types.workspace = true
+reth-testing-utils.workspace = true
+reth-trie.workspace = true
+alloy-trie = { workspace = true, features = ["ethereum"] }
+reth-provider = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

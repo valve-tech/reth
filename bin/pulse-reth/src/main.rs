@@ -23,9 +23,10 @@ use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_msgboard::{args::MsgboardArgs, launch::MSGBOARD_RPC_NAMESPACE, MsgboardLauncher};
 use reth_node_ethereum::{node::EthereumAddOns, snap::EthereumBackfill, EthereumNode};
 use reth_pulsechain_node::{
-    consensus::PulsechainConsensus, evm::PulsechainEvmConfig, fork_check::watch_peer_fork_ids,
-    gas::install_gas_estimation_margin, launch::inject_pulsechain_bootnodes_if_unset,
-    spec::PulsechainChainSpec, PulsechainChainSpecParser, PulsechainNode,
+    cli::PulsechainSnap1Args, consensus::PulsechainConsensus, evm::PulsechainEvmConfig,
+    fork_check::watch_peer_fork_ids, gas::install_gas_estimation_margin,
+    launch::inject_pulsechain_bootnodes_if_unset, spec::PulsechainChainSpec,
+    PulsechainChainSpecParser, PulsechainNode,
 };
 use reth_rpc_builder::install_txpool_page_rpc;
 use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection, RpcModuleValidator};
@@ -93,6 +94,9 @@ struct EthereumExtArgs {
 struct PulsechainExtArgs {
     #[command(flatten)]
     msgboard: MsgboardArgs,
+
+    #[command(flatten)]
+    snap1: PulsechainSnap1Args,
 
     /// Enable firehose instrumentation (FIRE protocol + ExEx).
     ///
@@ -302,6 +306,7 @@ fn run_pulsechain_node() -> eyre::Result<()> {
         async move |mut builder, ext: PulsechainExtArgs| {
             let PulsechainExtArgs {
                 msgboard: msgboard_args,
+                snap1: PulsechainSnap1Args { snap1 },
                 firehose_enabled,
                 firehose_output,
                 firehose_replica,
@@ -333,7 +338,9 @@ fn run_pulsechain_node() -> eyre::Result<()> {
                     .with_components(
                         PulsechainNode::components()
                             .executor(PulsechainFirehoseExecutorBuilder)
-                            .network(MsgboardNetworkBuilder::new(launcher.clone())),
+                            .network(
+                                MsgboardNetworkBuilder::new(launcher.clone()).with_snap1(snap1),
+                            ),
                     )
                     .with_add_ons(EthereumAddOns::default())
                     .extend_rpc_modules(move |ctx| {
@@ -371,26 +378,26 @@ fn run_pulsechain_node() -> eyre::Result<()> {
             } else {
                 info!(target: "reth::cli", "Launching PulseChain node (stock, firehose disabled)");
 
-                let handle = builder
-                    .with_types::<PulsechainNode>()
-                    .with_components(
-                        PulsechainNode::components()
-                            .network(MsgboardNetworkBuilder::new(launcher.clone())),
-                    )
-                    .with_add_ons(EthereumAddOns::default())
-                    .extend_rpc_modules(move |ctx| {
-                        launcher_for_rpc.install_rpc(ctx.modules)?;
-                        let pool = ctx.pool().clone();
-                        let converter = ctx.registry.eth_api().converter().clone();
-                        install_txpool_page_rpc(ctx.modules, pool, converter)?;
+                let handle =
+                    builder
+                        .with_types::<PulsechainNode>()
+                        .with_components(PulsechainNode::components().network(
+                            MsgboardNetworkBuilder::new(launcher.clone()).with_snap1(snap1),
+                        ))
+                        .with_add_ons(EthereumAddOns::default())
+                        .extend_rpc_modules(move |ctx| {
+                            launcher_for_rpc.install_rpc(ctx.modules)?;
+                            let pool = ctx.pool().clone();
+                            let converter = ctx.registry.eth_api().converter().clone();
+                            install_txpool_page_rpc(ctx.modules, pool, converter)?;
 
-                        let eth_api = ctx.registry.eth_api().clone();
-                        install_gas_estimation_margin(ctx.modules, eth_api)?;
+                            let eth_api = ctx.registry.eth_api().clone();
+                            install_gas_estimation_margin(ctx.modules, eth_api)?;
 
-                        Ok(())
-                    })
-                    .launch()
-                    .await?;
+                            Ok(())
+                        })
+                        .launch()
+                        .await?;
 
                 launcher.install_post_launch_tasks(
                     handle.node.network.clone(),
@@ -514,6 +521,34 @@ mod firehose_args_tests {
         ])
         .expect("parse equals-true");
         assert!(w.ext.firehose_enabled);
+    }
+
+    #[test]
+    fn pulsechain_snap1_defaults_off_and_flag_turns_it_on() {
+        let w = PulseWrap::try_parse_from(["test"]).expect("parse");
+        assert!(!w.ext.snap1.snap1, "snap/1 must default off");
+
+        let w = PulseWrap::try_parse_from(["test", "--pulsechain.snap1"]).expect("parse");
+        assert!(w.ext.snap1.snap1);
+
+        let w = PulseWrap::try_parse_from(["test", "--pulsechain.snap1=false"]).expect("parse");
+        assert!(!w.ext.snap1.snap1);
+    }
+
+    /// The flag must also parse through the full binary CLI (`pulse-reth node ...`).
+    #[test]
+    fn pulsechain_snap1_parses_in_the_full_node_cli() {
+        use reth_ethereum_cli::interface::Commands;
+        type PulseCli = Cli<PulsechainChainSpecParser, PulsechainExtArgs, ValveRpcModuleValidator>;
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["pulse-reth", "node", "--chain", "pulsechain"];
+            args.extend_from_slice(extra);
+            let cli = <PulseCli as clap::Parser>::try_parse_from(args).expect("parse");
+            let Commands::Node(node) = cli.command else { panic!("not the node command") };
+            node.ext.snap1.snap1
+        };
+        assert!(!parse(&[]));
+        assert!(parse(&["--pulsechain.snap1"]));
     }
 
     #[test]

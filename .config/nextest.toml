@@ -36,3 +36,17 @@ slow-timeout = { period = "1m", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = "(package(reth-engine-tree) and test(bounds_pool_results)) or (package(reth-rpc) and test(call_allowance_respects_rpc_gas_cap)) or (package(reth-provider) and test(test_prunable_receipts_logic))"
 slow-timeout = { period = "1m", terminate-after = 5 }
+
+# Heavy on the fork's CI runner, not hung. Pipeline 5171 terminated both at 60 s on all three
+# tries; locally they take about 15 s (a deep storage trie checked node by node) and 14 s (a
+# memory-tier heap measurement over a large fill).
+[[profile.default.overrides]]
+filter = "(package(reth-pulsechain-snap) and test(every_deep_storage_trie_node_is_served_and_hash_linked)) or (package(reth-pulsechain-lite) and binary(store_memory))"
+slow-timeout = { period = "1m", terminate-after = 5 }
+
+# MDBX disk tests: bound by the runner's disk, not hung. Pipeline 5262 terminated
+# rotation_deletes_the_old_generation_and_bounds_disk at 60 s on all three tries (about 4 s
+# locally) while its neighbours ran at 50-59 s.
+[[profile.default.overrides]]
+filter = "(package(reth-pulsechain-lite) and test(/^store::tests::/)) or (package(reth-pulsechain-snap) and test(/^ranges::tests::/))"
+slow-timeout = { period = "1m", terminate-after = 5 }

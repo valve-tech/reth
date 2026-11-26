@@ -1,0 +1,5 @@
+fuzz-target/
+target/
+corpus/
+artifacts/
+coverage/

@@ -6426,11 +6426,17 @@ checksum = "1db0d8f1fc9e62caebd0319e11eaec5822b0186c171568f0480b46a0137f9108"
 dependencies = [
  "base64 0.22.1",
  "evmap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "indexmap 2.14.2",
+ "ipnet",
  "metrics",
  "metrics-util",
  "quanta 0.12.6",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -7668,6 +7674,7 @@ dependencies = [
  "reth-node-ethereum",
  "reth-primitives-traits",
  "reth-pulsechain-node",
+ "reth-pulsechain-snap",
  "reth-rpc-builder",
  "reth-rpc-server-types",
  "reth-transaction-pool",
@@ -10519,6 +10526,106 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-pulsechain-lc-server"
+version = "2.11.0"
+dependencies = [
+ "alloy-primitives",
+ "blst",
+ "bytes",
+ "clap",
+ "ethereum_ssz",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "parking_lot",
+ "reqwest",
+ "reth-pulsechain-forks",
+ "reth-pulsechain-light-client",
+ "reth-pulsechain-lite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "reth-pulsechain-light-client"
+version = "2.11.0"
+dependencies = [
+ "alloy-primitives",
+ "blst",
+ "ethereum_ssz",
+ "reth-pulsechain-forks",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "snap",
+ "thiserror 2.0.21",
+ "tree_hash",
+]
+
+[[package]]
+name = "reth-pulsechain-lite"
+version = "2.11.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "alloy-trie",
+ "async-trait",
+ "blst",
+ "bytes",
+ "clap",
+ "ethereum_ssz",
+ "evm2",
+ "futures",
+ "http-body-util",
+ "humantime",
+ "hyper",
+ "hyper-util",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "parking_lot",
+ "proptest",
+ "reqwest",
+ "reth-chainspec",
+ "reth-cli-util",
+ "reth-discv4",
+ "reth-eth-wire",
+ "reth-eth-wire-types",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-libmdbx",
+ "reth-network",
+ "reth-network-api",
+ "reth-network-peers",
+ "reth-pulsechain-forks",
+ "reth-pulsechain-light-client",
+ "reth-pulsechain-snap",
+ "reth-tasks",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smolgen",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "reth-pulsechain-node"
 version = "2.11.0"
 dependencies = [
@@ -10532,6 +10639,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer-local",
  "base64 0.22.1",
+ "clap",
  "evm2",
  "eyre",
  "firehose-tracer",
@@ -10562,6 +10670,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-provider",
  "reth-pulsechain-forks",
+ "reth-pulsechain-snap",
  "reth-rpc-api",
  "reth-rpc-builder",
  "reth-rpc-eth-api",
@@ -10572,6 +10681,38 @@ dependencies = [
  "reth-trie-common",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "reth-pulsechain-snap"
+version = "2.11.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "eyre",
+ "futures",
+ "metrics",
+ "metrics-util",
+ "proptest",
+ "reth-chain-state",
+ "reth-db-api",
+ "reth-eth-wire",
+ "reth-eth-wire-types",
+ "reth-execution-types",
+ "reth-metrics",
+ "reth-network",
+ "reth-network-api",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-stages-types",
+ "reth-storage-api",
+ "reth-testing-utils",
+ "reth-trie",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

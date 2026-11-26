@@ -1,0 +1,67 @@
+[package]
+name = "reth-pulsechain-snap-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "cargo-fuzz targets for reth-pulsechain-snap"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+
+reth-pulsechain-snap = { path = "..", features = ["fuzzing"] }
+reth-eth-wire-types = { path = "../../../net/eth-wire-types" }
+reth-provider = { path = "../../../storage/provider", features = ["test-utils"] }
+
+alloy-primitives = "1.6.1"
+alloy-rlp = { version = "0.3.16", features = ["derive"] }
+alloy-trie = { version = "0.9.9", features = ["ethereum"] }
+
+# Not part of the root workspace: it builds only with nightly and cargo-fuzz.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "snap1_decode"
+path = "fuzz_targets/snap1_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snap1_serve"
+path = "fuzz_targets/snap1_serve.rs"
+test = false
+doc = false
+bench = false
+
+# The root workspace's patches, so this crate builds the same dependency tree.
+[patch."https://github.com/alloy-rs/evm2"]
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-jit = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+
+[patch.crates-io]
+# Detached transaction tracing, until firehose-tracer 5.8.0 is released.
+firehose-tracer = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs", rev = "d35edd15f789c21af71b1e1d5e6c537f8335598e" }
+firehose-tracer-test = { git = "https://github.com/streamingfast/evm-firehose-tracer-rs", rev = "d35edd15f789c21af71b1e1d5e6c537f8335598e" }
+
+# reth-core
+reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-rpc-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+
+## State override compatibility
+# Vendored alloy-rpc-types-eth 2.5.0 (crates.io source) with one change in `src/state.rs`: the
+# `state` / `stateDiff` override maps also accept short hex words (`0x2a`), as PulseChain's
+# erigon 2.4.1 requires, besides the spec's 32-byte words. Its siblings stay on crates.io. Must
+# match the workspace `alloy-rpc-types-eth` version, or cargo ignores it. See its README.
+alloy-rpc-types-eth = { path = "../../../../crates/vendor/alloy-rpc-types-eth" }
+

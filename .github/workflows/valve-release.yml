@@ -44,8 +44,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A tag push publishes the tag's tree and every commit it reaches. This job fails the release
+  # when the tree, the tag message, or a commit that no released tag reaches cites a private name
+  # or a home-directory path (crates/pulsechain/lite/scripts/release-scan.sh). Only a tag with a
+  # published release counts as public: a branch or a second tag pushed with this one is new too.
+  # The push has already made those commits public, so scan before you push, against what GitHub
+  # holds at that time:
+  #   git fetch github && crates/pulsechain/lite/scripts/private-scan.sh <tag> --remotes=github
+  private-scan:
+    name: private references
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Validate tag input
+        id: vars
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$RAW_TAG" in v?*-pulse) ;; *) echo "::error::bad tag"; exit 1 ;; esac
+          case "$RAW_TAG" in *[!A-Za-z0-9._-]*) echo "::error::bad tag"; exit 1 ;; esac
+          printf 'tag=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+      # The workflow's own ref, not the tag: a rebuild of a tag cut before the scripts existed
+      # must still run them. The whole history and every tag, so the scan can read the commits
+      # that the tag adds.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan the tag's tree and new history
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq '.[] | select(.draft | not) | .tag_name' > "$RUNNER_TEMP/released"
+          crates/pulsechain/lite/scripts/release-scan.sh "$TAG" "$RUNNER_TEMP/released"
+
   build:
     name: ${{ matrix.target }}
+    needs: private-scan
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -116,6 +157,8 @@ jobs:
           cargo build --release --bin pulse-reth --target "$TARGET" \
             --no-default-features \
             --features "jemalloc,otlp,otlp-logs,portable,js-tracer,keccak-cache-global,asm-keccak,min-trace-logs"
+          # The lite node is its own package with its own (default) features.
+          cargo build --release -p reth-pulsechain-lite --bin reth-lite --target "$TARGET"
 
       - name: Check glibc
         if: contains(matrix.target, 'linux')
@@ -125,7 +168,7 @@ jobs:
           MAX_GLIBC: "2.36"
         run: |
           set -euo pipefail
-          BIN="target/${TARGET}/release/pulse-reth"
+          for BIN in "target/${TARGET}/release/pulse-reth" "target/${TARGET}/release/reth-lite"; do
           need=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
           test -n "$need" || { echo "::error::found no GLIBC symbol versions in $BIN"; exit 1; }
           echo "binary needs glibc >= $need (limit $MAX_GLIBC)"
@@ -134,6 +177,7 @@ jobs:
             objdump -T "$BIN" | grep -E "GLIBC_$need" | head -20
             exit 1
           fi
+          done
 
       - name: Package
         env:
@@ -157,7 +201,14 @@ jobs:
           # emit the same "<hash>  <file>" format, so the combined SHA256SUMS
           # stays uniform and `sha256sum -c`-verifiable.
           if command -v sha256sum >/dev/null 2>&1; then SHA256="sha256sum"; else SHA256="shasum -a 256"; fi
-          cd dist && $SHA256 "reth-${TAG}-${TARGET}.tar.gz" > "reth-${TAG}-${TARGET}.tar.gz.sha256"
+          LITE="target/${TARGET}/release/reth-lite"
+          test -x "$LITE" || { echo "::error::no binary at $LITE"; exit 1; }
+          "$LITE" --version || { echo "::error::reth-lite --version failed"; exit 1; }
+          mkdir -p stage-lite && cp "$LITE" stage-lite/reth-lite
+          tar -czf "dist/reth-lite-${TAG}-${TARGET}.tar.gz" -C stage-lite reth-lite
+          cd dist
+          $SHA256 "reth-${TAG}-${TARGET}.tar.gz" > "reth-${TAG}-${TARGET}.tar.gz.sha256"
+          $SHA256 "reth-lite-${TAG}-${TARGET}.tar.gz" > "reth-lite-${TAG}-${TARGET}.tar.gz.sha256"
           ls -la
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -202,21 +253,27 @@ jobs:
           cat > notes.tmpl <<'EOF'
           Firehose-instrumented PulseChain reth, `@TAG@`.
 
-          Built `--release --bin reth` on native runners per target — the same
-          build `rpc-cargo-rebuild` performs on the box.
+          Each target has two archives, built `--release` on a native runner:
+
+          | archive | binary | what it is |
+          |---|---|---|
+          | `reth-@TAG@-<target>.tar.gz` | `reth` | the full PulseChain node, the `pulse-reth` binary renamed `reth` |
+          | `reth-lite-@TAG@-<target>.tar.gz` | `reth-lite` | a verifying lite node with no chain database |
+
+          reth-lite verifies the state it serves, but it takes the head from the beacon URLs you give it, and by default (`--head.confirm=peer`) a static `--peer` must confirm each head. Read its [README](https://github.com/@REPO@/blob/@TAG@/crates/pulsechain/lite/README.md), which covers the flags and the trust model, before you run it.
 
           | target | platform |
           |---|---|
-          | `x86_64-unknown-linux-gnu` | the fleet, and most self-hosters |
+          | `x86_64-unknown-linux-gnu` | most Linux servers |
           | `aarch64-unknown-linux-gnu` | ARM servers |
-          | `aarch64-apple-darwin` | Apple Silicon (valve-node local setup) |
+          | `aarch64-apple-darwin` | Apple Silicon |
 
           Verify:
           ```
           sha256sum -c SHA256SUMS --ignore-missing
           ```
           EOF
-          sed "s/@TAG@/${TAG}/g" notes.tmpl > notes.md
+          sed -e "s|@TAG@|${TAG}|g" -e "s|@REPO@|${GH_REPO}|g" notes.tmpl > notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --notes-file notes.md
             gh release upload "$TAG" dist/* --clobber

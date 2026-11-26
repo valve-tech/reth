@@ -1,0 +1,113 @@
+{
+  "single_merkle_proof": {
+    "mainnet_current_sync_committee_merkle_proof": {
+      "branch": [
+        "0x5cf5804f5a8dc680445f5efd4069859f3c65dd2db869f1d091f454008f6d7ab7",
+        "0xc15a3515c2f69c510d27dc829bb763a071d12ed28861665a15eac18be09ec396",
+        "0xfeb3abafe78c2a78ed08962a29cb063c00ba6b3ae84ea7ec84bd8700182197dd",
+        "0xc1c4458facaf97b27f0a56c652241f4d6601c0e4932dadbc07e038334a2002b0",
+        "0x09ae5ca2a1d185a6812e4541b0516b41c8c70216fd51587ca16882770c82c135"
+      ],
+      "leaf": "0x5cf5804f5a8dc680445f5efd4069859f3c65dd2db869f1d091f454008f6d7ab7",
+      "leaf_index": 54,
+      "object": "mainnet_proof_BeaconState.ssz_snappy"
+    },
+    "mainnet_execution_merkle_proof": {
+      "branch": [
+        "0x50dbcb1fd7c53f50bb3bd1a30640f38eec60300722977902a47779cae66d448c",
+        "0x336488033fe5f3ef4ccc12af07b9370b92e553e35ecb4a337a1b1c0e4afe1e0e",
+        "0xdb56114e00fdd4c1f85c892bf35ac9a89289aaecb1ebd0a96cde606a748b5d71",
+        "0xbd254ff3956211e97ee1739acdf3c78505ab4e37170d3e0bfe80b4d0e283785c"
+      ],
+      "leaf": "0x39aa1669ff64f97b20c1dca6e89f963505fc4c7f0e784d5dc4f14a13cd1b966d",
+      "leaf_index": 25,
+      "object": "mainnet_proof_BeaconBlockBody.ssz"
+    },
+    "mainnet_finality_root_merkle_proof": {
+      "branch": [
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x504e8dfadf27180c21c80f1886b202de4c1c89ee2977562433abbbc92ea194e6",
+        "0x923ebc2107d5288dad0afd4187e0fe6caae2df92fcf6252ce7ce7feea56e7152",
+        "0xfeb3abafe78c2a78ed08962a29cb063c00ba6b3ae84ea7ec84bd8700182197dd",
+        "0xc1c4458facaf97b27f0a56c652241f4d6601c0e4932dadbc07e038334a2002b0",
+        "0x09ae5ca2a1d185a6812e4541b0516b41c8c70216fd51587ca16882770c82c135"
+      ],
+      "leaf": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "leaf_index": 105,
+      "object": "mainnet_proof_BeaconState.ssz_snappy"
+    },
+    "mainnet_next_sync_committee_merkle_proof": {
+      "branch": [
+        "0x5cf5804f5a8dc680445f5efd4069859f3c65dd2db869f1d091f454008f6d7ab7",
+        "0xc15a3515c2f69c510d27dc829bb763a071d12ed28861665a15eac18be09ec396",
+        "0xfeb3abafe78c2a78ed08962a29cb063c00ba6b3ae84ea7ec84bd8700182197dd",
+        "0xc1c4458facaf97b27f0a56c652241f4d6601c0e4932dadbc07e038334a2002b0",
+        "0x09ae5ca2a1d185a6812e4541b0516b41c8c70216fd51587ca16882770c82c135"
+      ],
+      "leaf": "0x5cf5804f5a8dc680445f5efd4069859f3c65dd2db869f1d091f454008f6d7ab7",
+      "leaf_index": 55,
+      "object": "mainnet_proof_BeaconState.ssz_snappy"
+    },
+    "minimal_current_sync_committee_merkle_proof": {
+      "branch": [
+        "0xd2efd48644ae17eb5563eb072155795618ffbbea1739e45d4c5c53b5a5e0f715",
+        "0x3ed3e6d46498f819d98c40f8540f76c1ec93d9a14a83696f87fd5cf6ccc139cd",
+        "0x002c1fe5bc0bd62db6f299a582f2a80a6d5748ccc82e7ed843eaf0ae0739f74a",
+        "0xc1c4458facaf97b27f0a56c652241f4d6601c0e4932dadbc07e038334a2002b0",
+        "0xae0f924ca0743910b3084644095439fe88a25d61c479a8228896cf29b0b1de21"
+      ],
+      "leaf": "0xd2efd48644ae17eb5563eb072155795618ffbbea1739e45d4c5c53b5a5e0f715",
+      "leaf_index": 54,
+      "object": "minimal_proof_BeaconState.ssz"
+    },
+    "minimal_execution_merkle_proof": {
+      "branch": [
+        "0x0bef6a35bdd273acdcd57d03a40b8c0d13c9261e8e496e2eba6cac0d790a1d88",
+        "0x336488033fe5f3ef4ccc12af07b9370b92e553e35ecb4a337a1b1c0e4afe1e0e",
+        "0xdb56114e00fdd4c1f85c892bf35ac9a89289aaecb1ebd0a96cde606a748b5d71",
+        "0xd6f951497206116f9433bbd441f52e6895486da08b8daba8cf9a78cae6ac1bd7"
+      ],
+      "leaf": "0xdb235d912263488e5eb36b8ff3b8d763c37ec92018e465fce2e5da7bdb8dda7d",
+      "leaf_index": 25,
+      "object": "minimal_proof_BeaconBlockBody.ssz"
+    },
+    "minimal_finality_root_merkle_proof": {
+      "branch": [
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x5f6f02af29218292d21a69b64a794a7c0873b3e0f54611972863706e8cbdf371",
+        "0xe7125ff9ab5a840c44bedb4731f440a405b44e15f2d1a89e27341b432fabe13d",
+        "0x002c1fe5bc0bd62db6f299a582f2a80a6d5748ccc82e7ed843eaf0ae0739f74a",
+        "0xc1c4458facaf97b27f0a56c652241f4d6601c0e4932dadbc07e038334a2002b0",
+        "0xae0f924ca0743910b3084644095439fe88a25d61c479a8228896cf29b0b1de21"
+      ],
+      "leaf": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "leaf_index": 105,
+      "object": "minimal_proof_BeaconState.ssz"
+    },
+    "minimal_next_sync_committee_merkle_proof": {
+      "branch": [
+        "0xd2efd48644ae17eb5563eb072155795618ffbbea1739e45d4c5c53b5a5e0f715",
+        "0x3ed3e6d46498f819d98c40f8540f76c1ec93d9a14a83696f87fd5cf6ccc139cd",
+        "0x002c1fe5bc0bd62db6f299a582f2a80a6d5748ccc82e7ed843eaf0ae0739f74a",
+        "0xc1c4458facaf97b27f0a56c652241f4d6601c0e4932dadbc07e038334a2002b0",
+        "0xae0f924ca0743910b3084644095439fe88a25d61c479a8228896cf29b0b1de21"
+      ],
+      "leaf": "0xd2efd48644ae17eb5563eb072155795618ffbbea1739e45d4c5c53b5a5e0f715",
+      "leaf_index": 55,
+      "object": "minimal_proof_BeaconState.ssz"
+    }
+  },
+  "source": "ethereum/consensus-spec-tests v1.4.0, tests/{minimal,mainnet}/capella",
+  "ssz_static": {
+    "mainnet_BeaconBlockBody_case_0.ssz": "0xebddc9378256185924887cd3cdcfea23fcb707f0f7547b96141b6e4fc61e84e5",
+    "mainnet_SignedBeaconBlock_case_0.ssz": "0x304dd326953032806218d02ddce8d5d9f3d88018ce194ab23b76acfe5177f694",
+    "minimal_BeaconBlockBody_case_0.ssz": "0x11778c81b0fdcc1ad073dcb07efcac7b9a560e29621691600ed426097e494a6c",
+    "minimal_BeaconBlockBody_case_1.ssz": "0x69851f5dcc9fba6e434f604678977145ec78cc48931f9768c245d41828aa4eb1",
+    "minimal_BeaconBlock_case_0.ssz": "0x448c07d7402ddee11bc8ecbed47134a8e93946e006b0ac855244c62171a620ad",
+    "minimal_BeaconBlock_case_1.ssz": "0x37a742d77428142b507c921d5644a082f5dc42b191500ce15cbedd9a7ced1d99",
+    "minimal_BeaconState_case_0.ssz": "0x733d5249765043bb956c2a669100af3b40b3ed268982ff529206e3cc76c66b1e",
+    "minimal_BeaconState_case_1.ssz": "0x101e890cc93bdd5fba833cced64c10859ec3ee259de32c5bdcc2eecefd45f0f3",
+    "minimal_SignedBeaconBlock_case_0.ssz": "0x9da61e878350c6ba547ef4a4fbefb97b7ef4a771a3c543c93e72b550d7215e1a",
+    "minimal_SignedBeaconBlock_case_1.ssz": "0x049ed81a08281f5859fd89849817986c21e07d792782940c659dcd4c9e4e5f01"
+  }
+}

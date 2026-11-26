@@ -1,0 +1,11 @@
+# SSE tokens for the beacon_sse target: -dict=beacon_sse.dict
+"event:"
+"event: head"
+"event: finalized_checkpoint"
+"data:"
+"data: {\"block\":\"0x1111111111111111111111111111111111111111111111111111111111111111\"}"
+"\"execution_optimistic\":true"
+"\x0a\x0a"
+"\x0d\x0a"
+"\x0d"
+": ping"

@@ -1,5 +1,6 @@
-use super::{database::parse_byte_size, DefaultRpcServerArgs};
+use super::DefaultRpcServerArgs;
 use clap::{builder::Resettable, Args};
+use reth_cli_util::parse_byte_size;
 use reth_rpc_server_types::constants::cache::{
     DEFAULT_BAL_CACHE_MAX_BYTES, DEFAULT_BAL_CACHE_MAX_LEN, DEFAULT_BLOCK_CACHE_MAX_BYTES,
     DEFAULT_BLOCK_CACHE_MAX_LEN, DEFAULT_CACHE_IDLE_TIMEOUT, DEFAULT_CONCURRENT_DB_REQUESTS,

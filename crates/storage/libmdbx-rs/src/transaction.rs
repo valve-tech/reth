@@ -199,7 +199,15 @@ where
                 self.inner.set_committed();
                 Err(Error::BotchedTransaction)
             }
-            Err(e) => Err(e),
+            // A failed commit aborts and finishes the transaction itself (and frees a read-only
+            // one): a second abort in `Drop` would fail with `BadTxn` or touch a freed handle.
+            // Only a commit from the wrong thread leaves the transaction open.
+            Err(e) => {
+                if e.to_err_code() != ffi::MDBX_THREAD_MISMATCH {
+                    self.inner.set_committed();
+                }
+                Err(e)
+            }
         }
     }
 

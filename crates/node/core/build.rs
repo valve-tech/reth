@@ -1,5 +1,8 @@
 #![allow(missing_docs)]
 
+mod build_version;
+
+use build_version::not_on_tag;
 use smolgen::{Build, Cargo, Emitter, Gitcl};
 use std::{env, error::Error};
 
@@ -31,13 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let sha_short = &sha[0..7];
 
     let is_dirty = env::var("VERGEN_GIT_DIRTY")? == "true";
-    // > git describe --always --tags
-    // if not on a tag: v0.2.0-beta.3-82-g1939939b
-    // if on a tag: v0.2.0-beta.3
-    // git picks the abbreviated hash length from the repository size, so match any SHA prefix.
-    let not_on_tag = env::var("VERGEN_GIT_DESCRIBE")?
-        .rsplit_once("-g")
-        .is_some_and(|(_, hash)| sha.starts_with(hash));
+    let not_on_tag = not_on_tag(&sha, &env::var("VERGEN_GIT_DESCRIBE")?);
     let version_suffix = if is_dirty || not_on_tag { "-dev" } else { "" };
     println!("cargo:rustc-env=RETH_VERSION_SUFFIX={version_suffix}");
 

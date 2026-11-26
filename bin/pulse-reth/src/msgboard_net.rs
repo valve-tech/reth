@@ -6,7 +6,10 @@ use reth_msgboard::MsgboardLauncher;
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
 use reth_node_api::{NodeTypes, PrimitivesTy, TxTy};
 use reth_node_builder::{components::NetworkBuilder, BuilderContext, FullNodeTypes};
+use reth_pulsechain_node::network::snap1_handler;
+use reth_pulsechain_snap::ProviderBackend;
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
+use std::sync::Arc;
 use tracing::info;
 
 /// Builds the network the way `EthereumNetworkBuilder` does, and registers the
@@ -27,12 +30,20 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub(crate) struct MsgboardNetworkBuilder {
     launcher: MsgboardLauncher,
+    /// Whether to also serve `snap/1` (`--pulsechain.snap1`). Off by default.
+    snap1: bool,
 }
 
 impl MsgboardNetworkBuilder {
     /// Wrap a launcher whose board this network will serve.
     pub(crate) const fn new(launcher: MsgboardLauncher) -> Self {
-        Self { launcher }
+        Self { launcher, snap1: false }
+    }
+
+    /// Also serves `snap/1` when `enabled`, as `PulsechainNetworkBuilder::with_snap1` does.
+    pub(crate) const fn with_snap1(mut self, enabled: bool) -> Self {
+        self.snap1 = enabled;
+        self
     }
 }
 
@@ -59,6 +70,12 @@ where
         let mut builder = ctx.network_builder().await?;
         let protocol = self.launcher.rlpx_sub_protocol(board, builder.handle());
         builder.network_mut().add_rlpx_sub_protocol(protocol);
+        if self.snap1 {
+            builder.network_mut().add_rlpx_sub_protocol(snap1_handler(Arc::new(
+                ProviderBackend::new(ctx.provider().clone()),
+            )));
+            info!(target: "reth::cli", "Serving snap/1 (--pulsechain.snap1)");
+        }
 
         let handle = ctx.start_network(builder, pool);
         info!(target: "reth::cli", enode=%handle.local_node_record(), "P2P networking initialized");

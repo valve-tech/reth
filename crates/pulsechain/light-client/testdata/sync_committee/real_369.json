@@ -1,0 +1,38 @@
+{
+  "source": "https://checkpoint.pulsechain.com finalized block and state",
+  "block_root": "0x4df46dc60d492ea2b6b008830c08f01decb9b74ef94753af8cd95b26212f6108",
+  "header": {
+    "slot": "11167808",
+    "proposer_index": "19585",
+    "parent_root": "0x048b1fb67579522cdfe6d17940ef66faeda755cfd8d1325ce00726c868cb3cbb",
+    "state_root": "0x5ffb8d436d9b7254c9130f2fdb4bb689080fc7c249619d129b4d7c59f088bd49",
+    "body_root": "0x58fa2aad3683a02ff784cab4357e399824e91cfc086b71834370e9f74f70c13b"
+  },
+  "state_fork": {
+    "previous_version": "0x0000036b",
+    "current_version": "0x0000036c"
+  },
+  "validators": 114777,
+  "sync_aggregate": {
+    "sync_committee_bits": "0xffffff7fffbbfffffddfffffffffffffffdffdfffffffffffff7ffffffffeffffffffffffffffff7fffdffefffffb7ffffffffffffffffffffffbfffbfffefff",
+    "sync_committee_signature": "0x83ccda26fa0b938772938b0df114d8a62bbfc10fd68fc84fbc931415e6b9405bbf292416bcd950eb6689c31f38884c0905a3bd154ecf574237d689ed521c1b1a675fbb340bd7619d620e1bcf0d5e5b949dcb0d6ce3ef7633ca29db3c0c37853b",
+    "participants": 495
+  },
+  "current_sync_committee_root": "0x43a1e6e0288d377f1cfdfb52667cd0e6b90b305a22117afd1dba1d1accec89e9",
+  "current_sync_committee_branch": [
+    "0x95f0708e23be944491efd83b915fe21951bef5665876ae3e6d0b274b1c9965de",
+    "0x917a451dab88697f473926c89a1a0867378509d1f517928e2a1fc3eb448b6952",
+    "0xd6a9c4d7f3eed053e1669e335c4728b097c5c7bafe790e60d9237a1b11dab7f9",
+    "0x5980810de8087417c3419040383019942ee79cee1b11d60fd3c70fa6ae8bbce8",
+    "0x5bc7cfecb1619da1b140005ea1590dafb091aefeea01853df9dd7821654739e8"
+  ],
+  "execution_payload_header_root": "0x6f2d319aaf27ba0c2f982d88dbae14a9a0abd7fa650a8f285bf04968abcbd79a",
+  "execution_branch": [
+    "0xce2298993fb2381ec71feacc2cfbab8d60062158f073970dc6cb1070f05ccdfc",
+    "0x336488033fe5f3ef4ccc12af07b9370b92e553e35ecb4a337a1b1c0e4afe1e0e",
+    "0xdb56114e00fdd4c1f85c892bf35ac9a89289aaecb1ebd0a96cde606a748b5d71",
+    "0x67ff52a3e5c0ad7e5bd9c579b94433b650e18cc9589299085d1176e1fbdc06bf"
+  ],
+  "execution_block_hash": "0xd8199fe5ba07e7eee260fe973a06fe92622451054cd6708b10ee6e68fd233f61",
+  "execution_block_number": "28133431"
+}

@@ -21,6 +21,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The reth-lite private-reference scan fails here instead of skipping without a checkout.
+  RETH_LITE_REQUIRE_GIT: 1
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -88,6 +90,46 @@ jobs:
             -p reth-pulsechain-forks \
             --all-targets
 
+      # reth-lite and the snap/1 server take untrusted input from peers, beacons
+      # and RPC callers, and are clippy-clean today, so they gate on warnings.
+      - name: cargo clippy (reth-lite and snap/1, strict)
+        run: cargo clippy --no-deps -p reth-pulsechain-lite -p reth-pulsechain-light-client -p reth-pulsechain-lc-server -p reth-pulsechain-snap --all-targets -- -D warnings
+
+      # The fuzz targets call the `fuzzing` APIs of both crates, and nothing else builds them.
+      - name: cargo check (reth-lite and snap/1 fuzzing APIs)
+        run: cargo check -p reth-pulsechain-lite -p reth-pulsechain-snap --features fuzzing --all-targets
+
+      # The fuzz crates are workspaces of their own, each with its own Cargo.lock, so the step
+      # above does not build them. Check them only when a change can break them: the fuzz
+      # crates, the fuzzing APIs, the lite and snap manifests, or the root manifest and lockfile
+      # (the fuzz crates copy the root [patch] sections). The GitLab fuzz-check job uses the same
+      # paths. When the base commit cannot be fetched, the check runs.
+      - name: Find changes that can break the fuzz crates
+        id: fuzz
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          changed=true
+          if [ -n "$BASE" ] && [ "$BASE" != 0000000000000000000000000000000000000000 ] &&
+            git fetch -q --depth=1 origin "$BASE" 2>/dev/null; then
+            paths='^(crates/pulsechain/(lite|snap)/(fuzz/|src/fuzz_api\.rs$|Cargo\.toml$)|Cargo\.(toml|lock)$)'
+            # Capture the list first. In a pipe, `grep -q` exits at the first match, git gets
+            # SIGPIPE, and pipefail turns a match in a long diff into "no change".
+            names=$(git diff --name-only "$BASE" HEAD)
+            if ! grep -qE "$paths" <<<"$names"; then
+              changed=false
+            fi
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      # Shares the workspace target directory, so it reuses what the steps above built.
+      - name: cargo check (fuzz workspaces)
+        if: steps.fuzz.outputs.changed == 'true'
+        run: |
+          cargo check --locked --manifest-path crates/pulsechain/lite/fuzz/Cargo.toml --all-targets --target-dir target
+          cargo check --locked --manifest-path crates/pulsechain/snap/fuzz/Cargo.toml --all-targets --target-dir target
+
       # Build the reth binary so the whole dependency graph of our build still
       # compiles end-to-end.
       - name: cargo check (reth binary)
@@ -115,6 +157,10 @@ jobs:
             -p reth-msgboard-types \
             -p reth-pulsechain-node \
             -p reth-pulsechain-forks \
+            -p reth-pulsechain-lite \
+            -p reth-pulsechain-light-client \
+            -p reth-pulsechain-lc-server \
+            -p reth-pulsechain-snap \
             -p reth-cli-commands
 
       # The gas-estimation tests spawn a local node and assert `eth_estimateGas`
@@ -124,3 +170,8 @@ jobs:
         # `--no-tests=fail` because a filter that matches nothing — after a rename,
         # say — would otherwise report success while testing nothing at all.
         run: cargo nextest run -p reth-node-ethereum --test e2e -E 'test(estimate::)' --no-tests=fail
+
+      # The `-dev` rule of the version text (crates/node/core/build_version.rs). reth-node-core
+      # is an upstream crate, so the package lists above do not reach its tests.
+      - name: cargo nextest (version text)
+        run: cargo nextest run -p reth-node-core --test build_version --no-tests=fail

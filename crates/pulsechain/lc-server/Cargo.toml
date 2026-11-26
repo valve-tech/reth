@@ -1,0 +1,53 @@
+[package]
+name = "reth-pulsechain-lc-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage = "https://github.com/valve-tech/reth"
+repository = "https://github.com/valve-tech/reth"
+description = "A PulseChain light-client data server: serves the beacon light-client API from standard beacon endpoints"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "reth-pulsechain-lc-server"
+path = "src/main.rs"
+
+[dependencies]
+# reth
+reth-pulsechain-forks.workspace = true
+reth-pulsechain-light-client.workspace = true
+
+# alloy
+alloy-primitives = { workspace = true, features = ["serde"] }
+
+# consensus
+ethereum_ssz.workspace = true
+
+# misc
+bytes.workspace = true
+clap = { workspace = true, features = ["derive"] }
+futures.workspace = true
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+metrics.workspace = true
+metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
+parking_lot.workspace = true
+reqwest.workspace = true
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true, features = ["std"] }
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "signal"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "std", "ansi"] }
+url = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+reth-pulsechain-light-client = { workspace = true, features = ["test-utils"] }
+reth-pulsechain-lite.workspace = true
+blst.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }

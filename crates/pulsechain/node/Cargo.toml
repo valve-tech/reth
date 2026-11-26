@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 # reth — pulsechain primitives / hardforks / chainspec
 reth-pulsechain-forks.workspace = true
+reth-pulsechain-snap.workspace = true
 
 # reth — consensus
 reth-consensus.workspace = true
@@ -80,6 +81,9 @@ jsonrpsee = { workspace = true, features = ["server"] }
 
 # alloy — RPC types (TransactionRequest, BlockId, StateOverride)
 alloy-rpc-types-eth.workspace = true
+
+# CLI flags
+clap = { workspace = true, features = ["derive"] }
 
 # error handling (ChainSpecParser::parse returns eyre::Result)
 eyre.workspace = true
