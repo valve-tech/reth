@@ -121,8 +121,24 @@ pub const EXECUTION_ABORTED: &str = "execution aborted";
 pub const RECEIPTS_UNAVAILABLE: &str = "receipts unavailable";
 /// The prefix of the text for a block or receipt that could not be rendered.
 pub const RENDERING_FAILED: &str = "rendering failed";
+/// The text for a receipt read that finds no room: every wide-read permit is held, or the most
+/// receipt fetches run.
+pub const RECEIPTS_BUSY: &str = "server busy: too many receipt fetches in flight";
 /// The text for receipts whose count differs from the block's transactions.
 pub const RECEIPTS_MISMATCH: &str = "receipts do not match the block";
+/// The text for an `eth_getLogs` that matches more than [`MAX_LOGS`] logs (Infura's).
+pub const TOO_MANY_LOGS: &str = "query returned more than 10000 results";
+/// The text for an `eth_getLogs` that needs the receipts of more than [`MAX_LOG_FETCHES`]
+/// blocks whose receipts the node does not hold.
+pub const LOG_BLOCKS_TOO_MANY: &str = "query needs the receipts of more than 32 blocks the node \
+                                       does not hold: narrow the block range or the filter";
+/// geth's text for an `eth_getLogs` whose numbered `fromBlock` is above its numbered `toBlock`.
+pub const INVALID_BLOCK_RANGE: &str = "invalid block range";
+/// geth's text for an `eth_getLogs` filter with more than [`MAX_LOG_TOPICS`] topic positions.
+pub const TOO_MANY_TOPICS: &str = "exceed max topics";
+/// geth's text for an `eth_getLogs` filter with more than [`MAX_LOG_FILTER_VALUES`] addresses,
+/// or alternatives at one topic position.
+pub const TOO_MANY_FILTER_VALUES: &str = "exceed max addresses or topics per search position";
 
 /// The largest request body (geth's limit).
 const MAX_BODY: usize = 5 << 20;
@@ -173,13 +189,92 @@ const MAX_CONCURRENT_RENDERS: usize = 2;
 /// The most logs a transaction receipt may hold and still be rendered without a render permit.
 /// Its [`Value`] form is then at most a few hundred KiB.
 const INLINE_RECEIPT_LOGS: usize = 256;
-/// Receipt sets kept.
-const RECEIPT_CACHE: usize = 64;
-/// Receipt bytes kept ([`receipt_set_bytes`]): a log-heavy block holds several MiB, outside
-/// `--cache.size`.
+/// Receipt sets the cache of single reads keeps.
+const RECEIPT_CACHE: usize = 32;
+/// Receipt sets the cache of wide reads (`eth_getLogs`, `eth_feeHistory` rewards) keeps. A wide
+/// read pushes out only wide sets, so it cannot empty the cache that single reads use.
+const WIDE_RECEIPT_CACHE: usize = 32;
+/// Receipt bytes kept ([`receipt_set_bytes`]) in the two caches together, half in each: a
+/// log-heavy block holds several MiB, outside `--cache.size`.
 pub(crate) const RECEIPT_CACHE_BYTES: usize = 32 << 20;
 /// How long one receipt fetch may run. Each read waits on it at most its own request timeout.
 const RECEIPT_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The most logs one `eth_getLogs` answers.
+const MAX_LOGS: usize = 10_000;
+/// The most blocks whose receipts one `eth_getLogs` fetches from peers, the sets the wide cache
+/// keeps: blocks with transactions whose bloom matches the filter and whose receipts the node
+/// does not hold. The range needs no
+/// cap of its own: it starts at the lowest held block, at most [`crate::chain::HEADERS_WINDOW`]
+/// below the head, and a header's bloom and the held receipts are read without a fetch.
+const MAX_LOG_FETCHES: usize = WIDE_RECEIPT_CACHE;
+/// The log bytes ([`log_bytes`]) an `eth_getLogs` answer may hold and still be rendered on the
+/// request's task, as a receipt of [`INLINE_RECEIPT_LOGS`] small logs is.
+const INLINE_LOG_BYTES: usize = 64 << 10;
+/// Receipt fetches one `eth_getLogs` waits on at once.
+const LOG_RECEIPT_FETCHES: usize = 8;
+/// The log bytes one `eth_getLogs` collects ([`log_bytes`]), so its answer stays well under
+/// [`MAX_SINGLE_RESPONSE`]: hex doubles the data, and each log adds a few hundred bytes of text.
+const MAX_LOG_BYTES: usize = 24 << 20;
+/// geth's caps on a log filter: topic positions, and addresses or alternatives at one position.
+const MAX_LOG_TOPICS: usize = 4;
+const MAX_LOG_FILTER_VALUES: usize = 1000;
+
+/// Wide reads (`eth_getLogs`, `eth_feeHistory` rewards) of one block's receipts that wait on a
+/// fetch at once, across all requests.
+const WIDE_FETCHES: usize = 16;
+/// How long a wide read waits for one of the [`WIDE_FETCHES`] permits.
+const WIDE_PERMIT_WAIT: Duration = Duration::from_secs(1);
+/// Receipt fetches running at once, of every kind.
+const MAX_RECEIPT_FETCHES: usize = 256;
+
+/// One running receipt fetch, as the reads of its block share it.
+struct FetchEntry {
+    fetch: ReceiptFetch,
+    /// The reads that wait on it: the last to leave removes the entry.
+    waiters: usize,
+    /// Whether the set is kept even when a set must leave the cache for it: set when any read
+    /// that is not wide waits on it.
+    keep_always: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What [`Api::join_receipt_fetch`] found.
+enum Joined {
+    /// The cached set.
+    Held(Arc<Vec<WireReceipt>>),
+    /// The shared fetch, and this read's place among its waiters.
+    Fetch(ReceiptFetch, Waiter),
+}
+
+/// A read's place among the waiters of a receipt fetch. Its drop removes the fetch once no read
+/// waits on it, so a fetch every read left is stopped (it is driven only by its waiters) and
+/// unlisted.
+struct Waiter {
+    api: Arc<Api>,
+    hash: B256,
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        let mut running = self.api.receipt_fetches.lock();
+        if let Some(entry) = running.get_mut(&self.hash) {
+            entry.waiters -= 1;
+            if entry.waiters == 0 {
+                running.remove(&self.hash);
+            }
+        }
+    }
+}
+
+/// Where a receipt fetch keeps the set it got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// In the cache, pushing out the least recently used sets.
+    Always,
+    /// In the wide cache, pushing out only wide sets: a wide read must not push out the sets of
+    /// single reads.
+    Wide,
+}
 
 /// A receipt fetch that every read of its block waits on.
 type ReceiptFetch = Shared<BoxFuture<'static, Result<Arc<Vec<WireReceipt>>, FetchError>>>;
@@ -217,6 +312,7 @@ pub const SERVED: &[&str] = &[
     "eth_accounts",
     "eth_mining",
     "eth_hashrate",
+    "eth_getLogs",
 ];
 
 /// The served methods that read no block and no state: they answer with no head, and while the
@@ -333,11 +429,16 @@ pub struct Api {
     hot: Arc<HotSet>,
     net: Arc<dyn PeerNetwork>,
     receipts: Mutex<ReceiptCache>,
+    /// The receipt sets of wide reads, apart from `receipts`.
+    wide_receipts: Mutex<ReceiptCache>,
     /// The receipt fetches running, at most one per block. Each removes itself when it ends.
-    receipt_fetches: Mutex<B256Map<ReceiptFetch>>,
+    receipt_fetches: Mutex<B256Map<FetchEntry>>,
     warming: Mutex<WarmQueue>,
     warm_calls: tokio::sync::Semaphore,
     warm_reads: tokio::sync::Semaphore,
+    /// Bounds the wide receipt reads that wait on a fetch at once, across all requests: each
+    /// holds one permit for its block ([`Api::receipts_wide`]).
+    wide_fetches: tokio::sync::Semaphore,
     trust_label: String,
 }
 
@@ -403,10 +504,15 @@ impl Api {
             hot: p.hot,
             net: p.net,
             receipts: Mutex::new(ReceiptCache::default()),
+            wide_receipts: Mutex::new(ReceiptCache::new(
+                WIDE_RECEIPT_CACHE,
+                RECEIPT_CACHE_BYTES / 2,
+            )),
             receipt_fetches: Mutex::default(),
             warming: Mutex::new(WarmQueue::default()),
             warm_calls: tokio::sync::Semaphore::new(WARM_CALLS_RUNNING),
             warm_reads: tokio::sync::Semaphore::new(WARM_READS_RUNNING),
+            wide_fetches: tokio::sync::Semaphore::new(WIDE_FETCHES),
             trust_label: p.trust_label,
         }))
     }
@@ -486,6 +592,7 @@ impl Api {
             "eth_getBlockByNumber" | "eth_getBlockByHash" => self.get_block(method, p).await,
             "eth_getTransactionReceipt" => self.tx_receipt(p, mode).await,
             "eth_getBlockReceipts" => self.block_receipts(p, mode).await,
+            "eth_getLogs" => self.get_logs(p, mode).await,
             _ => self.answer_value(method, p, mode).await.and_then(|v| Rendered::of(&v)),
         }
     }
@@ -950,39 +1057,135 @@ impl Api {
         if b.body.transactions.is_empty() {
             return Ok(Arc::new(Vec::new()));
         }
-        let fetch = {
-            let mut fetches = self.receipt_fetches.lock();
-            // A fetch caches its set before it leaves `fetches`, so one that ends meanwhile is
-            // found in one or the other.
-            if let Some(r) = self.receipts.lock().get(&b.hash) {
-                return Ok(r);
-            }
-            if mode != OnMiss::Fetch {
-                return Err(RpcError::miss(1));
-            }
-            fetches.entry(b.hash).or_insert_with(|| self.start_receipt_fetch(b)).clone()
+        let (fetch, _waiter) = match self.join_receipt_fetch(b, mode, Keep::Always, None)? {
+            Joined::Held(r) => return Ok(r),
+            Joined::Fetch(fetch, waiter) => (fetch, waiter),
         };
         fetch.await.map_err(|e| RpcError::other(format!("{RECEIPTS_UNAVAILABLE}: {e}")))
     }
 
-    /// Fetches `b`'s receipts in a task of its own, so the reads that wait on it can leave.
-    fn start_receipt_fetch(self: &Arc<Self>, b: &HeldBlock) -> ReceiptFetch {
-        let (api, header, hash) = (self.clone(), b.header.clone(), b.hash);
-        let task = tokio::spawn(async move {
-            let fetch = AssertUnwindSafe(api.receipt_source.receipts(&header)).catch_unwind();
+    /// The set of `hash`, from either cache.
+    fn cached_receipts(&self, hash: &B256) -> Option<Arc<Vec<WireReceipt>>> {
+        let narrow = self.receipts.lock().get(hash);
+        narrow.or_else(|| self.wide_receipts.lock().get(hash))
+    }
+
+    /// Whether the receipts of `b` are held: it has no transactions, or a cache holds them.
+    fn receipts_held(&self, b: &HeldBlock) -> bool {
+        b.body.transactions.is_empty() ||
+            self.receipts.lock().contains(&b.hash) ||
+            self.wide_receipts.lock().contains(&b.hash)
+    }
+
+    /// The receipts of `b` for a read over many blocks: the cached set, else the fetch of the
+    /// block that reads share, joined or started. The read holds one of the [`WIDE_FETCHES`]
+    /// wide-read permits while it waits on the fetch, and waits at most [`WIDE_PERMIT_WAIT`] for
+    /// one ([`RECEIPTS_BUSY`]). A set this read starts the fetch of is kept in the wide cache
+    /// ([`Keep::Wide`]), where it pushes out only other wide sets, so a wide read never pushes out
+    /// the sets single reads use. `fetches` counts the fetches this read starts: past `max` the
+    /// read fails with [`LOG_BLOCKS_TOO_MANY`].
+    async fn receipts_wide(
+        self: &Arc<Self>,
+        b: &HeldBlock,
+        mode: OnMiss,
+        fetches: &std::sync::atomic::AtomicUsize,
+        max: usize,
+    ) -> Result<Arc<Vec<WireReceipt>>, RpcError> {
+        if b.body.transactions.is_empty() {
+            return Ok(Arc::new(Vec::new()));
+        }
+        if let Some(r) = self.cached_receipts(&b.hash) {
+            return Ok(r);
+        }
+        if mode != OnMiss::Fetch {
+            return Err(RpcError::miss(1));
+        }
+        // The permit is this read's: a narrow read that joins the fetch never waits on it.
+        let _permit =
+            match tokio::time::timeout(WIDE_PERMIT_WAIT, self.wide_fetches.acquire()).await {
+                Ok(Ok(permit)) => permit,
+                // The semaphore is never closed.
+                Ok(Err(_)) | Err(_) => return Err(RpcError::new(-32005, RECEIPTS_BUSY)),
+            };
+        let (fetch, _waiter) =
+            match self.join_receipt_fetch(b, mode, Keep::Wide, Some((fetches, max)))? {
+                Joined::Held(r) => return Ok(r),
+                Joined::Fetch(fetch, waiter) => (fetch, waiter),
+            };
+        fetch.await.map_err(|e| RpcError::other(format!("{RECEIPTS_UNAVAILABLE}: {e}")))
+    }
+
+    /// The cached receipts of `b`, or the fetch of them that reads share, with this read's place
+    /// among its waiters. A new fetch keeps its set as `keep` says; a read that joins with
+    /// [`Keep::Always`] makes the fetch keep its set so. A new fetch counts in `fetches`, which
+    /// may hold at most its `max`. At [`MAX_RECEIPT_FETCHES`] fetches no new one starts.
+    fn join_receipt_fetch(
+        self: &Arc<Self>,
+        b: &HeldBlock,
+        mode: OnMiss,
+        keep: Keep,
+        fetches: Option<(&std::sync::atomic::AtomicUsize, usize)>,
+    ) -> Result<Joined, RpcError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut running = self.receipt_fetches.lock();
+        // A fetch caches its set before its waiters leave, so the set is found here or there.
+        if let Some(r) = self.cached_receipts(&b.hash) {
+            return Ok(Joined::Held(r));
+        }
+        if mode != OnMiss::Fetch {
+            return Err(RpcError::miss(1));
+        }
+        // Made only once the read waits: a waiter dropped under the lock would deadlock.
+        let waiter = || Waiter { api: self.clone(), hash: b.hash };
+        if let Some(entry) = running.get_mut(&b.hash) {
+            entry.waiters += 1;
+            if keep == Keep::Always {
+                entry.keep_always.store(true, Relaxed);
+            }
+            return Ok(Joined::Fetch(entry.fetch.clone(), waiter()));
+        }
+        if running.len() >= MAX_RECEIPT_FETCHES {
+            return Err(RpcError::new(-32005, RECEIPTS_BUSY));
+        }
+        if let Some((n, max)) = fetches &&
+            n.fetch_add(1, Relaxed) >= max
+        {
+            return Err(RpcError::new(-32005, LOG_BLOCKS_TOO_MANY));
+        }
+        let keep_always = Arc::new(std::sync::atomic::AtomicBool::new(keep == Keep::Always));
+        let fetch = self.receipt_fetch(b, keep_always.clone());
+        running.insert(b.hash, FetchEntry { fetch: fetch.clone(), waiters: 1, keep_always });
+        Ok(Joined::Fetch(fetch, waiter()))
+    }
+
+    /// The fetch of `b`'s receipts, driven by the reads that wait on it: it stops when the last
+    /// of them leaves. Only the network fetch has [`RECEIPT_FETCH_TIMEOUT`]. The set is kept with
+    /// the cache of single reads when `keep_always` is set at the end, else in the wide cache.
+    fn receipt_fetch(
+        self: &Arc<Self>,
+        b: &HeldBlock,
+        keep_always: Arc<std::sync::atomic::AtomicBool>,
+    ) -> ReceiptFetch {
+        let (api, source, header, hash) =
+            (Arc::downgrade(self), self.receipt_source.clone(), b.header.clone(), b.hash);
+        async move {
+            let fetch = AssertUnwindSafe(source.receipts(&header)).catch_unwind();
             // A fetch that ran out of time or panicked found no source.
             let res = match tokio::time::timeout(RECEIPT_FETCH_TIMEOUT, fetch).await {
                 Ok(Ok(res)) => res.map(Arc::new),
                 Ok(Err(_)) | Err(_) => Err(FetchError::NoSource),
             };
-            if let Ok(r) = &res {
-                api.receipts.lock().insert(hash, r.clone());
+            if let (Ok(r), Some(api)) = (&res, api.upgrade()) {
+                if keep_always.load(std::sync::atomic::Ordering::Relaxed) {
+                    api.receipts.lock().insert(hash, r.clone());
+                } else {
+                    api.wide_receipts.lock().insert(hash, r.clone());
+                }
             }
-            api.receipt_fetches.lock().remove(&hash);
             res
-        });
-        // The task fails to join only when the runtime shuts down.
-        task.map(|joined| joined.unwrap_or(Err(FetchError::NoSource))).boxed().shared()
+        }
+        .boxed()
+        .shared()
     }
 
     async fn tx_receipt(self: &Arc<Self>, p: &Value, mode: OnMiss) -> Result<Rendered, RpcError> {
@@ -1030,6 +1233,138 @@ impl Api {
         };
         self.warm_if_needed("eth_getBlockReceipts", p, mode, &res);
         res
+    }
+
+    // --- logs ---
+
+    /// `eth_getLogs` over held blocks: a block whose header bloom cannot hold a match is skipped,
+    /// and the receipts of the others are read through [`Self::receipts_for`], so every log comes
+    /// from receipts verified against their block's receipts root.
+    async fn get_logs(self: &Arc<Self>, p: &Value, mode: OnMiss) -> Result<Rendered, RpcError> {
+        let filter = p.get(0).ok_or_else(|| RpcError::params("missing filter"))?;
+        let filter = filter.as_object().ok_or_else(|| RpcError::params("invalid filter"))?;
+        let query = LogQuery::parse(filter)?;
+        let blocks = self.log_blocks(filter)?;
+        // A block without transactions has no logs, and needs no receipts.
+        let blocks: Vec<HeldBlock> = blocks
+            .into_iter()
+            .filter(|b| !b.body.transactions.is_empty() && query.may_match(&b.header.logs_bloom))
+            .collect();
+        let res = self.collect_logs(&query, blocks, mode).await;
+        self.warm_if_needed("eth_getLogs", p, mode, &res);
+        let (logs, bytes) = res?;
+        // Few logs of a few bytes each render at once; a large answer takes a render permit,
+        // which bounds the typed and `Value` forms held at once.
+        if logs.len() <= INLINE_RECEIPT_LOGS && bytes <= INLINE_LOG_BYTES {
+            return Rendered::of(&json!(logs));
+        }
+        render_blocking(&self.render_permits, move || Ok(json!(logs))).await
+    }
+
+    /// The blocks of a log filter, lowest first: the `blockHash` block, or the canonical blocks
+    /// from `fromBlock` to `toBlock` (latest by default). A range above the head ends at it.
+    fn log_blocks(&self, f: &serde_json::Map<String, Value>) -> Result<Vec<HeldBlock>, RpcError> {
+        let field = |k: &str| f.get(k).filter(|v| !v.is_null());
+        if let Some(hash) = field("blockHash") {
+            if field("fromBlock").is_some() || field("toBlock").is_some() {
+                return Err(RpcError::params(
+                    "cannot specify both BlockHash and FromBlock/ToBlock, choose one or the other",
+                ));
+            }
+            let hash: B256 = serde_json::from_value(hash.clone())
+                .map_err(|_| RpcError::params("invalid block hash"))?;
+            return self
+                .chain
+                .by_hash(&hash)
+                .map(|b| vec![b])
+                .ok_or_else(|| RpcError::other(NOT_IN_WINDOW));
+        }
+        let head = self.head()?;
+        let (from, from_numbered) = self.log_bound(field("fromBlock"), &head)?;
+        let (to, to_numbered) = self.log_bound(field("toBlock"), &head)?;
+        // As geth: only two numbers can be out of order. A range that starts above the head is
+        // empty.
+        if from_numbered && to_numbered && from > to {
+            return Err(RpcError::other(INVALID_BLOCK_RANGE));
+        }
+        let to = to.min(head.header.number);
+        if from > to {
+            return Ok(Vec::new());
+        }
+        let lowest = self.chain.lowest().unwrap_or(head.header.number);
+        if from < lowest {
+            return Err(RpcError::pruned(from, lowest));
+        }
+        // Every canonical block from the lowest to the head is held; one that went meanwhile is
+        // outside the window.
+        (from..=to)
+            .map(|n| self.chain.by_number(n).ok_or_else(|| RpcError::other(NOT_IN_WINDOW)))
+            .collect()
+    }
+
+    /// A `fromBlock` or `toBlock` as a number, and whether the filter gave it as a number. A
+    /// number above the head is kept: the range ends at the head.
+    fn log_bound(&self, v: Option<&Value>, head: &HeldBlock) -> Result<(u64, bool), RpcError> {
+        let Some(v) = v else { return Ok((head.header.number, false)) };
+        let s = v.as_str().ok_or_else(|| RpcError::params("invalid block number"))?;
+        if let Some(n) = parse_quantity(s) {
+            return Ok((n, true));
+        }
+        if !matches!(s, "latest" | "pending" | "earliest" | "safe" | "finalized") {
+            return Err(RpcError::params("invalid block number"));
+        }
+        let b = self.resolve(v, 0)?.ok_or_else(|| RpcError::other(NOT_IN_WINDOW))?;
+        Ok((b.header.number, false))
+    }
+
+    /// The logs of `blocks` that match `query`, in block order, and their [`log_bytes`]. The
+    /// receipts of up to [`LOG_RECEIPT_FETCHES`] blocks are read at once, through
+    /// [`Self::receipts_wide`], and at most [`MAX_LOG_FETCHES`] of them are fetched.
+    async fn collect_logs(
+        self: &Arc<Self>,
+        query: &LogQuery,
+        blocks: Vec<HeldBlock>,
+        mode: OnMiss,
+    ) -> Result<(Vec<Log>, usize), RpcError> {
+        use futures::StreamExt;
+        let missing = blocks.iter().filter(|b| !self.receipts_held(b)).count();
+        // Every block whose receipts are not held counts in the miss.
+        if mode != OnMiss::Fetch && missing > 0 {
+            return Err(RpcError::miss(missing as u64));
+        }
+        if missing > MAX_LOG_FETCHES {
+            return Err(RpcError::new(-32005, LOG_BLOCKS_TOO_MANY));
+        }
+        let fetches = std::sync::atomic::AtomicUsize::new(0);
+        let fetches = &fetches;
+        let mut reads = futures::stream::iter(blocks)
+            .map(|b| async move {
+                let r = self.receipts_wide(&b, mode, fetches, MAX_LOG_FETCHES).await;
+                (b, r)
+            })
+            .buffered(LOG_RECEIPT_FETCHES);
+        let (mut logs, mut bytes) = (Vec::new(), 0usize);
+        while let Some((b, receipts)) = reads.next().await {
+            let receipts = receipts?;
+            check_receipts(&b, &receipts)?;
+            let mut log_index = 0u64;
+            for (tx, wr) in receipts.iter().enumerate() {
+                for l in &wr.receipt.logs {
+                    if query.matches(l) {
+                        if logs.len() >= MAX_LOGS {
+                            return Err(RpcError::new(-32005, TOO_MANY_LOGS));
+                        }
+                        bytes = bytes.saturating_add(log_bytes(l));
+                        if bytes > MAX_LOG_BYTES {
+                            return Err(RpcError::new(-32003, RESPONSE_TOO_LARGE));
+                        }
+                        logs.push(rpc_log(&b, tx, log_index, l.clone()));
+                    }
+                    log_index += 1;
+                }
+            }
+        }
+        Ok((logs, bytes))
     }
 
     // --- fees ---
@@ -1151,6 +1486,74 @@ impl Api {
     }
 }
 
+/// The address and topic criteria of an `eth_getLogs` filter. An empty list matches anything.
+#[derive(Debug)]
+struct LogQuery {
+    addresses: Vec<Address>,
+    /// The alternatives at each topic position.
+    topics: Vec<Vec<B256>>,
+}
+
+impl LogQuery {
+    /// Reads `address` (one or a list) and `topics` (each position null, one topic, or a list in
+    /// which a null matches anything), as geth does.
+    fn parse(f: &serde_json::Map<String, Value>) -> Result<Self, RpcError> {
+        let bad_address = || RpcError::params("invalid addresses in query");
+        let addresses = match f.get("address") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|a| serde_json::from_value(a.clone()).map_err(|_| bad_address()))
+                .collect::<Result<_, _>>()?,
+            Some(a) => vec![serde_json::from_value(a.clone()).map_err(|_| bad_address())?],
+        };
+        let bad_topic = || RpcError::params("invalid topic(s)");
+        let topic = |t: &Value| serde_json::from_value::<B256>(t.clone()).map_err(|_| bad_topic());
+        let topics = match f.get("topics") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(positions)) => positions
+                .iter()
+                .map(|pos| match pos {
+                    Value::Null => Ok(Vec::new()),
+                    Value::Array(alts) if alts.iter().any(Value::is_null) => Ok(Vec::new()),
+                    Value::Array(alts) => alts.iter().map(topic).collect(),
+                    t => Ok(vec![topic(t)?]),
+                })
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err(bad_topic()),
+        };
+        if topics.len() > MAX_LOG_TOPICS {
+            return Err(RpcError::other(TOO_MANY_TOPICS));
+        }
+        if addresses.len() > MAX_LOG_FILTER_VALUES ||
+            topics.iter().any(|alts| alts.len() > MAX_LOG_FILTER_VALUES)
+        {
+            return Err(RpcError::other(TOO_MANY_FILTER_VALUES));
+        }
+        Ok(Self { addresses, topics })
+    }
+
+    /// Whether a block with `bloom` may hold a matching log. A verified header's bloom holds
+    /// every address and topic of its block's logs, so `false` proves there is none.
+    fn may_match(&self, bloom: &alloy_primitives::Bloom) -> bool {
+        use alloy_primitives::BloomInput;
+        let has = |item: &[u8]| bloom.contains_input(BloomInput::Raw(item));
+        (self.addresses.is_empty() || self.addresses.iter().any(|a| has(a.as_slice()))) &&
+            self.topics
+                .iter()
+                .all(|alts| alts.is_empty() || alts.iter().any(|t| has(t.as_slice())))
+    }
+
+    /// Whether `log` matches. As geth, a log with fewer topics than the filter names positions
+    /// does not match, even when the extra positions match anything.
+    fn matches(&self, log: &alloy_primitives::Log) -> bool {
+        let topics = log.topics();
+        (self.addresses.is_empty() || self.addresses.contains(&log.address)) &&
+            self.topics.len() <= topics.len() &&
+            self.topics.iter().zip(topics).all(|(alts, t)| alts.is_empty() || alts.contains(t))
+    }
+}
+
 /// The warm jobs queued or running.
 #[derive(Debug, Default)]
 struct WarmQueue {
@@ -1245,7 +1648,8 @@ fn max_params(method: &str) -> usize {
         "web3_sha3" |
         "eth_getTransactionByHash" |
         "eth_getTransactionReceipt" |
-        "eth_getBlockReceipts" => 1,
+        "eth_getBlockReceipts" |
+        "eth_getLogs" => 1,
         "eth_getBalance" |
         "eth_getTransactionCount" |
         "eth_getCode" |
@@ -1442,15 +1846,28 @@ fn render_failed(e: &dyn std::fmt::Display) -> RpcError {
 }
 
 /// Verified receipt sets by block hash, the least recently used first.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ReceiptCache {
-    /// At most [`RECEIPT_CACHE`] sets, each with its [`receipt_set_bytes`].
+    /// At most `max_sets` sets, each with its [`receipt_set_bytes`].
     sets: VecDeque<(B256, Arc<Vec<WireReceipt>>, usize)>,
-    /// The sum of the sets' bytes: at most [`RECEIPT_CACHE_BYTES`].
+    /// The sum of the sets' bytes: at most `max_bytes`.
     bytes: usize,
+    max_sets: usize,
+    max_bytes: usize,
+}
+
+impl Default for ReceiptCache {
+    /// The cache of single reads: [`RECEIPT_CACHE`] sets and half of [`RECEIPT_CACHE_BYTES`].
+    fn default() -> Self {
+        Self::new(RECEIPT_CACHE, RECEIPT_CACHE_BYTES / 2)
+    }
 }
 
 impl ReceiptCache {
+    const fn new(max_sets: usize, max_bytes: usize) -> Self {
+        Self { sets: VecDeque::new(), bytes: 0, max_sets, max_bytes }
+    }
+
     fn get(&mut self, hash: &B256) -> Option<Arc<Vec<WireReceipt>>> {
         let i = self.sets.iter().position(|(h, ..)| h == hash)?;
         let set = self.sets.remove(i)?;
@@ -1459,15 +1876,20 @@ impl ReceiptCache {
         Some(receipts)
     }
 
+    /// Whether the set of `hash` is held. It does not count as a use.
+    fn contains(&self, hash: &B256) -> bool {
+        self.sets.iter().any(|(h, ..)| h == hash)
+    }
+
     /// Keeps `receipts`, pushing out the least recently used sets to make room. A set over the
     /// whole bound, or one a concurrent fetch already kept, is not kept.
     fn insert(&mut self, hash: B256, receipts: Arc<Vec<WireReceipt>>) {
         let bytes = receipt_set_bytes(&receipts);
-        if bytes > RECEIPT_CACHE_BYTES || self.sets.iter().any(|(h, ..)| *h == hash) {
+        if bytes > self.max_bytes || self.sets.iter().any(|(h, ..)| *h == hash) {
             return;
         }
         // Both terms are at most the bound, so the sum cannot overflow.
-        while self.sets.len() >= RECEIPT_CACHE || self.bytes + bytes > RECEIPT_CACHE_BYTES {
+        while self.sets.len() >= self.max_sets || self.bytes + bytes > self.max_bytes {
             let Some((.., gone)) = self.sets.pop_front() else { break };
             self.bytes -= gone;
         }
@@ -1476,18 +1898,20 @@ impl ReceiptCache {
     }
 }
 
+/// The memory one log holds: the log, its topics and its data.
+fn log_bytes(l: &alloy_primitives::Log) -> usize {
+    size_of::<alloy_primitives::Log>()
+        .saturating_add(l.topics().len().saturating_mul(size_of::<B256>()))
+        .saturating_add(l.data.data.len())
+}
+
 /// The memory one receipt set holds: each receipt and log, and the log topics and data.
 fn receipt_set_bytes(receipts: &[WireReceipt]) -> usize {
-    let log = |l: &alloy_primitives::Log| {
-        size_of::<alloy_primitives::Log>()
-            .saturating_add(l.topics().len().saturating_mul(size_of::<B256>()))
-            .saturating_add(l.data.data.len())
-    };
     receipts.iter().fold(0, |sum: usize, r| {
         r.receipt
             .logs
             .iter()
-            .map(log)
+            .map(log_bytes)
             .fold(sum.saturating_add(size_of::<WireReceipt>()), usize::saturating_add)
     })
 }
@@ -1513,6 +1937,21 @@ fn rpc_receipts(
     Ok(out)
 }
 
+/// `inner` as the RPC shows it: a log of transaction `tx` of `b`, the block's log number
+/// `log_index`.
+fn rpc_log(b: &HeldBlock, tx: usize, log_index: u64, inner: alloy_primitives::Log) -> Log {
+    Log {
+        inner,
+        block_hash: Some(b.hash),
+        block_number: Some(b.header.number),
+        block_timestamp: Some(b.header.timestamp),
+        transaction_hash: Some(*b.body.transactions[tx].tx_hash()),
+        transaction_index: Some(tx as u64),
+        log_index: Some(log_index),
+        removed: false,
+    }
+}
+
 /// The receipt of transaction `i`, whose first log is the block's log number `log_index`.
 /// `receipts` matches the block (see [`check_receipts`]).
 fn rpc_receipt(
@@ -1526,16 +1965,7 @@ fn rpc_receipt(
     let r = &wr.receipt;
     let logs: Vec<Log> = (log_index..)
         .zip(&r.logs)
-        .map(|(log_index, l)| Log {
-            inner: l.clone(),
-            block_hash: Some(b.hash),
-            block_number: Some(b.header.number),
-            block_timestamp: Some(b.header.timestamp),
-            transaction_hash: Some(*tx.tx_hash()),
-            transaction_index: Some(i as u64),
-            log_index: Some(log_index),
-            removed: false,
-        })
+        .map(|(log_index, l)| rpc_log(b, i, log_index, l.clone()))
         .collect();
     let cumulative = r.cumulative_gas_used;
     let prev_gas = i.checked_sub(1).map_or(0, |p| receipts[p].receipt.cumulative_gas_used);

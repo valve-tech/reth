@@ -1728,6 +1728,12 @@ mod tests {
             RECEIPTS_MISMATCH,
             BODY_BUDGET_FULL,
             BATCH_TOO_LARGE,
+            RECEIPTS_BUSY,
+            TOO_MANY_LOGS,
+            LOG_BLOCKS_TOO_MANY,
+            INVALID_BLOCK_RANGE,
+            TOO_MANY_TOPICS,
+            TOO_MANY_FILTER_VALUES,
         ];
         // The RPC answers this `RoundsError` with its own text. Its round is `N` in the README.
         // `BlockHashUnavailable` never reaches a client: `eth_call` maps it to
@@ -1809,6 +1815,9 @@ mod tests {
             ("RESPONSE_TOO_LARGE", -32003),
             ("RESPONSE_BUDGET_FULL", -32005),
             ("BODY_BUDGET_FULL", -32005),
+            ("RECEIPTS_BUSY", -32005),
+            ("TOO_MANY_LOGS", -32005),
+            ("LOG_BLOCKS_TOO_MANY", -32005),
             ("REQUEST_TIMED_OUT", -32002),
         ];
         let code_of =

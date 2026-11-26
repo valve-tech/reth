@@ -74,14 +74,29 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   eth_getUncleCountByBlock{Hash,Number} eth_getTransactionByHash
   eth_getTransactionByBlock{Hash,Number}AndIndex eth_getTransactionReceipt
   eth_getBlockReceipts eth_gasPrice eth_maxPriorityFeePerGas eth_feeHistory
-  web3_clientVersion web3_sha3 net_listening net_peerCount eth_accounts eth_mining
-  eth_hashrate`. `eth_feeHistory` does not take `rewardPercentiles`. Everything else,
+  eth_getLogs web3_clientVersion web3_sha3 net_listening net_peerCount eth_accounts
+  eth_mining eth_hashrate`. `eth_feeHistory` does not take `rewardPercentiles`. Everything else,
   including `eth_sendRawTransaction`, is `-32601` `method not served`.
 * Node answers: `web3_clientVersion` is `reth-lite/v` and the version that `--version`
   prints. `net_peerCount` is the number of connected eth peers. `net_listening` is `true`.
   The node holds no keys and does not mine, so `eth_accounts` is `[]`, `eth_mining` is
   `false` and `eth_hashrate` is `0x0`. These, `eth_chainId`, `net_version` and `web3_sha3`
   read no block, so they answer before the first head and while the node is halted.
+* Logs: `eth_getLogs` takes geth's filter: `blockHash`, or `fromBlock` and `toBlock` (both
+  `latest` by default), `address` (one or a list) and `topics` (each position null, one topic
+  or a list; a null in a list matches anything). It reads held blocks only. A block whose
+  header bloom cannot hold a match is skipped. The receipts of the others come through the
+  receipt path above, so every log is checked against its block's receipts root, and in
+  `error` and `error-and-warm` a block whose receipts are not held counts in the miss. A
+  range that starts above the head is `[]`, and one that ends above it ends at the head. A
+  `fromBlock` below the lowest held block answers the pruned-history error below. One request
+  reads the receipts the node holds, and fetches those of at most 32 other blocks with
+  transactions whose bloom matches. It keeps a set it fetched in the wide receipt cache, where it
+  pushes out only other wide sets, never the sets single reads use. Concurrent reads of one block,
+  of any kind, share one fetch, which keeps its set as a narrow read does when one joins. At
+  most 16 wide reads of a block wait on fetches at once across all requests. A fetch runs only
+  while a read waits on it. An answer of more than 256 logs or
+  64 KiB of log data is rendered under a render permit, as a large receipt is.
 * Uncle counts: PulseChain blocks have no uncles, so a held block answers `0x0`. A block not
   held is `null`, as geth answers it.
 * Miss: `-32046` `state not verified locally`, `data: {"missing": N}`, in `error` and
@@ -103,7 +118,8 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
 * Batches: at most 1000 requests, as geth. A larger batch gets an array of one `-32600`
   `batch too large` error with the id of its first call, as geth answers it.
 * Responses: when a batch's answers pass 25,000,000 bytes, as geth, each later answer gets
-  `-32003` `response too large`. A single answer over 64 MiB gets the same error. Do not send it
+  `-32003` `response too large`. A single answer over 64 MiB gets the same error, and so
+  does an `eth_getLogs` whose logs hold more than 24 MiB of data and topics. Do not send it
   again unchanged: ask for less.
 * Requests: a body over 5 MiB gets HTTP 413, as geth. Each body is charged its bytes and its
   parsed form to a shared 48 MiB body budget. One body may hold at most 12 MiB of it, so one
@@ -112,7 +128,15 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
 * Busy: when large responses in flight fill the 64 MiB shared response budget, an answer gets
   `-32005` `server busy: too many large responses in flight`. When large request bodies fill the
   body budget, a body that finds no room for its parsed form within 1 s gets `-32005`
-  `server busy: too many large requests in flight`. Send either one again later.
+  `server busy: too many large requests in flight`. When 256 receipt fetches run, or a wide
+  receipt read (`eth_getLogs`, `eth_feeHistory` rewards) finds none of its 16 permits free
+  within 1 s, the read gets `-32005` `server busy: too many receipt fetches in flight`. Send
+  any of them again later.
+* Log limits: an `eth_getLogs` that matches more than 10,000 logs gets `-32005` `query
+  returned more than 10000 results`, as Infura answers it. One whose filter's bloom matches
+  more than 32 blocks with transactions whose receipts the node does not hold gets `-32005`
+  `query needs the receipts of more than 32 blocks the node does not hold: narrow the block
+  range or the filter`. Ask for a smaller range.
 * Timeout: a request still unanswered after 60 s gets `-32002` `request timed out`, as geth. So
   does a large request body that sends nothing for 10 s or arrives slower than 256 KiB/s. A
   batch keeps the answers it finished before then.
@@ -146,7 +170,13 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   * `not serving: the chain was re-seeded during the request`: the request ran across a re-seed;
     send it again.
   * `not available in lite node: outside the recent block window`: a state read or
-    `eth_feeHistory` names a block above the head or a hash the node does not hold.
+    `eth_feeHistory` names a block above the head or a hash the node does not hold, or an
+    `eth_getLogs` names a `blockHash` the node does not hold.
+  * `invalid block range`: an `eth_getLogs` with a numbered `fromBlock` above its numbered
+    `toBlock`, as geth answers it.
+  * `exceed max topics` and `exceed max addresses or topics per search position`: an
+    `eth_getLogs` filter with more than 4 topic positions, or more than 1000 addresses or
+    alternatives at one position, as geth answers them.
   * `not available in lite node: BLOCKHASH of a block outside the held headers`: an `eth_call`
     or `eth_estimateGas` read `BLOCKHASH` of a block below the held headers.
   * `block is not canonical`: a block given by hash with EIP-1898 `requireCanonical: true` is
@@ -321,7 +351,10 @@ minutes, while the root is still the source's finalized root.
 * With `--discovery=off` and no `--peer` the node cannot fetch state: reads outside held state miss.
 * Receipts come from a peer (eth/68 `GetReceipts`) and are checked against the header's receipts
   root; they are fetched in `fetch` mode and are a miss in the other modes. The node keeps the
-  receipts of at most 64 blocks and 32 MiB, in RAM outside `--cache.size`.
+  receipts of at most 64 blocks and 32 MiB, in RAM outside `--cache.size`, in two halves: 32
+  blocks and 16 MiB for single reads (a receipt, a block's receipts), and 32 blocks and 16 MiB
+  for wide reads (`eth_getLogs`, `eth_feeHistory` rewards). A wide read pushes out only wide
+  sets.
 * The node keeps each RPC answer as its JSON text from the moment it computes it until the client
   has read it. So the 64 MiB response budget bounds the memory that answers hold. A render of a
   full block, of block receipts or of a receipt with more than 256 logs also holds the typed

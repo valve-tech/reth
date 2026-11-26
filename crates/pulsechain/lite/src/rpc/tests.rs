@@ -516,7 +516,6 @@ async fn send_raw_transaction_and_unlisted_methods_are_refused() {
     let r = rig(OnMiss::Fetch, true);
     for m in [
         "eth_sendRawTransaction",
-        "eth_getLogs",
         "eth_getProof",
         "debug_traceTransaction",
         "eth_newFilter",
@@ -3117,14 +3116,23 @@ fn push_head(r: &Rig, transactions: Vec<TxEnvelope>) -> HeldBlock {
 }
 
 fn push_head_by(r: &Rig, transactions: Vec<TxEnvelope>, beneficiary: Address) -> HeldBlock {
+    push_head_with(r, transactions, |h| h.beneficiary = beneficiary)
+}
+
+/// [`push_head`], with the header edited by `edit` before it is hashed.
+fn push_head_with(
+    r: &Rig,
+    transactions: Vec<TxEnvelope>,
+    edit: impl FnOnce(&mut Header),
+) -> HeldBlock {
     let parent = r.chain.head().unwrap();
-    let header = Header {
+    let mut header = Header {
         number: parent.header.number + 1,
         parent_hash: parent.hash,
         timestamp: now(),
-        beneficiary,
         ..parent.header
     };
+    edit(&mut header);
     let b = HeldBlock {
         hash: header.hash_slow(),
         header,
@@ -3383,13 +3391,15 @@ async fn receipts_are_fetched_once_and_the_least_recently_used_set_leaves_first(
 #[tokio::test]
 async fn the_receipt_cache_holds_at_most_its_byte_bound() {
     let r = rig(OnMiss::Fetch, true);
-    // One receipt with a log of a third of the bound: two sets fit, three do not.
+    // One receipt with a log of a third of the single-read cache's half of the bound: two sets
+    // fit, three do not.
+    let bound = RECEIPT_CACHE_BYTES / 2;
     let mut big = wire_receipt(21_000);
     big.receipt.logs[0].data =
-        alloy_primitives::LogData::new_unchecked(vec![], vec![0; RECEIPT_CACHE_BYTES / 3].into());
+        alloy_primitives::LogData::new_unchecked(vec![], vec![0; bound / 3].into());
     let set = vec![big];
     let bytes = receipt_set_bytes(&set);
-    assert!(2 * bytes <= RECEIPT_CACHE_BYTES && 3 * bytes > RECEIPT_CACHE_BYTES, "{bytes}");
+    assert!(2 * bytes <= bound && 3 * bytes > bound, "{bytes}");
     let source = Arc::new(CountingReceipts(Receipts(set), Default::default()));
     let api = api_with(&r, cfg_943(), r.honest.clone(), source.clone());
     let fetches = || source.1.load(std::sync::atomic::Ordering::SeqCst);
@@ -4129,4 +4139,633 @@ fn the_readme_states_the_render_bounds() {
     assert!(readme.contains(&large), "{large} not in the README");
     assert_eq!(MAX_CONCURRENT_RENDERS, 2, "the README says two renders");
     assert!(readme.contains("At most two renders run at once"));
+}
+
+// --- eth_getLogs ---
+
+const T1: B256 = B256::repeat_byte(0x11);
+const T2: B256 = B256::repeat_byte(0x22);
+const T3: B256 = B256::repeat_byte(0x33);
+
+fn log_of(address: Address, topics: &[B256]) -> alloy_primitives::Log {
+    alloy_primitives::Log::new_unchecked(address, topics.to_vec(), Bytes::from_static(&[7]))
+}
+
+fn receipt_of(cumulative: u64, logs: Vec<alloy_primitives::Log>) -> WireReceipt {
+    ReceiptWithBloom {
+        logs_bloom: alloy_primitives::logs_bloom(&logs),
+        receipt: alloy_consensus::EthereumReceipt {
+            tx_type: alloy_consensus::TxType::Legacy,
+            success: true,
+            cumulative_gas_used: cumulative,
+            logs,
+        },
+    }
+}
+
+/// Receipts by block number; counts the fetches it answers.
+#[derive(Default)]
+struct ReceiptsByNumber {
+    sets: Mutex<HashMap<u64, Vec<WireReceipt>>>,
+    fetches: Mutex<Vec<u64>>,
+}
+
+#[async_trait]
+impl ReceiptSource for ReceiptsByNumber {
+    async fn receipts(&self, header: &Header) -> Result<Vec<WireReceipt>, FetchError> {
+        self.fetches.lock().push(header.number);
+        Ok(self.sets.lock().get(&header.number).cloned().unwrap_or_default())
+    }
+}
+
+/// Puts a block on the head with one transaction per receipt in `receipts`, and a header bloom
+/// of `bloom`, and gives `source` its receipts.
+fn push_logs_block(
+    r: &Rig,
+    source: &ReceiptsByNumber,
+    receipts: Vec<WireReceipt>,
+    bloom: alloy_primitives::Bloom,
+) -> HeldBlock {
+    let next = r.chain.head().unwrap().header.number + 1;
+    let txs =
+        (0..receipts.len() as u64).map(|i| legacy_tx(next * 100 + i, 2_000_000_000)).collect();
+    let b = push_head_with(r, txs, |h| h.logs_bloom = bloom);
+    source.sets.lock().insert(b.header.number, receipts);
+    b
+}
+
+/// A block whose bloom holds its logs.
+fn push_logged(
+    r: &Rig,
+    source: &ReceiptsByNumber,
+    logs: Vec<Vec<alloy_primitives::Log>>,
+) -> HeldBlock {
+    let mut cumulative = 0;
+    let receipts: Vec<_> = logs
+        .into_iter()
+        .map(|l| {
+            cumulative += 21_000;
+            receipt_of(cumulative, l)
+        })
+        .collect();
+    let bloom = receipts.iter().fold(Default::default(), |mut b: alloy_primitives::Bloom, r| {
+        b.accrue_bloom(&r.logs_bloom);
+        b
+    });
+    push_logs_block(r, source, receipts, bloom)
+}
+
+/// A rig with three log blocks on the head: A (1004) has `ALICE [T1 T2]` and `VIEW [T1]` in
+/// two transactions; B (1005) would match anything but its bloom is empty; C (1006) has
+/// `ALICE [T3]`.
+fn logs_rig(mode: OnMiss) -> (Rig, Arc<Api>, Arc<ReceiptsByNumber>, [HeldBlock; 3]) {
+    let r = rig(mode, true);
+    let source = Arc::new(ReceiptsByNumber::default());
+    let a =
+        push_logged(&r, &source, vec![vec![log_of(ALICE, &[T1, T2])], vec![log_of(VIEW, &[T1])]]);
+    let everything = vec![receipt_of(21_000, vec![log_of(ALICE, &[T1, T2, T3])])];
+    let b = push_logs_block(&r, &source, everything, Default::default());
+    let c = push_logged(&r, &source, vec![vec![log_of(ALICE, &[T3])]]);
+    let cfg = LiteConfig { on_miss: mode, ..cfg_943() };
+    let api = api_with(&r, cfg, r.honest.clone(), source.clone());
+    (r, api, source, [a, b, c])
+}
+
+/// The `(blockNumber, logIndex, address)` of each log in an `eth_getLogs` answer.
+fn log_ids(v: &Value) -> Vec<(u64, u64, String)> {
+    let num =
+        |v: &Value| u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    result(v)
+        .as_array()
+        .unwrap_or_else(|| panic!("not a list: {v}"))
+        .iter()
+        .map(|l| {
+            (num(&l["blockNumber"]), num(&l["logIndex"]), l["address"].as_str().unwrap().to_owned())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn get_logs_matches_addresses_and_topics_and_skips_blocks_by_their_bloom() {
+    let (_r, api, source, [a, ..]) = logs_rig(OnMiss::Fetch);
+    let (alice, view) = (h(ALICE), h(VIEW));
+    let from = json!(hex_u64(a.header.number));
+    for (filter, want) in [
+        (json!({"fromBlock": from, "address": alice}), vec![(1004, 0, &alice), (1006, 0, &alice)]),
+        (
+            json!({"fromBlock": from, "address": [view, alice]}),
+            vec![(1004, 0, &alice), (1004, 1, &view), (1006, 0, &alice)],
+        ),
+        (json!({"fromBlock": from, "topics": [T1]}), vec![(1004, 0, &alice), (1004, 1, &view)]),
+        (json!({"fromBlock": from, "topics": [null, T2]}), vec![(1004, 0, &alice)]),
+        (json!({"fromBlock": from, "topics": [[T2, T3]]}), vec![(1006, 0, &alice)]),
+        (
+            json!({"fromBlock": from, "address": alice, "topics": [[T1, null]]}),
+            vec![(1004, 0, &alice), (1006, 0, &alice)],
+        ),
+        (json!({"fromBlock": from, "address": alice, "topics": [[], []]}), vec![(1004, 0, &alice)]),
+        // As geth: a log with fewer topics than the filter's positions does not match.
+        (json!({"fromBlock": from, "topics": [T1, null]}), vec![(1004, 0, &alice)]),
+        (json!({"fromBlock": from, "address": view, "topics": [T3]}), vec![]),
+        // The default range is the head alone.
+        (json!({"address": alice}), vec![(1006, 0, &alice)]),
+    ] {
+        let want: Vec<_> = want.into_iter().map(|(n, i, a)| (n, i, a.clone())).collect();
+        assert_eq!(log_ids(&call(&api, "eth_getLogs", json!([filter])).await), want, "{filter}");
+    }
+    // B's bloom holds nothing, so its receipts, which would match every filter, are never read.
+    assert!(!source.fetches.lock().contains(&1005), "{:?}", source.fetches.lock());
+    // Each log carries its block and transaction, as a receipt's log does.
+    let v = call(&api, "eth_getLogs", json!([{"blockHash": format!("{:#x}", a.hash)}])).await;
+    let logs = result(&v).as_array().unwrap();
+    assert_eq!(logs.len(), 2);
+    assert_eq!(logs[1]["blockHash"], json!(a.hash));
+    assert_eq!(logs[1]["transactionIndex"], "0x1");
+    assert_eq!(logs[1]["transactionHash"], json!(a.body.transactions[1].tx_hash()));
+    assert_eq!(logs[1]["topics"], json!([T1]));
+    assert_eq!(logs[1]["removed"], json!(false));
+}
+
+#[tokio::test]
+async fn get_logs_block_hash_and_range_forms_refuse_what_they_cannot_serve() {
+    let (r, api, _source, [a, _, c]) = logs_rig(OnMiss::Fetch);
+    let logs = |f: Value| {
+        let api = api.clone();
+        async move { call(&api, "eth_getLogs", json!([f])).await }
+    };
+    let unknown = format!("{:#x}", B256::repeat_byte(0xee));
+    assert_eq!(error(&logs(json!({"blockHash": unknown})).await), (-32000, NOT_IN_WINDOW));
+    let both = json!({"blockHash": format!("{:#x}", a.hash), "fromBlock": "0x3ec"});
+    assert_eq!(
+        error(&logs(both).await),
+        (-32602, "cannot specify both BlockHash and FromBlock/ToBlock, choose one or the other")
+    );
+    // A null bound is no bound.
+    let hash_only = json!({"blockHash": format!("{:#x}", a.hash), "fromBlock": null});
+    assert_eq!(log_ids(&logs(hash_only).await).len(), 2);
+    assert_eq!(logs(json!({"fromBlock": "0x1"})).await["error"], pruned(1, 1000));
+    assert_eq!(
+        error(&logs(json!({"fromBlock": "0x3ee", "toBlock": "0x3ec"})).await),
+        (-32000, INVALID_BLOCK_RANGE)
+    );
+    // Above the head: a range that starts there is empty, and one that ends there ends at the
+    // head.
+    assert_eq!(result(&logs(json!({"fromBlock": "0xfffffff"})).await), &json!([]));
+    let to_far = json!({"fromBlock": hex_u64(c.header.number), "toBlock": "0xfffffff"});
+    assert_eq!(log_ids(&logs(to_far).await).len(), 1);
+    // Tags resolve as for any block read.
+    let all = json!({"fromBlock": "earliest", "toBlock": "latest", "address": h(ALICE)});
+    assert_eq!(log_ids(&logs(all).await).len(), 2);
+    assert_eq!(error(&logs(json!({"fromBlock": "safe"})).await), (-32000, FINALITY_UNCONFIRMED));
+    for (filter, want) in [
+        (json!(null), "invalid filter"),
+        (json!("latest"), "invalid filter"),
+        (json!({"fromBlock": "0xzz"}), "invalid block number"),
+        (json!({"fromBlock": 5}), "invalid block number"),
+        (json!({"fromBlock": "soon"}), "invalid block number"),
+        (json!({"blockHash": "0x12"}), "invalid block hash"),
+        (json!({"address": "0x12"}), "invalid addresses in query"),
+        (json!({"address": [h(ALICE), 7]}), "invalid addresses in query"),
+        (json!({"topics": ["0x12"]}), "invalid topic(s)"),
+        (json!({"topics": [[T1, 7]]}), "invalid topic(s)"),
+        (json!({"topics": T1}), "invalid topic(s)"),
+    ] {
+        assert_eq!(error(&logs(filter.clone()).await), (-32602, want), "{filter}");
+    }
+    assert_eq!(error(&call(&api, "eth_getLogs", json!([])).await), (-32602, "missing filter"));
+    let v = call(&api, "eth_getLogs", json!([{}, {}])).await;
+    assert_eq!(error(&v), (-32602, "too many arguments, want at most 1"));
+    // geth's caps on the filter.
+    assert_eq!(
+        error(&logs(json!({"topics": [T1, T1, T1, T1, T1]})).await),
+        (-32000, TOO_MANY_TOPICS)
+    );
+    assert_eq!(log_ids(&logs(json!({"topics": [T1, T2, null, null]})).await).len(), 0);
+    let many: Vec<_> =
+        (0..=MAX_LOG_FILTER_VALUES).map(|i| h(Address::with_last_byte(i as u8))).collect();
+    assert_eq!(error(&logs(json!({"address": many})).await), (-32000, TOO_MANY_FILTER_VALUES));
+    let many: Vec<_> = (0..=MAX_LOG_FILTER_VALUES).map(|_| T1).collect();
+    assert_eq!(error(&logs(json!({"topics": [many]})).await), (-32000, TOO_MANY_FILTER_VALUES));
+    let most: Vec<_> = (0..MAX_LOG_FILTER_VALUES).map(|_| T1).collect();
+    assert_eq!(log_ids(&logs(json!({"fromBlock": "0x3ec", "topics": [most]})).await).len(), 2);
+    // The range form reads the canonical chain up to the head, so a stale head refuses it. The
+    // hash form names a verified block, which is still served.
+    push_head_with(&r, vec![], |h| h.timestamp = now() - 120);
+    assert_eq!(error(&logs(json!({"address": h(ALICE)})).await), (-32000, STALE_HEAD));
+    let by_hash = json!({"blockHash": format!("{:#x}", a.hash)});
+    assert_eq!(log_ids(&logs(by_hash).await).len(), 2);
+}
+
+/// The scan of a range is bounded without a cap of its own: it starts at the lowest held block,
+/// which is at most the header window below the head.
+#[tokio::test]
+async fn get_logs_scans_at_most_the_header_window() {
+    let r = rig(OnMiss::Fetch, true);
+    extend_head(&r, 3 * crate::chain::HEADERS_WINDOW);
+    let head = r.chain.head().unwrap().header.number;
+    let lowest = r.chain.lowest().unwrap();
+    assert!(head - lowest <= crate::chain::HEADERS_WINDOW, "the chain holds {lowest}..={head}");
+    let range = |from: u64| json!([{"fromBlock": hex_u64(from)}]);
+    // Empty blocks have no logs and need no receipts.
+    assert_eq!(result(&call(&r.api, "eth_getLogs", range(lowest)).await), &json!([]));
+    let below = call(&r.api, "eth_getLogs", range(lowest - 1)).await;
+    assert_eq!(below["error"], pruned(lowest - 1, lowest));
+}
+
+/// A wide read keeps what other reads cached: it reads the held sets, and fetches the others
+/// for itself, at most 32, keeping a set only where the cache has a free slot.
+#[tokio::test]
+async fn get_logs_fetches_at_most_32_sets_and_never_pushes_out_cached_ones() {
+    let r = rig(OnMiss::Fetch, true);
+    let source = Arc::new(ReceiptsByNumber::default());
+    let cached: Vec<HeldBlock> = (0..RECEIPT_CACHE)
+        .map(|_| push_logged(&r, &source, vec![vec![log_of(ALICE, &[T1])]]))
+        .collect();
+    let first = r.chain.head().unwrap().header.number + 1;
+    for _ in 0..=MAX_LOG_FETCHES {
+        push_logged(&r, &source, vec![vec![log_of(ALICE, &[T1])]]);
+    }
+    let api = api_with(&r, cfg_943(), r.honest.clone(), source.clone());
+    // Other reads fill the cache.
+    for b in &cached {
+        result(&call(&api, "eth_getBlockReceipts", json!([format!("{:#x}", b.hash)])).await);
+    }
+    source.fetches.lock().clear();
+    let from = |n: u64| json!([{"fromBlock": hex_u64(n), "address": h(ALICE)}]);
+    // One block too many to fetch: refused before any fetch.
+    let v = call(&api, "eth_getLogs", from(first)).await;
+    assert_eq!(error(&v), (-32005, LOG_BLOCKS_TOO_MANY));
+    assert!(source.fetches.lock().is_empty(), "receipts fetched before the cap");
+    assert!(LOG_BLOCKS_TOO_MANY.contains(&format!("more than {MAX_LOG_FETCHES} blocks")));
+    // At the cap: every block's receipts are fetched once, and the cached sets are read.
+    let to = first + MAX_LOG_FETCHES as u64 - 1;
+    let range = json!([{"fromBlock": hex_u64(cached[0].header.number), "toBlock": hex_u64(to), "address": h(ALICE)}]);
+    let v = call(&api, "eth_getLogs", range).await;
+    assert_eq!(log_ids(&v).len(), RECEIPT_CACHE + MAX_LOG_FETCHES);
+    assert_eq!(source.fetches.lock().len(), MAX_LOG_FETCHES);
+    {
+        let shared = api.receipts.lock();
+        assert!(cached.iter().all(|b| shared.contains(&b.hash)), "a wide read pushed out a set");
+        assert_eq!(shared.sets.len(), RECEIPT_CACHE);
+    }
+    // A filter that no bloom holds reads no receipts, whatever the range.
+    let none = json!([{"fromBlock": hex_u64(first), "address": h(COLD)}]);
+    assert_eq!(result(&call(&api, "eth_getLogs", none).await), &json!([]));
+}
+
+/// Concurrent wide reads of one block share one fetch.
+#[tokio::test]
+async fn concurrent_wide_reads_of_one_block_share_one_fetch() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let r = rig(OnMiss::Fetch, true);
+    let gated = Arc::new(GatedReceipts {
+        answer: Ok(vec![wire_receipt(21_000)]),
+        gate: tokio::sync::Semaphore::new(0),
+        started: Default::default(),
+    });
+    let b = push_head(&r, vec![legacy_tx(77, 2_000_000_000)]);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), gated.clone());
+    let logs = json!([{"blockHash": format!("{:#x}", b.hash)}]);
+    let reads = [
+        tokio::spawn({
+            let (api, p) = (api.clone(), logs.clone());
+            async move { call(&api, "eth_getLogs", p).await }
+        }),
+        tokio::spawn({
+            let (api, p) = (api.clone(), logs);
+            async move { call(&api, "eth_getLogs", p).await }
+        }),
+    ];
+    for _ in 0..100 {
+        if gated.started.load(SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gated.gate.add_permits(10);
+    for read in reads {
+        result(&read.await.unwrap());
+    }
+    assert_eq!(gated.started.load(SeqCst), 1);
+}
+
+/// However many wide reads run, at most 16 of their fetches run at once.
+#[tokio::test]
+async fn wide_reads_run_at_most_16_receipt_fetches_at_once() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let r = rig(OnMiss::Fetch, true);
+    let gated = Arc::new(GatedReceipts {
+        answer: Ok(vec![wire_receipt(21_000)]),
+        gate: tokio::sync::Semaphore::new(0),
+        started: Default::default(),
+    });
+    let first = r.chain.head().unwrap().header.number + 1;
+    for i in 0..24 {
+        push_head(&r, vec![legacy_tx(100 + i, 2_000_000_000)]);
+    }
+    let api = api_with(&r, cfg_943(), r.honest.clone(), gated.clone());
+    // Three reads of 8 blocks each: each has 8 reads in flight.
+    let reads: Vec<_> = (0..3u64)
+        .map(|i| {
+            let (from, to) = (first + 8 * i, first + 8 * i + 7);
+            let p = json!([{"fromBlock": hex_u64(from), "toBlock": hex_u64(to)}]);
+            let api = api.clone();
+            tokio::spawn(async move { call(&api, "eth_getLogs", p).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gated.started.load(SeqCst), WIDE_FETCHES);
+    gated.gate.add_permits(100);
+    for read in reads {
+        assert_eq!(log_ids(&read.await.unwrap()).len(), 8);
+    }
+    assert_eq!(gated.started.load(SeqCst), 24);
+}
+
+/// A narrow read never waits on a wide-read permit, even when a wide read of the same block is
+/// waiting for one. That wide read gives up after its own short wait, with a busy error.
+#[tokio::test]
+async fn a_narrow_read_never_waits_on_a_wide_read_permit() {
+    let r = rig(OnMiss::Fetch, true);
+    let source =
+        Arc::new(CountingReceipts(Receipts(vec![wire_receipt(21_000)]), Default::default()));
+    let b = push_head(&r, vec![legacy_tx(77, 2_000_000_000)]);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), source.clone());
+    let n = u32::try_from(WIDE_FETCHES).unwrap();
+    let held = api.wide_fetches.acquire_many(n).await.unwrap();
+    let hash = format!("{:#x}", b.hash);
+    let wide = tokio::spawn({
+        let (api, p) = (api.clone(), json!([{"blockHash": hash.clone()}]));
+        async move { call(&api, "eth_getLogs", p).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let narrow = call(&api, "eth_getBlockReceipts", json!([hash]));
+    let v = tokio::time::timeout(Duration::from_millis(500), narrow).await.expect("waited");
+    assert_eq!(result(&v).as_array().unwrap().len(), 1);
+    let v = wide.await.unwrap();
+    assert_eq!(error(&v), (-32005, RECEIPTS_BUSY));
+    drop(held);
+    assert_eq!(source.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A narrow read that joins a wide read's fetch makes it keep its set, as a narrow fetch does.
+#[tokio::test]
+async fn a_fetch_a_narrow_read_joins_keeps_its_set_in_a_full_cache() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let r = rig(OnMiss::Fetch, true);
+    let gated = Arc::new(GatedReceipts {
+        answer: Ok(vec![wire_receipt(21_000)]),
+        gate: tokio::sync::Semaphore::new(0),
+        started: Default::default(),
+    });
+    let b = push_head(&r, vec![legacy_tx(77, 2_000_000_000)]);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), gated.clone());
+    {
+        let mut cache = api.receipts.lock();
+        for i in 0..RECEIPT_CACHE {
+            cache.insert(B256::with_last_byte(i as u8), Arc::new(vec![wire_receipt(21_000)]));
+        }
+    }
+    let hash = format!("{:#x}", b.hash);
+    let wide = tokio::spawn({
+        let (api, p) = (api.clone(), json!([{"blockHash": hash.clone()}]));
+        async move { call(&api, "eth_getLogs", p).await }
+    });
+    for _ in 0..100 {
+        if gated.started.load(SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let narrow = tokio::spawn({
+        let api = api.clone();
+        async move { call(&api, "eth_getBlockReceipts", json!([hash])).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gated.gate.add_permits(10);
+    result(&wide.await.unwrap());
+    result(&narrow.await.unwrap());
+    assert_eq!(gated.started.load(SeqCst), 1);
+    assert!(api.receipts.lock().contains(&b.hash), "the joined fetch kept its set only if room");
+}
+
+/// Never answers, and notes when its fetch is dropped.
+#[derive(Default)]
+struct Hangs {
+    started: std::sync::atomic::AtomicUsize,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl ReceiptSource for Hangs {
+    async fn receipts(&self, _: &Header) -> Result<Vec<WireReceipt>, FetchError> {
+        struct Dropped(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _dropped = Dropped(self.dropped.clone());
+        std::future::pending().await
+    }
+}
+
+/// A fetch is driven by its waiters only: when every one leaves, it stops and is unlisted.
+#[tokio::test]
+async fn a_fetch_every_waiter_left_stops_and_is_unlisted() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let r = rig(OnMiss::Fetch, true);
+    let hangs = Arc::new(Hangs::default());
+    let b = push_head(&r, vec![legacy_tx(77, 2_000_000_000)]);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), hangs.clone());
+    let short = Duration::from_millis(100);
+    let reads = futures::future::join(api.receipts_for(&b, OnMiss::Fetch), async {
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        api.receipts_wide(&b, OnMiss::Fetch, &n, 1).await
+    });
+    assert!(tokio::time::timeout(short, reads).await.is_err());
+    assert_eq!(hangs.started.load(SeqCst), 1, "two waiters, one fetch");
+    assert_eq!(hangs.dropped.load(SeqCst), 1, "the fetch was not stopped");
+    assert!(api.receipt_fetches.lock().is_empty(), "an abandoned fetch is still listed");
+    // A later read starts again.
+    assert!(tokio::time::timeout(short, api.receipts_for(&b, OnMiss::Fetch)).await.is_err());
+    assert_eq!((hangs.started.load(SeqCst), hangs.dropped.load(SeqCst)), (2, 2));
+}
+
+#[tokio::test]
+async fn no_receipt_fetch_starts_past_the_most_that_run_at_once() {
+    let r = rig(OnMiss::Fetch, true);
+    let b = push_head(&r, vec![legacy_tx(77, 2_000_000_000)]);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), Arc::new(Receipts(vec![wire_receipt(1)])));
+    for i in 0..MAX_RECEIPT_FETCHES {
+        let fetch: ReceiptFetch = futures::future::pending().boxed().shared();
+        let entry = FetchEntry { fetch, waiters: 1, keep_always: Default::default() };
+        api.receipt_fetches.lock().insert(B256::from(U256::from(i)), entry);
+    }
+    let v = call(&api, "eth_getBlockReceipts", json!([format!("{:#x}", b.hash)])).await;
+    assert_eq!(error(&v), (-32005, RECEIPTS_BUSY));
+    api.receipt_fetches.lock().clear();
+    let v = call(&api, "eth_getBlockReceipts", json!([format!("{:#x}", b.hash)])).await;
+    assert_eq!(result(&v).as_array().unwrap().len(), 1);
+}
+
+/// With the cache of single reads full, a wide read keeps what it fetches in the wide cache, and
+/// never pushes out a single read's set: a repeat reads it, and error-and-warm warms it.
+#[tokio::test]
+async fn wide_reads_keep_their_sets_when_single_reads_fill_their_cache() {
+    let r = rig(OnMiss::Fetch, true);
+    let source = Arc::new(ReceiptsByNumber::default());
+    let narrow: Vec<HeldBlock> = (0..RECEIPT_CACHE)
+        .map(|_| push_logged(&r, &source, vec![vec![log_of(VIEW, &[T2])]]))
+        .collect();
+    let first = r.chain.head().unwrap().header.number + 1;
+    for _ in 0..5 {
+        push_logged(&r, &source, vec![vec![log_of(ALICE, &[T1])]]);
+    }
+    let api = api_with(&r, cfg_943(), r.honest.clone(), source.clone());
+    for b in &narrow {
+        result(&call(&api, "eth_getBlockReceipts", json!([format!("{:#x}", b.hash)])).await);
+    }
+    assert_eq!(api.receipts.lock().sets.len(), RECEIPT_CACHE);
+    source.fetches.lock().clear();
+    let logs = json!([{"fromBlock": hex_u64(first), "address": h(ALICE)}]);
+    for _ in 0..2 {
+        assert_eq!(log_ids(&call(&api, "eth_getLogs", logs.clone()).await).len(), 5);
+    }
+    assert_eq!(source.fetches.lock().len(), 5, "a repeat fetched again");
+    assert!(
+        narrow.iter().all(|b| api.receipts.lock().contains(&b.hash)),
+        "a wide set pushed one out"
+    );
+    // error-and-warm: the warm job keeps what it fetched, so a retry answers.
+    let cfg = LiteConfig { on_miss: OnMiss::ErrorAndWarm, ..cfg_943() };
+    let warm = api_with(&r, cfg, r.honest.clone(), source.clone());
+    for b in &narrow {
+        warm.receipts.lock().insert(b.hash, Arc::new(vec![receipt_of(21_000, vec![])]));
+    }
+    assert_eq!(error(&call(&warm, "eth_getLogs", logs.clone()).await).0, MISS_CODE);
+    let mut v = Value::Null;
+    for _ in 0..100 {
+        v = call(&warm, "eth_getLogs", logs.clone()).await;
+        if v.get("result").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(log_ids(&v).len(), 5);
+    assert_eq!(warm.receipts.lock().sets.len(), RECEIPT_CACHE);
+}
+
+/// The wide cache pushes out its own least recently used set, within its own bounds.
+#[test]
+fn the_wide_cache_pushes_out_only_its_own_sets() {
+    let set = || Arc::new(vec![wire_receipt(21_000)]);
+    let mut wide = ReceiptCache::new(WIDE_RECEIPT_CACHE, RECEIPT_CACHE_BYTES / 2);
+    for i in 0..=WIDE_RECEIPT_CACHE {
+        wide.insert(B256::with_last_byte(i as u8), set());
+    }
+    assert_eq!(wide.sets.len(), WIDE_RECEIPT_CACHE);
+    assert!(!wide.contains(&B256::with_last_byte(0)) && wide.contains(&B256::with_last_byte(1)));
+    assert_eq!(MAX_LOG_FETCHES, WIDE_RECEIPT_CACHE);
+}
+
+/// A few logs that carry much data are rendered under a render permit, as a large receipt is.
+#[tokio::test]
+async fn a_logs_answer_of_much_data_is_rendered_under_a_render_permit() {
+    let r = rig(OnMiss::Fetch, true);
+    let source = Arc::new(ReceiptsByNumber::default());
+    let data = |len: usize| {
+        alloy_primitives::Log::new_unchecked(ALICE, vec![T1], Bytes::from(vec![0xab; len]))
+    };
+    let small = push_logged(&r, &source, vec![vec![data(100)]]);
+    let large = push_logged(&r, &source, vec![vec![data(INLINE_LOG_BYTES)]]);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), source);
+    let n = u32::try_from(MAX_CONCURRENT_RENDERS).unwrap();
+    let held = api.render_permits.clone().acquire_many_owned(n).await.unwrap();
+    let read = |b: &HeldBlock| {
+        let (api, p) = (api.clone(), json!([{"blockHash": format!("{:#x}", b.hash)}]));
+        async move { call(&api, "eth_getLogs", p).await }
+    };
+    let v = tokio::time::timeout(Duration::from_secs(30), read(&small)).await.unwrap();
+    assert_eq!(log_ids(&v).len(), 1);
+    let wait = tokio::time::timeout(Duration::from_millis(200), read(&large)).await;
+    assert!(wait.is_err(), "a log of much data rendered with every render permit taken");
+    drop(held);
+    let v = tokio::time::timeout(Duration::from_secs(30), read(&large)).await.unwrap();
+    assert_eq!(log_ids(&v).len(), 1);
+}
+
+#[tokio::test]
+async fn get_logs_answers_at_most_10000_logs() {
+    for (n, ok) in [(MAX_LOGS, true), (MAX_LOGS + 1, false)] {
+        let r = rig(OnMiss::Fetch, true);
+        let source = Arc::new(ReceiptsByNumber::default());
+        let b = push_logged(&r, &source, vec![(0..n).map(|_| log_of(ALICE, &[T1])).collect()]);
+        let api = api_with(&r, cfg_943(), r.honest.clone(), source);
+        let v = call(&api, "eth_getLogs", json!([{"blockHash": format!("{:#x}", b.hash)}])).await;
+        if ok {
+            let ids = log_ids(&v);
+            assert_eq!((ids.len(), ids.last().unwrap().1), (n, n as u64 - 1));
+        } else {
+            assert_eq!(error(&v), (-32005, TOO_MANY_LOGS));
+        }
+    }
+    assert!(TOO_MANY_LOGS.contains(&format!("more than {MAX_LOGS} results")));
+}
+
+#[tokio::test]
+async fn get_logs_refuses_an_answer_past_its_byte_bound() {
+    let r = rig(OnMiss::Fetch, true);
+    let source = Arc::new(ReceiptsByNumber::default());
+    let big = |len: usize| {
+        alloy_primitives::Log::new_unchecked(ALICE, vec![T1], Bytes::from(vec![0xab; len]))
+    };
+    let small = MAX_LOG_BYTES / 2;
+    let b = push_logged(&r, &source, vec![vec![big(small)], vec![big(small)]]);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), source);
+    let by_hash = json!([{"blockHash": format!("{:#x}", b.hash)}]);
+    assert_eq!(error(&call(&api, "eth_getLogs", by_hash).await), (-32003, RESPONSE_TOO_LARGE));
+    let one = json!([{"blockHash": format!("{:#x}", b.hash), "topics": [T2]}]);
+    assert_eq!(result(&call(&api, "eth_getLogs", one).await), &json!([]));
+}
+
+#[tokio::test]
+async fn get_logs_misses_count_every_block_whose_receipts_are_not_held() {
+    let (_r, api, source, [a, ..]) = logs_rig(OnMiss::Error);
+    let from = json!([{"fromBlock": hex_u64(a.header.number), "address": h(ALICE)}]);
+    let v = call(&api, "eth_getLogs", from.clone()).await;
+    assert_eq!(
+        v["error"],
+        json!({"code": MISS_CODE, "message": MISS_MESSAGE, "data": {"missing": 2}})
+    );
+    assert!(source.fetches.lock().is_empty());
+    // error-and-warm fetches them in the background, and the read then answers.
+    let (_r, api, source, [a, ..]) = logs_rig(OnMiss::ErrorAndWarm);
+    let from = json!([{"fromBlock": hex_u64(a.header.number), "address": h(ALICE)}]);
+    assert_eq!(error(&call(&api, "eth_getLogs", from.clone()).await).0, MISS_CODE);
+    for _ in 0..100 {
+        if source.fetches.lock().len() == 2 && api.warming.lock().keys.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(log_ids(&call(&api, "eth_getLogs", from).await).len(), 2);
+}
+
+#[tokio::test]
+async fn get_logs_takes_its_logs_only_from_receipts_that_match_the_block() {
+    let r = rig(OnMiss::Fetch, true);
+    let failing = Arc::new(Failing(FetchError::Unverifiable));
+    let api = api_with(&r, cfg_943(), r.honest.clone(), failing);
+    // The rig's head has two transactions and an empty bloom: only a filter with no criteria
+    // reads its receipts.
+    let latest = json!([{}]);
+    let unverifiable = "every source returned data that failed verification";
+    let v = call(&api, "eth_getLogs", latest.clone()).await;
+    assert_eq!(error(&v), (-32000, format!("receipts unavailable: {unverifiable}").as_str()));
+    let short = Arc::new(Receipts(vec![wire_receipt(21_000)]));
+    let api = api_with(&r, cfg_943(), r.honest.clone(), short);
+    assert_eq!(error(&call(&api, "eth_getLogs", latest).await), (-32000, RECEIPTS_MISMATCH));
 }
