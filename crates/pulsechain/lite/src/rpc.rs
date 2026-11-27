@@ -486,7 +486,6 @@ impl PeerNetwork for NoPeers {
 pub struct Api {
     cfg: LiteConfig,
     /// The suggested tip and the head it was computed at: it changes only with the head.
-    tip: Mutex<Option<(B256, u128)>>,
     chain: Arc<HeaderChain>,
     exec: ExecCtx,
     render_permits: Arc<tokio::sync::Semaphore>,
@@ -565,7 +564,6 @@ impl Api {
         exec.evm_timeout = p.cfg.evm_timeout;
         Some(Arc::new(Self {
             cfg: p.cfg,
-            tip: Mutex::default(),
             chain: p.chain,
             exec,
             render_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RENDERS)),
@@ -821,7 +819,9 @@ impl Api {
             "eth_gasPrice" => {
                 let head = self.head()?;
                 let tip = self.suggested_tip();
-                Ok(json!(hex_u128(tip + u128::from(head.header.base_fee_per_gas.unwrap_or(0)))))
+                Ok(json!(hex_u128(
+                    tip.saturating_add(u128::from(head.header.base_fee_per_gas.unwrap_or(0))),
+                )))
             }
             "eth_maxPriorityFeePerGas" => {
                 self.head()?;
@@ -1620,58 +1620,9 @@ impl Api {
 
     // --- fees ---
 
-    fn recent(&self, n: u64) -> Vec<HeldBlock> {
-        let Some(head) = self.chain.head() else { return vec![] };
-        let lowest = self.chain.lowest().unwrap_or(0);
-        (head.header.number.saturating_sub(n.saturating_sub(1)).max(lowest)..=head.header.number)
-            .filter_map(|i| self.chain.by_number(i))
-            .collect()
-    }
-
-    /// [`Self::compute_tip`] at the head, computed once per head, as reth's oracle keeps its
-    /// `last_price`: a batch of fee estimates recovers the window's senders once.
-    fn suggested_tip(&self) -> u128 {
-        let Some(head) = self.chain.head() else { return self.compute_tip() };
-        if let Some((at, tip)) = *self.tip.lock() &&
-            at == head.hash
-        {
-            return tip;
-        }
-        let tip = self.compute_tip();
-        *self.tip.lock() = Some((head.hash, tip));
-        tip
-    }
-
-    /// 60th percentile of the three lowest tips of each of the last 20 blocks, as reth's oracle
-    /// counts them: a tip under 2 wei and a transaction sent by the block's beneficiary do not
-    /// count. A window with no tips answers the chain's default. The answer is never below the
-    /// chain's minimum tip, and never above [`MAX_TIP`].
-    fn compute_tip(&self) -> u128 {
-        let mut tips = Vec::new();
-        for b in self.recent(20) {
-            let base = b.header.base_fee_per_gas.unwrap_or(0);
-            let mut t: Vec<(u128, &TxEnvelope)> = b
-                .body
-                .transactions
-                .iter()
-                .filter_map(|tx| tx.effective_tip_per_gas(base).map(|tip| (tip, tx)))
-                .filter(|(tip, _)| *tip >= IGNORE_TIP_BELOW)
-                .collect();
-            t.sort_unstable_by_key(|(tip, _)| *tip);
-            // Senders are recovered lazily: only until three tips are found.
-            tips.extend(
-                t.into_iter()
-                    .filter(|(_, tx)| recover(tx).is_ok_and(|s| s != b.header.beneficiary))
-                    .take(3)
-                    .map(|(tip, _)| tip),
-            );
-        }
-        let min = chain_min_tip(self.cfg.chain_id);
-        if tips.is_empty() {
-            return min.unwrap_or(DEFAULT_TIP);
-        }
-        tips.sort_unstable();
-        tips[(tips.len() - 1) * 60 / 100].max(min.unwrap_or(0)).min(MAX_TIP)
+    /// The chain's tip answer: see [`chain_tip`].
+    const fn suggested_tip(&self) -> u128 {
+        chain_tip(self.cfg.chain_id)
     }
 
     async fn fee_history(self: &Arc<Self>, p: &Value, mode: OnMiss) -> Result<Value, RpcError> {
@@ -2214,28 +2165,20 @@ fn decode_revert_reason(data: &[u8]) -> Option<String> {
     String::from_utf8(s.to_vec()).ok()
 }
 
-/// reth's oracle ignores tips under 2 wei (`DEFAULT_IGNORE_GAS_PRICE`).
-const IGNORE_TIP_BELOW: u128 = 2;
-
-/// The tip a window with no transactions suggests on a chain without a minimum: 1 gwei.
-const DEFAULT_TIP: u128 = 1_000_000_000;
-
-/// The highest tip the oracle suggests: reth's `DEFAULT_MAX_GAS_PRICE`, 500 gwei.
-const MAX_TIP: u128 = 500_000_000_000;
-
-/// The chain's effective minimum tip, as pulse-reth's gas oracle floors it: 0.001 gwei on 943.
-const fn chain_min_tip(chain_id: u64) -> Option<u128> {
+/// The tip `eth_maxPriorityFeePerGas` answers, as valve's pulse-reth nodes answer it. On 369 it
+/// is a fixed 50,000 gwei, to match rpc.pulsechain.com. On 943 it is 1,000,000 wei (0.001 gwei),
+/// the network's minimum accepted tip: pulse-reth answers the lowest tip of at least that over
+/// 100 blocks, which is it. The API is built only for those two chains.
+const fn chain_tip(chain_id: u64) -> u128 {
     match chain_id {
-        943 => Some(1_000_000),
-        _ => None,
+        369 => 50_000_000_000_000,
+        _ => 1_000_000,
     }
 }
 
 /// The sender of `tx`. A signature that does not recover is an error, never the zero address.
 fn recover(tx: &TxEnvelope) -> Result<Address, RpcError> {
     use alloy_consensus::transaction::SignerRecoverable;
-    #[cfg(test)]
-    tests::RECOVERIES.with(|n| n.set(n.get() + 1));
     tx.recover_signer().map_err(|_| RpcError::other(BAD_SENDER))
 }
 
