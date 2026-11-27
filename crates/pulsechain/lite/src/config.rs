@@ -42,6 +42,8 @@ const MIN_HEAD_MAX_AGE: Duration = Duration::from_secs(20);
 /// The longest duration flag. The follower multiplies `--beacon.poll` by a small factor, which
 /// panics on overflow, and a day is already far past any useful value of each flag.
 const MAX_DURATION: Duration = Duration::from_secs(24 * 3600);
+/// The shortest `--snap.probe-timeout`: any wait above zero.
+const MIN_SNAP_PROBE: Duration = Duration::from_millis(1);
 
 /// What to do when a read needs state the node has not verified yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -502,6 +504,12 @@ pub struct LiteArgs {
     /// -32000 "execution aborted (timeout = 5s)", with the limit given.
     #[arg(long = "rpc.evmtimeout", value_parser = parse_duration, default_value = "5s")]
     pub rpc_evmtimeout: Duration,
+    /// How long a newly connected `snap/1` peer has to answer its first request, a probe that an
+    /// honest server answers at once. A discovered peer that answers neither the probe nor any
+    /// other request in this time loses its session; a static `--peer` is kept, with a warning.
+    /// Above 0.
+    #[arg(long = "snap.probe-timeout", value_parser = parse_duration, default_value = "3s")]
+    pub snap_probe_timeout: Duration,
 }
 
 impl std::fmt::Debug for LiteArgs {
@@ -803,6 +811,8 @@ pub struct LiteConfig {
     pub head_max_age: Duration,
     /// EVM time limit of one `eth_call` or `eth_estimateGas` run; zero sets no limit.
     pub evm_timeout: Duration,
+    /// How long a new `snap/1` peer has to answer the probe.
+    pub snap_probe_timeout: Duration,
     /// Upstream JSON-RPC state sources. Secret: never log these.
     pub upstream_urls: Vec<Url>,
     /// Where state comes from when `upstream_urls` is not empty.
@@ -839,6 +849,7 @@ impl std::fmt::Debug for LiteConfig {
             .field("checkpoint", &self.checkpoint)
             .field("head_max_age", &self.head_max_age)
             .field("evm_timeout", &self.evm_timeout)
+            .field("snap_probe_timeout", &self.snap_probe_timeout)
             .field("upstream_urls", &upstreams)
             .field("upstream_mode", &self.upstream_mode)
             .finish()
@@ -910,6 +921,7 @@ impl Default for LiteConfig {
             checkpoint: None,
             head_max_age: Duration::from_secs(60),
             evm_timeout: crate::call::DEFAULT_EVM_TIMEOUT,
+            snap_probe_timeout: crate::net::wire::PROBE_TIMEOUT,
             upstream_urls: Vec::new(),
             upstream_mode: UpstreamMode::Fallback,
         }
@@ -1003,10 +1015,17 @@ impl LiteArgs {
             ("--finalized.recheck", self.finalized_recheck),
             ("--head.max-age", self.head_max_age),
             ("--rpc.evmtimeout", self.rpc_evmtimeout),
+            ("--snap.probe-timeout", self.snap_probe_timeout),
         ] {
             if value > MAX_DURATION {
                 return Err(ConfigError::DurationTooLong { flag, max: MAX_DURATION });
             }
+        }
+        if self.snap_probe_timeout < MIN_SNAP_PROBE {
+            return Err(ConfigError::DurationTooShort {
+                flag: "--snap.probe-timeout",
+                min: MIN_SNAP_PROBE,
+            });
         }
         if self.beacon_poll < MIN_POLL {
             return Err(ConfigError::DurationTooShort { flag: "--beacon.poll", min: MIN_POLL });
@@ -1122,6 +1141,7 @@ impl LiteArgs {
             checkpoint,
             head_max_age: self.head_max_age,
             evm_timeout: self.rpc_evmtimeout,
+            snap_probe_timeout: self.snap_probe_timeout,
             upstream_urls,
             upstream_mode: self.upstream_mode.unwrap_or_default(),
             ..LiteConfig::default()
@@ -1386,13 +1406,19 @@ mod tests {
             "beacon.poll" => a.beacon_poll,
             "finalized.recheck" => a.finalized_recheck,
             "rpc.evmtimeout" => a.rpc_evmtimeout,
+            "snap.probe-timeout" => a.snap_probe_timeout,
             _ => a.head_max_age,
         })
     }
 
     const SIZE_FLAGS: [&str; 2] = ["cache.size", "disk.limit"];
-    const DURATION_FLAGS: [&str; 4] =
-        ["beacon.poll", "finalized.recheck", "head.max-age", "rpc.evmtimeout"];
+    const DURATION_FLAGS: [&str; 5] = [
+        "beacon.poll",
+        "finalized.recheck",
+        "head.max-age",
+        "rpc.evmtimeout",
+        "snap.probe-timeout",
+    ];
 
     /// Size flags take pulse-reth's sizes: binary `B KB MB GB TB`, whole numbers only.
     #[test]
@@ -2072,6 +2098,34 @@ mod tests {
             }
         }
         assert_eq!(problems, Vec::<String>::new(), "README flag table out of date");
+    }
+
+    #[test]
+    fn the_snap_probe_timeout_defaults_to_3s_reaches_the_network_and_refuses_zero() {
+        let cfg = |args: &[&str]| {
+            let mut all = vec!["--beacon.url=https://a", "--head.confirm=none"];
+            all.extend_from_slice(args);
+            parse_exact(&all).unwrap().into_config()
+        };
+        let key = reth_network::config::rng_secret_key();
+        let default = cfg(&[]).unwrap();
+        assert_eq!(default.snap_probe_timeout, Duration::from_secs(3));
+        assert_eq!(default.snap_probe_timeout, LiteConfig::default().snap_probe_timeout);
+        let opts = crate::net::wire::NetOptions::from_config(&default, key);
+        assert_eq!(opts.snap_probe, Some(Duration::from_secs(3)));
+        let short = cfg(&["--snap.probe-timeout=250ms"]).unwrap();
+        assert_eq!(short.snap_probe_timeout, Duration::from_millis(250));
+        let opts = crate::net::wire::NetOptions::from_config(&short, key);
+        assert_eq!(opts.snap_probe, Some(Duration::from_millis(250)));
+        assert_eq!(
+            cfg(&["--snap.probe-timeout=0s"]).unwrap_err().to_string(),
+            "--snap.probe-timeout must be at least 1ms"
+        );
+        assert_eq!(
+            cfg(&["--snap.probe-timeout=25h"]).unwrap_err().to_string(),
+            "--snap.probe-timeout must be at most 24h"
+        );
+        assert!(format!("{short:?}").contains("snap_probe_timeout: 250ms"));
     }
 
     #[test]

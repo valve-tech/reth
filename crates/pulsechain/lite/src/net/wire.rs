@@ -11,7 +11,8 @@
 //! Many peers advertise `snap/1` and never answer a `snap/1` request. So the first request to a
 //! new peer is a probe: `GetByteCodes` for a hash no account has, which an honest server answers
 //! at once with an empty list. A discovered peer that gives no answer to the probe or to any
-//! other request within [`PROBE_TIMEOUT`] loses its session, so its slot goes back to discovery.
+//! other request within the probe time (`--snap.probe-timeout`, [`PROBE_TIMEOUT`] by default)
+//! loses its session, so its slot goes back to discovery.
 //! A static peer is kept, with a warning.
 
 use super::{
@@ -541,7 +542,7 @@ pub struct NetOptions {
     pub dns: bool,
     /// How long the network refuses a banned discovered peer: [`BAN_FOR`] in a real run.
     pub ban_for: Duration,
-    /// How long a new peer has to answer the `snap/1` probe: [`PROBE_TIMEOUT`] in a real run;
+    /// How long a new peer has to answer the `snap/1` probe: `--snap.probe-timeout` in a real run;
     /// `None` sends no probe.
     pub snap_probe: Option<Duration>,
 }
@@ -563,7 +564,7 @@ impl NetOptions {
             discovery_interval: None,
             dns: true,
             ban_for: BAN_FOR,
-            snap_probe: Some(PROBE_TIMEOUT),
+            snap_probe: Some(cfg.snap_probe_timeout),
         }
     }
 }
@@ -1402,10 +1403,20 @@ mod tests {
     /// out, and not before. The probe asks for the code of a hash that no account has.
     #[tokio::test(start_paused = true)]
     async fn a_discovered_peer_that_never_answers_the_probe_is_dropped() {
-        let client = Snap1Client::new(HashSet::new(), Some(PROBE_TIMEOUT));
+        peer_dropped_at_the_probe_timeout(PROBE_TIMEOUT).await;
+    }
+
+    /// A configured `--snap.probe-timeout` is the wait: a short one drops the peer as soon.
+    #[tokio::test(start_paused = true)]
+    async fn the_probe_waits_the_configured_time() {
+        peer_dropped_at_the_probe_timeout(Duration::from_millis(250)).await;
+    }
+
+    async fn peer_dropped_at_the_probe_timeout(wait: Duration) {
+        let client = Snap1Client::new(HashSet::new(), Some(wait));
         let peer = PeerId::repeat_byte(1);
         let (task, _to_conn, mut sent) = probed(&client, peer);
-        tokio::time::sleep(PROBE_TIMEOUT - Duration::from_millis(1)).await;
+        tokio::time::sleep(wait - Duration::from_millis(1)).await;
         assert_eq!(client.peers(), vec![peer]);
         let ended = tokio::time::timeout(Duration::from_millis(2), task).await;
         assert!(ended.is_ok(), "a peer that never answered the probe was kept");
