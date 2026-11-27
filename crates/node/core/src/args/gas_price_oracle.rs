@@ -47,6 +47,11 @@ pub struct GasPriceOracleArgs {
     /// it keeps its last answer: `--gpo.default-suggested-fee` at start, else 0. It changes two
     /// defaults: `--gpo.ignoreprice` becomes 1000 gwei and `--gpo.maxprice` becomes 1 PLS (1e18
     /// wei). Either flag set to its reth default value still reads as unset.
+    ///
+    /// The `pulsechain` mode also computes `eth_feeHistory` rewards as erigon-pulse does. It
+    /// drops the coinbase's transactions and self-transfers, with no ignore price, and reads each
+    /// percentile of the gas the remaining transactions used, not of the block's gas used. A block
+    /// with no transaction left has zero rewards.
     #[arg(
         long = "gpo.sample-mode",
         default_value_t = DefaultRpcServerArgs::get_global().gas_price_oracle.sample_mode,

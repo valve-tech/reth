@@ -627,6 +627,8 @@ Gas Price Oracle:
 
           `pulsechain` runs erigon-pulse's algorithm, so `eth_maxPriorityFeePerGas` matches rpc.pulsechain.com. It walks exactly `--gpo.blocks` blocks back from the head, empty ones included. Per block it drops tips under `--gpo.ignoreprice`, transactions from the block's coinbase and self-transfers, then keeps the lowest 40% of the rest (at least 3, at most 1000). It answers the `--gpo.percentile` sample, capped at `--gpo.maxprice`. With no sample it keeps its last answer: `--gpo.default-suggested-fee` at start, else 0. It changes two defaults: `--gpo.ignoreprice` becomes 1000 gwei and `--gpo.maxprice` becomes 1 PLS (1e18 wei). Either flag set to its reth default value still reads as unset.
 
+          The `pulsechain` mode also computes `eth_feeHistory` rewards as erigon-pulse does. It drops the coinbase's transactions and self-transfers, with no ignore price, and reads each percentile of the gas the remaining transactions used, not of the block's gas used. A block with no transaction left has zero rewards.
+
           [default: reth]
           [possible values: reth, pulsechain]
 

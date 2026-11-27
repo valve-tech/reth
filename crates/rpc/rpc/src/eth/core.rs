@@ -1510,6 +1510,70 @@ mod tests {
         assert_eq!(api.gas_oracle().suggest_tip_cap().await.unwrap(), U256::from(3 * PLS));
     }
 
+    /// `eth_feeHistory` rewards under the pulsechain mode drop a self-transfer and read the gas of
+    /// the transactions kept; reth's mode reads the whole block. The fee history cache follows
+    /// the oracle's mode.
+    #[tokio::test]
+    async fn pulsechain_mode_reaches_fee_history_rewards() {
+        use reth_ethereum_primitives::{Receipt, Transaction as EthTransaction};
+        const BASE_FEE: u64 = 7;
+        let key = generators::generate_key(&mut generators::rng());
+        let eip1559 = |tip: u128, to: Address, nonce: u64| {
+            generators::sign_tx_with_key_pair(
+                key,
+                EthTransaction::Eip1559(alloy_consensus::TxEip1559 {
+                    nonce,
+                    max_priority_fee_per_gas: tip,
+                    max_fee_per_gas: tip + u128::from(BASE_FEE),
+                    to: alloy_primitives::TxKind::Call(to),
+                    ..Default::default()
+                }),
+            )
+        };
+        let sender = eip1559(1, Address::ZERO, 0).recover_signer().unwrap();
+        let other = Address::repeat_byte(0xaa);
+
+        for (config, want) in [
+            (GasPriceOracleConfig::pulsechain(), 5 * GWEI),
+            (GasPriceOracleConfig::default(), GWEI),
+        ] {
+            let provider = chain_369_provider();
+            let header = Header {
+                number: 1,
+                gas_limit: 30_000_000,
+                gas_used: 121_000,
+                base_fee_per_gas: Some(BASE_FEE),
+                ..Default::default()
+            };
+            let transactions = vec![eip1559(GWEI, sender, 0), eip1559(5 * GWEI, other, 1)];
+            let hash = header.hash_slow();
+            provider.add_block(
+                hash,
+                Block { header, body: BlockBody { transactions, ..Default::default() } },
+            );
+            let receipt = |cumulative_gas_used| Receipt {
+                tx_type: alloy_consensus::TxType::Eip1559,
+                success: true,
+                cumulative_gas_used,
+                logs: Vec::new(),
+            };
+            // the self-transfer uses 100,000 gas, the other transaction 21,000
+            provider.add_receipts(1, vec![receipt(100_000), receipt(121_000)]);
+            let api = build_369_eth_api(provider, config);
+            assert_eq!(api.fee_history_cache().config().sample_mode, config.sample_mode);
+
+            let history = EthApiServer::fee_history(
+                &api,
+                U64::from(1),
+                BlockNumberOrTag::Number(1),
+                Some(vec![50.0]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(history.reward, Some(vec![vec![want]]), "{:?}", config.sample_mode);
+        }
+    }
+
     /// Requesting all blocks should be ok
     #[tokio::test]
     async fn test_fee_history_all_blocks() {

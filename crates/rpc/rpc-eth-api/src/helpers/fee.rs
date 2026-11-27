@@ -8,10 +8,11 @@ use alloy_primitives::U256;
 use alloy_rpc_types_eth::{BlockNumberOrTag, FeeHistory};
 use futures::{Future, StreamExt};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
-use reth_primitives_traits::BlockBody;
 use reth_rpc_eth_types::{
-    fee_history::calculate_reward_percentiles_for_block, utils::checked_blob_gas_used_ratio,
-    EthApiError, FeeHistoryCache, FeeHistoryEntry, GasPriceOracle, RpcInvalidTransactionError,
+    fee_history::{on_resolution_grid, reward_percentiles_for_block},
+    utils::checked_blob_gas_used_ratio,
+    EthApiError, FeeHistoryCache, FeeHistoryEntry, GasPriceOracle, GasPriceSampleMode,
+    RpcInvalidTransactionError,
 };
 use reth_storage_api::{
     BlockIdReader, BlockNumReader, BlockReaderIdExt, HeaderProvider, ProviderHeader,
@@ -158,8 +159,21 @@ pub trait EthFees:
                 Vec::new()
             };
 
+            // valve-tech fork: the cache keeps rewards at its resolution's percentiles only. The
+            // pulsechain mode answers erigon's exact reward, so a percentile off that grid reads
+            // the blocks instead.
+            let sample_mode = self.gas_oracle().config().sample_mode;
+            let off_grid = sample_mode == GasPriceSampleMode::Pulsechain &&
+                reward_percentiles.as_ref().is_some_and(|percentiles| {
+                    !on_resolution_grid(percentiles, self.fee_history_cache().resolution())
+                });
+
             // Check if the requested range is within the cache bounds
-            let fee_entries = self.fee_history_cache().get_history(start_block, end_block).await;
+            let fee_entries = if off_grid {
+                None
+            } else {
+                self.fee_history_cache().get_history(start_block, end_block).await
+            };
 
             if let Some(fee_entries) = fee_entries {
                 if fee_entries.len() != block_count as usize {
@@ -224,22 +238,16 @@ pub trait EthFees:
                         futures::stream::iter(hashes)
                             .map(|hash| self.cache().get_block_and_receipts(hash))
                             .buffered(4);
-                    let mut header_idx = 0;
                     while let Some(result) = stream.next().await {
-                        let header = &headers[header_idx];
-                        header_idx += 1;
                         let (block, receipts) = result
                             .map_err(Self::Error::from_eth_err)?
                             .ok_or(EthApiError::InvalidBlockRange)?;
-                        rewards.push(
-                            calculate_reward_percentiles_for_block(
-                                percentiles,
-                                header.base_fee_per_gas().unwrap_or_default(),
-                                block.body().transactions(),
-                                &receipts,
-                            )
-                            .unwrap_or_default(),
-                        );
+                        rewards.push(reward_percentiles_for_block(
+                            sample_mode,
+                            percentiles,
+                            &block,
+                            &receipts,
+                        ));
                     }
                 }
 

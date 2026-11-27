@@ -565,6 +565,11 @@ where
                 with_chain_min_tip(gas_oracle_config, provider.chain_spec().chain_id());
             GasPriceOracle::new(provider.clone(), gas_oracle_config, eth_cache.clone())
         });
+        // valve-tech fork: the cached rewards follow the oracle's sample mode
+        let fee_history_cache_config = FeeHistoryCacheConfig {
+            sample_mode: gas_oracle.config().sample_mode,
+            ..fee_history_cache_config
+        };
         let fee_history_cache =
             FeeHistoryCache::<HeaderTy<N::Primitives>>::new(fee_history_cache_config);
         let new_canonical_blocks = provider.canonical_state_stream();

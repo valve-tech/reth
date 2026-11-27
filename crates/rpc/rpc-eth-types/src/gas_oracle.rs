@@ -128,6 +128,8 @@ pub enum GasPriceSampleMode {
     /// the head, empty ones included. Each block gives the lowest 40 percent of its tips (at
     /// least 3, at most 1,000), after it drops tips under `ignore_price`, transactions from the
     /// block's coinbase and self-transfers. With no sample, the oracle keeps its last answer.
+    /// `eth_feeHistory` rewards follow erigon-pulse too, see
+    /// [`calculate_pulsechain_reward_percentiles`](crate::fee_history::calculate_pulsechain_reward_percentiles).
     Pulsechain,
 }
 
