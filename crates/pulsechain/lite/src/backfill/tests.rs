@@ -363,3 +363,24 @@ fn a_backfilled_block_takes_only_its_listed_missing_body() {
     assert_eq!(chain.by_number(999).map(|b| b.hash), Some(truth.at(999).hash));
     assert_eq!(chain.backfill_bodiless(10).1.len(), 1);
 }
+
+/// A backfill hangs only below a canonical block: a held side block is no anchor, and the chain
+/// holds nothing below it.
+#[test]
+fn a_backfill_from_a_side_block_is_refused() {
+    let truth = Truth::new(1100);
+    let chain = truth.chain(1000, 1001);
+    let side = HeldBlock {
+        header: Header { extra_data: vec![0xee].into(), ..truth.at(1001).header.clone() },
+        ..truth.at(1001).clone()
+    };
+    let side = HeldBlock { hash: side.header.hash_slow(), ..side };
+    chain.insert(side.clone()).unwrap();
+    let epoch = chain.epoch();
+    assert_eq!(
+        chain.backfill(epoch, side.hash, vec![truth.at(1000).clone()]),
+        Err(ChainError::Unknown)
+    );
+    assert_eq!(chain.lowest_canonical().map(|(_, b)| b.hash), Some(truth.at(1000).hash));
+    assert_eq!(chain.head().map(|b| b.hash), Some(truth.at(1001).hash));
+}

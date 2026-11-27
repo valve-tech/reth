@@ -5713,3 +5713,19 @@ async fn get_ready_answers_200_when_ready_and_503_with_the_failing_checks() {
     assert!(health.bytes().await.unwrap().is_empty());
     task.abort();
 }
+
+/// A Host header that is not an authority, or is not text, is refused like a foreign name; a
+/// request with no Host header did not come from a browser and passes.
+#[test]
+fn a_host_header_that_names_no_authority_is_not_local() {
+    let headers = |host: &[u8]| {
+        let mut map = hyper::HeaderMap::new();
+        map.insert(hyper::header::HOST, hyper::header::HeaderValue::from_bytes(host).unwrap());
+        map
+    };
+    assert!(local_host(&hyper::HeaderMap::new()));
+    assert!(local_host(&headers(b"localhost:8545")));
+    for host in [&b"local host"[..], b"localhost/x", b"[::1", b"\xfflocalhost"] {
+        assert!(!local_host(&headers(host)), "{}", String::from_utf8_lossy(host));
+    }
+}

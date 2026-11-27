@@ -52,6 +52,8 @@ enum Mode {
     Behind,
     /// An answer over the body cap.
     Huge,
+    /// An honest answer padded past the body cap, sent without a length.
+    Unsized,
     /// Proofs with more nodes than any honest proof.
     Padded,
     /// Proofs that leave out the slots asked for.
@@ -87,7 +89,7 @@ impl FakeRpc {
                     if mode == Mode::Silent {
                         std::future::pending::<()>().await;
                     }
-                    let (status, reply) = match mode {
+                    let (status, mut reply) = match mode {
                         Mode::Down => ("500 Internal Server Error", b"oops".to_vec()),
                         Mode::Huge => ("200 OK", vec![b' '; MAX_UPSTREAM_BODY + 1]),
                         _ => {
@@ -112,10 +114,15 @@ impl FakeRpc {
                             ("200 OK", serde_json::to_vec(&replies).unwrap())
                         }
                     };
+                    let length = if mode == Mode::Unsized {
+                        reply.resize(MAX_UPSTREAM_BODY + 1, b' ');
+                        String::new()
+                    } else {
+                        format!("content-length: {}\r\n", reply.len())
+                    };
                     let head = format!(
-                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: \
-                         {}\r\nconnection: close\r\n\r\n",
-                        reply.len()
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{length}\
+                         connection: close\r\n\r\n"
                     );
                     let _ = sock.write_all(head.as_bytes()).await;
                     let _ = sock.write_all(&reply).await;
@@ -353,6 +360,7 @@ async fn a_fetch_no_upstream_serves_is_unverifiable_after_a_bad_answer_and_no_so
         (Mode::Down, &alice[..], FetchError::NoSource),
         (Mode::Behind, &alice[..], FetchError::NoSource),
         (Mode::Huge, &alice[..], FetchError::NoSource),
+        (Mode::Unsized, &alice[..], FetchError::NoSource),
     ] {
         let r = rig(&[mode]).await;
         assert_eq!(r.fetcher.fetch(r.world.root, misses).await, Err(want), "{mode:?}");
