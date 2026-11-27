@@ -1,5 +1,10 @@
 //! The response budget bounds the heap that answers waiting to be written really hold. This needs
 //! its own test binary: it swaps the global allocator to count live heap bytes.
+//!
+//! The count is one for the whole process, so a test reads it only while it holds [`MEASURING`].
+//! `cargo nextest` runs each test in a process of its own, but `cargo test` runs the tests of a
+//! binary on parallel threads of one process. Without the lock, one test counts the answers the
+//! other holds or frees.
 
 use alloy_consensus::{
     BlockBody, EthereumReceipt, Header, ReceiptWithBloom, Signed, TxEnvelope, TxLegacy, TxType,
@@ -26,7 +31,10 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::Instant,
+};
 
 struct Counting;
 
@@ -51,6 +59,10 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
+
+/// Held by each test that reads [`LIVE`], for all of its run: no other test allocates or frees
+/// while it counts.
+static MEASURING: Mutex<()> = Mutex::const_new(());
 
 /// Logs in each receipt: small logs, whose parsed form is several times their text.
 const LOGS: usize = 3000;
@@ -185,6 +197,7 @@ async fn held_by_replies(
 
 #[tokio::test]
 async fn answers_waiting_to_be_written_hold_no_more_heap_than_the_response_budget() {
+    let _measuring = MEASURING.lock().await;
     let api = api();
     let far = Instant::now() + Duration::from_secs(600);
     let unbounded = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
@@ -226,6 +239,7 @@ fn long_id_request(method: &str, i: u64, len: usize) -> Value {
 
 #[tokio::test]
 async fn error_answers_and_result_heads_hold_no_more_heap_than_their_text() {
+    let _measuring = MEASURING.lock().await;
     let api = api();
     let far = Instant::now() + Duration::from_secs(600);
     let unbounded = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
