@@ -20,7 +20,7 @@ use super::{
     peers::BAN_FOR,
 };
 use crate::beacon::{HeadConfirm, PeerHeader};
-use alloy_consensus::Header;
+use alloy_consensus::{Header, TxEnvelope};
 use alloy_eips::{eip2124::Head, BlockHashOrNumber};
 use alloy_primitives::{bytes::BytesMut, B256};
 use async_trait::async_trait;
@@ -506,9 +506,12 @@ pub const TX_PEERS: usize = 8;
 /// How long the network manager may take to list its sessions.
 const LIST_PEERS_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// The peers a transaction goes to, out of the `connected` ones: the static ones first, then the
-/// others, at most [`TX_PEERS`].
-fn tx_targets(statics: &HashSet<PeerId>, mut connected: Vec<PeerId>) -> Vec<PeerId> {
+/// How long one peer has to answer a backfill request.
+const HISTORY_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The peers a transaction goes to, or a backfill asks, out of the `connected` ones: the static
+/// ones first, then the others, at most [`TX_PEERS`].
+fn preferred_peers(statics: &HashSet<PeerId>, mut connected: Vec<PeerId>) -> Vec<PeerId> {
     connected.sort_unstable_by_key(|p| (!statics.contains(p), *p));
     connected.dedup();
     connected.truncate(TX_PEERS);
@@ -621,24 +624,28 @@ impl LiteNetwork {
                 raw,
             )?;
         let tx = Arc::new(tx);
-        let connected = match tokio::time::timeout(LIST_PEERS_TIMEOUT, self.handle.get_all_peers())
-            .await
-        {
-            Ok(Ok(all)) => all.into_iter().map(|p| p.remote_id).collect(),
-            Ok(Err(e)) => {
-                tracing::debug!(%e, "the network manager is gone: no peer to send a transaction to");
-                Vec::new()
-            }
-            Err(_) => {
-                tracing::debug!("the network manager did not list its peers in time");
-                Vec::new()
-            }
-        };
-        let targets = tx_targets(&self.statics, connected);
+        let targets = self.connected_preferred().await;
         for peer in &targets {
             self.handle.send_transactions(*peer, vec![tx.clone()]);
         }
         Ok(targets.len())
+    }
+
+    /// The connected peers, the static ones first, at most [`TX_PEERS`].
+    async fn connected_preferred(&self) -> Vec<PeerId> {
+        let connected =
+            match tokio::time::timeout(LIST_PEERS_TIMEOUT, self.handle.get_all_peers()).await {
+                Ok(Ok(all)) => all.into_iter().map(|p| p.remote_id).collect(),
+                Ok(Err(e)) => {
+                    tracing::debug!(%e, "the network manager is gone: no peer connected");
+                    Vec::new()
+                }
+                Err(_) => {
+                    tracing::debug!("the network manager did not list its peers in time");
+                    Vec::new()
+                }
+            };
+        preferred_peers(&self.statics, connected)
     }
 
     /// The node's own record (ports are the bound ones).
@@ -828,6 +835,56 @@ impl LiteNetwork {
         );
         let reply = tokio::time::timeout(Duration::from_secs(4), rx).await.ok()?.ok()?.ok()?;
         reply.0.into_iter().next()
+    }
+}
+
+#[async_trait]
+impl crate::backfill::History for LiteNetwork {
+    async fn headers_down(&self, hash: B256, limit: u64) -> Vec<Header> {
+        for peer in self.connected_preferred().await {
+            let (tx, rx) = oneshot::channel();
+            let request = GetBlockHeaders {
+                start_block: hash.into(),
+                limit,
+                skip: 0,
+                direction: HeadersDirection::Falling,
+            };
+            self.handle.send_request(peer, PeerRequest::GetBlockHeaders { request, response: tx });
+            match tokio::time::timeout(HISTORY_TIMEOUT, rx).await {
+                Ok(Ok(Ok(headers))) if !headers.0.is_empty() => return headers.0,
+                Ok(Ok(Ok(_))) => tracing::debug!(%peer, "a peer has no headers below the anchor"),
+                Ok(Ok(Err(e))) => tracing::debug!(%peer, %e, "a backfill header request failed"),
+                Ok(Err(_)) => tracing::debug!(%peer, "a peer left during a backfill request"),
+                Err(_) => tracing::debug!(%peer, "a backfill header request timed out"),
+            }
+        }
+        Vec::new()
+    }
+
+    async fn bodies(&self, hashes: &[B256]) -> Vec<alloy_consensus::BlockBody<TxEnvelope>> {
+        for peer in self.connected_preferred().await {
+            let (tx, rx) = oneshot::channel();
+            let request = reth_eth_wire_types::GetBlockBodies(hashes.to_vec());
+            self.handle.send_request(peer, PeerRequest::GetBlockBodies { request, response: tx });
+            match tokio::time::timeout(HISTORY_TIMEOUT, rx).await {
+                Ok(Ok(Ok(bodies))) if !bodies.0.is_empty() => {
+                    return bodies
+                        .0
+                        .into_iter()
+                        .map(|b| alloy_consensus::BlockBody {
+                            transactions: b.transactions.into_iter().map(Into::into).collect(),
+                            ommers: b.ommers,
+                            withdrawals: b.withdrawals,
+                        })
+                        .collect()
+                }
+                Ok(Ok(Ok(_))) => tracing::debug!(%peer, "a peer has no bodies below the anchor"),
+                Ok(Ok(Err(e))) => tracing::debug!(%peer, %e, "a backfill body request failed"),
+                Ok(Err(_)) => tracing::debug!(%peer, "a peer left during a backfill request"),
+                Err(_) => tracing::debug!(%peer, "a backfill body request timed out"),
+            }
+        }
+        Vec::new()
     }
 }
 
@@ -1741,6 +1798,61 @@ mod tests {
         );
     }
 
+    /// The backfill asks a peer for the headers below a hash, highest first, and for bodies, over
+    /// real eth sessions. With no peer answering, it gets nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_backfill_asks_a_peer_for_headers_below_a_hash_and_for_bodies() {
+        use crate::backfill::History;
+        use reth_network::eth_requests::IncomingEthRequest;
+        let rt = reth_tasks::Runtime::test();
+        let top = B256::with_last_byte(7);
+        let headers: Vec<Header> =
+            (0..3).map(|i| Header { number: 10 - i, ..Default::default() }).collect();
+        let (tx, mut rx) = mpsc::channel(16);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let (served, seen) = (headers.clone(), asked.clone());
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                match req {
+                    IncomingEthRequest::GetBlockHeaders { request, response, .. } => {
+                        seen.lock().push(format!("{request:?}"));
+                        let _ =
+                            response.send(Ok(reth_eth_wire_types::BlockHeaders(served.clone())));
+                    }
+                    IncomingEthRequest::GetBlockBodies { request, response, .. } => {
+                        seen.lock().push(format!("{} bodies", request.0.len()));
+                        type Body = <EthNetworkPrimitives as NetworkPrimitives>::BlockBody;
+                        let body = Body {
+                            transactions: vec![],
+                            ommers: vec![],
+                            withdrawals: Some(Default::default()),
+                        };
+                        let _ = response.send(Ok(reth_eth_wire_types::BlockBodies(vec![body; 2])));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let none = LiteNetwork::start_with(test_opts(369, vec![]), rt.clone()).await.unwrap();
+        assert!(none.headers_down(top, 3).await.is_empty());
+        assert!(none.bodies(&[top]).await.is_empty());
+        let (_b, b_rec) = eth_only_peer(rt.clone(), Some(tx)).await;
+        let opts = NetOptions { statics: vec![b_rec], discovery: false, ..test_opts(369, vec![]) };
+        let a = LiteNetwork::start_with(opts, rt).await.unwrap();
+        wait_for("A to connect to B", || a.handle.num_connected_peers() == 1).await;
+        assert_eq!(a.headers_down(top, 3).await, headers);
+        let bodies = a.bodies(&[top, B256::with_last_byte(8)]).await;
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0].withdrawals, Some(Default::default()));
+        let want = GetBlockHeaders {
+            start_block: top.into(),
+            limit: 3,
+            skip: 0,
+            direction: HeadersDirection::Falling,
+        };
+        assert_eq!(*asked.lock(), vec![format!("{want:?}"), "2 bodies".to_owned()]);
+    }
+
     /// A transaction goes to the static peers first, then to the others, at most [`TX_PEERS`].
     #[test]
     fn a_transaction_goes_to_the_static_peers_first_and_to_at_most_eight() {
@@ -1748,9 +1860,9 @@ mod tests {
         let statics: HashSet<PeerId> = [peer(9), peer(12)].into();
         let connected: Vec<PeerId> = (1..=12).rev().map(peer).chain([peer(3)]).collect();
         let want: Vec<PeerId> = [9, 12, 1, 2, 3, 4, 5, 6].map(peer).to_vec();
-        assert_eq!(tx_targets(&statics, connected), want);
-        assert_eq!(tx_targets(&statics, vec![peer(5), peer(9)]), vec![peer(9), peer(5)]);
-        assert!(tx_targets(&statics, Vec::new()).is_empty());
+        assert_eq!(preferred_peers(&statics, connected), want);
+        assert_eq!(preferred_peers(&statics, vec![peer(5), peer(9)]), vec![peer(9), peer(5)]);
+        assert!(preferred_peers(&statics, Vec::new()).is_empty());
     }
 
     /// A reth peer that asks this node for headers, bodies or receipts gets an empty answer at

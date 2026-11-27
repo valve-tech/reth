@@ -10,7 +10,10 @@
 //! counts for the chain (descent, `BLOCKHASH`, anchor checks), but it is not served: an accessor
 //! answers as if it were not held.
 
-use alloy_consensus::{constants::EMPTY_ROOT_HASH, BlockBody, Header, TxEnvelope};
+use alloy_consensus::{
+    constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH},
+    BlockBody, Header, TxEnvelope,
+};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{map::B256Map, B256};
 use parking_lot::RwLock;
@@ -59,11 +62,13 @@ pub(crate) fn body_bytes(body: &BlockBody<TxEnvelope>) -> u64 {
 
 /// Whether `block` carries an empty body in place of the one its header names. A catch-up walk
 /// over the body budget replaces the bodies of its oldest blocks with `Arc::default()`, and the
-/// chain then holds them without a body. An empty body passes only for a header that names no
-/// transactions and no withdrawals, so it is never served in place of a real one.
+/// chain then holds them without a body, and so does a backfill for a body no peer served. An
+/// empty body passes only for a header that names no transactions, no uncles and no
+/// withdrawals, so it is never served in place of a real one.
 fn lacks_body(block: &HeldBlock) -> bool {
     let (body, header) = (&block.body, &block.header);
     (body.transactions.is_empty() && header.transactions_root != EMPTY_ROOT_HASH) ||
+        (body.ommers.is_empty() && header.ommers_hash != EMPTY_OMMER_ROOT_HASH) ||
         (body.withdrawals.is_none() && header.withdrawals_root.is_some())
 }
 
@@ -98,6 +103,9 @@ pub enum ChainError {
     /// The block does not descend from the finalized block.
     #[error("block does not descend from the finalized block")]
     NotFromFinalized,
+    /// The chain was re-seeded since the caller read it.
+    #[error("the chain was re-seeded")]
+    Reseeded,
 }
 
 /// How the finalized anchor compares with what is held.
@@ -129,6 +137,8 @@ struct Inner {
     /// Whether `finalized` was confirmed by a beacon quorum at depth (not only seeded). Changed
     /// only together with `finalized`, under the same lock.
     finality_confirmed: bool,
+    /// The blocks a backfill held without the body no peer served, for a later try.
+    bodiless: alloy_primitives::map::B256Set,
 }
 
 impl Inner {
@@ -596,6 +606,95 @@ impl HeaderChain {
             want = below;
         }
         lowest
+    }
+
+    /// The lowest canonical block held, with or without its body, and the seed epoch, read
+    /// together: what [`Self::backfill`] extends.
+    pub fn lowest_canonical(&self) -> Option<(u64, HeldBlock)> {
+        let g = self.inner.read();
+        let block = g.canonical.values().find_map(|h| g.by_hash.get(h))?.clone();
+        Some((self.epoch(), block))
+    }
+
+    /// Holds `blocks` below the held canonical block `anchor`, highest first, as its canonical
+    /// ancestors. Each block's hash must be the parent hash of the one above it, `anchor`
+    /// first, and its number one less: the first block that does not link ends the run. A
+    /// block is held with its body when its body is not empty or its header names an empty
+    /// one, and without it otherwise (see `lacks_body`). The body budget applies as to any
+    /// block, so the lowest bodies go first. Blocks below the header window, or past
+    /// [`MAX_BLOCKS`], are not held. Returns how many were held.
+    ///
+    /// The hashes must be the blocks' own (the caller hashes each header) and the bodies
+    /// checked against their headers: the chain checks only that they link.
+    pub fn backfill(
+        &self,
+        epoch: u64,
+        anchor: B256,
+        blocks: Vec<HeldBlock>,
+    ) -> Result<usize, ChainError> {
+        let mut g = self.inner.write();
+        if self.epoch() != epoch {
+            return Err(ChainError::Reseeded);
+        }
+        let top = g.by_hash.get(&anchor).ok_or(ChainError::Unknown)?;
+        let (mut parent, mut number) = (top.header.parent_hash, top.header.number);
+        if g.canonical.get(&number) != Some(&anchor) {
+            return Err(ChainError::Unknown);
+        }
+        let head = g.head.and_then(|h| g.by_hash.get(&h)).map_or(number, |b| b.header.number);
+        let floor = head.saturating_sub(HEADERS_WINDOW);
+        let room = MAX_BLOCKS.saturating_sub(g.by_hash.len());
+        let mut held = 0;
+        for block in blocks.into_iter().take(room) {
+            let Some(below) = number.checked_sub(1) else { break };
+            if block.hash != parent || block.header.number != below || below < floor {
+                break;
+            }
+            if g.canonical.get(&below).is_some_and(|h| *h != block.hash) {
+                break;
+            }
+            (parent, number) = (block.header.parent_hash, below);
+            g.canonical.insert(below, block.hash);
+            if lacks_body(&block) {
+                g.bodiless.insert(block.hash);
+                g.by_hash.entry(block.hash).or_insert(block);
+            } else {
+                g.add(block);
+            }
+            held += 1;
+        }
+        g.enforce_body_budget(self.body_budget, None);
+        Ok(held)
+    }
+
+    /// Up to `max` canonical blocks a backfill held without a body, and the seed epoch, read
+    /// together. Blocks gone from the chain, or with a body since, leave the list.
+    pub fn backfill_bodiless(&self, max: usize) -> (u64, Vec<HeldBlock>) {
+        let mut g = self.inner.write();
+        let Inner { bodiless, by_hash, body_sizes, canonical, .. } = &mut *g;
+        bodiless.retain(|h| {
+            by_hash.get(h).is_some_and(|b| canonical.get(&b.header.number) == Some(h)) &&
+                !body_sizes.contains_key(h)
+        });
+        let blocks = bodiless.iter().take(max).filter_map(|h| by_hash.get(h).cloned()).collect();
+        (self.epoch(), blocks)
+    }
+
+    /// Gives `block`, one that [`Self::backfill_bodiless`] listed, the body it carries, checked
+    /// against its header by the caller. Returns whether it was taken: not across a re-seed,
+    /// not for a block no longer listed, and not for a body that `lacks_body`. The body budget
+    /// applies, so the lowest bodies go first.
+    pub fn backfill_body(&self, epoch: u64, block: HeldBlock) -> bool {
+        let mut g = self.inner.write();
+        if self.epoch() != epoch || lacks_body(&block) || !g.bodiless.remove(&block.hash) {
+            return false;
+        }
+        if !g.by_hash.contains_key(&block.hash) || g.body_sizes.contains_key(&block.hash) {
+            return false;
+        }
+        g.add(block);
+        g.enforce_body_budget(self.body_budget, None);
+        true
     }
 
     /// Compares an anchor block with the canonical chain.

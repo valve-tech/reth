@@ -6,6 +6,7 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+pub mod backfill;
 pub mod beacon;
 pub mod call;
 pub mod chain;

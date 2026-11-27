@@ -411,6 +411,17 @@ minutes, while the root is still the source's finalized root.
   2.5 times its text. At most two renders run at once.
 * With `--state.hot-set=N` the node counts the reads of up to 8N accounts and slots in RAM
   outside `--cache.size`: up to about 70 MB at the maximum, `65536`.
+* The node seeds its chain from one finalized block. After each seed (at start and after a
+  re-seed) it asks its peers for the 256 canonical blocks below the lowest block it holds, with
+  eth/68 `GetBlockHeaders` and `GetBlockBodies`, the `--peer` nodes first. It keeps a header
+  only when its hash is the parent hash of the block above it, so the run links to the seeded
+  block, and a body only when it matches its header's roots. So `BLOCKHASH` and reads of
+  recent blocks work right after a start. A block whose body no peer serves is held for
+  `BLOCKHASH` only. The backfill stays inside the 512-block header window below the head, and
+  its bodies count in the body budget below, the lowest first. It tries three times, 5 s
+  apart. A backfill that did not hold the 256 blocks with their bodies (no peer answered, or a
+  body did not match) is tried again after 30 s, then after twice as long each time, at most
+  10 minutes, until it finishes or the node re-seeds.
 * The node keeps the bodies of held blocks in RAM outside `--cache.size`: 10% of memory, at least
   32 MiB and at most 256 MiB (256 MiB when memory is not found), by the node's estimate of their
   size, and up to as much again while the node walks to a new head. Past that, the oldest blocks

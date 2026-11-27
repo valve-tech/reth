@@ -294,6 +294,14 @@ pub async fn run(
     }
     let follower = Arc::new(follower);
     let follower_task = tokio::spawn(follower.run());
+    // After each seed, the blocks below the anchor, so BLOCKHASH and recent block reads work.
+    let backfill_task = match &*net {
+        AnyNet::Real(n) => {
+            let history: Arc<dyn crate::backfill::History> = Arc::new(n.clone());
+            Some(tokio::spawn(crate::backfill::backfill_loop(chain.clone(), history)))
+        }
+        AnyNet::None(_) => None,
+    };
     let hot_task = tokio::spawn(refresh_loop(chain.clone(), hot.clone(), fetcher.clone()));
 
     let api = Api::new(ApiParts {
@@ -339,6 +347,9 @@ pub async fn run(
     server.abort();
     probe_task.abort();
     follower_task.abort();
+    if let Some(task) = backfill_task {
+        task.abort();
+    }
     hot_task.abort();
     gauges.abort();
     let second_signal = async move {
