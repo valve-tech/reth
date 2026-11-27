@@ -2589,6 +2589,18 @@ mod tests {
         assert_refused(&mut store, &update, 21, SyncCommitteeError::UnexpectedFinalizedHeader);
     }
 
+    /// As the spec asks, a finality update at the genesis slot proves the zero root and carries
+    /// the empty header. A real header at slot 0 is refused, even with a branch that proves it.
+    #[test]
+    fn a_finalized_header_at_the_genesis_slot_must_be_empty() {
+        let chain = TestChain::capella();
+        let mut store = chain.store();
+        let update = chain.update(Spec::new(20, Some(0), Some(1)));
+        assert_eq!(update.finalized_header.beacon.slot, 0);
+        assert_ne!(update.finalized_header, LightClientHeader::default());
+        assert_refused(&mut store, &update, 21, SyncCommitteeError::UnexpectedFinalizedHeader);
+    }
+
     impl Real369 {
         /// The domain of the block's `sync_aggregate` on `chain_id`: the fork of the slot
         /// before the block.
