@@ -45,14 +45,20 @@ pub enum FailureSource {
     Anchor,
     /// A p2p peer's proof.
     Peer,
+    /// An upstream JSON-RPC source's proof or code (`--upstream.url`).
+    Upstream,
 }
 
 impl FailureSource {
+    /// Every source, in label order of the README.
+    const ALL: [Self; 4] = [Self::Beacon, Self::Anchor, Self::Peer, Self::Upstream];
+
     const fn label(self) -> &'static str {
         match self {
             Self::Beacon => "beacon",
             Self::Anchor => "anchor",
             Self::Peer => "peer",
+            Self::Upstream => "upstream",
         }
     }
 }
@@ -174,7 +180,7 @@ impl LiteMetrics {
         m.answers_unverified.increment(0);
         m.anchor_disagreements.increment(0);
         counter!("lite_anchor_unreachable_total").increment(0);
-        for source in [FailureSource::Beacon, FailureSource::Anchor, FailureSource::Peer] {
+        for source in FailureSource::ALL {
             counter!("lite_proof_failures_total", "source" => source.label()).increment(0);
             counter!("lite_beacon_optimistic_total", "source" => source.label()).increment(0);
         }
@@ -363,10 +369,7 @@ mod tests {
                     m.request("eth_getBalance", outcome);
                 }
             }
-            for (n, source) in [FailureSource::Beacon, FailureSource::Anchor, FailureSource::Peer]
-                .into_iter()
-                .enumerate()
-            {
+            for (n, source) in FailureSource::ALL.into_iter().enumerate() {
                 for _ in 0..=n {
                     m.proof_failure(source);
                 }
@@ -381,6 +384,7 @@ mod tests {
             "lite_proof_failures_total{source=\"beacon\"} 1",
             "lite_proof_failures_total{source=\"anchor\"} 2",
             "lite_proof_failures_total{source=\"peer\"} 3",
+            "lite_proof_failures_total{source=\"upstream\"} 4",
             "lite_answers_total{verified=\"true\"} 0",
             "lite_answers_total{verified=\"false\"} 1",
         ] {

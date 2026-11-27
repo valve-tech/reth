@@ -68,6 +68,29 @@ impl FromStr for OnMiss {
     }
 }
 
+/// Where state comes from when upstream URLs are given (`--upstream.mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpstreamMode {
+    /// Peers first; the upstreams when no peer serves the state, or every answer fails
+    /// verification.
+    #[default]
+    Fallback,
+    /// The upstreams only: no state is fetched from peers.
+    Only,
+}
+
+impl FromStr for UpstreamMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "fallback" => Ok(Self::Fallback),
+            "only" => Ok(Self::Only),
+            other => Err(format!("unknown --upstream.mode `{other}` (fallback|only)")),
+        }
+    }
+}
+
 /// Whether a new head needs an execution peer to report the same block hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HeadConfirm {
@@ -407,6 +430,21 @@ pub struct LiteArgs {
     /// pulse-reth's `B KB MB GB TB`, binary: `1GB` is 2^30 bytes.
     #[arg(long = "disk.limit", value_parser = parse_byte_size, default_value = "3GB")]
     pub disk_limit: usize,
+    /// JSON-RPC URL of an upstream state source, repeatable. Opt-in. The node fetches state from
+    /// it with batched `eth_getProof` and `eth_getCode` and verifies every answer against the
+    /// head's roots, as it does a peer's. The whole URL is a secret: logs show only its host.
+    // Kept as text and validated in `LiteArgs::into_config`, as `--beacon.url` is.
+    #[arg(long = "upstream.url")]
+    pub upstream_url: Vec<String>,
+    /// File with one upstream URL per line, read in order. Blank lines and lines starting with
+    /// `#` are ignored. Keeps a key out of the command line. Exclusive with `--upstream.url`.
+    #[arg(long = "upstream.url-file")]
+    pub upstream_url_file: Option<PathBuf>,
+    /// Where state comes from with upstream URLs: `fallback` (peers first, the upstreams when no
+    /// peer serves the state) or `only` (the upstreams alone). Default: `fallback`. Refused
+    /// without an upstream URL.
+    #[arg(long = "upstream.mode", value_name = "UPSTREAM_MODE")]
+    pub upstream_mode: Option<UpstreamMode>,
     /// Static `snap/1` peer enode, repeatable. Always kept and preferred over discovered peers.
     /// The host must be an IP address: a host name is refused.
     #[arg(long = "peer")]
@@ -476,6 +514,8 @@ impl std::fmt::Debug for LiteArgs {
             .field("beacon_url_file", &self.beacon_url_file.as_deref().map(shown_path))
             .field("finalized_url", &self.finalized_url.as_ref().map(|_| "<redacted>"))
             .field("finalized_url_file", &self.finalized_url_file.as_deref().map(shown_path))
+            .field("upstream_url", &format_args!("<{} redacted>", self.upstream_url.len()))
+            .field("upstream_url_file", &self.upstream_url_file.as_deref().map(shown_path))
             .finish_non_exhaustive()
     }
 }
@@ -554,6 +594,12 @@ pub enum ConfigError {
     /// Neither `--beacon.url` nor `--beacon.url-file` was given.
     #[error("no beacon URL: give --beacon.url (repeatable) or --beacon.url-file")]
     NoBeaconUrl,
+    /// Both `--upstream.url` and `--upstream.url-file` were given.
+    #[error("--upstream.url and --upstream.url-file are mutually exclusive: give only one")]
+    UpstreamUrlConflict,
+    /// `--upstream.mode` was given without an upstream URL.
+    #[error("--upstream.mode needs --upstream.url or --upstream.url-file")]
+    UpstreamModeWithoutUrl,
     /// Both `--finalized.url` and `--finalized.url-file` were given.
     #[error("--finalized.url and --finalized.url-file are mutually exclusive: give only one")]
     FinalizedUrlConflict,
@@ -757,11 +803,17 @@ pub struct LiteConfig {
     pub head_max_age: Duration,
     /// EVM time limit of one `eth_call` or `eth_estimateGas` run; zero sets no limit.
     pub evm_timeout: Duration,
+    /// Upstream JSON-RPC state sources. Secret: never log these.
+    pub upstream_urls: Vec<Url>,
+    /// Where state comes from when `upstream_urls` is not empty.
+    pub upstream_mode: UpstreamMode,
 }
 
 impl std::fmt::Debug for LiteConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let beacons: Vec<String> = self.beacon_urls.iter().map(crate::beacon::host_label).collect();
+        let upstreams: Vec<String> =
+            self.upstream_urls.iter().map(crate::beacon::host_label).collect();
         f.debug_struct("LiteConfig")
             .field("chain_id", &self.chain_id)
             .field("datadir", &shown_path(&self.datadir))
@@ -787,6 +839,8 @@ impl std::fmt::Debug for LiteConfig {
             .field("checkpoint", &self.checkpoint)
             .field("head_max_age", &self.head_max_age)
             .field("evm_timeout", &self.evm_timeout)
+            .field("upstream_urls", &upstreams)
+            .field("upstream_mode", &self.upstream_mode)
             .finish()
     }
 }
@@ -856,6 +910,8 @@ impl Default for LiteConfig {
             checkpoint: None,
             head_max_age: Duration::from_secs(60),
             evm_timeout: crate::call::DEFAULT_EVM_TIMEOUT,
+            upstream_urls: Vec::new(),
+            upstream_mode: UpstreamMode::Fallback,
         }
     }
 }
@@ -896,6 +952,19 @@ impl LiteArgs {
                 .map(|s| parse_url(s, "--beacon.url", None))
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        let upstream_urls = match (&self.upstream_url_file, self.upstream_url.is_empty()) {
+            (Some(_), false) => return Err(ConfigError::UpstreamUrlConflict),
+            (Some(path), true) => read_url_file(path, "--upstream.url-file")?,
+            (None, true) => Vec::new(),
+            (None, false) => self
+                .upstream_url
+                .iter()
+                .map(|s| parse_url(s, "--upstream.url", None))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        if upstream_urls.is_empty() && self.upstream_mode.is_some() {
+            return Err(ConfigError::UpstreamModeWithoutUrl);
+        }
         for (i, u) in beacon_urls.iter().enumerate() {
             if beacon_urls[..i].contains(u) {
                 return Err(ConfigError::DuplicateUrl);
@@ -1053,6 +1122,8 @@ impl LiteArgs {
             checkpoint,
             head_max_age: self.head_max_age,
             evm_timeout: self.rpc_evmtimeout,
+            upstream_urls,
+            upstream_mode: self.upstream_mode.unwrap_or_default(),
             ..LiteConfig::default()
         })
     }
@@ -1913,7 +1984,18 @@ mod tests {
             }
         };
         let d = LiteConfig::default();
+        let mode = parse_exact(&[
+            "--beacon.url=https://a",
+            "--head.confirm=none",
+            "--upstream.url=https://up.example/k",
+        ])
+        .unwrap()
+        .into_config()
+        .unwrap()
+        .upstream_mode;
+        assert_eq!(mode, UpstreamMode::Fallback);
         let computed = [
+            ("upstream.mode", "`fallback` with an upstream URL".to_owned()),
             (
                 "discovery",
                 format!("{} without `--peer`, {} with `--peer`", toggle(&[]), toggle(&[peer])),
@@ -1990,6 +2072,63 @@ mod tests {
             }
         }
         assert_eq!(problems, Vec::<String>::new(), "README flag table out of date");
+    }
+
+    #[test]
+    fn upstream_urls_are_opt_in_secret_and_take_a_mode() {
+        let cfg = |args: &[&str]| {
+            let mut all = vec!["--beacon.url=https://a", "--head.confirm=none"];
+            all.extend_from_slice(args);
+            parse_exact(&all).unwrap().into_config()
+        };
+        let none = cfg(&[]).unwrap();
+        assert!(none.upstream_urls.is_empty());
+        let key = "https://rpc.up.example/v1/vk_upstream_secret";
+        let one = cfg(&[&format!("--upstream.url={key}"), "--upstream.url=http://127.0.0.1:8545"])
+            .unwrap();
+        assert_eq!(one.upstream_urls.len(), 2);
+        assert_eq!(one.upstream_urls[0].as_str(), key);
+        assert_eq!(one.upstream_mode, UpstreamMode::Fallback);
+        let shown = format!("{one:?}");
+        assert!(!shown.contains("vk_upstream_secret"), "{shown}");
+        assert!(
+            shown.contains("https://*.up.example") && shown.contains("http://127.0.0.1"),
+            "{shown}"
+        );
+        let args =
+            parse_exact(&["--beacon.url=https://a", &format!("--upstream.url={key}")]).unwrap();
+        assert!(!format!("{args:?}").contains("vk_upstream_secret"));
+        let only = cfg(&["--upstream.url=https://up.example/k", "--upstream.mode=only"]).unwrap();
+        assert_eq!(only.upstream_mode, UpstreamMode::Only);
+        for (args, want) in [
+            (
+                vec!["--upstream.mode=only"],
+                "--upstream.mode needs --upstream.url or --upstream.url-file",
+            ),
+            (vec!["--upstream.url=ftp://up.example/k"], "--upstream.url must be an http(s) URL"),
+            (
+                vec!["--upstream.url=http://up.example/k"],
+                "--upstream.url must use https unless the host is loopback",
+            ),
+            (
+                vec!["--upstream.url=https://up.example/#vk_secret"],
+                "--upstream.url must not have a fragment: the node never sends it; put a key in \
+                 the path or the query",
+            ),
+        ] {
+            assert_eq!(cfg(&args).unwrap_err().to_string(), want, "{args:?}");
+        }
+        let (_d, file) = url_file("# upstreams\nhttps://up.example/vk_from_file\n");
+        let file = file.replace("--beacon.url-file=", "--upstream.url-file=");
+        let from_file = cfg(&[&file]).unwrap();
+        assert_eq!(from_file.upstream_urls[0].as_str(), "https://up.example/vk_from_file");
+        let both = cfg(&[&file, "--upstream.url=https://up.example/k"]).unwrap_err();
+        assert_eq!(
+            both.to_string(),
+            "--upstream.url and --upstream.url-file are mutually exclusive: give only one"
+        );
+        let bad = parse_exact(&["--beacon.url=https://a", "--upstream.mode=sometimes"]);
+        assert!(bad.unwrap_err().to_string().contains("unknown --upstream.mode `sometimes`"));
     }
 
     #[test]

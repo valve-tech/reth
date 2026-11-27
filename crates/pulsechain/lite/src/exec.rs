@@ -8,7 +8,7 @@ use crate::{
     config::OnMiss,
     state::{BlockHashes, Lookup, MissKey, MissingDb, PartialState},
 };
-use alloy_primitives::B256;
+use alloy_primitives::{map::B256Map, Address, B256};
 use async_trait::async_trait;
 
 /// Why fetching state failed.
@@ -27,6 +27,17 @@ pub enum FetchError {
 pub trait Fetcher: Send + Sync {
     /// Fetches and verifies `misses` at state root `root`.
     async fn fetch(&self, root: B256, misses: &[MissKey]) -> Result<(), FetchError>;
+
+    /// [`Self::fetch`], with an account for each code hash where the run read one. A source that
+    /// serves code by account, not by hash, needs it; the default ignores it.
+    async fn fetch_with_owners(
+        &self,
+        root: B256,
+        misses: &[MissKey],
+        _owners: &B256Map<Address>,
+    ) -> Result<(), FetchError> {
+        self.fetch(root, misses).await
+    }
 }
 
 /// Receives misses to fetch in the background (`error-and-warm`).
@@ -86,7 +97,8 @@ pub async fn run_rounds<T>(
         if misses.is_empty() {
             return Ok(Rounds { value, rounds: round });
         }
-        handle_misses(state, fetcher, warm, mode, misses, round, &mut stuck).await?;
+        let owners = db.take_code_owners();
+        handle_misses(state, fetcher, warm, mode, misses, &owners, round, &mut stuck).await?;
     }
     Err(RoundsError::TooManyRounds(max_rounds))
 }
@@ -121,10 +133,10 @@ where
         // The permit moves into the blocking task: a caller that gives up (a request timeout)
         // does not free the slot while the run is still going.
         let permit = permits.clone().acquire_owned().await.map_err(|_| RoundsError::Aborted)?;
-        let (back, value, misses) = tokio::task::spawn_blocking(move || {
+        let (back, value, misses, owners) = tokio::task::spawn_blocking(move || {
             let value = f(&mut db);
             drop(permit);
-            (f, value, db.take_misses())
+            (f, value, db.take_misses(), db.take_code_owners())
         })
         .await
         .map_err(|_| RoundsError::Aborted)?;
@@ -133,11 +145,12 @@ where
         if misses.is_empty() {
             return Ok(Rounds { value, rounds: round });
         }
-        let got = handle_misses(state, fetcher, warm, mode, misses, round, &mut stuck).await?;
-        let codes = unheld_code(state, &got);
+        let got =
+            handle_misses(state, fetcher, warm, mode, misses, &owners, round, &mut stuck).await?;
+        let (codes, owners) = unheld_code(state, &got);
         // Best effort: a run that needs the code misses it, and that fetch reports its error.
         if !codes.is_empty() &&
-            let Err(e) = fetcher.fetch(state.root(), &codes).await
+            let Err(e) = fetcher.fetch_with_owners(state.root(), &codes, &owners).await
         {
             tracing::debug!(%e, codes = codes.len(), "code prefetch failed");
         }
@@ -145,9 +158,10 @@ where
     Err(RoundsError::TooManyRounds(max_rounds))
 }
 
-/// The code misses of the accounts among `fetched` that now resolve, each once.
-fn unheld_code(state: &PartialState, fetched: &[MissKey]) -> Vec<MissKey> {
-    let mut codes = Vec::new();
+/// The code misses of the accounts among `fetched` that now resolve, each once, and the
+/// account of each.
+fn unheld_code(state: &PartialState, fetched: &[MissKey]) -> (Vec<MissKey>, B256Map<Address>) {
+    let (mut codes, mut owners) = (Vec::new(), B256Map::default());
     for key in fetched {
         if let MissKey::Account(address, _) = key &&
             let Lookup::Hit(Some(account)) = state.account(address) &&
@@ -155,9 +169,10 @@ fn unheld_code(state: &PartialState, fetched: &[MissKey]) -> Vec<MissKey> {
             !codes.contains(&code)
         {
             codes.push(code);
+            owners.insert(account.code_hash, *address);
         }
     }
-    codes
+    (codes, owners)
 }
 
 /// Fetches in a row that leave the same misses unreadable before the rounds end. One is not
@@ -174,12 +189,14 @@ struct Stuck {
 
 /// Fetches `misses` in `fetch` mode and returns them, and records in `stuck` whether the fetch
 /// left any of them unreadable.
+#[expect(clippy::too_many_arguments)]
 async fn handle_misses(
     state: &PartialState,
     fetcher: &dyn Fetcher,
     warm: Option<&dyn WarmSink>,
     mode: OnMiss,
     misses: Vec<MissKey>,
+    owners: &B256Map<Address>,
     round: u32,
     stuck: &mut Stuck,
 ) -> Result<Vec<MissKey>, RoundsError> {
@@ -205,7 +222,7 @@ async fn handle_misses(
             Err(RoundsError::Missing(n))
         }
         OnMiss::Fetch => {
-            fetcher.fetch(state.root(), &misses).await?;
+            fetcher.fetch_with_owners(state.root(), &misses, owners).await?;
             // When every miss resolved, the same misses next round mean the shared cache dropped
             // the nodes in between, and fetching them again helps.
             if !misses.iter().any(|k| still_missing(state, k)) {

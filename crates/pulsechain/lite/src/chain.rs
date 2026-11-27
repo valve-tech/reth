@@ -608,6 +608,15 @@ impl HeaderChain {
         lowest
     }
 
+    /// The hash and number of the highest canonical block held whose state root is `root`, with
+    /// or without its body: a block a state read at `root` can name. Blocks often share a root.
+    pub fn block_with_state_root(&self, root: &B256) -> Option<(B256, u64)> {
+        let g = self.inner.read();
+        g.canonical.iter().rev().find_map(|(n, h)| {
+            g.by_hash.get(h).filter(|b| b.header.state_root == *root).map(|_| (*h, *n))
+        })
+    }
+
     /// The lowest canonical block held, with or without its body, and the seed epoch, read
     /// together: what [`Self::backfill`] extends.
     pub fn lowest_canonical(&self) -> Option<(u64, HeldBlock)> {

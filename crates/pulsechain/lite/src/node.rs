@@ -229,6 +229,46 @@ fn note_unconfirmed_start(cfg: &LiteConfig, store: Option<&StoreOrigin>, metrics
     }
 }
 
+/// Where state misses are fetched: the peers, or with `--upstream.url` the upstreams, alone
+/// (`--upstream.mode=only`) or when the peers do not serve the state (`fallback`). Each upstream
+/// is asked `eth_blockNumber` once, in the background, so the log says whether it answers.
+fn state_fetcher(
+    cfg: &LiteConfig,
+    chain: &Arc<HeaderChain>,
+    store: &Arc<Store>,
+    metrics: &LiteMetrics,
+    net: &Arc<AnyNet>,
+    p2p: Arc<P2pFetcher<AnyNet>>,
+) -> Arc<dyn crate::exec::Fetcher> {
+    use crate::{
+        config::UpstreamMode,
+        upstream::{FallbackFetcher, UpstreamFetcher, Upstreams},
+    };
+    if cfg.upstream_urls.is_empty() {
+        return p2p;
+    }
+    let upstreams = Upstreams::new(cfg.upstream_urls.clone());
+    let upstream =
+        Arc::new(UpstreamFetcher::new(upstreams, chain.clone(), store.clone(), metrics.clone()));
+    let hosts: Vec<String> = cfg.upstream_urls.iter().map(crate::beacon::host_label).collect();
+    tracing::info!(?hosts, mode = ?cfg.upstream_mode, "upstream state sources: every answer is verified");
+    tokio::spawn({
+        let upstream = upstream.clone();
+        async move { upstream.upstreams().probe().await }
+    });
+    match cfg.upstream_mode {
+        UpstreamMode::Only => upstream,
+        UpstreamMode::Fallback => {
+            let net = net.clone();
+            Arc::new(FallbackFetcher {
+                primary: p2p,
+                upstream,
+                state_peers: Arc::new(move || Transport::peers(&*net).len()),
+            })
+        }
+    }
+}
+
 /// Runs the node until the first message on `signals`, or until its sender is gone, then saves
 /// the memory cache to disk. A second message, or [`FLUSH_DEADLINE`], stops the save.
 pub async fn run(
@@ -252,9 +292,16 @@ pub async fn run(
     let chain = Arc::new(HeaderChain::with_body_budget(cfg.body_budget));
 
     let net = if cfg.peers.is_empty() && !cfg.discovery {
-        tracing::warn!(
-            "no --peer given and discovery is off: state cannot be fetched, reads outside held state will miss"
-        );
+        if cfg.upstream_urls.is_empty() {
+            tracing::warn!(
+                "no --peer given and discovery is off: state cannot be fetched, reads outside held state will miss"
+            );
+        } else {
+            tracing::warn!(
+                "no --peer given and discovery is off: state comes from the upstreams only, and \
+                 receipts cannot be fetched"
+            );
+        }
         AnyNet::None(NoNetwork)
     } else {
         let net = LiteNetwork::start(&cfg, network_runtime()?).await?;
@@ -268,7 +315,8 @@ pub async fn run(
         AnyNet::Real(net)
     };
     let net = Arc::new(net);
-    let fetcher = Arc::new(P2pFetcher::new(net.clone(), store.clone(), metrics.clone()));
+    let p2p = Arc::new(P2pFetcher::new(net.clone(), store.clone(), metrics.clone()));
+    let fetcher = state_fetcher(&cfg, &chain, &store, &metrics, &net, p2p.clone());
     let hot = Arc::new(HotSet::new(cfg.state_hot_set_size()));
 
     let mut follow = FollowConfig::from(&cfg);
@@ -309,7 +357,7 @@ pub async fn run(
         chain: chain.clone(),
         store: store.clone(),
         fetcher: fetcher.clone(),
-        receipts: fetcher,
+        receipts: p2p,
         metrics: metrics.clone(),
         hot,
         net: net.clone(),

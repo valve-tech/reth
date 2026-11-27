@@ -59,6 +59,9 @@ trusted peer by its id and keeps it past the inbound limit.
 | `--head.verify` | `quorum` | `quorum`: `--beacon.quorum` sources choose the head; `sync-committee`: opt-in light-client verification (see `SYNC-COMMITTEE-DESIGN.md`). It needs a source with lighthouse-pulse `--light-client-server` and refuses to start without one. A head is then a block whose header the sync committee signed, and a verified finality update moves finality. The node keeps its light-client store in `<datadir>/sync-committee.ssz`. It writes the file atomically on a committee change or a finality move, at most once every 10 minutes. A restart uses the file when it is for this chain and its finalized header is at most 30 days old, the checkpoint's limit: the node then catches up with `light_client/updates` and does not bootstrap again. A damaged, stale or wrong-chain file is ignored with a warning, and the node bootstraps. After the seed an anchor that disagrees with the verified chain is logged and counted, and does not halt serving |
 | `--checkpoint` | the root pinned for 369 (slot 11169568); none on 943 | trusted finalized beacon block root (`0x` hex) that the first `--head.verify=sync-committee` bootstrap proves the first committee from. It wins over the pin, and a usable `sync-committee.ssz` wins over both. The node refuses a root or a pin whose block is more than 30 days old; the error says how to get a fresh one. Without a pin or this flag (943 today) the anchor's finalized root decides the first committee, and the node warns. With `--head.confirm=none` too, that is an unconfirmed start: see the trust model. Refused without `--head.verify=sync-committee` |
 | `--head.max-age` | `60s` | latest and state reads answer `-32000` `head is stale` when the head is older than this, or has not moved for this long; at least `20s`, and the node warns when it is not above one slot (`10s`) plus `--beacon.poll`, or two slots with `--head.verify=sync-committee` |
+| `--upstream.url` | none | JSON-RPC URL of an upstream state source, repeatable. Opt-in. The node fetches state from it with batched `eth_getProof` and `eth_getCode` at the block named by hash, and verifies every answer against that block's state root, as it does a peer's: see "Upstream state sources" below. The whole URL is a secret, as `--beacon.url`'s: logs and errors show only the scheme and the host. A URL with a fragment is refused |
+| `--upstream.url-file` | none | file with one upstream URL per line, read in order; blank lines and `#` lines are skipped. Keeps a key out of the command line; use mode `600`. Exclusive with `--upstream.url` |
+| `--upstream.mode` | `fallback` with an upstream URL | `fallback`: state comes from peers, and from the upstreams when no state peer is connected or the peers do not serve it; `only`: from the upstreams alone. Refused without an upstream URL. Receipts always come from peers |
 | `--rpc.evmtimeout` | `5s` | EVM time limit of one `eth_call` or `eth_estimateGas`; `0` sets no limit. The text and the default are as geth's `--rpc.evmtimeout` for `eth_call`. The limit on `eth_estimateGas` is reth-lite's: geth bounds an estimate by the gas cap only. It covers the EVM time of one run over the state held, not the state fetches between runs, and for `eth_estimateGas` the whole search |
 
 Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same parser. Durations take the forms of pulse-reth's humantime flags, such as `--engine.state-root-task-timeout`:
@@ -167,7 +170,7 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   is ready and 503 when it is not, with `{"ready": <bool>, "checks": [...]}`. Each check has
   an `id`, a `label`, `ok` and a `detail` that says why it fails. The checks are `consensus`
   (the node follows heads and is not halted), `head` (the head is fresh, by the stale-head
-  rule of `--head.max-age`), `peers` (a connected peer serves `snap/1`) and `state` (the
+  rule of `--head.max-age`), `peers` (a connected peer serves `snap/1`, or an `--upstream.url` is given) and `state` (the
   node's own state probe verified a read at most 6 blocks below the head). After each new
   head the node reads the account of the head's beneficiary at the head, fetching what it
   misses in every `--state.on-miss` mode, within 20 s. A client's read never counts, so an
@@ -253,7 +256,8 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   * An `eth_call` or `eth_estimateGas` that halts or that the EVM refuses answers the EVM's text.
 * Metrics: `lite_requests_total{method,outcome}`, `lite_answers_total{verified}`,
   `lite_cache_bytes`, `lite_disk_bytes`, `lite_disk_limit_bytes`, `lite_head_lag_seconds`,
-  `lite_head_number`, `lite_peers{kind=static|discovered}`, `lite_proof_failures_total{source}`,
+  `lite_head_number`, `lite_peers{kind=static|discovered}`,
+  `lite_proof_failures_total{source=beacon|anchor|peer|upstream}`,
   `lite_anchor_mismatch`, `lite_anchor_ahead`, `lite_anchor_unreachable_total`, `lite_warm_queue`,
   `lite_beacon_optimistic_total{source}`, `lite_head_verify{mode}`, `lite_unconfirmed_start` (1
   when nothing but the anchor confirms the block the node starts from: alert on it), and with
@@ -264,6 +268,29 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   answers checked against a block's roots; `verified="false"` counts `eth_blockNumber`,
   `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` and the hash
   that `eth_sendRawTransaction` answers, which no root checks. The node answers above count in neither series.
+
+## Upstream state sources
+
+With `--upstream.url` the node can fetch state from JSON-RPC endpoints, such as a node you run
+or a provider. It asks with batched `eth_getProof` and `eth_getCode` calls, at most 20 in one
+request with an `eth_blockNumber` first, and names the block by hash (EIP-1898). It verifies
+every proof against that block's state root, and code against the code hash the verified
+account names, as it verifies a peer's answer. So an upstream cannot make it give a wrong
+answer, only fail to give one.
+
+* An endpoint whose answer fails verification is not asked for 30 minutes while another
+  endpoint is not resting, and what it was asked for goes to the next endpoint. When every
+  endpoint rests, the node asks them all. The warning is logged once per rest. It counts in `lite_proof_failures_total{source="upstream"}`.
+* An endpoint that fails 3 requests in a row (no connection, a timeout, an HTTP error) rests for
+  30 s. A JSON-RPC error, a `null` result, or an `eth_blockNumber` below the block, sends the call
+  to the next endpoint and rests no one.
+* A request may take 8 s, and an answer may be 8 MiB; at most 4 requests run at once. An
+  answer whose parsed form would take more than 16 MiB is refused before it is parsed.
+* `eth_getCode` takes an account, so a code miss is asked of an account that the read found
+  with that code hash, or one that an upstream proved.
+* At start the node asks each endpoint for `eth_blockNumber` and logs whether it answers.
+* With `fallback` and no `--peer` and discovery off, state comes from the upstreams only, and
+  receipts, which come from peers, cannot be fetched.
 
 ## Trust model
 
@@ -347,6 +374,9 @@ block itself: it learns the head from the beacon URLs. Here is what each source 
   liveness: the node uses the first update that verifies. In this mode `--head.confirm` defaults to `none`, so no `--peer` is needed. The
   committee members are not slashed for signing a wrong header, so an explicit
   `--head.confirm=peer` keeps its value as an extra check.
+* **Upstream state sources** (`--upstream.url`) cannot make the node give a wrong answer
+  either: every proof and code blob is checked against the head's roots. An upstream sees which
+  accounts and slots the node reads, and the URL may hold a key: use one you run or trust.
 * **Discovered and static peers** that serve state cannot make the node give a wrong answer: every
   piece is checked against the head's state root. A peer whose data fails verification is dropped
   and ignored for 30 minutes.
@@ -397,7 +427,8 @@ minutes, while the root is still the source's finalized root.
 * With `--beacon.quorum` above 1, every beacon URL must be on its own host. The check treats
   every loopback name and address as one host and ignores a trailing dot, but it cannot see two
   DNS names for one provider.
-* With `--discovery=off` and no `--peer` the node cannot fetch state: reads outside held state miss.
+* With `--discovery=off` and no `--peer` the node cannot fetch state, unless it has an
+  `--upstream.url`: reads outside held state miss.
 * Receipts come from a peer (eth/68 `GetReceipts`) and are checked against the header's receipts
   root; they are fetched in `fetch` mode and are a miss in the other modes. The node keeps the
   receipts of at most 64 blocks and 32 MiB, in RAM outside `--cache.size`, in two halves: 32

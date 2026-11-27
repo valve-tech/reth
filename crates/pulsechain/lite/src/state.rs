@@ -142,6 +142,9 @@ pub struct MissingDb {
     /// `EXTCODESIZE`, `EXTCODECOPY` and `CALL`, and a clone shares the padded bytes and the jump
     /// table.
     codes: B256Map<Bytecode>,
+    /// An account this run read for each code hash, so a source that serves code by account
+    /// (`eth_getCode`) can fetch a code miss. At most one entry per account read.
+    code_owners: B256Map<Address>,
 }
 
 impl std::fmt::Debug for MissingDb {
@@ -156,7 +159,14 @@ impl std::fmt::Debug for MissingDb {
 impl MissingDb {
     /// A database over `state` with a `BLOCKHASH` source.
     pub fn new(state: PartialState, hashes: BlockHashes) -> Self {
-        Self { state, hashes, misses: Vec::new(), caller: None, codes: B256Map::default() }
+        Self {
+            state,
+            hashes,
+            misses: Vec::new(),
+            caller: None,
+            codes: B256Map::default(),
+            code_owners: B256Map::default(),
+        }
     }
 
     /// The same database for a caller that holds the `Arc` behind `caller` while it waits.
@@ -180,6 +190,12 @@ impl MissingDb {
     pub fn take_misses(&mut self) -> Vec<MissKey> {
         let mut seen = std::collections::HashSet::new();
         std::mem::take(&mut self.misses).into_iter().filter(|k| seen.insert(k.clone())).collect()
+    }
+
+    /// For each code hash of an account this run read, one such account. A code miss asks for
+    /// code by hash, which `eth_getCode` cannot take.
+    pub fn take_code_owners(&mut self) -> B256Map<Address> {
+        std::mem::take(&mut self.code_owners)
     }
 
     /// Whether any read has missed since the last [`Self::take_misses`].
@@ -207,7 +223,12 @@ impl Database for MissingDb {
 
     fn get_account(&mut self, address: &Address) -> Result<Option<AccountInfo>, Infallible> {
         Ok(match self.state.account(address) {
-            Lookup::Hit(a) => a.map(|a| AccountInfo::new(a.balance, a.nonce, a.code_hash, None)),
+            Lookup::Hit(a) => a.map(|a| {
+                if a.code_hash != KECCAK_EMPTY && !a.code_hash.is_zero() {
+                    self.code_owners.entry(a.code_hash).or_insert(*address);
+                }
+                AccountInfo::new(a.balance, a.nonce, a.code_hash, None)
+            }),
             Lookup::Miss(k) => self.miss(k),
         })
     }

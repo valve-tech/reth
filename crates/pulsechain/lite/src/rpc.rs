@@ -598,8 +598,8 @@ impl Api {
     }
 
     /// The readiness checks of `GET /ready`, and whether every one passes: the node follows heads
-    /// and is not halted, the head is fresh, a state peer is connected, and the node's own
-    /// newest state probe ([`Self::probe_state`])
+    /// and is not halted, the head is fresh, a state peer is connected or an upstream state
+    /// source is configured, and the node's own newest state probe ([`Self::probe_state`])
     /// verified a read at most [`PROBE_MAX_LAG`] blocks below the head. A client's read never
     /// counts: an odd key or block must not take the node out of a load balancer.
     pub fn readiness(&self) -> (bool, Value) {
@@ -613,9 +613,12 @@ impl Api {
             let age = now.saturating_sub(b.header.timestamp);
             format!("block {}, {age} s old", b.header.number)
         });
-        let peers = match self.net.state_peers() {
-            0 => Err("no connected peer serves state (snap/1)".to_owned()),
-            n => Ok(format!("{n} connected peers serve state (snap/1)")),
+        let peers = match (self.net.state_peers(), self.cfg.upstream_urls.len()) {
+            (0, 0) => Err("no connected peer serves state (snap/1)".to_owned()),
+            (n, 0) => Ok(format!("{n} connected peers serve state (snap/1)")),
+            (n, u) => Ok(format!(
+                "{n} connected peers serve state (snap/1), and {u} upstream state sources"
+            )),
         };
         let head_number = self.chain.head().map(|b| b.header.number);
         let state = match &*self.state_probe.lock() {
@@ -2733,7 +2736,7 @@ const PARSED_VALUE_COST: usize = 128;
 /// of its bytes (strings) and [`PARSED_VALUE_COST`] for each value or entry it opens. The parsed
 /// form of `0,` is 48 times the text, so byte budgets that count only the text do not bound it.
 #[derive(Debug, Default)]
-struct JsonCost {
+pub(crate) struct JsonCost {
     bytes: usize,
     values: usize,
     in_string: bool,
@@ -2741,7 +2744,7 @@ struct JsonCost {
 }
 
 impl JsonCost {
-    fn feed(&mut self, text: &[u8]) {
+    pub(crate) fn feed(&mut self, text: &[u8]) {
         self.bytes = self.bytes.saturating_add(text.len());
         for &c in text {
             if self.in_string {
@@ -2763,7 +2766,7 @@ impl JsonCost {
         }
     }
 
-    const fn cost(&self) -> usize {
+    pub(crate) const fn cost(&self) -> usize {
         self.values.saturating_add(1).saturating_mul(PARSED_VALUE_COST).saturating_add(self.bytes)
     }
 }

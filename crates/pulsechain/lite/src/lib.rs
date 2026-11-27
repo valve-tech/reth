@@ -29,6 +29,7 @@ pub mod store;
 pub mod sync_committee_file;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod upstream;
 pub mod verify;
 
 pub use reth_pulsechain_light_client::sync_committee;

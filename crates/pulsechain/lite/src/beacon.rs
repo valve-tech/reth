@@ -143,7 +143,7 @@ pub const MAX_WITHDRAWALS: usize = 1 << 13;
 /// a large fraction of a second of CPU; the bound keeps hostile answers from taking every core.
 const MAX_CONCURRENT_PARSES: usize = 2;
 
-fn classify(e: &reqwest::Error) -> SourceError {
+pub(crate) fn classify(e: &reqwest::Error) -> SourceError {
     if e.is_timeout() {
         SourceError::Timeout
     } else if e.is_connect() {
@@ -7047,7 +7047,7 @@ mod tests {
         // The failure series exist from the start, at zero.
         let failures: Vec<_> =
             out.lines().filter(|l| l.starts_with("lite_proof_failures_total{")).collect();
-        assert!(failures.len() == 3 && failures.iter().all(|l| l.ends_with(" 0")), "{out}");
+        assert!(failures.len() == 4 && failures.iter().all(|l| l.ends_with(" 0")), "{out}");
         assert!(out.contains("lite_beacon_optimistic_total{source=\"beacon\"} 5"), "{out}");
     }
 
@@ -7079,7 +7079,7 @@ mod tests {
         // The failure series exist from the start, at zero.
         let failures: Vec<_> =
             out.lines().filter(|l| l.starts_with("lite_proof_failures_total{")).collect();
-        assert!(failures.len() == 3 && failures.iter().all(|l| l.ends_with(" 0")), "{out}");
+        assert!(failures.len() == 4 && failures.iter().all(|l| l.ends_with(" 0")), "{out}");
         assert!(out.contains("lite_beacon_optimistic_total{source=\"anchor\"} 3"), "{out}");
     }
 

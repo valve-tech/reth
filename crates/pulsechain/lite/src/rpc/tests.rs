@@ -5440,6 +5440,21 @@ impl Fetcher for Flaky {
     }
 }
 
+/// An upstream state source serves state with no peer connected.
+#[tokio::test]
+async fn readiness_takes_an_upstream_state_source_in_place_of_a_state_peer() {
+    let r = rig(OnMiss::Fetch, true);
+    let upstream = "https://up.example/vk_ready_key".parse().unwrap();
+    let cfg = LiteConfig { upstream_urls: vec![upstream], ..cfg_943() };
+    let api = api_with(&r, cfg, r.honest.clone(), Arc::new(Receipts(vec![])));
+    api.probe_state().await;
+    assert_eq!(failing(&api), vec![]);
+    let (_, body) = api.readiness();
+    let detail = &checks(&body)[2].2;
+    assert_eq!(detail, "0 connected peers serve state (snap/1), and 1 upstream state sources");
+    assert!(!body.to_string().contains("vk_ready_key"));
+}
+
 #[tokio::test]
 async fn get_ready_answers_200_when_ready_and_503_with_the_failing_checks() {
     let r = rig(OnMiss::Fetch, true);
