@@ -96,9 +96,10 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   or `state unavailable` in `fetch`.
 * Fee history: `eth_feeHistory` with `rewardPercentiles` reads each block's receipts through
   the receipt path above, so the rewards come from receipts checked against the block's
-  receipts root. A reward is geth's: the effective tips of the block's transactions, lowest
-  first, each weighted by the gas it used, read at each percentile of the block's gas used. A
-  block without transactions rewards `0x0` and needs no receipts. As for `eth_getLogs`, a set
+  receipts root. On 943 a reward is geth's: the effective tips of the block's transactions,
+  lowest first, each weighted by the gas it used, read at each percentile of the block's gas
+  used. On 369 it is rpc.pulsechain.com's (see fee estimates below). A block without
+  transactions rewards `0x0` and needs no receipts. As for `eth_getLogs`, a set
   the request fetches is kept in the wide receipt cache. With percentiles the history covers at
   most the newest 32 blocks, the sets the wide cache keeps, so a repeat reads them; as geth
   truncates a long history, `oldestBlock` then says where it starts. In `error` and
@@ -143,7 +144,10 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   self-transfers, and keeps the lowest 40% of the rest (at least 3). It answers the 60th
   percentile of those samples, at most 1 PLS. With no sample it keeps its last answer, and
   50,000 gwei before its first. On 943 it is a fixed 1,000,000 wei (0.001 gwei), the network's
-  minimum accepted tip. `eth_gasPrice` adds the head's base fee.
+  minimum accepted tip. `eth_gasPrice` adds the head's base fee. The `eth_feeHistory` rewards
+  on 369 are rpc.pulsechain.com's too: they skip the coinbase's transactions and
+  self-transfers, with no tip floor, and read each percentile of the gas of the transactions
+  left. A block with none left has zero rewards. On 943 the rewards are geth's.
 * Batches: at most 1000 requests, as geth. A larger batch gets an array of one `-32600`
   `batch too large` error with the id of its first call, as geth answers it.
 * Responses: when a batch's answers pass 25,000,000 bytes, as geth, each later answer gets

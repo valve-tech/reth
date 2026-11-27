@@ -512,7 +512,7 @@ pub struct Api {
     /// The newest state probe, for `GET /ready`.
     state_probe: Mutex<Option<StateProbe>>,
     /// The tip oracle of 369 ([`tip`]).
-    tips: Mutex<tip::TipOracle>,
+    tips: tip::TipOracle,
     trust_label: String,
 }
 
@@ -588,7 +588,7 @@ impl Api {
             wide_fetches: tokio::sync::Semaphore::new(WIDE_FETCHES),
             recent_txs: Mutex::default(),
             state_probe: Mutex::default(),
-            tips: Mutex::default(),
+            tips: tip::TipOracle::default(),
             trust_label: p.trust_label,
         }))
     }
@@ -821,14 +821,14 @@ impl Api {
             }
             "eth_gasPrice" => {
                 let head = self.head()?;
-                let tip = self.suggested_tip(&head);
+                let tip = self.suggested_tip(&head).await?;
                 Ok(json!(hex_u128(
                     tip.saturating_add(u128::from(head.header.base_fee_per_gas.unwrap_or(0))),
                 )))
             }
             "eth_maxPriorityFeePerGas" => {
                 let head = self.head()?;
-                Ok(json!(hex_u128(self.suggested_tip(&head))))
+                Ok(json!(hex_u128(self.suggested_tip(&head).await?)))
             }
             "eth_sendRawTransaction" => self.send_raw_transaction(p, mode).await,
             "eth_feeHistory" => {
@@ -1626,11 +1626,38 @@ impl Api {
     /// The tip `eth_maxPriorityFeePerGas` answers at `head`, as valve's pulse-reth nodes answer
     /// it. On 369 it is erigon-pulse's oracle over the held blocks ([`tip`]), as rpc.pulsechain.com
     /// answers. On 943 it is a fixed [`MIN_TIP_943`]. The API is built only for those two chains.
-    fn suggested_tip(&self, head: &HeldBlock) -> u128 {
+    async fn suggested_tip(&self, head: &HeldBlock) -> Result<u128, RpcError> {
         match self.cfg.chain_id {
-            369 => self.tips.lock().suggest(&self.chain, head),
-            _ => MIN_TIP_943,
+            369 => self.tip_369(head).await,
+            _ => Ok(MIN_TIP_943),
         }
+    }
+
+    /// The 369 tip at `head` ([`tip`]). A call at an answered head reads the answer and
+    /// nothing else. Otherwise the senders of the window blocks not yet cached are recovered
+    /// once, off the async workers under a render permit, with no lock of the oracle's state
+    /// held.
+    async fn tip_369(&self, head: &HeldBlock) -> Result<u128, RpcError> {
+        if let Some(price) = self.tips.answered(&head.hash) {
+            return Ok(price)
+        }
+        let _computing = self.tips.computing().await;
+        if let Some(price) = self.tips.answered(&head.hash) {
+            return Ok(price)
+        }
+        let blocks = tip::window(&self.chain, head);
+        let missing = self.tips.missing(&blocks);
+        if !missing.is_empty() {
+            let computed = run_blocking(&self.render_permits, move || {
+                missing
+                    .iter()
+                    .map(|b| (b.hash, b.body.transactions.len(), tip::block_tips(b)))
+                    .collect()
+            })
+            .await?;
+            self.tips.insert_window(computed);
+        }
+        Ok(self.tips.answer_over(&head.hash, &blocks))
     }
 
     async fn fee_history(self: &Arc<Self>, p: &Value, mode: OnMiss) -> Result<Value, RpcError> {
@@ -1720,7 +1747,25 @@ impl Api {
             .map(|b| async move {
                 let receipts =
                     self.receipts_wide(&b, mode, fetches, MAX_REWARD_BLOCKS as usize).await?;
-                block_rewards(&b, &receipts, percentiles)
+                // 369 reads rpc.pulsechain.com's (erigon-pulse's) rewards, 943 geth's
+                if self.cfg.chain_id != 369 || b.body.transactions.is_empty() {
+                    return block_rewards(&b, &receipts, percentiles, None)
+                }
+                if let Some(tips) = self.tips.cached(&b.hash) {
+                    return block_rewards(&b, &receipts, percentiles, Some(&tips.kept))
+                }
+                // The senders are recovered off the async workers, with no lock held, and the
+                // block is cached apart from the tip window.
+                let percentiles = percentiles.to_vec();
+                let (hash, txs) = (b.hash, b.body.transactions.len());
+                let (tips, rewards) = run_blocking(&self.render_permits, move || {
+                    let tips = Arc::new(tip::block_tips(&b));
+                    let rewards = block_rewards(&b, &receipts, &percentiles, Some(&tips.kept));
+                    (tips, rewards)
+                })
+                .await?;
+                self.tips.insert_other(hash, txs, tips);
+                rewards
             })
             .buffered(LOG_RECEIPT_FETCHES)
             .try_collect()
@@ -1752,10 +1797,15 @@ fn reward_percentiles(raw: &[Value]) -> Result<Vec<f64>, RpcError> {
 /// geth's rewards of block `b` at `percentiles`: the effective tips of its transactions, lowest
 /// first, each weighted by the gas it used, read at each percentile of the block's gas used. A
 /// block without transactions has a zero reward at each.
+///
+/// With `kept`, the rewards are erigon-pulse's, as rpc.pulsechain.com answers on 369
+/// ([`tip::rewards`]): only the transactions `kept` marks count, and each percentile is of
+/// their gas.
 fn block_rewards(
     b: &HeldBlock,
     receipts: &[WireReceipt],
     percentiles: &[f64],
+    kept: Option<&[bool]>,
 ) -> Result<Vec<String>, RpcError> {
     if b.body.transactions.is_empty() {
         return Ok(vec![hex_u128(0); percentiles.len()]);
@@ -1772,6 +1822,10 @@ fn block_rewards(
         prev = cumulative;
         // A held block's transactions pay at least its base fee, so a tip always exists.
         txs.push((tx.effective_tip_per_gas(base).unwrap_or(0), used));
+    }
+    if let Some(kept) = kept {
+        let txs = txs.into_iter().zip(kept.iter().copied()).map(|((tip, gas), k)| (tip, gas, k));
+        return Ok(tip::rewards(txs, percentiles).into_iter().map(hex_u128).collect());
     }
     // Stable, as geth's sort: equal tips keep the block's order.
     txs.sort_by_key(|(tip, _)| *tip);
@@ -2226,15 +2280,24 @@ async fn render_blocking(
     permits: &Arc<tokio::sync::Semaphore>,
     f: impl FnOnce() -> Result<Value, RpcError> + Send + 'static,
 ) -> Result<Rendered, RpcError> {
+    run_blocking(permits, move || f().and_then(|v| Rendered::of(&v))).await?
+}
+
+/// Runs CPU-heavy work, such as sender recovery, off the runtime workers under one of
+/// `permits`. The permit is freed when `f` returns, before its answer leaves the task.
+async fn run_blocking<T: Send + 'static>(
+    permits: &Arc<tokio::sync::Semaphore>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, RpcError> {
     let permit = permits.clone().acquire_owned().await.map_err(|e| render_failed(&e))?;
     // The permit moves into the task: a request that times out does not free it early.
     tokio::task::spawn_blocking(move || {
-        let out = f().and_then(|v| Rendered::of(&v));
+        let out = f();
         drop(permit);
         out
     })
     .await
-    .map_err(|e| render_failed(&e))?
+    .map_err(|e| render_failed(&e))
 }
 
 /// The error of a block or receipt that could not be rendered.

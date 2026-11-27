@@ -1277,6 +1277,49 @@ async fn fee_history_rewards_weight_each_tip_by_the_gas_its_transaction_used() {
     assert!(result(&v).get("reward").is_none(), "{v}");
 }
 
+/// On 369 the rewards are rpc.pulsechain.com's (erigon-pulse's): a self-transfer is not read,
+/// and each percentile is of the gas of the transactions read. 943 keeps geth's rule.
+#[tokio::test]
+async fn fee_history_rewards_on_369_follow_erigon() {
+    let r = rig(OnMiss::Fetch, true);
+    let source = Arc::new(ReceiptsByNumber::default());
+    // Tips over the 1 gwei base fee of 3 (a self-transfer), 1 and 2 gwei, which used 60k, 20k
+    // and 20k gas.
+    let txs =
+        vec![tipped(0, 3 * GWEI, sender()), tipped(1, GWEI, ALICE), tipped(2, 2 * GWEI, ALICE)];
+    let b = push_head_with(&r, txs, |h| h.gas_used = 100_000);
+    let receipts = [60_000, 80_000, 100_000].map(|c| receipt_of(c, vec![])).to_vec();
+    source.sets.lock().insert(b.header.number, receipts);
+    let percentiles = json!([50, 100]);
+    let (one, two, three) = (hex_u128(GWEI), hex_u128(2 * GWEI), hex_u128(3 * GWEI));
+    for (cfg, want) in [
+        // kept gas 40k: 20k reaches the 50th percentile at the 1 gwei transaction
+        (LiteConfig { chain_id: 369, ..LiteConfig::default() }, json!([[one, two]])),
+        // block gas 100k: 50k is reached only at the 3 gwei self-transfer
+        (cfg_943(), json!([[three.clone(), three]])),
+    ] {
+        let api = api_with(&r, cfg, r.honest.clone(), source.clone());
+        let v = call(&api, "eth_feeHistory", json!(["0x1", "latest", percentiles])).await;
+        assert_eq!(result(&v)["reward"], want, "chain {}", api.cfg.chain_id);
+    }
+
+    // a block whose every transaction is the coinbase's has zero rewards on 369
+    let txs = vec![tipped(3, GWEI, ALICE)];
+    let b = push_head_with(&r, txs, |h| {
+        h.gas_used = 21_000;
+        h.beneficiary = sender();
+    });
+    source.sets.lock().insert(b.header.number, vec![receipt_of(21_000, vec![])]);
+    let api = api_with(
+        &r,
+        LiteConfig { chain_id: 369, ..LiteConfig::default() },
+        r.honest.clone(),
+        source,
+    );
+    let v = call(&api, "eth_feeHistory", json!(["0x1", "latest", percentiles])).await;
+    assert_eq!(result(&v)["reward"], json!([["0x0", "0x0"]]));
+}
+
 #[tokio::test]
 async fn fee_history_reward_percentiles_are_checked_as_geth_checks_them() {
     let r = rig(OnMiss::Fetch, true);
@@ -1418,7 +1461,10 @@ async fn fee_history_rewards_come_only_from_receipts_that_match_the_block() {
     // A total that goes down is not a set the receipts root could commit to.
     let head = r.chain.head().unwrap();
     let falling = [wire_receipt(42_000), wire_receipt(21_000)];
-    assert_eq!(block_rewards(&head, &falling, &[50.0]), Err(RpcError::other(RECEIPTS_MISMATCH)));
+    assert_eq!(
+        block_rewards(&head, &falling, &[50.0], None),
+        Err(RpcError::other(RECEIPTS_MISMATCH))
+    );
 }
 
 #[tokio::test]
@@ -3750,7 +3796,7 @@ async fn a_batch_of_1000_gas_price_calls_recovers_each_sender_once() {
     for i in 0..25 {
         push_head(&r, vec![tipped(2 * i, 2_000 * g, ALICE), tipped(2 * i + 1, 3_000 * g, ALICE)]);
     }
-    let recovered = || api.tips.lock().recovered;
+    let recovered = || api.tips.recovered.load(std::sync::atomic::Ordering::Relaxed);
     let batch = |method: &str| {
         let item = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": []});
         Value::Array(vec![item; 1000]).to_string()
@@ -3773,7 +3819,92 @@ async fn a_batch_of_1000_gas_price_calls_recovers_each_sender_once() {
         push_head(&r, vec![tipped(200 + i, 2_000 * g, ALICE)]);
         tip_369(&api).await;
     }
-    assert!(api.tips.lock().cached_blocks() <= tip::CACHED_BLOCKS);
+    assert!(api.tips.cached_blocks().0 <= tip::CACHED_BLOCKS);
+}
+
+/// A 369 rig of `n` heads of two tipped transactions each, whose receipts `source` serves.
+fn tipped_chain(n: u64) -> (Rig, Arc<Api>, Arc<ReceiptsByNumber>) {
+    let r = rig(OnMiss::Fetch, true);
+    let source = Arc::new(ReceiptsByNumber::default());
+    for i in 0..n {
+        let txs = vec![
+            tipped(2 * i, 2_000 * GWEI_TIP, ALICE),
+            tipped(2 * i + 1, 3_000 * GWEI_TIP, ALICE),
+        ];
+        let b = push_head_with(&r, txs, |h| h.gas_used = 42_000);
+        let receipts = vec![receipt_of(21_000, vec![]), receipt_of(42_000, vec![])];
+        source.sets.lock().insert(b.header.number, receipts);
+    }
+    let cfg = LiteConfig { chain_id: 369, ..LiteConfig::default() };
+    let api = api_with(&r, cfg, r.honest.clone(), source.clone());
+    (r, api, source)
+}
+
+/// A fee history over blocks older than the tip window caches them apart from the window: the
+/// window stays cached, and the next head recovers only its own senders.
+#[tokio::test]
+async fn fee_history_over_old_blocks_leaves_the_tip_window_cached() {
+    let (r, api, source) = tipped_chain(120);
+    let recovered = || api.tips.recovered.load(std::sync::atomic::Ordering::Relaxed);
+    tip_369(&api).await;
+    assert_eq!(recovered(), 40);
+    let head = r.chain.head().unwrap();
+    let window = tip::window(&r.chain, &head);
+    assert_eq!(window.len(), 20);
+
+    // three fee histories of 32 blocks each, all below the window: 96 blocks, more than the
+    // window cache holds
+    for newest in [head.header.number - 20, head.header.number - 52, head.header.number - 84] {
+        let v = call(&api, "eth_feeHistory", json!(["0x20", hex_u64(newest), [50]])).await;
+        assert_eq!(result(&v)["reward"].as_array().unwrap().len(), 32, "{v}");
+    }
+    assert_eq!(recovered(), 40 + 96 * 2, "each old block's senders are recovered once");
+    assert!(window.iter().all(|b| api.tips.in_window(&b.hash)), "the window stays cached");
+    let (in_window, others) = api.tips.cached_blocks();
+    assert_eq!((in_window, others), (20, tip::OTHER_BLOCKS));
+
+    // a new head recovers its own two senders only
+    let txs = vec![tipped(1_000, 2_000 * GWEI_TIP, ALICE), tipped(1_001, 2_000 * GWEI_TIP, ALICE)];
+    let b = push_head_with(&r, txs, |h| h.gas_used = 42_000);
+    let receipts = vec![receipt_of(21_000, vec![]), receipt_of(42_000, vec![])];
+    source.sets.lock().insert(b.header.number, receipts);
+    call(&api, "eth_gasPrice", json!([])).await;
+    assert_eq!(recovered(), 40 + 96 * 2 + 2);
+
+    // a fee history over the window reads the window cache and recovers nothing
+    let v = call(&api, "eth_feeHistory", json!(["0x10", "latest", [50]])).await;
+    assert_eq!(result(&v)["reward"].as_array().unwrap().len(), 16, "{v}");
+    assert_eq!(recovered(), 40 + 96 * 2 + 2);
+}
+
+/// A fee history waiting to recover senders holds no lock of the tip oracle: with every render
+/// permit taken, so its recovery cannot start, `eth_gasPrice` at an answered head still answers
+/// at once, and the fee history finishes once a permit is free.
+#[tokio::test]
+async fn a_fee_history_waiting_to_recover_holds_no_tip_lock() {
+    let (r, api, _source) = tipped_chain(60);
+    tip_369(&api).await;
+    let head = r.chain.head().unwrap();
+    let permits = api.render_permits.clone().acquire_many_owned(MAX_CONCURRENT_RENDERS as u32);
+    let permits = permits.await.unwrap();
+
+    let fee = {
+        let api = api.clone();
+        let newest = hex_u64(head.header.number - 25);
+        tokio::spawn(
+            async move { call(&api, "eth_feeHistory", json!(["0x8", newest, [50]])).await },
+        )
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!fee.is_finished(), "the fee history waits for a render permit");
+    let price =
+        tokio::time::timeout(Duration::from_secs(2), call(&api, "eth_gasPrice", json!([]))).await;
+    assert!(price.is_ok(), "eth_gasPrice waited on the fee history");
+    assert_eq!(api.tips.cached_blocks().0, 20);
+
+    drop(permits);
+    let v = tokio::time::timeout(Duration::from_secs(10), fee).await.unwrap().unwrap();
+    assert_eq!(result(&v)["reward"].as_array().unwrap().len(), 8, "{v}");
 }
 
 const GWEI_TIP: u128 = 1_000_000_000;

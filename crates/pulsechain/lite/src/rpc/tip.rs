@@ -7,11 +7,22 @@
 //! from the block's coinbase, and self-transfers. It keeps the lowest 40 percent of the rest (at
 //! least 3, at most 1,000). It answers the 60th percentile of all samples, capped at 1 PLS. With
 //! no sample it keeps its last answer.
+//!
+//! The same module keeps which transactions erigon's `eth_feeHistory` rewards read on 369: those
+//! with a known sender that is not the coinbase and that are no self-transfer, with no ignore
+//! price ([`BlockTips::kept`]).
 
 use crate::chain::{HeaderChain, HeldBlock};
 use alloy_consensus::{transaction::SignerRecoverable, Transaction as _, TxEnvelope};
 use alloy_primitives::{map::B256Map, Address, B256};
-use std::{collections::VecDeque, sync::Arc};
+use parking_lot::Mutex;
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 const GWEI: u128 = 1_000_000_000;
 /// The blocks erigon walks back from the head.
@@ -35,6 +46,8 @@ const MAX_SAMPLES: usize = 1_000;
 pub(super) const INITIAL_TIP: u128 = 50_000 * GWEI;
 /// The blocks whose samples are kept: the window, and room for a reorganisation.
 pub(super) const CACHED_BLOCKS: usize = 64;
+/// The blocks outside the window whose tips a fee history keeps: one fee history's worth.
+pub(super) const OTHER_BLOCKS: usize = 32;
 
 /// One transaction as erigon's oracle reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,14 +69,17 @@ pub(super) fn effective_tip(tx: &TxEnvelope, base_fee: Option<u64>) -> u128 {
     }
 }
 
+/// Whether erigon reads `tx` of a block with `coinbase`: its sender is known, is not the
+/// coinbase, and is not its recipient.
+pub(super) fn keeps(tx: &TxTip, coinbase: Address) -> bool {
+    tx.sender.is_some_and(|sender| sender != coinbase && tx.to != Some(sender))
+}
+
 /// One block's samples, as erigon's `getBlockPrices` takes them, sorted ascending.
 pub(super) fn block_samples(txs: impl IntoIterator<Item = TxTip>, coinbase: Address) -> Vec<u128> {
     let mut tips: Vec<u128> = txs
         .into_iter()
-        .filter(|tx| {
-            tx.tip >= IGNORE_PRICE &&
-                tx.sender.is_some_and(|sender| sender != coinbase && tx.to != Some(sender))
-        })
+        .filter(|tx| tx.tip >= IGNORE_PRICE && keeps(tx, coinbase))
         .map(|tx| tx.tip)
         .collect();
     tips.sort_unstable();
@@ -82,77 +98,205 @@ pub(super) fn answer(mut samples: Vec<u128>, last: u128) -> u128 {
     samples[(samples.len() - 1) * PERCENTILE / 100].min(MAX_PRICE)
 }
 
-/// The oracle's state: each block's samples, computed once, and the answer for the last head.
+/// erigon's `eth_feeHistory` rewards at `percentiles`, from each transaction's tip, gas used and
+/// whether erigon keeps it ([`keeps`]). It reads each percentile of the gas the kept
+/// transactions used, and answers zeros when none is kept.
+pub(super) fn rewards(
+    txs: impl IntoIterator<Item = (u128, u64, bool)>,
+    percentiles: &[f64],
+) -> Vec<u128> {
+    let mut txs: Vec<(u128, u64)> =
+        txs.into_iter().filter(|(.., kept)| *kept).map(|(tip, gas, _)| (tip, gas)).collect();
+    if txs.is_empty() {
+        return vec![0; percentiles.len()]
+    }
+    txs.sort_by_key(|(tip, _)| *tip);
+    let total: u64 = txs.iter().map(|(_, gas)| gas).sum();
+    let (mut at, mut sum) = (0, txs[0].1);
+    let mut out = Vec::with_capacity(percentiles.len());
+    for p in percentiles {
+        // As erigon: the float threshold truncated to whole gas.
+        let threshold = (total as f64 * p / 100.0) as u64;
+        while sum < threshold && at < txs.len() - 1 {
+            at += 1;
+            sum = sum.saturating_add(txs[at].1);
+        }
+        out.push(txs[at].0);
+    }
+    out
+}
+
+/// What the oracle keeps of one block: its samples, and which transactions erigon's rewards
+/// read. [`block_tips`] computes it.
+#[derive(Debug)]
+pub(super) struct BlockTips {
+    /// The block's tip samples ([`block_samples`]).
+    samples: Box<[u128]>,
+    /// Which of the block's transactions erigon's rewards read ([`keeps`]), in block order.
+    pub(super) kept: Box<[bool]>,
+}
+
+/// What the oracle keeps of `b`. It recovers each sender of `b`: the caller runs it off the
+/// async workers, and with no lock held.
+pub(super) fn block_tips(b: &HeldBlock) -> BlockTips {
+    let base_fee = b.header.base_fee_per_gas;
+    let txs: Vec<TxTip> = b
+        .body
+        .transactions
+        .iter()
+        .map(|tx| TxTip {
+            tip: effective_tip(tx, base_fee),
+            sender: tx.recover_signer().ok(),
+            to: tx.to(),
+        })
+        .collect();
+    let coinbase = b.header.beneficiary;
+    BlockTips {
+        kept: txs.iter().map(|tx| keeps(tx, coinbase)).collect(),
+        samples: block_samples(txs, coinbase).into(),
+    }
+}
+
+/// The blocks the tip at `head` reads: `head` and its parents, 20 at most, as far back as `chain`
+/// holds them with their bodies, and never the genesis block.
+pub(super) fn window(chain: &HeaderChain, head: &HeldBlock) -> Vec<HeldBlock> {
+    let mut out = Vec::new();
+    let mut block = Some(head.clone());
+    for _ in 0..head.header.number.min(CHECK_BLOCKS) {
+        let Some(b) = block else { break };
+        block = chain.by_hash(&b.header.parent_hash);
+        out.push(b);
+    }
+    out
+}
+
+/// [`BlockTips`] by block hash, at most `max`, the oldest pushed out first.
+#[derive(Debug)]
+struct BlockCache {
+    blocks: B256Map<Arc<BlockTips>>,
+    order: VecDeque<B256>,
+    max: usize,
+}
+
+impl BlockCache {
+    fn new(max: usize) -> Self {
+        Self { blocks: B256Map::default(), order: VecDeque::new(), max }
+    }
+
+    fn get(&self, hash: &B256) -> Option<Arc<BlockTips>> {
+        self.blocks.get(hash).cloned()
+    }
+
+    fn insert(&mut self, hash: B256, tips: Arc<BlockTips>) {
+        if self.blocks.contains_key(&hash) {
+            return
+        }
+        if self.order.len() >= self.max &&
+            let Some(old) = self.order.pop_front()
+        {
+            self.blocks.remove(&old);
+        }
+        self.order.push_back(hash);
+        self.blocks.insert(hash, tips);
+    }
+}
+
+/// The oracle's state. Every lock is held only for a lookup or an insert: senders are recovered
+/// by [`block_tips`] with no lock held.
 #[derive(Debug)]
 pub(super) struct TipOracle {
-    /// The samples of recent blocks, by block hash. At most [`CACHED_BLOCKS`].
-    samples: B256Map<Arc<[u128]>>,
-    /// The keys of `samples`, oldest first.
-    order: VecDeque<B256>,
+    /// The blocks of the tip window. Only the tip's walk ([`window`]) inserts here, so a fee
+    /// history over older blocks never pushes the window out.
+    window: Mutex<BlockCache>,
+    /// The blocks an `eth_feeHistory` read that the window cache did not hold.
+    others: Mutex<BlockCache>,
     /// The head of the last answer, and the answer.
-    last: (B256, u128),
+    last: Mutex<(B256, u128)>,
+    /// One tip computation at a time, so that calls at a new head recover its senders once.
+    /// Held across the recovery, but it guards no state: a call at an answered head never
+    /// takes it.
+    computing: tokio::sync::Mutex<()>,
     /// The senders recovered so far.
-    pub(super) recovered: u64,
+    pub(super) recovered: AtomicU64,
 }
 
 impl Default for TipOracle {
     fn default() -> Self {
         Self {
-            samples: B256Map::default(),
-            order: VecDeque::new(),
-            last: (B256::ZERO, INITIAL_TIP),
-            recovered: 0,
+            window: Mutex::new(BlockCache::new(CACHED_BLOCKS)),
+            others: Mutex::new(BlockCache::new(OTHER_BLOCKS)),
+            last: Mutex::new((B256::ZERO, INITIAL_TIP)),
+            computing: tokio::sync::Mutex::new(()),
+            recovered: AtomicU64::new(0),
         }
     }
 }
 
 impl TipOracle {
-    /// The tip at `head`. It walks 20 blocks back from `head`, or to the oldest block that
-    /// `chain` holds with its body. An answer is computed once per head, and a block's samples
-    /// once per block.
-    pub(super) fn suggest(&mut self, chain: &HeaderChain, head: &HeldBlock) -> u128 {
-        if self.last.0 == head.hash {
-            return self.last.1
+    /// The answer at `head`, if the oracle has it.
+    pub(super) fn answered(&self, head: &B256) -> Option<u128> {
+        let last = self.last.lock();
+        (last.0 == *head).then_some(last.1)
+    }
+
+    /// The computation guard: see [`Self::computing`].
+    pub(super) async fn computing(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.computing.lock().await
+    }
+
+    /// The blocks of `blocks` whose tips the window cache does not hold.
+    pub(super) fn missing(&self, blocks: &[HeldBlock]) -> Vec<HeldBlock> {
+        let window = self.window.lock();
+        blocks.iter().filter(|b| window.get(&b.hash).is_none()).cloned().collect()
+    }
+
+    /// Caches the tips of window blocks that [`block_tips`] computed.
+    pub(super) fn insert_window(&self, computed: Vec<(B256, usize, BlockTips)>) {
+        let mut window = self.window.lock();
+        for (hash, txs, tips) in computed {
+            self.recovered.fetch_add(txs as u64, Ordering::Relaxed);
+            window.insert(hash, Arc::new(tips));
         }
-        let mut samples = Vec::new();
-        let mut block = Some(head.clone());
-        for _ in 0..head.header.number.min(CHECK_BLOCKS) {
-            let Some(b) = block else { break };
-            samples.extend_from_slice(&self.block_samples(&b));
-            block = chain.by_hash(&b.header.parent_hash);
-        }
-        let price = answer(samples, self.last.1);
-        self.last = (head.hash, price);
+    }
+
+    /// The tip at `head` over `blocks`, its [`window`], whose tips are cached: computes and
+    /// stores the answer. A block that is no longer cached gives no sample.
+    pub(super) fn answer_over(&self, head: &B256, blocks: &[HeldBlock]) -> u128 {
+        let samples: Vec<u128> = {
+            let window = self.window.lock();
+            blocks
+                .iter()
+                .filter_map(|b| window.get(&b.hash))
+                .flat_map(|t| t.samples.to_vec())
+                .collect()
+        };
+        let mut last = self.last.lock();
+        let price = answer(samples, last.1);
+        *last = (*head, price);
         price
     }
 
-    /// The samples of `b`, from the cache or computed and cached.
-    fn block_samples(&mut self, b: &HeldBlock) -> Arc<[u128]> {
-        if let Some(s) = self.samples.get(&b.hash) {
-            return s.clone()
-        }
-        let base_fee = b.header.base_fee_per_gas;
-        let txs = b.body.transactions.iter().map(|tx| TxTip {
-            tip: effective_tip(tx, base_fee),
-            sender: tx.recover_signer().ok(),
-            to: tx.to(),
-        });
-        let s: Arc<[u128]> = block_samples(txs, b.header.beneficiary).into();
-        self.recovered += b.body.transactions.len() as u64;
-        if self.order.len() >= CACHED_BLOCKS &&
-            let Some(old) = self.order.pop_front()
-        {
-            self.samples.remove(&old);
-        }
-        self.order.push_back(b.hash);
-        self.samples.insert(b.hash, s.clone());
-        s
+    /// The tips of `hash` for a fee history, from either cache.
+    pub(super) fn cached(&self, hash: &B256) -> Option<Arc<BlockTips>> {
+        self.window.lock().get(hash).or_else(|| self.others.lock().get(hash))
     }
 
-    /// The number of blocks whose samples are cached.
+    /// Caches the tips of a block a fee history read, apart from the window.
+    pub(super) fn insert_other(&self, hash: B256, txs: usize, tips: Arc<BlockTips>) {
+        self.recovered.fetch_add(txs as u64, Ordering::Relaxed);
+        self.others.lock().insert(hash, tips);
+    }
+
+    /// Whether the window cache holds `hash`.
     #[cfg(test)]
-    pub(super) fn cached_blocks(&self) -> usize {
-        self.samples.len()
+    pub(super) fn in_window(&self, hash: &B256) -> bool {
+        self.window.lock().get(hash).is_some()
+    }
+
+    /// The number of blocks each cache holds: the window, the others.
+    #[cfg(test)]
+    pub(super) fn cached_blocks(&self) -> (usize, usize) {
+        (self.window.lock().blocks.len(), self.others.lock().blocks.len())
     }
 }
 
@@ -280,5 +424,90 @@ mod tests {
             n += 1;
         }
         assert!(n >= 5, "expected at least 5 captures, found {n}");
+    }
+    #[test]
+    fn erigons_rewards_keep_what_keeps_keeps() {
+        // the coinbase, a self-transfer and an unknown sender are not read; a low tip is
+        let cases = [
+            (TxTip { tip: 1, sender: Some(COINBASE), to: None }, false),
+            (tx(1, 5, Some(5)), false),
+            (TxTip { tip: 1, sender: None, to: None }, false),
+            (tx(0, 1, Some(2)), true),
+            (tx(1, 6, None), true),
+        ];
+        for (t, want) in cases {
+            assert_eq!(keeps(&t, COINBASE), want, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn erigons_rewards_read_the_gas_of_the_kept_transactions() {
+        // the dropped transaction used most of the gas: over all gas the 50th percentile would
+        // be the 3; over the kept 40k it is the 1
+        let txs = [(3, 60_000, false), (1, 20_000, true), (2, 20_000, true)];
+        assert_eq!(rewards(txs, &[0.0, 50.0, 100.0]), [1, 1, 2]);
+        assert_eq!(rewards(txs.map(|(t, g, _)| (t, g, true)), &[50.0]), [3]);
+    }
+
+    #[test]
+    fn erigons_rewards_are_zero_when_nothing_is_kept() {
+        assert_eq!(rewards([(3, 21_000, false)], &[10.0, 90.0]), [0, 0]);
+        assert_eq!(rewards([], &[10.0, 90.0]), [0, 0]);
+    }
+
+    /// One capture of `eth_feeHistory`, shared with pulse-reth's fee history tests.
+    #[derive(serde::Deserialize)]
+    struct FeeCapture {
+        histories: Vec<FeeHistory>,
+        blocks: Vec<FeeBlock>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FeeHistory {
+        percentiles: Vec<f64>,
+        reward: Vec<Vec<alloy_primitives::U128>>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FeeBlock {
+        coinbase: Address,
+        base_fee: Option<alloy_primitives::U64>,
+        txs: Vec<FeeTx>,
+    }
+
+    /// `[type, gasPrice or maxFeePerGas, maxPriorityFeePerGas, from, to, gasUsed]`
+    type FeeTx = (u8, U256, Option<U256>, Address, Option<Address>, u64);
+
+    /// The differential test of the rewards: each block of each capture, at each percentile
+    /// set, gets rpc.pulsechain.com's `eth_feeHistory` rewards.
+    #[test]
+    fn the_rewards_match_rpc_pulsechain_com_on_each_capture() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../rpc/rpc-eth-types/testdata/gpo-pulsechain-fee-history"
+        );
+        let mut rows = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue
+            }
+            let capture: FeeCapture =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            for history in &capture.histories {
+                for (b, want) in capture.blocks.iter().zip(&history.reward) {
+                    let base_fee = b.base_fee.map(|f| f.to());
+                    let txs = b.txs.iter().map(|&(kind, fee, priority, from, to, gas)| {
+                        let tip = effective_tip(&envelope(kind, fee.to(), priority), base_fee);
+                        (tip, gas, keeps(&TxTip { tip, sender: Some(from), to }, b.coinbase))
+                    });
+                    let want: Vec<u128> = want.iter().map(|r| r.to()).collect();
+                    assert_eq!(rewards(txs, &history.percentiles), want, "{}", path.display());
+                    rows += 1;
+                }
+            }
+        }
+        assert!(rows >= 3 * 8 * 4, "expected 3 captures of 8 blocks and 4 sets, found {rows} rows");
     }
 }
