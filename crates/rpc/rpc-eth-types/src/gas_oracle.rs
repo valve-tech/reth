@@ -4,7 +4,7 @@
 use super::{EthApiError, EthResult, EthStateCache, RpcInvalidTransactionError};
 use alloy_consensus::{constants::GWEI_TO_WEI, BlockHeader, Transaction, TxReceipt};
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{map::FbBuildHasher, B256, U256};
+use alloy_primitives::{map::FbBuildHasher, Address, B256, U256};
 use alloy_rpc_types_eth::BlockId;
 use derive_more::{Deref, DerefMut, From, Into};
 use itertools::Itertools;
@@ -18,7 +18,10 @@ use reth_rpc_server_types::{
 };
 use reth_storage_api::{BlockReaderIdExt, NodePrimitivesProvider};
 use serde::{Deserialize, Serialize};
-use std::fmt::{self, Debug, Formatter};
+use std::{
+    fmt::{self, Debug, Formatter},
+    str::FromStr,
+};
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -61,6 +64,10 @@ pub struct GasPriceOracleConfig {
     /// that transactions must pay to be mined. `None` leaves the suggestion unbounded below.
     #[serde(default)]
     pub min_price: Option<U256>,
+
+    /// valve-tech fork: how the oracle samples recent blocks. See [`GasPriceSampleMode`].
+    #[serde(default)]
+    pub sample_mode: GasPriceSampleMode,
 }
 
 impl Default for GasPriceOracleConfig {
@@ -75,6 +82,79 @@ impl Default for GasPriceOracleConfig {
             max_price: Some(DEFAULT_MAX_GAS_PRICE),
             ignore_price: Some(DEFAULT_IGNORE_GAS_PRICE),
             min_price: None,
+            sample_mode: GasPriceSampleMode::Reth,
+        }
+    }
+}
+
+impl GasPriceOracleConfig {
+    /// valve-tech fork: the settings rpc.pulsechain.com runs, erigon-pulse's `FullNodeGPO`: the
+    /// [`GasPriceSampleMode::Pulsechain`] sampling over 20 blocks at the 60th percentile, tips
+    /// under 1,000 gwei ignored, and a cap of 1 PLS.
+    pub fn pulsechain() -> Self {
+        Self {
+            blocks: DEFAULT_GAS_PRICE_BLOCKS,
+            percentile: DEFAULT_GAS_PRICE_PERCENTILE,
+            max_price: Some(PULSECHAIN_MAX_PRICE),
+            ignore_price: Some(PULSECHAIN_IGNORE_PRICE),
+            sample_mode: GasPriceSampleMode::Pulsechain,
+            ..Default::default()
+        }
+    }
+}
+
+/// valve-tech fork: erigon-pulse ignores tips under 1,000 gwei (`DefaultIgnorePrice`).
+pub const PULSECHAIN_IGNORE_PRICE: U256 = U256::from_limbs([1_000 * GWEI_TO_WEI, 0, 0, 0]);
+
+/// valve-tech fork: erigon-pulse caps its suggestion at 1 PLS, 1e18 wei (`DefaultMaxPrice`).
+pub const PULSECHAIN_MAX_PRICE: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
+
+/// erigon-pulse samples the lowest 40 percent of each block's filtered tips...
+const PULSECHAIN_SAMPLE_PERCENT: usize = 40;
+/// ...and at least 3 of them, where the block has 3...
+const PULSECHAIN_MIN_SAMPLES: usize = 3;
+/// ...and at most 1,000 (the `limit` that `SuggestTipCap` passes to `getBlockPrices`).
+const PULSECHAIN_MAX_SAMPLES: usize = 1_000;
+
+/// valve-tech fork: how [`GasPriceOracle::suggest_tip_cap`] samples recent blocks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GasPriceSampleMode {
+    /// reth's sampling: the 3 lowest tips of each block, over the newest `blocks` blocks that
+    /// give a sample. Empty blocks do not count.
+    #[default]
+    Reth,
+    /// erigon-pulse's sampling, as rpc.pulsechain.com answers: exactly `blocks` blocks back from
+    /// the head, empty ones included. Each block gives the lowest 40 percent of its tips (at
+    /// least 3, at most 1,000), after it drops tips under `ignore_price`, transactions from the
+    /// block's coinbase and self-transfers. With no sample, the oracle keeps its last answer.
+    Pulsechain,
+}
+
+impl GasPriceSampleMode {
+    /// The mode's name, as the `--gpo.sample-mode` flag takes it.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reth => "reth",
+            Self::Pulsechain => "pulsechain",
+        }
+    }
+}
+
+impl fmt::Display for GasPriceSampleMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for GasPriceSampleMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "reth" => Ok(Self::Reth),
+            "pulsechain" => Ok(Self::Pulsechain),
+            _ => Err(format!("unknown gas price sample mode {s:?}, expected reth or pulsechain")),
         }
     }
 }
@@ -123,7 +203,11 @@ where
                 price: oracle_config
                     .default_suggested_fee
                     .or(oracle_config.min_price)
-                    .unwrap_or_else(|| GasPriceOracleResult::default().price),
+                    .unwrap_or_else(|| match oracle_config.sample_mode {
+                        GasPriceSampleMode::Reth => GasPriceOracleResult::default().price,
+                        // erigon's price cache starts at 0
+                        GasPriceSampleMode::Pulsechain => U256::ZERO,
+                    }),
             },
             lowest_effective_tip_cache: EffectiveTipLruCache(LruMap::with_hasher(
                 cached_values,
@@ -151,6 +235,14 @@ where
         // if we have stored a last price, then we check whether or not it was for the same head
         if inner.last_price.block_hash == header.hash() {
             return Ok(inner.last_price.price)
+        }
+
+        if self.oracle_config.sample_mode == GasPriceSampleMode::Pulsechain {
+            let samples =
+                self.pulsechain_samples(&mut inner, header.hash(), header.number()).await?;
+            let price =
+                percentile_sample(samples, self.oracle_config.percentile, inner.last_price.price);
+            return Ok(self.store_price(&mut inner, header.hash(), price))
         }
 
         // if all responses are empty, then we can return a maximum of 2*check_block blocks' worth
@@ -194,8 +286,19 @@ where
         // Take the configured percentile of the populated blocks. With no populated block in
         // range, keep the last price: it is the last real observed tip, or the configured
         // default suggested fee when the oracle has no history yet.
-        let mut price = window.price(self.oracle_config.percentile, inner.last_price.price);
+        let price = window.price(self.oracle_config.percentile, inner.last_price.price);
 
+        Ok(self.store_price(&mut inner, header.hash(), price))
+    }
+
+    /// Caps `price` at the max price, floors it at the min price, and stores it as the answer for
+    /// the head `block_hash`.
+    fn store_price(
+        &self,
+        inner: &mut GasPriceOracleInner,
+        block_hash: B256,
+        mut price: U256,
+    ) -> U256 {
         // constrain to the max price
         if let Some(max_price) = self.oracle_config.max_price &&
             price > max_price
@@ -208,9 +311,9 @@ where
             price = price.max(min_price);
         }
 
-        inner.last_price = GasPriceOracleResult { block_hash: header.hash(), price };
+        inner.last_price = GasPriceOracleResult { block_hash, price };
 
-        Ok(price)
+        price
     }
 
     /// Get the `limit` lowest effective tip values for the given block. If the oracle has a
@@ -274,6 +377,58 @@ where
         }
 
         Ok(Some((parent_hash, prices)))
+    }
+
+    /// valve-tech fork: the tip samples of [`GasPriceSampleMode::Pulsechain`], as erigon-pulse's
+    /// `SuggestTipCap` collects them. It walks exactly `blocks` blocks back from the head (at
+    /// least 1), and stops before the genesis block. Empty blocks count toward `blocks`.
+    async fn pulsechain_samples(
+        &self,
+        inner: &mut GasPriceOracleInner,
+        head_hash: B256,
+        head_number: u64,
+    ) -> EthResult<Vec<U256>> {
+        let blocks = u64::from(self.oracle_config.blocks.max(1));
+        let mut samples = Vec::new();
+        let mut current_hash = head_hash;
+        for _ in 0..head_number.min(blocks) {
+            let (parent_hash, block_values) =
+                if let Some(vals) = inner.lowest_effective_tip_cache.get(&current_hash) {
+                    vals.to_owned()
+                } else {
+                    let (parent_hash, block_values) = self
+                        .pulsechain_block_values(current_hash)
+                        .await?
+                        .ok_or(EthApiError::HeaderNotFound(current_hash.into()))?;
+                    inner
+                        .lowest_effective_tip_cache
+                        .insert(current_hash, (parent_hash, block_values.clone()));
+                    (parent_hash, block_values)
+                };
+            samples.extend(block_values);
+            current_hash = parent_hash;
+        }
+        Ok(samples)
+    }
+
+    /// valve-tech fork: one block's samples for [`GasPriceSampleMode::Pulsechain`], with the
+    /// block's parent hash. `None` if the block is not found.
+    async fn pulsechain_block_values(
+        &self,
+        block_hash: B256,
+    ) -> EthResult<Option<(B256, Vec<U256>)>> {
+        let Some(block) = self.cache.get_recovered_block(block_hash).await? else {
+            return Ok(None)
+        };
+        let base_fee = block.base_fee_per_gas();
+        let txs = block.transactions_recovered().map(|tx| PulsechainTx {
+            tip: pulsechain_effective_tip(*tx, base_fee),
+            sender: tx.signer(),
+            to: tx.to(),
+        });
+        let values = pulsechain_block_samples(txs, block.beneficiary(), self.ignore_price);
+        let parent_hash = block.parent_hash();
+        Ok(Some((parent_hash, values)))
     }
 
     /// Suggests a max priority fee value using a simplified and more predictable algorithm
@@ -384,6 +539,65 @@ where
         Ok(median)
     }
 }
+
+/// valve-tech fork: one transaction as erigon-pulse's oracle reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PulsechainTx {
+    /// The effective tip, see [`pulsechain_effective_tip`].
+    pub tip: u128,
+    /// The sender.
+    pub sender: Address,
+    /// The recipient, `None` for a contract creation.
+    pub to: Option<Address>,
+}
+
+/// valve-tech fork: erigon's `GetEffectiveGasTip`: the tip a transaction pays over `base_fee`,
+/// and 0 where its fee cap is under the base fee. Before London it is the priority fee or gas
+/// price.
+pub fn pulsechain_effective_tip<T: Transaction>(tx: &T, base_fee: Option<u64>) -> u128 {
+    match base_fee {
+        Some(base_fee) => tx.effective_tip_per_gas(base_fee).unwrap_or_default(),
+        None => tx.priority_fee_or_price(),
+    }
+}
+
+/// valve-tech fork: one block's samples, as erigon-pulse's `getBlockPrices` takes them. It drops
+/// a tip under `ignore_price`, a transaction from `coinbase`, and a self-transfer (a recipient
+/// equal to the sender). It sorts the rest ascending and keeps the lowest 40 percent: at least 3,
+/// at most all of them, and at most 1,000. erigon also drops a transaction whose sender it does
+/// not know; a recovered block knows every sender.
+pub fn pulsechain_block_samples(
+    txs: impl IntoIterator<Item = PulsechainTx>,
+    coinbase: Address,
+    ignore_price: Option<u128>,
+) -> Vec<U256> {
+    let mut tips: Vec<u128> = txs
+        .into_iter()
+        .filter(|tx| {
+            ignore_price.is_none_or(|ignore| tx.tip >= ignore) &&
+                tx.sender != coinbase &&
+                tx.to != Some(tx.sender)
+        })
+        .map(|tx| tx.tip)
+        .collect();
+    tips.sort_unstable();
+    let keep = (tips.len() * PULSECHAIN_SAMPLE_PERCENT / 100)
+        .max(PULSECHAIN_MIN_SAMPLES)
+        .min(tips.len())
+        .min(PULSECHAIN_MAX_SAMPLES);
+    tips.truncate(keep);
+    tips.into_iter().map(U256::from).collect()
+}
+
+/// The sample at `percentile` of `samples`, or `fallback` when there is none.
+fn percentile_sample(mut samples: Vec<U256>, percentile: u32, fallback: U256) -> U256 {
+    if samples.is_empty() {
+        return fallback
+    }
+    samples.sort_unstable();
+    samples[(samples.len() - 1) * percentile as usize / 100]
+}
+
 /// The tip samples that [`GasPriceOracle::suggest_tip_cap`] collects over its block window.
 ///
 /// valve-tech fork: a block with no usable sample is skipped. A block has no usable sample when
@@ -570,5 +784,254 @@ mod tests {
 
         assert_eq!(suggest(&blocks, 40, last), suggest_upstream(&blocks, 40, last));
         assert_ne!(suggest(&blocks, 40, last), U256::ZERO);
+    }
+
+    // --- valve-tech fork: the `pulsechain` sample mode ---
+
+    const COINBASE: Address = Address::repeat_byte(0xc0);
+    const GWEI: u128 = GWEI_TO_WEI as u128;
+    const IGNORE: Option<u128> = Some(1_000 * GWEI);
+
+    fn ptx(tip: u128, sender: u8, to: Option<u8>) -> PulsechainTx {
+        PulsechainTx { tip, sender: Address::repeat_byte(sender), to: to.map(Address::repeat_byte) }
+    }
+
+    fn samples(txs: Vec<PulsechainTx>) -> Vec<u128> {
+        pulsechain_block_samples(txs, COINBASE, IGNORE).into_iter().map(|v| v.to()).collect()
+    }
+
+    #[test]
+    fn pulsechain_drops_the_coinbase() {
+        let mut txs = vec![ptx(2_000 * GWEI, 1, Some(2)), ptx(3_000 * GWEI, 3, Some(4))];
+        txs.push(PulsechainTx { tip: 1_500 * GWEI, sender: COINBASE, to: None });
+        assert_eq!(samples(txs), [2_000 * GWEI, 3_000 * GWEI]);
+    }
+
+    #[test]
+    fn pulsechain_drops_self_transfers() {
+        let txs = vec![
+            ptx(1_500 * GWEI, 1, Some(1)),
+            ptx(2_000 * GWEI, 2, Some(3)),
+            // a contract creation has no recipient and is no self-transfer
+            ptx(3_000 * GWEI, 4, None),
+        ];
+        assert_eq!(samples(txs), [2_000 * GWEI, 3_000 * GWEI]);
+    }
+
+    #[test]
+    fn pulsechain_drops_tips_under_the_ignore_price() {
+        let txs = vec![
+            ptx(1_000 * GWEI - 1, 1, Some(2)),
+            ptx(1_000 * GWEI, 3, Some(4)),
+            ptx(4_000 * GWEI, 5, Some(6)),
+        ];
+        assert_eq!(samples(txs), [1_000 * GWEI, 4_000 * GWEI]);
+    }
+
+    #[test]
+    fn pulsechain_keeps_the_lowest_40_percent_and_at_least_3() {
+        let block = |n: u8| -> Vec<PulsechainTx> {
+            (0..n).rev().map(|i| ptx(1_000 * GWEI + u128::from(i), i, Some(i + 1))).collect()
+        };
+        let lowest = |n: u128| (0..n).map(|i| 1_000 * GWEI + i).collect::<Vec<_>>();
+        // 20 * 40% = 8, sorted ascending
+        assert_eq!(samples(block(20)), lowest(8));
+        // 5 * 40% = 2, raised to 3
+        assert_eq!(samples(block(5)), lowest(3));
+        // fewer than 3: all of them
+        assert_eq!(samples(block(2)), lowest(2));
+        assert!(samples(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn pulsechain_keeps_at_most_1000_per_block() {
+        let txs: Vec<_> = (0..3_000u32)
+            .map(|i| PulsechainTx {
+                tip: 1_000 * GWEI + u128::from(i),
+                sender: Address::with_last_byte(1),
+                to: None,
+            })
+            .collect();
+        assert_eq!(pulsechain_block_samples(txs, COINBASE, IGNORE).len(), 1_000);
+    }
+
+    #[test]
+    fn pulsechain_effective_tip_saturates_at_zero() {
+        let tx = alloy_consensus::TxEip1559 {
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 30,
+            ..Default::default()
+        };
+        assert_eq!(pulsechain_effective_tip(&tx, Some(80)), 20);
+        assert_eq!(pulsechain_effective_tip(&tx, Some(50)), 30);
+        // reth's own sampling refuses this transaction with `FeeCapTooLow`; erigon counts 0
+        assert_eq!(pulsechain_effective_tip(&tx, Some(101)), 0);
+        assert_eq!(pulsechain_effective_tip(&tx, None), 30);
+        let legacy = alloy_consensus::TxLegacy { gas_price: 100, ..Default::default() };
+        assert_eq!(pulsechain_effective_tip(&legacy, Some(60)), 40);
+    }
+
+    #[test]
+    fn percentile_sample_keeps_the_fallback_without_samples() {
+        assert_eq!(percentile_sample(Vec::new(), 60, U256::from(7)), U256::from(7));
+        assert_eq!(percentile_sample(tips(&[5, 1, 4, 2, 3]), 60, U256::from(7)), U256::from(3));
+    }
+
+    #[test]
+    fn pulsechain_sample_mode_names() {
+        for mode in [GasPriceSampleMode::Reth, GasPriceSampleMode::Pulsechain] {
+            assert_eq!(mode.as_str().parse::<GasPriceSampleMode>(), Ok(mode));
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+        }
+        assert!("erigon".parse::<GasPriceSampleMode>().is_err());
+    }
+
+    #[test]
+    fn config_without_sample_mode_deserializes_as_reth() {
+        let mut value = serde_json::to_value(GasPriceOracleConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("sampleMode").expect("the field is serialized");
+        let config: GasPriceOracleConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config, GasPriceOracleConfig::default());
+    }
+
+    /// One capture from rpc.pulsechain.com, made by `testdata/gpo-pulsechain/capture.py`.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Capture {
+        head: u64,
+        max_priority_fee_per_gas: U256,
+        gas_price: U256,
+        blocks: Vec<CaptureBlock>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CaptureBlock {
+        number: u64,
+        coinbase: Address,
+        base_fee: Option<alloy_primitives::U64>,
+        txs: Vec<CaptureTx>,
+    }
+
+    /// One captured transaction: `[type, gasPrice or maxFeePerGas, maxPriorityFeePerGas, from,
+    /// to]`.
+    type CaptureTx = (u8, U256, Option<U256>, Address, Option<Address>);
+
+    impl CaptureBlock {
+        fn base_fee(&self) -> Option<u64> {
+            self.base_fee.map(|b| b.to())
+        }
+
+        fn pulsechain_txs(&self) -> Vec<PulsechainTx> {
+            let base_fee = self.base_fee();
+            self.txs
+                .iter()
+                .map(|&(kind, fee, priority, sender, to)| {
+                    let fee: u128 = fee.to();
+                    let tip = match (kind, priority) {
+                        (0 | 1, None) => pulsechain_effective_tip(
+                            &alloy_consensus::TxLegacy { gas_price: fee, ..Default::default() },
+                            base_fee,
+                        ),
+                        (2 | 4, Some(priority)) => pulsechain_effective_tip(
+                            &alloy_consensus::TxEip1559 {
+                                max_fee_per_gas: fee,
+                                max_priority_fee_per_gas: priority.to(),
+                                ..Default::default()
+                            },
+                            base_fee,
+                        ),
+                        other => panic!("unexpected transaction shape {other:?}"),
+                    };
+                    PulsechainTx { tip, sender, to }
+                })
+                .collect()
+        }
+    }
+
+    fn captures() -> Vec<(String, Capture)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/gpo-pulsechain");
+        let mut out: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "json"))
+            .map(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                (name, serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap())
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The `pulsechain` mode over each capture, as `suggest_tip_cap` computes it with erigon's
+    /// defaults.
+    fn pulsechain_answer(capture: &Capture) -> U256 {
+        let config = GasPriceOracleConfig::pulsechain();
+        let ignore = config.ignore_price.map(|p| p.saturating_to());
+        let samples = capture
+            .blocks
+            .iter()
+            .take(config.blocks as usize)
+            .flat_map(|b| pulsechain_block_samples(b.pulsechain_txs(), b.coinbase, ignore))
+            .collect();
+        percentile_sample(samples, config.percentile, U256::ZERO).min(config.max_price.unwrap())
+    }
+
+    /// The differential test: each capture's `eth_maxPriorityFeePerGas` from rpc.pulsechain.com
+    /// equals the `pulsechain` mode's answer over the same 20 blocks.
+    #[test]
+    fn pulsechain_mode_matches_rpc_pulsechain_com() {
+        let captures = captures();
+        assert!(captures.len() >= 5, "expected at least 5 captures, found {}", captures.len());
+        for (name, capture) in &captures {
+            assert_eq!(capture.blocks.len(), 20, "{name}");
+            for (i, b) in capture.blocks.iter().enumerate() {
+                assert_eq!(b.number, capture.head - i as u64, "{name}: blocks run newest first");
+            }
+            assert_eq!(
+                pulsechain_answer(capture),
+                capture.max_priority_fee_per_gas,
+                "{name}: the pulsechain mode disagrees with erigon"
+            );
+            // eth_gasPrice is the tip plus the head's base fee, on both nodes
+            let head_base_fee = U256::from(capture.blocks[0].base_fee().unwrap());
+            assert_eq!(
+                capture.gas_price,
+                capture.max_priority_fee_per_gas + head_base_fee,
+                "{name}"
+            );
+        }
+    }
+
+    /// The negative control: without the self-transfer rule, or with reth's 2 wei ignore price,
+    /// the captures do not all give erigon's answer, so the differential test can fail. A capture
+    /// may still agree by chance: many transactions can pay the same tip.
+    #[test]
+    fn pulsechain_captures_need_each_erigon_rule() {
+        let captures = captures();
+        let answer = |capture: &Capture, keep_to: bool, ignore: u128| {
+            let samples = capture
+                .blocks
+                .iter()
+                .flat_map(|b| {
+                    let txs = b
+                        .pulsechain_txs()
+                        .into_iter()
+                        .map(|tx| PulsechainTx { to: if keep_to { tx.to } else { None }, ..tx });
+                    pulsechain_block_samples(txs, b.coinbase, Some(ignore))
+                })
+                .collect();
+            percentile_sample(samples, 60, U256::ZERO)
+        };
+        let differ = |keep_to: bool, ignore: u128| {
+            captures
+                .iter()
+                .filter(|(_, c)| answer(c, keep_to, ignore) != c.max_priority_fee_per_gas)
+                .count()
+        };
+        assert_eq!(differ(true, 1_000 * GWEI), 0, "the control agrees on every capture");
+        assert!(differ(false, 1_000 * GWEI) > captures.len() / 2, "self-transfers");
+        assert!(differ(true, 2) > captures.len() / 2, "the ignore price");
     }
 }

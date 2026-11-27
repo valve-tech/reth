@@ -633,7 +633,10 @@ mod tests {
         node::RpcNodeCoreAdapter,
         EthApiServer,
     };
-    use reth_rpc_eth_types::{receipt::EthReceiptConverter, EthConfig, RpcInvalidTransactionError};
+    use reth_rpc_eth_types::{
+        receipt::EthReceiptConverter, EthConfig, GasPriceOracleConfig, GasPriceSampleMode,
+        RpcInvalidTransactionError,
+    };
     use reth_rpc_server_types::constants::DEFAULT_MAX_CALL_MANY_CALLS;
     use reth_storage_api::{
         AccountHistoryReader, BalProvider, BlockReaderIdExt, NodePrimitivesProvider,
@@ -1281,11 +1284,24 @@ mod tests {
     /// from 1. A block with `Some(tip)` holds four transactions that pay that tip; `None` is an
     /// empty block.
     fn add_tip_chain(provider: &MockEthProvider, tips: &[Option<u128>]) {
-        const BASE_FEE: u64 = 7;
-        let mut parent_hash = B256::ZERO;
+        extend_tip_chain(provider, B256::ZERO, 1, tips);
+    }
+
+    /// The base fee of each block that [`extend_tip_chain`] adds.
+    const TIP_CHAIN_BASE_FEE: u64 = 7;
+
+    /// Adds blocks as [`add_tip_chain`] does, on top of `parent_hash`, numbered from
+    /// `first_number`. Returns the hash of the newest block.
+    fn extend_tip_chain(
+        provider: &MockEthProvider,
+        mut parent_hash: B256,
+        first_number: u64,
+        tips: &[Option<u128>],
+    ) -> B256 {
+        const BASE_FEE: u64 = TIP_CHAIN_BASE_FEE;
         for (i, tip) in tips.iter().enumerate() {
             let header = Header {
-                number: i as u64 + 1,
+                number: i as u64 + first_number,
                 parent_hash,
                 gas_limit: 30_000_000,
                 base_fee_per_gas: Some(BASE_FEE),
@@ -1320,6 +1336,7 @@ mod tests {
             provider.add_header(hash, header);
             parent_hash = hash;
         }
+        parent_hash
     }
 
     /// A quiet chain: 30 blocks that pay a 10 gwei tip, then 100 empty blocks. The oracle must
@@ -1392,6 +1409,105 @@ mod tests {
             let tip = api.gas_oracle().suggest_tip_cap().await.unwrap();
             assert_eq!(tip, U256::from(want), "observed tip {observed}");
         }
+    }
+
+    // --- valve-tech fork: the `pulsechain` sample mode on chain 369 ---
+
+    const GWEI: u128 = 1_000_000_000;
+
+    /// An eth API on a 369 mock chain whose oracle runs the given config, as the node builder
+    /// passes `--gpo.*` through.
+    fn build_369_eth_api(provider: MockEthProvider, config: GasPriceOracleConfig) -> FakeEthApi {
+        EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .gas_oracle_config(config)
+        .build()
+    }
+
+    fn chain_369_provider() -> MockEthProvider {
+        let spec = ChainSpecBuilder::mainnet().chain(reth_chainspec::Chain::from_id(369)).build();
+        MockEthProvider::default().with_chain_spec(spec)
+    }
+
+    /// The config reaches the oracle behind `eth_maxPriorityFeePerGas` and `eth_gasPrice`, and
+    /// `eth_gasPrice` adds the head's base fee to the tip.
+    #[tokio::test]
+    async fn pulsechain_mode_reaches_the_fee_endpoints() {
+        use reth_rpc_eth_api::helpers::EthFees;
+        let provider = chain_369_provider();
+        add_tip_chain(&provider, &[Some(2_000 * GWEI); 30]);
+        let api = build_369_eth_api(provider, GasPriceOracleConfig::pulsechain());
+
+        assert_eq!(api.gas_oracle().config().sample_mode, GasPriceSampleMode::Pulsechain);
+        let tip = EthApiServer::max_priority_fee_per_gas(&api).await.unwrap();
+        assert_eq!(tip, U256::from(2_000 * GWEI));
+        let price = EthApiServer::gas_price(&api).await.unwrap();
+        assert_eq!(price, U256::from(2_000 * GWEI + u128::from(TIP_CHAIN_BASE_FEE)));
+        assert_eq!(EthFees::gas_price(&api).await.unwrap(), price);
+    }
+
+    /// erigon walks exactly 20 blocks back, and an empty block counts toward the 20. Twenty
+    /// empty blocks on top hide every older tip; nineteen do not.
+    #[tokio::test]
+    async fn pulsechain_mode_counts_empty_blocks_toward_the_window() {
+        use reth_rpc_eth_api::helpers::LoadFee;
+        for (empty, want) in [(19, 2_000 * GWEI), (20, 0)] {
+            let mut tips = vec![Some(2_000 * GWEI); 30];
+            tips.extend(std::iter::repeat_n(None, empty));
+            let provider = chain_369_provider();
+            add_tip_chain(&provider, &tips);
+            let api = build_369_eth_api(provider.clone(), GasPriceOracleConfig::pulsechain());
+            let tip = api.gas_oracle().suggest_tip_cap().await.unwrap();
+            assert_eq!(tip, U256::from(want), "{empty} empty blocks on top");
+
+            // the control: reth's sampling skips the empty blocks
+            let api = build_369_eth_api(provider, GasPriceOracleConfig::default());
+            let tip = api.gas_oracle().suggest_tip_cap().await.unwrap();
+            assert_eq!(tip, U256::from(500 * GWEI), "reth caps at its 500 gwei max");
+        }
+    }
+
+    /// With no sample in the window, the oracle keeps its last answer, and 0 before it has one,
+    /// as erigon's price cache does.
+    #[tokio::test]
+    async fn pulsechain_mode_keeps_the_last_answer_without_samples() {
+        use reth_rpc_eth_api::helpers::LoadFee;
+        let provider = chain_369_provider();
+        add_tip_chain(&provider, &[None; 25]);
+        let api = build_369_eth_api(provider.clone(), GasPriceOracleConfig::pulsechain());
+        assert_eq!(api.gas_oracle().suggest_tip_cap().await.unwrap(), U256::ZERO);
+
+        // a populated head, then a quiet stretch of 20 blocks
+        let head = provider.sealed_header_by_number_or_tag(BlockNumberOrTag::Latest).unwrap();
+        let head = head.unwrap();
+        let head = extend_tip_chain(&provider, head.hash(), 26, &[Some(3_000 * GWEI)]);
+        assert_eq!(api.gas_oracle().suggest_tip_cap().await.unwrap(), U256::from(3_000 * GWEI));
+        extend_tip_chain(&provider, head, 27, &[None; 20]);
+        assert_eq!(
+            api.gas_oracle().suggest_tip_cap().await.unwrap(),
+            U256::from(3_000 * GWEI),
+            "a window with no sample keeps the last answer"
+        );
+    }
+
+    /// The suggestion is capped at 1 PLS.
+    #[tokio::test]
+    async fn pulsechain_mode_caps_at_1_pls() {
+        use reth_rpc_eth_api::helpers::LoadFee;
+        const PLS: u128 = 1_000_000_000_000_000_000;
+        let provider = chain_369_provider();
+        add_tip_chain(&provider, &[Some(3 * PLS); 25]);
+        let api = build_369_eth_api(provider.clone(), GasPriceOracleConfig::pulsechain());
+        assert_eq!(api.gas_oracle().suggest_tip_cap().await.unwrap(), U256::from(PLS));
+
+        let uncapped =
+            GasPriceOracleConfig { max_price: None, ..GasPriceOracleConfig::pulsechain() };
+        let api = build_369_eth_api(provider, uncapped);
+        assert_eq!(api.gas_oracle().suggest_tip_cap().await.unwrap(), U256::from(3 * PLS));
     }
 
     /// Requesting all blocks should be ok

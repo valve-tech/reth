@@ -1381,6 +1381,7 @@ mod tests {
                 max_price: 500_000_000_000,
                 percentile: 60,
                 default_suggested_fee: None,
+                sample_mode: Default::default(),
             },
             rpc_send_raw_transaction_sync_timeout: std::time::Duration::from_secs(30),
             testing_skip_invalid_transactions: true,

@@ -40,7 +40,8 @@ pub use capabilities::{EthCapabilities, EthCapabilitiesHead, EthCapabilitiesReso
 pub use error::{EthApiError, EthResult, RevertError, RpcInvalidTransactionError, SignError};
 pub use fee_history::{FeeHistoryCache, FeeHistoryCacheConfig, FeeHistoryEntry};
 pub use gas_oracle::{
-    GasCap, GasPriceOracle, GasPriceOracleConfig, GasPriceOracleResult, RPC_DEFAULT_GAS_CAP,
+    GasCap, GasPriceOracle, GasPriceOracleConfig, GasPriceOracleResult, GasPriceSampleMode,
+    RPC_DEFAULT_GAS_CAP,
 };
 pub use id_provider::EthSubscriptionIdProvider;
 pub use pending_block::{PendingBlock, PendingBlockEnv, PendingBlockEnvOrigin};
