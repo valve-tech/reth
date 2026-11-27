@@ -1703,6 +1703,65 @@ mod tests {
         }
     }
 
+    /// A storage ranges request is answered as the range server answers it, and at a root the
+    /// node does not hold with an empty answer for the same request id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_ranges_are_served_and_an_unknown_root_is_answered_empty() {
+        let (mut backend, root, _) = test_backend(Lane::Hot, Probe::default());
+        let state = FakeState::generated(40, 30);
+        let mut ranges = FakeFactory::default();
+        let root_with_storage = ranges.add(state.clone());
+        backend.ranges = ranges;
+        backend.lanes = HashMap::from([(root_with_storage, Lane::Hot)]);
+        let server = Snap1Server::new(Arc::new(backend), Snap1Config::default());
+        let with_storage: Vec<B256> = state
+            .accounts
+            .iter()
+            .filter(|(_, a)| !a.storage.is_empty())
+            .map(|(hash, _)| *hash)
+            .collect();
+        assert_eq!(with_storage.len(), 4);
+        let req = |root_hash| reth_eth_wire_types::snap::GetStorageRangesMessage {
+            request_id: 8,
+            root_hash,
+            account_hashes: with_storage.clone(),
+            starting_hash: Default::default(),
+            limit_hash: Default::default(),
+            response_bytes: 1 << 20,
+        };
+        let storage = |msg: Option<Snap1Message>| match msg {
+            Some(Snap1Message::Shared(SnapProtocolMessage::StorageRanges(m))) => m,
+            other => panic!("not a storage ranges response: {other:?}"),
+        };
+        let want =
+            crate::serve_storage_ranges(&server.backend.ranges, &req(root_with_storage)).unwrap();
+        assert_eq!(want.slots.iter().map(Vec::len).collect::<Vec<_>>(), [30; 4]);
+        let got = storage(
+            server
+                .handle(
+                    peer(1),
+                    Snap1Message::Shared(SnapProtocolMessage::GetStorageRanges(req(
+                        root_with_storage,
+                    ))),
+                )
+                .await,
+        );
+        assert_eq!(got, want);
+        // The backend holds no state at `root` and lists no lane for it.
+        let got = storage(
+            server
+                .handle(
+                    peer(1),
+                    Snap1Message::Shared(SnapProtocolMessage::GetStorageRanges(req(root))),
+                )
+                .await,
+        );
+        assert_eq!(
+            got,
+            StorageRangesMessage { request_id: 8, slots: Vec::new(), proof: Vec::new() }
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelled_requests_keep_their_slots_until_the_job_ends() {
         let (backend, root, state) = backend(Lane::Hot, Duration::from_millis(400));

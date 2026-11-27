@@ -751,4 +751,36 @@ mod tests {
         let resp = serve_storage_ranges(&f, &storage_request(present, root)).unwrap();
         assert_eq!(resp.slots.len(), 5);
     }
+
+    /// A budget that the first account's whole range uses up exactly ends the answer there: the
+    /// next account is not walked, and the complete range needs no proof.
+    #[test]
+    fn a_budget_spent_at_an_account_boundary_ends_the_answer_without_a_proof() {
+        use crate::test_utils::FakeAccount;
+        use reth_primitives_traits::Account;
+        let storage = |tag: &str| {
+            (0..2u8)
+                .map(|i| (keccak256([tag.as_bytes(), &[i]].concat()), U256::MAX))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let (first, second) = (keccak256("first"), keccak256("second"));
+        let mut state = FakeState::default();
+        for (hash, tag) in [(first, "a"), (second, "b")] {
+            let account = FakeAccount { account: Account::default(), storage: storage(tag) };
+            state.accounts.insert(hash, account);
+        }
+        let mut f = FakeFactory::default();
+        let root = f.add(state.clone());
+        let full: Vec<StorageData> = state.accounts[&first]
+            .storage
+            .iter()
+            .map(|(h, v)| StorageData::from_value(*h, *v))
+            .collect();
+        assert!(full.iter().all(|slot| slot.length() == MAX_SLOT_ENCODED_BYTES));
+        let mut req = storage_request(vec![first, second], root);
+        req.response_bytes = full.iter().map(StorageData::length).sum::<usize>() as u64;
+        let resp = serve_storage_ranges(&f, &req).unwrap();
+        assert_eq!(resp.slots, vec![full]);
+        assert!(resp.proof.is_empty());
+    }
 }
