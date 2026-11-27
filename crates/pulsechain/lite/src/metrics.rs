@@ -6,10 +6,89 @@
 //! request. `lite_head_lag_seconds` starts at `+Inf` instead: a node with no verified
 //! head yet serves nothing, and a lag of 0 would read as a perfect head. The two
 //! `lite_sync_*` gauges stay 0 without `--head.verify=sync-committee`, and both
-//! `lite_head_verify{mode}` series read 0 until the node sets its mode.
+//! `lite_head_verify{mode}` series read 0 until the node sets its mode. The two `lite_rounds_*`
+//! counters start at zero for each method in [`ROUND_METHODS`]; `lite_rounds` has buckets only
+//! with a recorder from [`prometheus_builder`].
 
 use crate::config::HeadVerify;
-use metrics::{counter, describe_counter, describe_gauge, gauge, Counter, Gauge};
+use metrics::{
+    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram, Counter,
+    Gauge, Histogram,
+};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
+/// The methods that read state in rounds, the `method` label of the `lite_rounds*` series. A
+/// fixed list keeps the series bounded.
+pub const ROUND_METHODS: [&str; 7] = [
+    "eth_call",
+    "eth_estimateGas",
+    "eth_getBalance",
+    "eth_getTransactionCount",
+    "eth_getCode",
+    "eth_getStorageAt",
+    "eth_sendRawTransaction",
+];
+
+/// The `le` bounds of `lite_rounds`, up to the round limit of 40 (`LiteConfig::max_rounds`). A
+/// larger limit counts in `+Inf`.
+pub const ROUND_BUCKETS: [f64; 12] =
+    [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0, 30.0, 40.0];
+
+/// The exporter with the buckets of the lite histograms. Without them `lite_rounds` renders as a
+/// summary.
+pub fn prometheus_builder() -> PrometheusBuilder {
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(Matcher::Full("lite_rounds".to_owned()), &ROUND_BUCKETS)
+        .expect("the bucket list is not empty")
+}
+
+/// The round series of one method. The default records nothing.
+#[derive(Debug, Clone)]
+pub struct RoundMetrics {
+    /// `lite_rounds{method}`: the runs of one request.
+    rounds: Histogram,
+    /// `lite_rounds_fetched_keys_total{method}`
+    fetched_keys: Counter,
+    /// `lite_rounds_exhausted_total{method}`
+    exhausted: Counter,
+}
+
+impl Default for RoundMetrics {
+    fn default() -> Self {
+        Self {
+            rounds: Histogram::noop(),
+            fetched_keys: Counter::noop(),
+            exhausted: Counter::noop(),
+        }
+    }
+}
+
+impl RoundMetrics {
+    fn new(method: &'static str) -> Self {
+        Self {
+            rounds: histogram!("lite_rounds", "method" => method),
+            fetched_keys: counter!("lite_rounds_fetched_keys_total", "method" => method),
+            exhausted: counter!("lite_rounds_exhausted_total", "method" => method),
+        }
+    }
+
+    /// Records the runs of one request that ran at least once: answered, failed or dropped.
+    pub fn runs(&self, runs: u32) {
+        if runs > 0 {
+            self.rounds.record(f64::from(runs));
+        }
+    }
+
+    /// Counts `keys` keys of state that a round fetched and stored.
+    pub fn fetched(&self, keys: usize) {
+        self.fetched_keys.increment(keys as u64);
+    }
+
+    /// Counts one request that still missed state after the round limit.
+    pub fn exhausted(&self) {
+        self.exhausted.increment(1);
+    }
+}
 
 /// How a request ended, the `outcome` label of `lite_requests_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +174,7 @@ pub struct LiteMetrics {
     answers_verified: Counter,
     answers_unverified: Counter,
     anchor_disagreements: Counter,
+    rounds: [RoundMetrics; ROUND_METHODS.len()],
 }
 
 impl LiteMetrics {
@@ -111,6 +191,18 @@ impl LiteMetrics {
         describe_counter!(
             "lite_beacon_optimistic_total",
             "Beacon blocks skipped because the source had not validated their execution, by source"
+        );
+        describe_histogram!(
+            "lite_rounds",
+            "Runs of one state-reading request, answered or not: 1 when the state was held"
+        );
+        describe_counter!(
+            "lite_rounds_fetched_keys_total",
+            "Keys of state that rounds fetched and stored, by method"
+        );
+        describe_counter!(
+            "lite_rounds_exhausted_total",
+            "Requests that still missed state after the round limit, by method"
         );
         describe_gauge!("lite_cache_bytes", "Verified cache size in memory");
         describe_gauge!("lite_disk_bytes", "Disk used by the store's generations");
@@ -160,6 +252,7 @@ impl LiteMetrics {
             answers_verified: counter!("lite_answers_total", "verified" => "true"),
             answers_unverified: counter!("lite_answers_total", "verified" => "false"),
             anchor_disagreements: counter!("lite_anchor_disagreements_total"),
+            rounds: ROUND_METHODS.map(RoundMetrics::new),
         };
         for g in [
             &m.cache_bytes,
@@ -179,6 +272,10 @@ impl LiteMetrics {
         m.answers_verified.increment(0);
         m.answers_unverified.increment(0);
         m.anchor_disagreements.increment(0);
+        for r in &m.rounds {
+            r.fetched_keys.increment(0);
+            r.exhausted.increment(0);
+        }
         counter!("lite_anchor_unreachable_total").increment(0);
         for source in FailureSource::ALL {
             counter!("lite_proof_failures_total", "source" => source.label()).increment(0);
@@ -213,6 +310,15 @@ impl LiteMetrics {
         } else {
             self.answers_unverified.increment(1);
         }
+    }
+
+    /// The round series of `method`. A method not in [`ROUND_METHODS`] records nothing.
+    pub fn rounds(&self, method: &str) -> RoundMetrics {
+        ROUND_METHODS
+            .iter()
+            .position(|m| *m == method)
+            .map(|i| self.rounds[i].clone())
+            .unwrap_or_default()
     }
 
     /// Counts one rejected piece of data.

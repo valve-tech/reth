@@ -275,6 +275,18 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   answers checked against a block's roots; `verified="false"` counts `eth_blockNumber`,
   `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` and the hash
   that `eth_sendRawTransaction` answers, which no root checks. The node answers above count in neither series.
+* Round metrics, by `method` (`eth_call`, `eth_estimateGas`, `eth_getBalance`,
+  `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` and `eth_sendRawTransaction`, which
+  reads the sender's account). A request reads state in runs: a run that misses state is thrown
+  away, the node fetches what it missed, and the next run starts. `lite_rounds{method}` is a
+  histogram of the runs of each request, answered, failed or dropped at its deadline, with `le`
+  buckets 1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30 and 40: 1 when the node held the state.
+  `lite_rounds_fetched_keys_total{method}`
+  counts the keys of state (an account, a slot or a code hash) the runs missed and the node fetched
+  and stored, and the code of each account an `eth_call` or `eth_estimateGas` round fetched. One
+  key can take several trie nodes. `lite_rounds_exhausted_total{method}` counts the requests that
+  still missed state after the round limit, 40 runs. The node's own state probe counts in none.
+  In `error` and `error-and-warm` modes a request with misses makes one run and fetches nothing.
 
 ## Upstream state sources
 

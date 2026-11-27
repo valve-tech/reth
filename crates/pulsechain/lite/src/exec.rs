@@ -6,6 +6,7 @@
 
 use crate::{
     config::OnMiss,
+    metrics::RoundMetrics,
     state::{BlockHashes, Lookup, MissKey, MissingDb, PartialState},
 };
 use alloy_primitives::{map::B256Map, Address, B256};
@@ -79,7 +80,9 @@ pub struct Rounds<T> {
     pub rounds: u32,
 }
 
-/// Runs `f` until it completes with no misses.
+/// Runs `f` until it completes with no misses. `metrics` records the runs, the keys fetched, and
+/// a request that reaches `max_rounds`.
+#[expect(clippy::too_many_arguments)]
 pub async fn run_rounds<T>(
     state: &PartialState,
     hashes: &BlockHashes,
@@ -87,20 +90,44 @@ pub async fn run_rounds<T>(
     warm: Option<&dyn WarmSink>,
     mode: OnMiss,
     max_rounds: u32,
+    metrics: &RoundMetrics,
     mut f: impl FnMut(&mut MissingDb) -> T,
 ) -> Result<Rounds<T>, RoundsError> {
+    let mut runs = Runs { metrics, runs: 0 };
     let mut stuck = Stuck::default();
     for round in 1..=max_rounds {
         let mut db = MissingDb::new(state.clone(), hashes.clone());
         let value = f(&mut db);
+        runs.runs = round;
         let misses = db.take_misses();
         if misses.is_empty() {
             return Ok(Rounds { value, rounds: round });
         }
         let owners = db.take_code_owners();
-        handle_misses(state, fetcher, warm, mode, misses, &owners, round, &mut stuck).await?;
+        let got =
+            handle_misses(state, fetcher, warm, mode, misses, &owners, round, &mut stuck).await?;
+        metrics.fetched(state_keys(&got));
     }
+    metrics.exhausted();
     Err(RoundsError::TooManyRounds(max_rounds))
+}
+
+/// Records the runs of one request when the request ends: with a result, with an error, or
+/// dropped by its caller at a deadline.
+struct Runs<'a> {
+    metrics: &'a RoundMetrics,
+    runs: u32,
+}
+
+impl Drop for Runs<'_> {
+    fn drop(&mut self) {
+        self.metrics.runs(self.runs);
+    }
+}
+
+/// The keys among `keys` that name state. No fetch serves a block hash.
+fn state_keys(keys: &[MissKey]) -> usize {
+    keys.iter().filter(|k| !matches!(k, MissKey::Header(_))).count()
 }
 
 /// Like [`run_rounds`], for heavy closures (EVM runs): each run goes to a blocking thread, at most
@@ -117,6 +144,7 @@ pub async fn run_rounds_blocking<T, F>(
     mode: OnMiss,
     max_rounds: u32,
     permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    metrics: &RoundMetrics,
     f: F,
 ) -> Result<Rounds<T>, RoundsError>
 where
@@ -124,6 +152,7 @@ where
     F: FnMut(&mut MissingDb) -> T + Send + 'static,
 {
     let mut f = f;
+    let mut runs = Runs { metrics, runs: 0 };
     let mut stuck = Stuck::default();
     for round in 1..=max_rounds {
         // Dropped with this future, so the closure can see that no one waits for it.
@@ -142,19 +171,23 @@ where
         .map_err(|_| RoundsError::Aborted)?;
         drop(caller);
         f = back;
+        runs.runs = round;
         if misses.is_empty() {
             return Ok(Rounds { value, rounds: round });
         }
         let got =
             handle_misses(state, fetcher, warm, mode, misses, &owners, round, &mut stuck).await?;
+        metrics.fetched(state_keys(&got));
         let (codes, owners) = unheld_code(state, &got);
         // Best effort: a run that needs the code misses it, and that fetch reports its error.
-        if !codes.is_empty() &&
-            let Err(e) = fetcher.fetch_with_owners(state.root(), &codes, &owners).await
-        {
-            tracing::debug!(%e, codes = codes.len(), "code prefetch failed");
+        if !codes.is_empty() {
+            match fetcher.fetch_with_owners(state.root(), &codes, &owners).await {
+                Ok(()) => metrics.fetched(codes.len()),
+                Err(e) => tracing::debug!(%e, codes = codes.len(), "code prefetch failed"),
+            }
         }
     }
+    metrics.exhausted();
     Err(RoundsError::TooManyRounds(max_rounds))
 }
 
@@ -376,11 +409,20 @@ mod tests {
     async fn proxy_impl_mapping_converges_and_never_returns_a_partial_result() {
         let (st, honest, hashes) = setup();
         let seen = Mutex::new(Vec::new());
-        let out = run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 40, |db| {
-            let v = read_through_proxy(db);
-            seen.lock().unwrap().push(v);
-            v
-        })
+        let out = run_rounds(
+            &st,
+            &hashes,
+            &honest,
+            None,
+            OnMiss::Fetch,
+            40,
+            &RoundMetrics::default(),
+            |db| {
+                let v = read_through_proxy(db);
+                seen.lock().unwrap().push(v);
+                v
+            },
+        )
         .await
         .unwrap();
         assert_eq!(out.value, U256::from(4242));
@@ -397,9 +439,18 @@ mod tests {
     #[tokio::test]
     async fn error_mode_counts_misses_and_fetches_nothing() {
         let (st, honest, hashes) = setup();
-        let err = run_rounds(&st, &hashes, &honest, None, OnMiss::Error, 40, read_through_proxy)
-            .await
-            .unwrap_err();
+        let err = run_rounds(
+            &st,
+            &hashes,
+            &honest,
+            None,
+            OnMiss::Error,
+            40,
+            &RoundMetrics::default(),
+            read_through_proxy,
+        )
+        .await
+        .unwrap_err();
         // Account(proxy) is the only distinct miss of the first run: the storage read dedups to
         // it, and impl resolves to the zero address, whose account is a second miss.
         assert_eq!(err, RoundsError::Missing(2));
@@ -424,6 +475,7 @@ mod tests {
             Some(&q),
             OnMiss::ErrorAndWarm,
             40,
+            &RoundMetrics::default(),
             read_through_proxy,
         )
         .await
@@ -446,6 +498,7 @@ mod tests {
                 Some(&q),
                 OnMiss::ErrorAndWarm,
                 40,
+                &RoundMetrics::default(),
                 read_through_proxy,
             )
             .await;
@@ -457,6 +510,7 @@ mod tests {
             Some(&q),
             OnMiss::ErrorAndWarm,
             40,
+            &RoundMetrics::default(),
             read_through_proxy,
         )
         .await
@@ -510,6 +564,7 @@ mod tests {
             OnMiss::Fetch,
             40,
             &permits,
+            &RoundMetrics::default(),
             walk_chain,
         )
         .await
@@ -549,6 +604,7 @@ mod tests {
             OnMiss::Fetch,
             40,
             &permits,
+            &RoundMetrics::default(),
             |db: &mut MissingDb| db.get_account(&Address::repeat_byte(1)).unwrap().is_some(),
         )
         .await
@@ -610,9 +666,18 @@ mod tests {
         let honest = Honest { world: w.nodes, store: store.clone(), calls: AtomicUsize::new(0) };
         let fetcher = LostAtOnce { honest, store };
         let hashes: BlockHashes = Arc::new(|_| None);
-        let out = run_rounds(&st, &hashes, &fetcher, None, OnMiss::Fetch, 40, read_through_proxy)
-            .await
-            .unwrap();
+        let out = run_rounds(
+            &st,
+            &hashes,
+            &fetcher,
+            None,
+            OnMiss::Fetch,
+            40,
+            &RoundMetrics::default(),
+            read_through_proxy,
+        )
+        .await
+        .unwrap();
         // The lost fetch costs one more fetch and run than `proxy_impl_mapping_converges`.
         assert_eq!((out.value, out.rounds), (U256::from(4242), 6));
         assert_eq!(fetcher.honest.calls.load(Ordering::SeqCst), 5);
@@ -622,10 +687,19 @@ mod tests {
     async fn too_many_rounds() {
         let (st, honest, hashes) = setup();
         let runs = AtomicUsize::new(0);
-        let err = run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 2, |db| {
-            runs.fetch_add(1, Ordering::SeqCst);
-            read_through_proxy(db)
-        })
+        let err = run_rounds(
+            &st,
+            &hashes,
+            &honest,
+            None,
+            OnMiss::Fetch,
+            2,
+            &RoundMetrics::default(),
+            |db| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                read_through_proxy(db)
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err, RoundsError::TooManyRounds(2));
@@ -654,6 +728,7 @@ mod tests {
             OnMiss::Fetch,
             max,
             &permits,
+            &RoundMetrics::default(),
             counted(runs.clone()),
         )
         .await;
@@ -668,6 +743,7 @@ mod tests {
             OnMiss::Fetch,
             max,
             &permits,
+            &RoundMetrics::default(),
             counted(runs.clone()),
         )
         .await
@@ -683,10 +759,19 @@ mod tests {
         let q = Queue(Mutex::default());
         for mode in [OnMiss::Fetch, OnMiss::Error, OnMiss::ErrorAndWarm] {
             let runs = AtomicUsize::new(0);
-            let err = run_rounds(&st, &hashes, &honest, Some(&q), mode, 40, |db| {
-                runs.fetch_add(1, Ordering::SeqCst);
-                db.get_block_hash(&U256::from(100)).unwrap()
-            })
+            let err = run_rounds(
+                &st,
+                &hashes,
+                &honest,
+                Some(&q),
+                mode,
+                40,
+                &RoundMetrics::default(),
+                |db| {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    db.get_block_hash(&U256::from(100)).unwrap()
+                },
+            )
             .await
             .unwrap_err();
             assert_eq!(err, RoundsError::BlockHashUnavailable(100), "{mode:?}");
@@ -701,10 +786,19 @@ mod tests {
         // The block number comes from storage, so the default of a missed slot names the wrong
         // block: the state must be complete before the hash miss is final.
         let (st, honest, hashes) = setup();
-        let err = run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 40, |db| {
-            let n = read_through_proxy(db);
-            db.get_block_hash(&n).unwrap()
-        })
+        let err = run_rounds(
+            &st,
+            &hashes,
+            &honest,
+            None,
+            OnMiss::Fetch,
+            40,
+            &RoundMetrics::default(),
+            |db| {
+                let n = read_through_proxy(db);
+                db.get_block_hash(&n).unwrap()
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err, RoundsError::BlockHashUnavailable(4242));
@@ -727,10 +821,19 @@ mod tests {
         let (st, _, hashes) = setup();
         let idle = Idle(AtomicUsize::new(0));
         let runs = AtomicUsize::new(0);
-        let err = run_rounds(&st, &hashes, &idle, None, OnMiss::Fetch, 40, |db| {
-            runs.fetch_add(1, Ordering::SeqCst);
-            read_through_proxy(db)
-        })
+        let err = run_rounds(
+            &st,
+            &hashes,
+            &idle,
+            None,
+            OnMiss::Fetch,
+            40,
+            &RoundMetrics::default(),
+            |db| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                read_through_proxy(db)
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err, RoundsError::NoProgress(3));
@@ -750,6 +853,7 @@ mod tests {
             OnMiss::Fetch,
             40,
             &permits,
+            &RoundMetrics::default(),
             read_through_proxy,
         )
         .await
@@ -766,15 +870,24 @@ mod tests {
         let honest = Honest { world: w.nodes, store: store.clone(), calls: AtomicUsize::new(0) };
         let hashes: BlockHashes = Arc::new(|_| None);
         let runs = AtomicUsize::new(0);
-        let out = run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 40, |db| {
-            // Before the second run, other requests push the first fetch out of the cache.
-            if runs.fetch_add(1, Ordering::SeqCst) == 1 {
-                for i in 0u64..64 {
-                    store.put(keccak256(i.to_be_bytes()), Bytes::from(vec![0; 1024]));
+        let out = run_rounds(
+            &st,
+            &hashes,
+            &honest,
+            None,
+            OnMiss::Fetch,
+            40,
+            &RoundMetrics::default(),
+            |db| {
+                // Before the second run, other requests push the first fetch out of the cache.
+                if runs.fetch_add(1, Ordering::SeqCst) == 1 {
+                    for i in 0u64..64 {
+                        store.put(keccak256(i.to_be_bytes()), Bytes::from(vec![0; 1024]));
+                    }
                 }
-            }
-            read_through_proxy(db)
-        })
+                read_through_proxy(db)
+            },
+        )
         .await
         .unwrap();
         // The lost fetch costs one more fetch and run than `proxy_impl_mapping_converges`.
@@ -792,9 +905,18 @@ mod tests {
             }
         }
         let (st, _, hashes) = setup();
-        let err = run_rounds(&st, &hashes, &Down, None, OnMiss::Fetch, 5, read_through_proxy)
-            .await
-            .unwrap_err();
+        let err = run_rounds(
+            &st,
+            &hashes,
+            &Down,
+            None,
+            OnMiss::Fetch,
+            5,
+            &RoundMetrics::default(),
+            read_through_proxy,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, RoundsError::Fetch(FetchError::NoSource));
     }
 
@@ -802,10 +924,19 @@ mod tests {
     async fn a_run_that_completes_with_a_real_zero_is_a_result() {
         // A slot that is genuinely zero in complete state is an answer, not a miss.
         let (st, honest, hashes) = setup();
-        let out = run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 40, |db| {
-            let _ = db.get_account(&IMPL).unwrap();
-            db.get_storage(&IMPL, &U256::from(999)).unwrap()
-        })
+        let out = run_rounds(
+            &st,
+            &hashes,
+            &honest,
+            None,
+            OnMiss::Fetch,
+            40,
+            &RoundMetrics::default(),
+            |db| {
+                let _ = db.get_account(&IMPL).unwrap();
+                db.get_storage(&IMPL, &U256::from(999)).unwrap()
+            },
+        )
         .await
         .unwrap();
         assert_eq!(out.value, U256::ZERO);
@@ -824,6 +955,7 @@ mod tests {
             OnMiss::Fetch,
             40,
             &permits,
+            &RoundMetrics::default(),
             |_: &mut MissingDb| -> U256 { panic!("the run panics") },
         )
         .await
@@ -848,6 +980,7 @@ mod tests {
             OnMiss::Fetch,
             40,
             &permits,
+            &RoundMetrics::default(),
             move |db| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 read_through_proxy(db)
@@ -857,6 +990,144 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, RoundsError::Aborted);
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// The `eth_call` round series, recorded by a Prometheus recorder of its own, and that
+    /// recorder's handle.
+    fn round_series() -> (RoundMetrics, metrics_exporter_prometheus::PrometheusHandle) {
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        let m = metrics::with_local_recorder(&recorder, crate::metrics::LiteMetrics::new);
+        (m.rounds("eth_call"), handle)
+    }
+
+    /// Asserts that `out` has each of `lines`.
+    fn assert_lines(out: &str, lines: &[&str]) {
+        for line in lines {
+            assert!(out.lines().any(|l| l == *line), "missing `{line}` in:\n{out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn round_metrics_record_the_runs_and_the_keys_each_round_fetched() {
+        let (st, honest, hashes) = setup();
+        let (rounds, handle) = round_series();
+        let out =
+            run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 40, &rounds, read_through_proxy)
+                .await
+                .unwrap();
+        assert_eq!(out.rounds, 5);
+        // A second request finds every key held: one run, nothing fetched.
+        let again =
+            run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 40, &rounds, read_through_proxy)
+                .await
+                .unwrap();
+        assert_eq!(again.rounds, 1);
+        let out = handle.render();
+        assert_lines(
+            &out,
+            &[
+                // The first run misses the proxy and the zero address its missing slot named.
+                // The next three miss one key each: the proxy slot, the impl, the impl slot.
+                "lite_rounds_fetched_keys_total{method=\"eth_call\"} 5",
+                "lite_rounds_exhausted_total{method=\"eth_call\"} 0",
+                "lite_rounds_bucket{method=\"eth_call\",le=\"1\"} 1",
+                "lite_rounds_bucket{method=\"eth_call\",le=\"4\"} 1",
+                "lite_rounds_bucket{method=\"eth_call\",le=\"5\"} 2",
+                "lite_rounds_bucket{method=\"eth_call\",le=\"+Inf\"} 2",
+                "lite_rounds_sum{method=\"eth_call\"} 6",
+                "lite_rounds_count{method=\"eth_call\"} 2",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn round_metrics_count_the_code_an_evm_round_fetched_with_its_account() {
+        let (st, honest) = contract_chain(5);
+        let hashes: BlockHashes = Arc::new(|_| None);
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let (rounds, handle) = round_series();
+        let out = run_rounds_blocking(
+            &st,
+            &hashes,
+            &honest,
+            None,
+            OnMiss::Fetch,
+            40,
+            &permits,
+            &rounds,
+            walk_chain,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.rounds, 6);
+        // Each of the five contract rounds fetches the contract's account, then its code.
+        assert_lines(
+            &handle.render(),
+            &[
+                "lite_rounds_fetched_keys_total{method=\"eth_call\"} 10",
+                "lite_rounds_bucket{method=\"eth_call\",le=\"5\"} 0",
+                "lite_rounds_bucket{method=\"eth_call\",le=\"6\"} 1",
+                "lite_rounds_count{method=\"eth_call\"} 1",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn round_metrics_count_a_request_that_reached_the_round_limit() {
+        let (st, honest, hashes) = setup();
+        let (rounds, handle) = round_series();
+        let err =
+            run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 2, &rounds, read_through_proxy)
+                .await
+                .unwrap_err();
+        assert_eq!(err, RoundsError::TooManyRounds(2));
+        // In error mode the first run's misses end the request: one run, nothing fetched.
+        let err =
+            run_rounds(&st, &hashes, &honest, None, OnMiss::Error, 40, &rounds, read_through_proxy)
+                .await
+                .unwrap_err();
+        assert!(matches!(err, RoundsError::Missing(_)), "{err:?}");
+        assert_lines(
+            &handle.render(),
+            &[
+                "lite_rounds_exhausted_total{method=\"eth_call\"} 1",
+                // Two keys in the first round and the proxy slot in the second.
+                "lite_rounds_fetched_keys_total{method=\"eth_call\"} 3",
+                "lite_rounds_bucket{method=\"eth_call\",le=\"1\"} 1",
+                "lite_rounds_bucket{method=\"eth_call\",le=\"2\"} 2",
+                "lite_rounds_count{method=\"eth_call\"} 2",
+            ],
+        );
+    }
+
+    /// A fetcher that never answers.
+    struct Hung;
+
+    #[async_trait]
+    impl Fetcher for Hung {
+        async fn fetch(&self, _: B256, _: &[MissKey]) -> Result<(), FetchError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn round_metrics_record_a_request_its_caller_dropped() {
+        let (st, _, hashes) = setup();
+        let (rounds, handle) = round_series();
+        let read =
+            run_rounds(&st, &hashes, &Hung, None, OnMiss::Fetch, 40, &rounds, read_through_proxy);
+        // A request deadline drops the request while its first fetch waits.
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), read).await;
+        assert!(timed_out.is_err());
+        assert_lines(
+            &handle.render(),
+            &[
+                "lite_rounds_bucket{method=\"eth_call\",le=\"1\"} 1",
+                "lite_rounds_count{method=\"eth_call\"} 1",
+                "lite_rounds_fetched_keys_total{method=\"eth_call\"} 0",
+            ],
+        );
     }
 }
 
@@ -1042,12 +1313,12 @@ mod props {
                 let got = rt.block_on(async {
                     if blocking {
                         run_rounds_blocking(
-                            &st, &hashes, &lossy, None, OnMiss::Fetch, max_rounds, &permits,
+                            &st, &hashes, &lossy, None, OnMiss::Fetch, max_rounds, &permits, &RoundMetrics::default(),
                             move |db| chained_reads(&plan, db),
                         )
                         .await
                     } else {
-                        run_rounds(&st, &hashes, &lossy, None, OnMiss::Fetch, max_rounds, |db| {
+                        run_rounds(&st, &hashes, &lossy, None, OnMiss::Fetch, max_rounds, &RoundMetrics::default(), |db| {
                             chained_reads(&plan, db)
                         })
                         .await
@@ -1111,10 +1382,10 @@ mod props {
                 };
                 let got = rt.block_on(async {
                     if blocking {
-                        run_rounds_blocking(&st, &hashes, &honest, None, OnMiss::Fetch, 40, &permits, run)
+                        run_rounds_blocking(&st, &hashes, &honest, None, OnMiss::Fetch, 40, &permits, &RoundMetrics::default(), run)
                             .await
                     } else {
-                        run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 40, run).await
+                        run_rounds(&st, &hashes, &honest, None, OnMiss::Fetch, 40, &RoundMetrics::default(), run).await
                     }
                 });
                 match got {

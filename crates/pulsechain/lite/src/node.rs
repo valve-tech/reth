@@ -451,7 +451,7 @@ pub fn install_prometheus(addr: std::net::SocketAddr) -> Result<(), Box<dyn std:
     let listener = std::net::TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
-    let handle = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
+    let handle = crate::metrics::prometheus_builder().install_recorder()?;
     let upkeep = handle.clone();
     tokio::spawn(async move {
         loop {

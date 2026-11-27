@@ -16,6 +16,7 @@
 use crate::{
     config::OnMiss,
     exec::{run_rounds_blocking, Fetcher, RoundsError, WarmSink},
+    metrics::RoundMetrics,
     state::{BlockHashes, MissingDb, PartialState},
     store::NodeStore,
 };
@@ -119,6 +120,8 @@ pub struct ExecCtx {
     pub exec_permits: Arc<tokio::sync::Semaphore>,
     /// The EVM time limit of one call; zero sets no limit.
     pub evm_timeout: Duration,
+    /// The round series of the method a call answers. The default records nothing.
+    pub rounds: RoundMetrics,
 }
 
 impl std::fmt::Debug for ExecCtx {
@@ -158,6 +161,7 @@ impl ExecCtx {
             gas_cap: GAS_CAP,
             exec_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EXECUTIONS)),
             evm_timeout: DEFAULT_EVM_TIMEOUT,
+            rounds: RoundMetrics::default(),
         })
     }
 
@@ -525,6 +529,7 @@ pub async fn eth_call(
         ctx.mode,
         ctx.max_rounds,
         &ctx.exec_permits,
+        &ctx.rounds,
         move |db| {
             let mut watchdog = Watchdog::new(db, run_ctx.evm_timeout);
             execute(&run_ctx, &env, db, &tx, &mut watchdog).outcome
@@ -571,6 +576,7 @@ pub async fn eth_estimate_gas(
         ctx.mode,
         ctx.max_rounds,
         &ctx.exec_permits,
+        &ctx.rounds,
         move |db| -> Result<u64, CallError> {
             let (ctx, header) = (&run_ctx, &header_owned);
             // One deadline for the whole search, as geth applies one to the call.

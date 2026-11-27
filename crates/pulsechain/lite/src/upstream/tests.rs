@@ -610,7 +610,10 @@ impl Fetcher for RecordsOwners {
 /// hash, in both round drivers.
 #[tokio::test]
 async fn the_rounds_hand_the_fetcher_the_account_of_each_missing_code() {
-    use crate::exec::{run_rounds, run_rounds_blocking, RoundsError};
+    use crate::{
+        exec::{run_rounds, run_rounds_blocking, RoundsError},
+        metrics::RoundMetrics,
+    };
     use evm2::evm::Database;
     let r = rig(&[Mode::Honest]).await;
     r.fetcher.fetch(r.world.root, &[MissKey::Account(VIEW, None)]).await.unwrap();
@@ -621,8 +624,17 @@ async fn the_rounds_hand_the_fetcher_the_account_of_each_missing_code() {
     };
     let want: B256Map<Address> = std::iter::once((view_code_hash(), VIEW)).collect();
     let rec = RecordsOwners::default();
-    let res =
-        run_rounds(&r.state(), &hashes, &rec, None, crate::config::OnMiss::Fetch, 3, read).await;
+    let res = run_rounds(
+        &r.state(),
+        &hashes,
+        &rec,
+        None,
+        crate::config::OnMiss::Fetch,
+        3,
+        &RoundMetrics::default(),
+        read,
+    )
+    .await;
     assert_eq!(res.unwrap_err(), RoundsError::Fetch(FetchError::NoSource));
     assert_eq!(*rec.0.lock(), vec![want.clone()]);
     let rec = RecordsOwners::default();
@@ -635,6 +647,7 @@ async fn the_rounds_hand_the_fetcher_the_account_of_each_missing_code() {
         crate::config::OnMiss::Fetch,
         3,
         &permits,
+        &RoundMetrics::default(),
         read,
     )
     .await;

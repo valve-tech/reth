@@ -14,7 +14,7 @@ use crate::{
     config::{LiteConfig, OnMiss},
     exec::{run_rounds, FetchError, Fetcher, RoundsError},
     hot_set::{Hot, HotSet},
-    metrics::{LiteMetrics, Outcome},
+    metrics::{LiteMetrics, Outcome, RoundMetrics},
     net::client::WireReceipt,
     state::{BlockHashes, MissingDb, PartialState},
     store::NodeStore,
@@ -664,6 +664,8 @@ impl Api {
         let Some(head) = self.chain.head().filter(|_| self.chain.is_live()) else { return };
         let state = PartialState::new(self.store.clone(), head.header.state_root);
         let who = head.header.beneficiary;
+        // The node's own probe is not a request: no round series records it.
+        let unrecorded = RoundMetrics::default();
         let read = run_rounds(
             &state,
             &self.hashes,
@@ -671,6 +673,7 @@ impl Api {
             None,
             OnMiss::Fetch,
             self.cfg.max_rounds,
+            &unrecorded,
             |db| db.get_account(&who).is_ok(),
         );
         let outcome = match tokio::time::timeout(PROBE_TIMEOUT, read).await {
@@ -1069,14 +1072,17 @@ impl Api {
         Box::pin(self.dispatch(method, p, mode))
     }
 
+    /// Reads state at `blk` in rounds, recorded in the round series of `method`.
     async fn state_read<T: Send>(
         &self,
+        method: &str,
         blk: &HeldBlock,
         mode: OnMiss,
         f: impl FnMut(&mut MissingDb) -> T + Send,
     ) -> Result<T, RpcError> {
         let state = PartialState::new(self.store.clone(), blk.header.state_root);
-        run_rounds(&state, &self.hashes, &*self.fetcher, None, mode, self.cfg.max_rounds, f)
+        let (rounds, max) = (self.metrics.rounds(method), self.cfg.max_rounds);
+        run_rounds(&state, &self.hashes, &*self.fetcher, None, mode, max, &rounds, f)
             .await
             .map(|r| r.value)
             .map_err(|e| self.map_rounds(e))
@@ -1093,7 +1099,7 @@ impl Api {
         let blk = self.state_block(p, 1)?;
         self.hot.record(Hot::Account(addr));
         let res = self
-            .state_read(&blk, mode, |db| {
+            .state_read(method, &blk, mode, |db| {
                 let acct = db.get_account(&addr).ok().flatten();
                 acct.map(|a| (a.balance, a.nonce))
             })
@@ -1120,7 +1126,7 @@ impl Api {
         let blk = self.state_block(p, 1)?;
         self.hot.record(Hot::Account(addr));
         let res = self
-            .state_read(&blk, mode, |db| {
+            .state_read(method, &blk, mode, |db| {
                 let hash =
                     db.get_account(&addr).ok().flatten().map_or(KECCAK_EMPTY, |a| a.code_hash);
                 if hash == KECCAK_EMPTY {
@@ -1146,7 +1152,7 @@ impl Api {
         let blk = self.state_block(p, 2)?;
         self.hot.record(Hot::Slot(addr, B256::from(slot)));
         let res = self
-            .state_read(&blk, mode, |db| db.get_storage(&addr, &slot).unwrap_or_default())
+            .state_read(method, &blk, mode, |db| db.get_storage(&addr, &slot).unwrap_or_default())
             .await
             .map(|v| json!(format!("0x{}", alloy_primitives::hex::encode(v.to_be_bytes::<32>()))));
         self.warm_if_needed(method, p, mode, &res);
@@ -1182,6 +1188,7 @@ impl Api {
         }
         let mut ctx = self.exec.clone();
         ctx.mode = mode;
+        ctx.rounds = self.metrics.rounds(method);
         let unheld = Arc::new(Unheld::default());
         ctx.hashes = call_block_hashes(self.chain.clone(), &blk, unheld.clone());
         let res = if estimate {
@@ -1449,7 +1456,7 @@ impl Api {
         check_pool_rules(&tx, &head.header)?;
         let from = recover(&tx)?;
         let res = self
-            .state_read(&head, mode, |db| {
+            .state_read("eth_sendRawTransaction", &head, mode, |db| {
                 db.get_account(&from)
                     .ok()
                     .flatten()

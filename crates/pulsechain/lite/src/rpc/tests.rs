@@ -371,6 +371,54 @@ async fn only_answers_checked_against_a_root_count_as_verified() {
     }
 }
 
+/// The line of `out` that starts with `series`, as a number.
+fn series(out: &str, series: &str) -> Option<f64> {
+    out.lines().find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+}
+
+#[tokio::test]
+async fn round_metrics_record_each_request_by_method() {
+    let mut r = rig(OnMiss::Fetch, true);
+    let recorder = crate::metrics::prometheus_builder().build_recorder();
+    let handle = recorder.handle();
+    r.metrics = metrics::with_local_recorder(&recorder, LiteMetrics::new);
+    let api = api_with(&r, cfg_943(), r.honest.clone(), Arc::new(Receipts(vec![])));
+    let view = json!([{"to": h(VIEW), "data": "0x"}, "latest"]);
+    for _ in 0..2 {
+        result(&call(&api, "eth_call", view.clone()).await);
+    }
+    result(&call(&api, "eth_getBalance", json!([h(ALICE), "latest"])).await);
+    // One run is too few for an account that is not held yet.
+    let one = LiteConfig { max_rounds: 1, ..cfg_943() };
+    let short = api_with(&r, one, r.honest.clone(), Arc::new(Receipts(vec![])));
+    let v = call(&short, "eth_getBalance", json!([h(sender()), "latest"])).await;
+    assert_eq!(error(&v), (-32000, "state discovery did not converge after 1 rounds"));
+    let out = handle.render();
+    for (name, want) in [
+        // The first call misses the sender (the zero address) and VIEW, and fetches VIEW's code
+        // with its account; then it misses slot 7; the third run reads complete state. The
+        // second call reads held state in one run.
+        ("lite_rounds_count{method=\"eth_call\"}", 2.0),
+        ("lite_rounds_sum{method=\"eth_call\"}", 4.0),
+        ("lite_rounds_bucket{method=\"eth_call\",le=\"1\"}", 1.0),
+        ("lite_rounds_bucket{method=\"eth_call\",le=\"2\"}", 1.0),
+        ("lite_rounds_bucket{method=\"eth_call\",le=\"3\"}", 2.0),
+        ("lite_rounds_fetched_keys_total{method=\"eth_call\"}", 4.0),
+        ("lite_rounds_exhausted_total{method=\"eth_call\"}", 0.0),
+        // ALICE in two runs, then the sender's account: fetched in the one run allowed, which
+        // is the limit.
+        ("lite_rounds_count{method=\"eth_getBalance\"}", 2.0),
+        ("lite_rounds_sum{method=\"eth_getBalance\"}", 3.0),
+        ("lite_rounds_fetched_keys_total{method=\"eth_getBalance\"}", 2.0),
+        ("lite_rounds_exhausted_total{method=\"eth_getBalance\"}", 1.0),
+        // A method that ran no request has its series at zero.
+        ("lite_rounds_count{method=\"eth_estimateGas\"}", 0.0),
+        ("lite_rounds_exhausted_total{method=\"eth_estimateGas\"}", 0.0),
+    ] {
+        assert_eq!(series(&out, name), Some(want), "{name} in:\n{out}");
+    }
+}
+
 #[tokio::test]
 async fn error_and_warm_misses_then_answers_locally_on_the_second_call() {
     let r = rig(OnMiss::ErrorAndWarm, true);
