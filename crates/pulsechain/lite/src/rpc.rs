@@ -511,6 +511,8 @@ pub struct Api {
     wide_fetches: tokio::sync::Semaphore,
     /// The newest state probe, for `GET /ready`.
     state_probe: Mutex<Option<StateProbe>>,
+    /// The tip oracle of 369 ([`tip`]).
+    tips: Mutex<tip::TipOracle>,
     trust_label: String,
 }
 
@@ -586,6 +588,7 @@ impl Api {
             wide_fetches: tokio::sync::Semaphore::new(WIDE_FETCHES),
             recent_txs: Mutex::default(),
             state_probe: Mutex::default(),
+            tips: Mutex::default(),
             trust_label: p.trust_label,
         }))
     }
@@ -818,14 +821,14 @@ impl Api {
             }
             "eth_gasPrice" => {
                 let head = self.head()?;
-                let tip = self.suggested_tip();
+                let tip = self.suggested_tip(&head);
                 Ok(json!(hex_u128(
                     tip.saturating_add(u128::from(head.header.base_fee_per_gas.unwrap_or(0))),
                 )))
             }
             "eth_maxPriorityFeePerGas" => {
-                self.head()?;
-                Ok(json!(hex_u128(self.suggested_tip())))
+                let head = self.head()?;
+                Ok(json!(hex_u128(self.suggested_tip(&head))))
             }
             "eth_sendRawTransaction" => self.send_raw_transaction(p, mode).await,
             "eth_feeHistory" => {
@@ -1620,9 +1623,14 @@ impl Api {
 
     // --- fees ---
 
-    /// The chain's tip answer: see [`chain_tip`].
-    const fn suggested_tip(&self) -> u128 {
-        chain_tip(self.cfg.chain_id)
+    /// The tip `eth_maxPriorityFeePerGas` answers at `head`, as valve's pulse-reth nodes answer
+    /// it. On 369 it is erigon-pulse's oracle over the held blocks ([`tip`]), as rpc.pulsechain.com
+    /// answers. On 943 it is a fixed [`MIN_TIP_943`]. The API is built only for those two chains.
+    fn suggested_tip(&self, head: &HeldBlock) -> u128 {
+        match self.cfg.chain_id {
+            369 => self.tips.lock().suggest(&self.chain, head),
+            _ => MIN_TIP_943,
+        }
     }
 
     async fn fee_history(self: &Arc<Self>, p: &Value, mode: OnMiss) -> Result<Value, RpcError> {
@@ -2165,16 +2173,10 @@ fn decode_revert_reason(data: &[u8]) -> Option<String> {
     String::from_utf8(s.to_vec()).ok()
 }
 
-/// The tip `eth_maxPriorityFeePerGas` answers, as valve's pulse-reth nodes answer it. On 369 it
-/// is a fixed 50,000 gwei, to match rpc.pulsechain.com. On 943 it is 1,000,000 wei (0.001 gwei),
-/// the network's minimum accepted tip: pulse-reth answers the lowest tip of at least that over
-/// 100 blocks, which is it. The API is built only for those two chains.
-const fn chain_tip(chain_id: u64) -> u128 {
-    match chain_id {
-        369 => 50_000_000_000_000,
-        _ => 1_000_000,
-    }
-}
+/// The tip `eth_maxPriorityFeePerGas` answers on 943: 1,000,000 wei (0.001 gwei), the network's
+/// minimum accepted tip. pulse-reth answers the lowest tip of at least that over 100 blocks,
+/// which is it.
+const MIN_TIP_943: u128 = 1_000_000;
 
 /// The sender of `tx`. A signature that does not recover is an error, never the zero address.
 fn recover(tx: &TxEnvelope) -> Result<Address, RpcError> {
@@ -3482,6 +3484,8 @@ impl AsyncWrite for ConnDeadlines {
         self.deadline(cx, res)
     }
 }
+
+mod tip;
 
 #[cfg(test)]
 mod tests;

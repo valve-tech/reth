@@ -138,8 +138,12 @@ Sizes take the forms of pulse-reth's size flags, because reth-lite uses the same
   balance is the confirmed one; ask the node that holds your pending transactions. As reth,
   `earliest` is the earliest available block: the lowest held block, not genesis.
 * Fee estimates: `eth_maxPriorityFeePerGas` gives the answer valve's pulse-reth nodes give. On
-  369 it is a fixed 50,000 gwei, to match rpc.pulsechain.com. On 943 it is a fixed 1,000,000 wei
-  (0.001 gwei), the network's minimum accepted tip. `eth_gasPrice` adds the head's base fee.
+  369 it runs rpc.pulsechain.com's oracle (erigon-pulse) over the held blocks, the newest 20 or
+  fewer. Per block it drops tips under 1,000 gwei, the coinbase's transactions and
+  self-transfers, and keeps the lowest 40% of the rest (at least 3). It answers the 60th
+  percentile of those samples, at most 1 PLS. With no sample it keeps its last answer, and
+  50,000 gwei before its first. On 943 it is a fixed 1,000,000 wei (0.001 gwei), the network's
+  minimum accepted tip. `eth_gasPrice` adds the head's base fee.
 * Batches: at most 1000 requests, as geth. A larger batch gets an array of one `-32600`
   `batch too large` error with the id of its first call, as geth answers it.
 * Responses: when a batch's answers pass 25,000,000 bytes, as geth, each later answer gets

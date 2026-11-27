@@ -3636,23 +3636,144 @@ async fn the_suggested_tip_on_943_is_a_fixed_1000000_wei() {
     assert_eq!(result(&got), &json!(hex_u128(1_000_000)));
 }
 
-/// On 369 the tip answer is fixed at 50,000 gwei, as valve's pulse-reth nodes answer it.
+fn api_369(r: &Rig) -> Arc<Api> {
+    let cfg = LiteConfig { chain_id: 369, ..LiteConfig::default() };
+    api_with(r, cfg, r.honest.clone(), Arc::new(Receipts(vec![])))
+}
+
+/// A transfer signed by [`sender_key`] to `to`, paying `tip` over the rig's 1 gwei base fee.
+fn tipped(nonce: u64, tip: u128, to: Address) -> TxEnvelope {
+    use alloy_consensus::SignableTransaction;
+    let tx = alloy_consensus::TxEip1559 {
+        chain_id: 369,
+        nonce,
+        gas_limit: 21_000,
+        max_fee_per_gas: GWEI_TIP + tip,
+        max_priority_fee_per_gas: tip,
+        to: TxKind::Call(to),
+        ..Default::default()
+    };
+    let sig = sign_hash(tx.signature_hash());
+    tx.into_signed(sig).into()
+}
+
+fn tip_369(api: &Arc<Api>) -> impl Future<Output = Value> + '_ {
+    call(api, "eth_maxPriorityFeePerGas", json!([]))
+}
+
+/// On 369 the tip answer is erigon-pulse's oracle over the held blocks, as rpc.pulsechain.com
+/// answers: a self-transfer, a tip under 1,000 gwei and the coinbase's transactions are not
+/// sampled, and `eth_gasPrice` adds the head's base fee.
 #[tokio::test]
-async fn the_suggested_tip_on_369_is_a_fixed_50000_gwei() {
+async fn the_suggested_tip_on_369_follows_erigons_oracle() {
     let r = rig(OnMiss::Fetch, true);
-    let api = api_with(
-        &r,
-        LiteConfig { chain_id: 369, ..LiteConfig::default() },
-        r.honest.clone(),
-        Arc::new(Receipts(vec![])),
-    );
+    let api = api_369(&r);
+    let g = GWEI_TIP;
     for i in 0..3 {
-        push_head(&r, vec![legacy_tx(i, 2 * GWEI_TIP)]);
+        push_head(
+            &r,
+            vec![
+                tipped(10 * i, 2_000 * g, ALICE),
+                tipped(10 * i + 1, 4_000 * g, ALICE),
+                // a self-transfer, which would put the answer on 2,000 gwei
+                tipped(10 * i + 2, 1_500 * g, sender()),
+                // under the ignore price
+                tipped(10 * i + 3, 999 * g, ALICE),
+            ],
+        );
     }
-    let tip = call(&api, "eth_maxPriorityFeePerGas", json!([])).await;
-    assert_eq!(result(&tip), &json!(hex_u128(50_000 * GWEI_TIP)));
+    // samples 2,000 x 3 and 4,000 x 3: index 5 * 60 / 100 = 3
+    assert_eq!(result(&tip_369(&api).await), &json!(hex_u128(4_000 * g)));
     let price = call(&api, "eth_gasPrice", json!([])).await;
-    assert_eq!(result(&price), &json!(hex_u128(50_000 * GWEI_TIP + 1_000_000_000)));
+    assert_eq!(result(&price), &json!(hex_u128(4_000 * g + 1_000_000_000)));
+
+    // a head whose coinbase sent its transactions gives no sample: three 1,000 gwei samples
+    // would put the answer on 2,000 gwei
+    let from_coinbase = (52..55).map(|n| tipped(n, 1_000 * g, ALICE)).collect();
+    push_head_with(&r, from_coinbase, |h| h.beneficiary = sender());
+    assert_eq!(result(&tip_369(&api).await), &json!(hex_u128(4_000 * g)));
+    // a new head copies its parent's header, so set the coinbase back
+    let other_coinbase = |h: &mut Header| h.beneficiary = Address::ZERO;
+    push_head_with(&r, vec![tipped(41, 100_000 * g, ALICE)], other_coinbase);
+    // samples 2,000 x 3, 4,000 x 3 and 100,000: index 6 * 60 / 100 = 3
+    assert_eq!(result(&tip_369(&api).await), &json!(hex_u128(4_000 * g)));
+    push_head_with(&r, (42..52).map(|n| tipped(n, 100_000 * g, ALICE)).collect(), other_coinbase);
+    // a block of 10 gives its lowest 40%, 4 more of 100,000: index 10 * 60 / 100 = 6
+    assert_eq!(result(&tip_369(&api).await), &json!(hex_u128(100_000 * g)));
+}
+
+/// Before any sample the answer is the 50,000 gwei that reth-lite answered before, the walk
+/// uses the blocks held when fewer than 20 are, an empty block counts toward the 20, and with no
+/// sample in 20 blocks the answer is the last one.
+#[tokio::test]
+async fn the_369_tip_walks_20_held_blocks_and_keeps_its_last_answer() {
+    let r = rig(OnMiss::Fetch, true);
+    let api = api_369(&r);
+    let g = GWEI_TIP;
+    // the rig holds 4 blocks, and none pays 1,000 gwei
+    assert_eq!(result(&tip_369(&api).await), &json!(hex_u128(50_000 * g)));
+
+    push_head(&r, vec![tipped(0, 3_000 * g, ALICE)]);
+    assert_eq!(result(&tip_369(&api).await), &json!(hex_u128(3_000 * g)));
+    // 20 empty blocks on top hide it
+    for _ in 0..20 {
+        push_head(&r, vec![]);
+    }
+    assert_eq!(
+        result(&tip_369(&api).await),
+        &json!(hex_u128(3_000 * g)),
+        "a window of 20 empty blocks keeps the last answer"
+    );
+
+    // prove the 20th block is read: a fresh oracle at 19 empty blocks on top of a tip
+    let r = rig(OnMiss::Fetch, true);
+    let api = api_369(&r);
+    push_head(&r, vec![tipped(0, 7_000 * g, ALICE)]);
+    for _ in 0..19 {
+        push_head(&r, vec![]);
+    }
+    assert_eq!(result(&tip_369(&api).await), &json!(hex_u128(7_000 * g)));
+    // one more empty block pushes it out, and the oracle keeps the 50,000 gwei it started with
+    let api = api_369(&r);
+    push_head(&r, vec![]);
+    assert_eq!(result(&tip_369(&api).await), &json!(hex_u128(50_000 * g)));
+}
+
+/// Senders are recovered once per block: a batch of 1000 `eth_gasPrice` calls at a head the
+/// oracle has answered recovers none, and at a new head it recovers only that block's
+/// transactions, once.
+#[tokio::test]
+async fn a_batch_of_1000_gas_price_calls_recovers_each_sender_once() {
+    let r = rig(OnMiss::Fetch, true);
+    let api = api_369(&r);
+    let g = GWEI_TIP;
+    for i in 0..25 {
+        push_head(&r, vec![tipped(2 * i, 2_000 * g, ALICE), tipped(2 * i + 1, 3_000 * g, ALICE)]);
+    }
+    let recovered = || api.tips.lock().recovered;
+    let batch = |method: &str| {
+        let item = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": []});
+        Value::Array(vec![item; 1000]).to_string()
+    };
+    tip_369(&api).await;
+    // the 20 blocks of the window, two transactions each
+    assert_eq!(recovered(), 40);
+    let v = handle(&api, batch("eth_gasPrice").as_bytes()).await;
+    assert_eq!(v.as_array().unwrap().len(), 1000);
+    assert!(v.as_array().unwrap().iter().all(|x| x["result"] == v[0]["result"]));
+    handle(&api, batch("eth_maxPriorityFeePerGas").as_bytes()).await;
+    assert_eq!(recovered(), 40, "a head the oracle answered recovers no sender");
+
+    push_head(&r, vec![tipped(100, 2_000 * g, ALICE), tipped(101, 2_000 * g, ALICE)]);
+    handle(&api, batch("eth_gasPrice").as_bytes()).await;
+    assert_eq!(recovered(), 42, "a new head recovers its own two senders, once");
+
+    // the cache is bounded
+    for i in 0..100 {
+        push_head(&r, vec![tipped(200 + i, 2_000 * g, ALICE)]);
+        tip_369(&api).await;
+    }
+    assert!(api.tips.lock().cached_blocks() <= tip::CACHED_BLOCKS);
 }
 
 const GWEI_TIP: u128 = 1_000_000_000;
