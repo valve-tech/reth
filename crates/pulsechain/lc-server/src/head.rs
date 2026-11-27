@@ -446,6 +446,40 @@ mod tests {
         stream.abort();
     }
 
+    /// The head cap counts the heads of one poll interval. A stream that spreads its heads over
+    /// more than one interval stays open and delivers them all.
+    #[tokio::test]
+    async fn heads_spread_over_poll_intervals_keep_the_event_stream_open() {
+        let (chain, rig) = rig_after_checkpoint(89).await;
+        rig.beacon.enable_events();
+        let (heads, mut events) = mpsc::channel(HEAD_QUEUE);
+        let poll = Duration::from_millis(500);
+        let stream = tokio::spawn(follow_events(rig.beacon.upstream(), chain.pins, poll, heads));
+        while rig.beacon.calls("/eth/v1/events") == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut got = Vec::new();
+        for burst in 0..2u8 {
+            for byte in 0..MAX_STREAM_HEADS as u8 {
+                rig.beacon.set_head(B256::repeat_byte(burst * 16 + byte));
+            }
+            while let Ok(Some(root)) =
+                tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+            {
+                got.push(root);
+            }
+            tokio::time::sleep(poll).await;
+        }
+        let want: Vec<B256> = [0u8, 16]
+            .into_iter()
+            .flat_map(|base| (0..MAX_STREAM_HEADS as u8).map(move |b| B256::repeat_byte(base + b)))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(rig.beacon.calls("/eth/v1/events"), 1);
+        stream.abort();
+    }
+
     /// A head that the store refused for a passing reason, here a head of period 2 before the
     /// store knows period 2's committee, is handled again when a beacon URL reports it again,
     /// from the blocks read the first time.

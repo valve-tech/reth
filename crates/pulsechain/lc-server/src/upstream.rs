@@ -755,6 +755,37 @@ mod tests {
         );
     }
 
+    /// A state URL on another chain fails the start check, though every beacon URL passes.
+    #[tokio::test]
+    async fn a_state_url_on_another_chain_fails_the_start_check() {
+        let mainnet = Fake::start(&pins(369)).await;
+        let testnet = Fake::start(&pins(943)).await;
+        let err = check_upstreams(&testnet.upstream(), &[mainnet.upstream()], &pins(369))
+            .await
+            .unwrap_err();
+        let StartCheckError::WrongChain(err) = err else { panic!("{err}") };
+        assert_eq!(
+            err.error,
+            PinError::GenesisValidatorsRoot {
+                got: pins(943).genesis_validators_root,
+                want: pins(369).genesis_validators_root,
+            }
+        );
+    }
+
+    /// Only a 200 answer with the event-stream media type opens a head event stream.
+    #[tokio::test]
+    async fn a_head_event_stream_must_be_an_event_stream() {
+        let idle = Duration::from_secs(5);
+        let fake = Fake::start(&pins(369)).await;
+        assert_eq!(fake.upstream().head_events(idle).await.err(), Some(UpstreamError::Status(404)));
+        fake.answer("/eth/v1/events", Answer::json(&json!({"data": {}})));
+        assert_eq!(fake.upstream().head_events(idle).await.err(), Some(UpstreamError::Body));
+        let streams = Fake::start(&pins(369)).await;
+        streams.enable_events();
+        assert!(streams.upstream().head_events(idle).await.is_ok());
+    }
+
     #[tokio::test]
     async fn an_unreadable_genesis_fails_the_check() {
         let fake = Fake::start(&pins(369)).await;
@@ -999,6 +1030,30 @@ mod tests {
         };
         assert_eq!(stream(MAX_SKIPPED_EVENTS).next_head().await, Some(root));
         assert_eq!(stream(MAX_SKIPPED_EVENTS + 1).next_head().await, None);
+    }
+
+    /// A stream whose body comes in `chunks`, one read each.
+    fn events_in(chunks: Vec<Vec<u8>>) -> HeadEvents {
+        let body = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+        HeadEvents::new(
+            reqwest::Response::from(hyper::Response::new(reqwest::Body::wrap_stream(body))),
+            Duration::from_secs(60),
+        )
+    }
+
+    /// An event may grow to [`MAX_SSE_EVENT`] bytes over several reads. One byte more ends the
+    /// stream before the next read, so the head behind it is never read.
+    #[tokio::test]
+    async fn an_event_over_the_size_limit_ends_the_stream() {
+        let root = B256::repeat_byte(7);
+        let head = format!("event: head\ndata: {}\n\n", json!({"slot": "5", "block": root}));
+        let stream = |len: usize| {
+            let mut tail = b"\n\n".to_vec();
+            tail.extend_from_slice(head.as_bytes());
+            events_in(vec![[b": ".to_vec(), vec![b'x'; len - 2]].concat(), tail])
+        };
+        assert_eq!(stream(MAX_SSE_EVENT).next_head().await, Some(root));
+        assert_eq!(stream(MAX_SSE_EVENT + 1).next_head().await, None);
     }
 
     /// A chunk of 417,792 newlines is 208,896 empty events. Each byte is searched once, so the
